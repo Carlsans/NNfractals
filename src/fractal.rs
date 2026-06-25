@@ -2,8 +2,8 @@ use burn::tensor::{Tensor, TensorData, backend::Backend};
 use rayon::prelude::*;
 use crate::config::Config;
 use crate::genome::Genome;
-use crate::formula::{eval_formula, eval_formula_tensor};
-use crate::transformer::transformer_forward_scalar;
+use crate::formula::{apply_formula, apply_formula_tensor};
+use crate::transformer::transformer_forward_latent;
 
 /// Build a [H*W, 2] tensor of (cx, cy) pixel coordinates using a genome's evolved view.
 pub fn pixel_coords<B: Backend>(
@@ -59,6 +59,9 @@ pub fn render_cpu_iter(
     let hf = (height.saturating_sub(1)).max(1) as f32;
     let n = (width * height) as usize;
 
+    // Run transformer ONCE per genome to get formula weights
+    let fw = transformer_forward_latent(&genome.transformer, &genome.latent);
+
     (0..n).into_par_iter().map(|idx| {
         let px = idx % width as usize;
         let py = idx / width as usize;
@@ -68,7 +71,7 @@ pub fn render_cpu_iter(
         let mut zx = 0.0f32;
         let mut zy = 0.0f32;
         for iter in 0..max_iter {
-            let (nzx, nzy) = forward_pixel(genome, zx, zy, cx, cy);
+            let (nzx, nzy) = apply_formula(&fw, zx, zy, cx, cy);
             zx = nzx;
             zy = nzy;
             let mod_sq = zx * zx + zy * zy;
@@ -77,29 +80,22 @@ pub fn render_cpu_iter(
                 let nu = log2_mod.log2();
                 return (iter as f32 + 1.0 - nu).max(0.0);
             }
+            // Prevent NaN propagation
+            if !zx.is_finite() || !zy.is_finite() {
+                return iter as f32;
+            }
         }
         max_iter as f32
     }).collect()
 }
 
-/// One fractal iteration:
-///   z_new = formula(z, c) + nn_blend * tanh_per_component(Transformer(z, c))
-fn forward_pixel(genome: &Genome, zx: f32, zy: f32, cx: f32, cy: f32) -> (f32, f32) {
-    let (fx, fy) = eval_formula(&genome.formula, zx, zy, cx, cy);
-    let (nx, ny) = transformer_forward_scalar(&genome.transformer, zx, zy, cx, cy);
-    (fx + genome.nn_blend * nx.tanh(), fy + genome.nn_blend * ny.tanh())
-}
-
 /// Tensor formula step for backprop.
+/// fw_re/fw_im: [1, N_BASIS]; z/c: [N, 2] → returns [N, 2].
 pub fn formula_step_tensor<B: Backend>(
-    formula: &[crate::formula::ComplexOp],
+    fw_re: &Tensor<B, 2>,
+    fw_im: &Tensor<B, 2>,
     z: &Tensor<B, 2>,
     c: &Tensor<B, 2>,
 ) -> Tensor<B, 2> {
-    let zx = z.clone().narrow(1, 0, 1);
-    let zy = z.clone().narrow(1, 1, 1);
-    let cx = c.clone().narrow(1, 0, 1);
-    let cy = c.clone().narrow(1, 1, 1);
-    let (fx, fy) = eval_formula_tensor(formula, zx, zy, &cx, &cy);
-    Tensor::cat(vec![fx, fy], 1)
+    apply_formula_tensor(fw_re, fw_im, z, c)
 }

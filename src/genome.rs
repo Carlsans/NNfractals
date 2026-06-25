@@ -2,7 +2,8 @@ use rand::Rng;
 use serde::{Deserialize, Serialize};
 use crate::config::Config;
 use crate::cppn::ActivationType;
-use crate::formula::{ComplexOp, template_formulas, mutate_formula, crossover_formulas};
+use crate::formula::{N_BASIS, basis_name};
+use crate::transformer::transformer_forward_latent;
 
 /// Single weight matrix stored in row-major order.
 /// weights[o * in_size + i] = weight from input i to output o.
@@ -69,41 +70,39 @@ impl LayerData {
     }
 }
 
-/// All weights for one transformer block:
-///   2 tokens [z, c] → self-attention → CPPN feed-forward → 1 complex output.
+/// All weights for one transformer block.
+/// embed_z and embed_c now map d_model → d_model (project full latent → two tokens).
+/// output maps d_model → N_BASIS (formula weights).
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TransformerWeights {
-    /// Input embedding: complex scalar → d_model complex vector (in=1, out=d_model)
+    /// Latent projection: d_model → d_model (was 1 → d_model)
     pub embed_z: LayerData,
     pub embed_c: LayerData,
-    /// Shared attention projections (in=d_model, out=d_model)
+    /// Attention projections: d_model → d_model
     pub w_q: LayerData,
     pub w_k: LayerData,
     pub w_v: LayerData,
-    /// Attention output projection (in=d_model, out=d_model)
     pub w_o: LayerData,
-    /// CPPN feed-forward layer 1 (in=d_model, out=d_ff)
+    /// Feed-forward: d_model → d_ff → d_model
     pub ff1: LayerData,
-    /// Feed-forward layer 2 (in=d_ff, out=d_model)
     pub ff2: LayerData,
-    /// Output projection: d_model → 1 complex scalar
+    /// Formula weight output: d_model → N_BASIS
     pub output: LayerData,
-    /// Per-neuron evolved activation for ff1 (length = d_ff)
     pub ff_acts: Vec<ActivationType>,
 }
 
 impl TransformerWeights {
     pub fn random(d_model: usize, d_ff: usize, pool: &[ActivationType], rng: &mut impl Rng) -> Self {
         TransformerWeights {
-            embed_z: LayerData::random(1,       d_model, rng),
-            embed_c: LayerData::random(1,       d_model, rng),
+            embed_z: LayerData::random(d_model, d_model, rng),
+            embed_c: LayerData::random(d_model, d_model, rng),
             w_q:     LayerData::random(d_model, d_model, rng),
             w_k:     LayerData::random(d_model, d_model, rng),
             w_v:     LayerData::random(d_model, d_model, rng),
             w_o:     LayerData::random(d_model, d_model, rng),
             ff1:     LayerData::random(d_model, d_ff,    rng),
             ff2:     LayerData::random(d_ff,    d_model, rng),
-            output:  LayerData::random(d_model, 1,       rng),
+            output:  LayerData::random(d_model, N_BASIS, rng),
             ff_acts: (0..d_ff).map(|_| {
                 if pool.is_empty() { ActivationType::Tanh }
                 else { pool[rng.random_range(0..pool.len())].clone() }
@@ -151,37 +150,25 @@ impl TransformerWeights {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Genome {
     pub transformer: TransformerWeights,
+    /// Latent code: d_model complex values evolved by GA.
+    /// Passed to the transformer to synthesize N_BASIS formula weights.
+    pub latent: Vec<(f32, f32)>,
     pub fitness: f32,
     pub id: u64,
-    #[serde(default = "default_formula")]
-    pub formula: Vec<ComplexOp>,
-    #[serde(default = "default_nn_blend")]
-    pub nn_blend: f32,
-    /// View center: evolves to discover interesting zoom regions.
     #[serde(default)]
     pub view_cx: f32,
     #[serde(default)]
     pub view_cy: f32,
-    /// Zoom level: 1.0 = full [-2,2] view, 4.0 = 4× zoom, etc.
     #[serde(default = "default_view_zoom")]
     pub view_zoom: f32,
 }
 
-fn default_formula()   -> Vec<ComplexOp> { vec![ComplexOp::Square, ComplexOp::AddC] }
-fn default_nn_blend()  -> f32 { 1.0 }
 fn default_view_zoom() -> f32 { 1.0 }
 
 impl Genome {
-    /// Compute the (xmin, xmax, ymin, ymax) view for this genome.
-    /// Base half-range is 2.0 (covers [-2,2] at zoom=1).
     pub fn view_bounds(&self) -> (f32, f32, f32, f32) {
         let half = 2.0 / self.view_zoom;
-        (
-            self.view_cx - half,
-            self.view_cx + half,
-            self.view_cy - half,
-            self.view_cy + half,
-        )
+        (self.view_cx - half, self.view_cx + half, self.view_cy - half, self.view_cy + half)
     }
 
     pub fn random(config: &Config, rng: &mut impl Rng) -> Self {
@@ -189,19 +176,15 @@ impl Genome {
         let d_ff    = config.d_ff();
         let pool    = ActivationType::all_from_config(&config.network.activation_pool);
 
-        let templates = template_formulas();
-        let formula = if rng.random::<f32>() < 0.6 {
-            templates[rng.random_range(0..templates.len())].clone()
-        } else {
-            let len = rng.random_range(2usize..=5);
-            (0..len).map(|_| ComplexOp::random(rng)).collect()
-        };
+        // Latent: d_model complex values, small Gaussian
+        let latent: Vec<(f32, f32)> = (0..d_model)
+            .map(|_| {
+                let r = rng.random::<f32>() * 2.0 - 1.0;
+                let i = rng.random::<f32>() * 2.0 - 1.0;
+                (r * 0.5, i * 0.5)
+            })
+            .collect();
 
-        let log_min = 0.05_f32.ln();
-        let log_max = 3.0_f32.ln();
-        let nn_blend = (log_min + rng.random::<f32>() * (log_max - log_min)).exp();
-
-        // 70% start centered, 30% with a slight random pan/zoom
         let (view_cx, view_cy, view_zoom) = if rng.random::<f32>() < 0.70 {
             (0.0, 0.0, 1.0)
         } else {
@@ -216,10 +199,9 @@ impl Genome {
 
         Genome {
             transformer: TransformerWeights::random(d_model, d_ff, &pool, rng),
+            latent,
             fitness: 0.0,
             id: rng.random(),
-            formula,
-            nn_blend,
             view_cx,
             view_cy,
             view_zoom,
@@ -227,13 +209,19 @@ impl Genome {
     }
 
     pub fn crossover(a: &Self, b: &Self, rng: &mut impl Rng) -> Self {
+        let latent = a.latent.iter().zip(b.latent.iter())
+            .map(|(&(ar, ai), &(br, bi))| {
+                let r = if rng.random_bool(0.5) { ar } else { br };
+                let i = if rng.random_bool(0.5) { ai } else { bi };
+                (r, i)
+            })
+            .collect();
+
         Genome {
             transformer: TransformerWeights::crossover(&a.transformer, &b.transformer, rng),
-            fitness:     0.0,
-            id:          rng.random(),
-            formula:     crossover_formulas(&a.formula, &b.formula, rng),
-            nn_blend:    if rng.random_bool(0.5) { a.nn_blend } else { b.nn_blend },
-            // Interpolate view: arithmetic mean for position, geometric mean for zoom
+            latent,
+            fitness: 0.0,
+            id: rng.random(),
             view_cx:   (a.view_cx + b.view_cx) * 0.5,
             view_cy:   (a.view_cy + b.view_cy) * 0.5,
             view_zoom: (a.view_zoom * b.view_zoom).sqrt(),
@@ -251,25 +239,18 @@ impl Genome {
         child.fitness = 0.0;
         child.transformer.mutate(mr, ms, ap, &pool, rng);
 
-        // 5% chance: completely replace formula — escapes local optima in formula space
-        if rng.random::<f32>() < 0.05 {
-            let len = rng.random_range(2usize..=6);
-            child.formula = (0..len).map(|_| ComplexOp::random(rng)).collect();
-        } else if rng.random::<f32>() < 0.45 {
-            mutate_formula(&mut child.formula, rng);
+        // Gaussian mutation on latent (same rate/scale as transformer)
+        for (r, i) in child.latent.iter_mut() {
+            if rng.random::<f32>() < mr { *r += rng.random::<f32>() * 2.0 * ms - ms; }
+            if rng.random::<f32>() < mr { *i += rng.random::<f32>() * 2.0 * ms - ms; }
         }
 
-        if rng.random::<f32>() < 0.12 {
-            child.nn_blend *= 1.0 + rng.random::<f32>() * 0.6 - 0.3;
-            child.nn_blend = child.nn_blend.clamp(0.02, 5.0);
-        }
-
-        // View mutations: biased toward zooming IN (deeper = richer detail).
+        // View mutations
         if rng.random::<f32>() < 0.30 {
             let zoom_delta = if rng.random::<f32>() < 0.65 {
-                1.0 + rng.random::<f32>() * 1.0   // zoom in: ×1.0 → ×2.0
+                1.0 + rng.random::<f32>() * 1.0
             } else {
-                1.0 / (1.0 + rng.random::<f32>() * 0.3)  // zoom out: ÷1.0 → ÷1.3
+                1.0 / (1.0 + rng.random::<f32>() * 0.3)
             };
             child.view_zoom = (child.view_zoom * zoom_delta).clamp(0.5, 25.0);
         }
@@ -282,12 +263,31 @@ impl Genome {
         child
     }
 
+    /// Label showing top-3 active basis functions by |weight|.
     pub fn formula_label(&self) -> String {
-        let ops: Vec<&str> = self.formula.iter().map(|op| op.label()).collect();
-        format!("{}  b={:.2}  z={:.1}x", ops.join("→"), self.nn_blend, self.view_zoom)
+        let fw = transformer_forward_latent(&self.transformer, &self.latent);
+        let mut indexed: Vec<(f32, usize)> = fw.iter()
+            .enumerate()
+            .map(|(i, &(r, im))| (r*r + im*im, i))
+            .collect();
+        indexed.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+        let top3: Vec<String> = indexed.iter().take(3)
+            .map(|(_, i)| basis_name(*i).to_string())
+            .collect();
+        format!("{}  z={:.1}x", top3.join("+"), self.view_zoom)
     }
 
+    /// Short identifier for formula diversity tracking.
     pub fn formula_ops_label(&self) -> String {
-        self.formula.iter().map(|op| op.label()).collect::<Vec<_>>().join("→")
+        let fw = transformer_forward_latent(&self.transformer, &self.latent);
+        let mut indexed: Vec<(f32, usize)> = fw.iter()
+            .enumerate()
+            .map(|(i, &(r, im))| (r*r + im*im, i))
+            .collect();
+        indexed.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+        indexed.iter().take(2)
+            .map(|(_, i)| basis_name(*i).to_string())
+            .collect::<Vec<_>>()
+            .join("+")
     }
 }

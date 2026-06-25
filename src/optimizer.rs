@@ -6,7 +6,7 @@ use std::time::Instant;
 
 use crate::config::Config;
 use crate::genome::{Genome, LayerData};
-use crate::transformer::{TransformerTensors, CLayer, transformer_forward_tensor};
+use crate::transformer::{TransformerTensors, CLayer, transformer_forward_latent_tensor};
 use crate::fractal::{pixel_coords, evaluate_fitness_full, render_cpu, formula_step_tensor};
 use crate::colormap::apply_colormap;
 use crate::fitness::{novelty_score, is_degenerate, behavior_descriptor, beauty_score};
@@ -181,13 +181,10 @@ where
         let n         = (ew * eh) as usize;
         let clamp_val = self.config.optimization.eval_clamp;
         let device    = self.device.clone();
-        let formula   = self.population[idx].formula.clone();
-        let nn_blend  = self.population[idx].nn_blend;
         let d_model   = self.config.network.d_model;
 
         let c_inner = pixel_coords::<B::InnerBackend>(ew, eh, &self.population[idx], &device);
 
-        // Helper: build an autodiff CLayer from a LayerData
         let mk2 = |data: Vec<f32>, r: usize, c: usize| -> Tensor<B, 2> {
             Tensor::from_inner(
                 Tensor::<B::InnerBackend, 2>::from_data(TensorData::new(data, [r, c]), &device)
@@ -228,22 +225,23 @@ where
                 "Gen {}  Backprop elite {} step {}/{}...",
                 self.generation, idx + 1, step + 1, self.config.optimization.backprop_steps
             ));
+
+            // Build differentiable latent tensors (fresh each step to pick up prior updates)
+            let lat_re_data: Vec<f32> = self.population[idx].latent.iter().map(|x| x.0).collect();
+            let lat_im_data: Vec<f32> = self.population[idx].latent.iter().map(|x| x.1).collect();
+            let latent_re = mk2(lat_re_data, 1, d_model);
+            let latent_im = mk2(lat_im_data, 1, d_model);
+
+            // Run transformer ONCE per genome: latent → formula weights
+            let (fw_re, fw_im) = transformer_forward_latent_tensor(
+                &tt, &ff_acts, &latent_re, &latent_im, d_model,
+            );
+
             let c: Tensor<B, 2> = Tensor::from_inner(c_inner.clone());
-            let c_re = c.clone().narrow(1, 0, 1);
-            let c_im = c.clone().narrow(1, 1, 1);
             let mut z: Tensor<B, 2> = Tensor::zeros([n, 2], &device);
 
             for _ in 0..max_iter {
-                let z_re = z.clone().narrow(1, 0, 1);
-                let z_im = z.clone().narrow(1, 1, 1);
-                let fz = formula_step_tensor(&formula, &z, &c);
-                let (nn_re, nn_im) = transformer_forward_tensor(
-                    &tt, &ff_acts, z_re, z_im, &c_re, &c_im, d_model);
-                let fz_re  = fz.clone().narrow(1, 0, 1);
-                let fz_im  = fz.narrow(1, 1, 1);
-                let new_re = fz_re + nn_re.tanh() * nn_blend;
-                let new_im = fz_im + nn_im.tanh() * nn_blend;
-                z = Tensor::cat(vec![new_re, new_im], 1).clamp(-clamp_val, clamp_val);
+                z = formula_step_tensor(&fw_re, &fw_im, &z, &c).clamp(-clamp_val, clamp_val);
             }
 
             let z_x   = z.clone().narrow(1, 0, 1).flatten::<1>(0, 1);
@@ -282,6 +280,24 @@ where
             update_layer!(tt.ff1,     tw.ff1);
             update_layer!(tt.ff2,     tw.ff2);
             update_layer!(tt.output,  tw.output);
+
+            // Apply gradient to latent
+            if let Some(g) = latent_re.grad(&grads) {
+                let v = (latent_re.clone().inner() - g.clamp(-CLIP, CLIP) * lr)
+                    .into_data().to_vec::<f32>().unwrap_or_default();
+                let lat = &mut self.population[idx].latent;
+                for (i, val) in v.iter().enumerate() {
+                    if i < lat.len() { lat[i].0 = *val; }
+                }
+            }
+            if let Some(g) = latent_im.grad(&grads) {
+                let v = (latent_im.clone().inner() - g.clamp(-CLIP, CLIP) * lr)
+                    .into_data().to_vec::<f32>().unwrap_or_default();
+                let lat = &mut self.population[idx].latent;
+                for (i, val) in v.iter().enumerate() {
+                    if i < lat.len() { lat[i].1 = *val; }
+                }
+            }
         }
     }
 
