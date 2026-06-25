@@ -81,54 +81,61 @@ pub fn is_degenerate(escape_times: &[f32]) -> bool {
 }
 
 /// Fractal beauty score in [0, 1].
-/// Combines boundary richness, gradient coherence, multi-scale self-similarity,
-/// and color spread — all computable from the escape-time array alone.
+/// Tuned to correlate with CLIP aesthetic perception: edge density and color entropy
+/// are the strongest predictors of perceived visual quality.
 pub fn beauty_score(escape_times: &[f32], width: usize, max_iter: u32) -> f32 {
     let n = escape_times.len();
     let height = n / width.max(1);
     if n == 0 || height == 0 { return 0.0; }
     let max = max_iter as f32;
 
-    // 1. Boundary richness: pixels in the "interesting" fractal zone (5-95% of max_iter).
-    //    These are the pixels near the escape boundary where fractal detail lives.
+    // 1. Boundary zone fraction: pixels in the detail-rich 5–90% band.
+    //    Target ~55%: produces a vivid image with both structure and open space.
     let boundary_frac = escape_times.iter()
-        .filter(|&&t| t > max * 0.05 && t < max * 0.95)
+        .filter(|&&t| t > max * 0.05 && t < max * 0.90)
         .count() as f32 / n as f32;
-    // Peak score at ~40%; falls off toward 0% (all interior) or 100% (all escaped)
-    let boundary_score = (1.0 - ((boundary_frac - 0.40) * 2.5_f32).abs()).max(0.0);
+    let boundary_score = (1.0 - ((boundary_frac - 0.55) * 2.0_f32).abs()).max(0.0);
 
-    // 2. Gradient coherence: ratio of mean gradient to max gradient.
-    //    High ratio = smooth, structured boundaries; low ratio = spiky noise.
-    let mut total_grad = 0.0f32;
-    let mut max_grad = 0.0f32;
-    let mut count = 0u32;
+    // 2. Edge density: fraction of adjacent pixel pairs with a notable gradient.
+    //    This is the #1 predictor of CLIP aesthetic score for fractals.
+    //    Rich structure = many local transitions across the image.
+    let edge_thresh = max * 0.03;
+    let mut edge_count = 0u32;
+    let mut total_pairs = 0u32;
     for y in 0..height {
         for x in 0..width {
             let t = escape_times[y * width + x];
             if x + 1 < width {
-                let g = (t - escape_times[y * width + x + 1]).abs();
-                total_grad += g;
-                if g > max_grad { max_grad = g; }
-                count += 1;
+                if (t - escape_times[y * width + x + 1]).abs() > edge_thresh { edge_count += 1; }
+                total_pairs += 1;
             }
             if y + 1 < height {
-                let g = (t - escape_times[(y + 1) * width + x]).abs();
-                total_grad += g;
-                if g > max_grad { max_grad = g; }
-                count += 1;
+                if (t - escape_times[(y + 1) * width + x]).abs() > edge_thresh { edge_count += 1; }
+                total_pairs += 1;
             }
         }
     }
-    let mean_grad = total_grad / count.max(1) as f32;
-    let coherence = if max_grad > 0.0 { (mean_grad / max_grad).min(1.0) } else { 0.0 };
-    let activity  = (mean_grad / (max * 0.005)).min(1.0); // non-zero gradient = not flat
-    let grad_score = 0.6 * coherence + 0.4 * activity;
+    let edge_density = edge_count as f32 / total_pairs.max(1) as f32;
+    let edge_score   = (edge_density * 4.0).min(1.0); // saturates at 25% edge pairs
 
-    // 3. Multi-scale self-similarity: entropy at 1/4 resolution vs full resolution.
-    //    True fractals look complex at every scale, so these should be similar.
+    // 3. Color entropy: distribution of escape times across 32 bins.
+    //    Entropy-based measure captures true richness (not just bin occupancy).
+    const BINS: usize = 32;
+    let mut hist = [0u32; BINS];
+    for &t in escape_times {
+        let b = ((t / max) * (BINS as f32 - 1.0)) as usize;
+        hist[b.min(BINS - 1)] += 1;
+    }
+    let n_f = n as f32;
+    let color_entropy: f32 = hist.iter()
+        .filter(|&&c| c > 0)
+        .map(|&c| { let p = c as f32 / n_f; -p * p.log2() })
+        .sum::<f32>() / (BINS as f32).log2();
+
+    // 4. Multi-scale self-similarity: true fractals look complex at every scale.
     let self_sim = {
-        let w4 = width / 4;
-        let h4 = height / 4;
+        let w4 = (width / 4).max(1);
+        let h4 = (height / 4).max(1);
         if w4 < 2 || h4 < 2 {
             0.5
         } else {
@@ -141,17 +148,7 @@ pub fn beauty_score(escape_times: &[f32], width: usize, max_iter: u32) -> f32 {
         }
     };
 
-    // 4. Color spread: fraction of the escape-time range actually used.
-    //    Beautiful fractals paint with the full palette, not a few bins.
-    const BINS: usize = 32;
-    let mut used_bins = [false; BINS];
-    for &t in escape_times {
-        let b = ((t / max) * (BINS as f32 - 1.0)) as usize;
-        used_bins[b.min(BINS - 1)] = true;
-    }
-    let spread = used_bins.iter().filter(|&&b| b).count() as f32 / BINS as f32;
-
-    0.30 * boundary_score + 0.25 * grad_score + 0.25 * self_sim + 0.20 * spread
+    0.25 * boundary_score + 0.30 * edge_score + 0.25 * color_entropy + 0.20 * self_sim
 }
 
 /// Shannon entropy of |z|² magnitudes (legacy, unused in current fitness path).

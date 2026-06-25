@@ -3,7 +3,7 @@ default_width  = 800
 default_height = 600
 max_iter       = 128
 bailout        = 4.0
-colormap       = "earth"   # earth | neon | bone | viridis | inferno | plasma | magma | turbo | cubehelix
+colormap       = "turbo"  # turbo = vibrant rainbow; earth | neon | bone | viridis | inferno | plasma | magma
 view_x_min     = -2.0
 view_x_max     =  2.0
 view_y_min     = -2.0
@@ -21,20 +21,20 @@ population_size          = 20
 elitism_count            = 4
 mutation_rate            = 0.15
 mutation_scale           = 0.05
-activation_mutation_prob = 0.05
-backprop_steps           = 8
+activation_mutation_prob = 0.08   # slightly higher to explore more activation patterns
+backprop_steps           = 6      # reduced from 8 to compensate for higher eval resolution
 learning_rate            = 0.003
-eval_width               = 48
-eval_height              = 48
-eval_max_iter            = 24
+eval_width               = 64     # increased from 48: better gradient resolution for beauty_score
+eval_height              = 64
+eval_max_iter            = 32     # increased from 24: more fractal detail during fitness eval
 eval_clamp               = 20.0
-restart_after_gens       = 25
-novelty_weight           = 0.5
+restart_after_gens       = 35     # increased from 25: more time to converge per population
+novelty_weight           = 0.3    # reduced from 0.5: more emphasis on beauty over novelty
 novelty_k                = 5
 archive_size             = 150
 
 [output]
 save_dir           = "./fractals"
 population_dir     = "./populations"
-min_beauty         = 0.45   # fractal beauty score threshold [0, 1]
+min_beauty         = 0.42   # slightly relaxed from 0.45 to allow more diverse saves
 min_save_distance  = 0.10   # min L2 distance between saved-image descriptors
