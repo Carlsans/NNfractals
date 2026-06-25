@@ -175,7 +175,7 @@ where
 
     fn backprop_step(&mut self, idx: usize) {
         let lr        = self.config.optimization.learning_rate;
-        let max_iter  = self.config.optimization.eval_max_iter;
+        let max_iter  = self.config.optimization.backprop_max_iter;
         let ew        = self.config.optimization.eval_width;
         let eh        = self.config.optimization.eval_height;
         let n         = (ew * eh) as usize;

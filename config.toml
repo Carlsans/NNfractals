@@ -18,15 +18,16 @@ activation_pool = ["sin", "cos", "tanh", "square", "identity", "sigmoid",
 
 [optimization]
 population_size          = 20
-elitism_count            = 4
+elitism_count            = 2
 mutation_rate            = 0.15
 mutation_scale           = 0.05
-activation_mutation_prob = 0.08   # slightly higher to explore more activation patterns
-backprop_steps           = 6      # reduced from 8 to compensate for higher eval resolution
+activation_mutation_prob = 0.08
+backprop_steps           = 2
 learning_rate            = 0.003
-eval_width               = 64     # increased from 48: better gradient resolution for beauty_score
-eval_height              = 64
-eval_max_iter            = 32     # increased from 24: more fractal detail during fitness eval
+eval_width               = 48
+eval_height              = 48
+eval_max_iter            = 24
+backprop_max_iter        = 6      # short unroll keeps autodiff graph shallow
 eval_clamp               = 20.0
 restart_after_gens       = 35     # increased from 25: more time to converge per population
 novelty_weight           = 0.3    # reduced from 0.5: more emphasis on beauty over novelty

@@ -51,6 +51,9 @@ pub struct OptimizationConfig {
     pub eval_width: u32,
     pub eval_height: u32,
     pub eval_max_iter: u32,
+    /// Max iterations used during backprop (shorter = faster graph, weaker gradient)
+    #[serde(default = "default_backprop_max_iter")]
+    pub backprop_max_iter: u32,
     pub eval_clamp: f32,
     pub restart_after_gens: u64,
     pub novelty_weight: f32,
@@ -77,6 +80,7 @@ pub struct OutputConfig {
     pub min_smoothness: f32,
 }
 
+fn default_backprop_max_iter() -> u32 { 6 }
 fn default_min_beauty()        -> f32 { 0.45 }
 fn default_min_save_distance() -> f32 { 0.10 }
 
