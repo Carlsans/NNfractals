@@ -185,7 +185,7 @@ where
         let nn_blend  = self.population[idx].nn_blend;
         let d_model   = self.config.network.d_model;
 
-        let c_inner = pixel_coords::<B::InnerBackend>(ew, eh, &self.config, &device);
+        let c_inner = pixel_coords::<B::InnerBackend>(ew, eh, &self.population[idx], &device);
 
         // Helper: build an autodiff CLayer from a LayerData
         let mk2 = |data: Vec<f32>, r: usize, c: usize| -> Tensor<B, 2> {

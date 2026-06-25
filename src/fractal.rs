@@ -5,15 +5,20 @@ use crate::genome::Genome;
 use crate::formula::{eval_formula, eval_formula_tensor};
 use crate::transformer::transformer_forward_scalar;
 
-/// Build a [H*W, 2] tensor of (cx, cy) pixel coordinates.
+/// Build a [H*W, 2] tensor of (cx, cy) pixel coordinates using a genome's evolved view.
 pub fn pixel_coords<B: Backend>(
-    width: u32, height: u32, config: &Config, device: &B::Device,
+    width: u32, height: u32, genome: &Genome, device: &B::Device,
 ) -> Tensor<B, 2> {
-    let n = (width * height) as usize;
-    let xmin = config.rendering.view_x_min;
-    let xmax = config.rendering.view_x_max;
-    let ymin = config.rendering.view_y_min;
-    let ymax = config.rendering.view_y_max;
+    let (xmin, xmax, ymin, ymax) = genome.view_bounds();
+    pixel_coords_raw::<B>(width, height, xmin, xmax, ymin, ymax, device)
+}
+
+fn pixel_coords_raw<B: Backend>(
+    width: u32, height: u32,
+    xmin: f32, xmax: f32, ymin: f32, ymax: f32,
+    device: &B::Device,
+) -> Tensor<B, 2> {
+    let n  = (width * height) as usize;
     let wf = (width.saturating_sub(1)).max(1) as f32;
     let hf = (height.saturating_sub(1)).max(1) as f32;
     let mut data = Vec::with_capacity(n * 2);
@@ -49,10 +54,7 @@ pub fn render_cpu_iter(
     genome: &Genome, config: &Config, width: u32, height: u32, max_iter: u32,
 ) -> Vec<f32> {
     let bailout_sq = config.rendering.bailout * config.rendering.bailout;
-    let xmin = config.rendering.view_x_min;
-    let xmax = config.rendering.view_x_max;
-    let ymin = config.rendering.view_y_min;
-    let ymax = config.rendering.view_y_max;
+    let (xmin, xmax, ymin, ymax) = genome.view_bounds();
     let wf = (width.saturating_sub(1)).max(1) as f32;
     let hf = (height.saturating_sub(1)).max(1) as f32;
     let n = (width * height) as usize;

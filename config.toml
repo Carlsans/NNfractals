@@ -3,7 +3,7 @@ default_width  = 800
 default_height = 600
 max_iter       = 128
 bailout        = 4.0
-colormap       = "turbo"  # turbo = vibrant rainbow; earth | neon | bone | viridis | inferno | plasma | magma
+colormap       = "inferno"  # inferno = black→purple→orange→yellow; earth | neon | turbo | viridis | plasma | magma
 view_x_min     = -2.0
 view_x_max     =  2.0
 view_y_min     = -2.0

@@ -157,12 +157,33 @@ pub struct Genome {
     pub formula: Vec<ComplexOp>,
     #[serde(default = "default_nn_blend")]
     pub nn_blend: f32,
+    /// View center: evolves to discover interesting zoom regions.
+    #[serde(default)]
+    pub view_cx: f32,
+    #[serde(default)]
+    pub view_cy: f32,
+    /// Zoom level: 1.0 = full [-2,2] view, 4.0 = 4× zoom, etc.
+    #[serde(default = "default_view_zoom")]
+    pub view_zoom: f32,
 }
 
-fn default_formula()  -> Vec<ComplexOp> { vec![ComplexOp::Square, ComplexOp::AddC] }
-fn default_nn_blend() -> f32 { 1.0 }
+fn default_formula()   -> Vec<ComplexOp> { vec![ComplexOp::Square, ComplexOp::AddC] }
+fn default_nn_blend()  -> f32 { 1.0 }
+fn default_view_zoom() -> f32 { 1.0 }
 
 impl Genome {
+    /// Compute the (xmin, xmax, ymin, ymax) view for this genome.
+    /// Base half-range is 2.0 (covers [-2,2] at zoom=1).
+    pub fn view_bounds(&self) -> (f32, f32, f32, f32) {
+        let half = 2.0 / self.view_zoom;
+        (
+            self.view_cx - half,
+            self.view_cx + half,
+            self.view_cy - half,
+            self.view_cy + half,
+        )
+    }
+
     pub fn random(config: &Config, rng: &mut impl Rng) -> Self {
         let d_model = config.network.d_model;
         let d_ff    = config.d_ff();
@@ -180,12 +201,28 @@ impl Genome {
         let log_max = 3.0_f32.ln();
         let nn_blend = (log_min + rng.random::<f32>() * (log_max - log_min)).exp();
 
+        // 70% start centered, 30% with a slight random pan/zoom
+        let (view_cx, view_cy, view_zoom) = if rng.random::<f32>() < 0.70 {
+            (0.0, 0.0, 1.0)
+        } else {
+            let z = 0.8 + rng.random::<f32>() * 2.2;
+            let pan = 0.8 / z;
+            (
+                (rng.random::<f32>() * 2.0 - 1.0) * pan,
+                (rng.random::<f32>() * 2.0 - 1.0) * pan,
+                z,
+            )
+        };
+
         Genome {
             transformer: TransformerWeights::random(d_model, d_ff, &pool, rng),
             fitness: 0.0,
             id: rng.random(),
             formula,
             nn_blend,
+            view_cx,
+            view_cy,
+            view_zoom,
         }
     }
 
@@ -196,6 +233,10 @@ impl Genome {
             id:          rng.random(),
             formula:     crossover_formulas(&a.formula, &b.formula, rng),
             nn_blend:    if rng.random_bool(0.5) { a.nn_blend } else { b.nn_blend },
+            // Interpolate view: arithmetic mean for position, geometric mean for zoom
+            view_cx:   (a.view_cx + b.view_cx) * 0.5,
+            view_cy:   (a.view_cy + b.view_cy) * 0.5,
+            view_zoom: (a.view_zoom * b.view_zoom).sqrt(),
         }
     }
 
@@ -210,19 +251,36 @@ impl Genome {
         child.fitness = 0.0;
         child.transformer.mutate(mr, ms, ap, &pool, rng);
 
-        if rng.random::<f32>() < 0.45 {
+        // 5% chance: completely replace formula — escapes local optima in formula space
+        if rng.random::<f32>() < 0.05 {
+            let len = rng.random_range(2usize..=6);
+            child.formula = (0..len).map(|_| ComplexOp::random(rng)).collect();
+        } else if rng.random::<f32>() < 0.45 {
             mutate_formula(&mut child.formula, rng);
         }
+
         if rng.random::<f32>() < 0.12 {
             child.nn_blend *= 1.0 + rng.random::<f32>() * 0.6 - 0.3;
             child.nn_blend = child.nn_blend.clamp(0.02, 5.0);
         }
+
+        // View mutations: independent pan and zoom
+        if rng.random::<f32>() < 0.20 {
+            let zoom_delta = 1.0 + (rng.random::<f32>() * 2.0 - 1.0) * 0.5;
+            child.view_zoom = (child.view_zoom * zoom_delta).clamp(0.5, 20.0);
+        }
+        if rng.random::<f32>() < 0.20 {
+            let pan = 0.6 / child.view_zoom;
+            child.view_cx = (child.view_cx + (rng.random::<f32>() * 2.0 - 1.0) * pan).clamp(-2.5, 2.5);
+            child.view_cy = (child.view_cy + (rng.random::<f32>() * 2.0 - 1.0) * pan).clamp(-2.5, 2.5);
+        }
+
         child
     }
 
     pub fn formula_label(&self) -> String {
         let ops: Vec<&str> = self.formula.iter().map(|op| op.label()).collect();
-        format!("{}  blend={:.2}", ops.join("→"), self.nn_blend)
+        format!("{}  b={:.2}  z={:.1}x", ops.join("→"), self.nn_blend, self.view_zoom)
     }
 
     pub fn formula_ops_label(&self) -> String {
