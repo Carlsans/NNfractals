@@ -148,7 +148,16 @@ pub fn beauty_score(escape_times: &[f32], width: usize, max_iter: u32) -> f32 {
         }
     };
 
-    0.25 * boundary_score + 0.30 * edge_score + 0.25 * color_entropy + 0.20 * self_sim
+    // 5. Cool-zone score: fraction of pixels in the 5–40% escape range.
+    //    With turbo colormap this range maps to blue/cyan — CLIP-preferred aesthetic.
+    //    Target ~30% of pixels; penalises both all-interior (boring) and all-exterior
+    //    (washed-out) images, rewarding a vivid cool palette.
+    let cool_frac = escape_times.iter()
+        .filter(|&&t| t > max * 0.05 && t < max * 0.40)
+        .count() as f32 / n as f32;
+    let cool_zone_score = (1.0 - ((cool_frac - 0.30) * 3.5).abs()).max(0.0);
+
+    0.20 * boundary_score + 0.25 * edge_score + 0.20 * color_entropy + 0.15 * self_sim + 0.20 * cool_zone_score
 }
 
 /// Shannon entropy of |z|² magnitudes (legacy, unused in current fitness path).

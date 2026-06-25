@@ -264,13 +264,17 @@ impl Genome {
             child.nn_blend = child.nn_blend.clamp(0.02, 5.0);
         }
 
-        // View mutations: independent pan and zoom
-        if rng.random::<f32>() < 0.20 {
-            let zoom_delta = 1.0 + (rng.random::<f32>() * 2.0 - 1.0) * 0.5;
-            child.view_zoom = (child.view_zoom * zoom_delta).clamp(0.5, 20.0);
+        // View mutations: biased toward zooming IN (deeper = richer detail).
+        if rng.random::<f32>() < 0.30 {
+            let zoom_delta = if rng.random::<f32>() < 0.65 {
+                1.0 + rng.random::<f32>() * 1.0   // zoom in: ×1.0 → ×2.0
+            } else {
+                1.0 / (1.0 + rng.random::<f32>() * 0.3)  // zoom out: ÷1.0 → ÷1.3
+            };
+            child.view_zoom = (child.view_zoom * zoom_delta).clamp(0.5, 25.0);
         }
-        if rng.random::<f32>() < 0.20 {
-            let pan = 0.6 / child.view_zoom;
+        if rng.random::<f32>() < 0.30 {
+            let pan = 0.5 / child.view_zoom;
             child.view_cx = (child.view_cx + (rng.random::<f32>() * 2.0 - 1.0) * pan).clamp(-2.5, 2.5);
             child.view_cy = (child.view_cy + (rng.random::<f32>() * 2.0 - 1.0) * pan).clamp(-2.5, 2.5);
         }
