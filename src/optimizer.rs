@@ -310,10 +310,12 @@ where
         let name     = format!("best_{:016x}", genome.id);
         let png_path = self.config.output.save_dir.join(format!("{name}.png"));
         let nn_path  = self.config.output.save_dir.join(format!("{name}.nn"));
+        let beauty   = beauty_score(&escape_times, w as usize, self.config.rendering.max_iter);
         save_png(&rgb, w, h, &png_path).unwrap_or(());
-        save_genome(genome, &nn_path).unwrap_or(());
-        let beauty = beauty_score(&escape_times, w as usize, self.config.rendering.max_iter);
-        display::print_save(genome, &png_path.display().to_string(), beauty);
+        let mut g = genome.clone();
+        g.beauty = beauty;
+        save_genome(&g, &nn_path).unwrap_or(());
+        display::print_save(&g, &png_path.display().to_string(), beauty);
         self.saved_count += 1;
         let desc = behavior_descriptor(&escape_times, self.config.rendering.max_iter);
         self.save_descriptors.push(desc);
@@ -368,12 +370,11 @@ where
         let png_path = self.config.output.save_dir.join(format!("{name}.png"));
         save_png(&rgb, w, h, &png_path).unwrap_or(());
 
-        let genome = &self.population[idx];
-        save_genome(genome, &nn_path).unwrap_or(());
-        self.save_descriptors.push(desc);
-
-        let mut g = genome.clone();
+        let mut g = self.population[idx].clone();
+        g.beauty  = beauty;
         g.fitness = beauty;
+        save_genome(&g, &nn_path).unwrap_or(());
+        self.save_descriptors.push(desc);
         display::print_save(&g, &png_path.display().to_string(), beauty);
         self.saved_count += 1;
     }

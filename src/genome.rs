@@ -154,6 +154,9 @@ pub struct Genome {
     /// Passed to the transformer to synthesize N_BASIS formula weights.
     pub latent: Vec<(f32, f32)>,
     pub fitness: f32,
+    /// Raw beauty score (no novelty inflation) at time of save; 0.0 if not yet saved.
+    #[serde(default)]
+    pub beauty: f32,
     pub id: u64,
     #[serde(default)]
     pub view_cx: f32,
@@ -201,6 +204,7 @@ impl Genome {
             transformer: TransformerWeights::random(d_model, d_ff, &pool, rng),
             latent,
             fitness: 0.0,
+            beauty: 0.0,
             id: rng.random(),
             view_cx,
             view_cy,
@@ -221,6 +225,7 @@ impl Genome {
             transformer: TransformerWeights::crossover(&a.transformer, &b.transformer, rng),
             latent,
             fitness: 0.0,
+            beauty: 0.0,
             id: rng.random(),
             view_cx:   (a.view_cx + b.view_cx) * 0.5,
             view_cy:   (a.view_cy + b.view_cy) * 0.5,
