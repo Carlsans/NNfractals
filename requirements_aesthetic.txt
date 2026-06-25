@@ -1,0 +1,4 @@
+open_clip_torch
+torch
+Pillow
+huggingface_hub

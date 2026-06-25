@@ -1,0 +1,40 @@
+[rendering]
+default_width  = 800
+default_height = 600
+max_iter       = 128
+bailout        = 4.0
+colormap       = "earth"   # earth | neon | bone | viridis | inferno | plasma | magma | turbo | cubehelix
+view_x_min     = -2.0
+view_x_max     =  2.0
+view_y_min     = -2.0
+view_y_max     =  2.0
+
+[network]
+d_model         = 8     # transformer hidden/embedding width (complex neurons)
+ff_mult         = 2     # feed-forward expansion: d_ff = d_model * ff_mult = 16
+activation_pool = ["sin", "cos", "tanh", "square", "identity", "sigmoid",
+                   "gauss", "atan", "fract", "swish", "sinc", "tent",
+                   "conj", "abs_re", "abs_im", "abs_both", "abs"]
+
+[optimization]
+population_size          = 20
+elitism_count            = 4
+mutation_rate            = 0.15
+mutation_scale           = 0.05
+activation_mutation_prob = 0.05
+backprop_steps           = 8
+learning_rate            = 0.003
+eval_width               = 48
+eval_height              = 48
+eval_max_iter            = 24
+eval_clamp               = 20.0
+restart_after_gens       = 25
+novelty_weight           = 0.5
+novelty_k                = 5
+archive_size             = 150
+
+[output]
+save_dir           = "./fractals"
+population_dir     = "./populations"
+min_beauty         = 0.45   # fractal beauty score threshold [0, 1]
+min_save_distance  = 0.10   # min L2 distance between saved-image descriptors

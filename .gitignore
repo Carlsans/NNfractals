@@ -1,0 +1,8 @@
+/target/
+fractals/
+populations/
+debug_out.txt
+*.nn
+/tmp/
+__pycache__/
+*.pyc
