@@ -9,7 +9,7 @@ use crate::genome::{Genome, LayerData};
 use crate::transformer::{TransformerTensors, CLayer, transformer_forward_latent_tensor};
 use crate::fractal::{pixel_coords, evaluate_fitness_full, render_cpu, formula_step_tensor};
 use crate::colormap::apply_colormap;
-use crate::fitness::{novelty_score, is_degenerate, behavior_descriptor, beauty_score};
+use crate::fitness::{novelty_score, is_degenerate, behavior_descriptor, beauty_score, beauty_score_full};
 use crate::io::{save_genome, save_png};
 use crate::display;
 use crate::aesthetic::AestheticScorer;
@@ -27,6 +27,7 @@ pub struct Optimizer<B: AutodiffBackend> {
     behavior_archive: VecDeque<Vec<f32>>,
     save_descriptors: Vec<Vec<f32>>,
     aesthetic: Option<AestheticScorer>,
+    last_sub_scores: Option<[f32; 5]>,  // [boundary, edge, entropy, self_sim, cool_zone]
 }
 
 impl<B: AutodiffBackend> Optimizer<B>
@@ -61,6 +62,7 @@ where
             stagnant_gens: 0,
             behavior_archive: VecDeque::new(),
             aesthetic,
+            last_sub_scores: None,
         }
     }
 
@@ -135,14 +137,18 @@ where
         if let Some(scorer) = &mut self.aesthetic {
             scorer.poll(self.generation);
         }
-        if self.generation % 5 == 0 && self.aesthetic.is_some() {
-            display::print_status(&format!("Gen {}  Rendering aesthetic probe...", self.generation));
+        if self.generation % 5 == 0 {
             let probe_path = PathBuf::from("/tmp/nnfractals_probe.png");
             let et  = render_cpu(&self.population[0], &self.config, 256, 256);
-            let rgb = apply_colormap(&et, self.config.rendering.max_iter, &self.config.rendering.colormap);
-            save_png(&rgb, 256, 256, &probe_path).unwrap_or(());
-            if let Some(scorer) = &mut self.aesthetic {
-                scorer.request(probe_path, self.generation);
+            let (_, bd) = beauty_score_full(&et, 256, self.config.rendering.max_iter);
+            self.last_sub_scores = Some([bd.boundary, bd.edge, bd.entropy, bd.self_sim, bd.cool_zone]);
+            if self.aesthetic.is_some() {
+                display::print_status(&format!("Gen {}  Rendering aesthetic probe...", self.generation));
+                let rgb = apply_colormap(&et, self.config.rendering.max_iter, &self.config.rendering.colormap);
+                save_png(&rgb, 256, 256, &probe_path).unwrap_or(());
+                if let Some(scorer) = &mut self.aesthetic {
+                    scorer.request(probe_path, self.generation);
+                }
             }
         }
 
@@ -156,6 +162,7 @@ where
             self.stagnant_gens,
             self.best_ever.as_ref().map(|g| g.fitness).unwrap_or(0.0),
             aes_line.as_deref(),
+            self.last_sub_scores.as_ref(),
         );
         display::print_status(&format!("Gen {} complete", self.generation));
 
@@ -310,10 +317,15 @@ where
         let name     = format!("best_{:016x}", genome.id);
         let png_path = self.config.output.save_dir.join(format!("{name}.png"));
         let nn_path  = self.config.output.save_dir.join(format!("{name}.nn"));
-        let beauty   = beauty_score(&escape_times, w as usize, self.config.rendering.max_iter);
+        let (beauty, bd) = beauty_score_full(&escape_times, w as usize, self.config.rendering.max_iter);
         save_png(&rgb, w, h, &png_path).unwrap_or(());
         let mut g = genome.clone();
-        g.beauty = beauty;
+        g.beauty            = beauty;
+        g.beauty_boundary   = bd.boundary;
+        g.beauty_edge       = bd.edge;
+        g.beauty_entropy    = bd.entropy;
+        g.beauty_self_sim   = bd.self_sim;
+        g.beauty_cool_zone  = bd.cool_zone;
         save_genome(&g, &nn_path).unwrap_or(());
         display::print_save(&g, &png_path.display().to_string(), beauty);
         self.saved_count += 1;
@@ -354,7 +366,7 @@ where
         let escape_times = render_cpu(genome, &self.config, w, h);
         if is_degenerate(&escape_times) { return; }
 
-        let beauty = beauty_score(&escape_times, w as usize, self.config.rendering.max_iter);
+        let (beauty, bd) = beauty_score_full(&escape_times, w as usize, self.config.rendering.max_iter);
         if beauty < self.config.output.min_beauty { return; }
 
         // Reject near-duplicates via behavioral descriptor L2 distance
@@ -371,7 +383,12 @@ where
         save_png(&rgb, w, h, &png_path).unwrap_or(());
 
         let mut g = self.population[idx].clone();
-        g.beauty  = beauty;
+        g.beauty           = beauty;
+        g.beauty_boundary  = bd.boundary;
+        g.beauty_edge      = bd.edge;
+        g.beauty_entropy   = bd.entropy;
+        g.beauty_self_sim  = bd.self_sim;
+        g.beauty_cool_zone = bd.cool_zone;
         g.fitness = beauty;
         save_genome(&g, &nn_path).unwrap_or(());
         self.save_descriptors.push(desc);

@@ -80,6 +80,96 @@ pub fn is_degenerate(escape_times: &[f32]) -> bool {
     same as f32 / escape_times.len() as f32 > 0.95
 }
 
+/// Per-component breakdown of the beauty score.
+#[derive(Clone, Debug, Default)]
+pub struct BeautyBreakdown {
+    pub boundary:  f32,
+    pub edge:      f32,
+    pub entropy:   f32,
+    pub self_sim:  f32,
+    pub cool_zone: f32,
+}
+
+impl BeautyBreakdown {
+    pub fn total(&self) -> f32 {
+        0.20 * self.boundary + 0.25 * self.edge + 0.20 * self.entropy
+            + 0.15 * self.self_sim + 0.20 * self.cool_zone
+    }
+}
+
+/// Full beauty score returning both composite and per-component breakdown.
+pub fn beauty_score_full(escape_times: &[f32], width: usize, max_iter: u32) -> (f32, BeautyBreakdown) {
+    let n = escape_times.len();
+    let height = n / width.max(1);
+    if n == 0 || height == 0 { return (0.0, BeautyBreakdown::default()); }
+    let max = max_iter as f32;
+
+    let boundary_frac = escape_times.iter()
+        .filter(|&&t| t > max * 0.05 && t < max * 0.90)
+        .count() as f32 / n as f32;
+    let boundary_score = (1.0 - ((boundary_frac - 0.55) * 2.0_f32).abs()).max(0.0);
+
+    let edge_thresh = max * 0.03;
+    let mut edge_count = 0u32;
+    let mut total_pairs = 0u32;
+    for y in 0..height {
+        for x in 0..width {
+            let t = escape_times[y * width + x];
+            if x + 1 < width {
+                if (t - escape_times[y * width + x + 1]).abs() > edge_thresh { edge_count += 1; }
+                total_pairs += 1;
+            }
+            if y + 1 < height {
+                if (t - escape_times[(y + 1) * width + x]).abs() > edge_thresh { edge_count += 1; }
+                total_pairs += 1;
+            }
+        }
+    }
+    let edge_density = edge_count as f32 / total_pairs.max(1) as f32;
+    let edge_score   = (edge_density * 4.0).min(1.0);
+
+    const BINS: usize = 32;
+    let mut hist = [0u32; BINS];
+    for &t in escape_times {
+        let b = ((t / max) * (BINS as f32 - 1.0)) as usize;
+        hist[b.min(BINS - 1)] += 1;
+    }
+    let n_f = n as f32;
+    let color_entropy: f32 = hist.iter()
+        .filter(|&&c| c > 0)
+        .map(|&c| { let p = c as f32 / n_f; -p * p.log2() })
+        .sum::<f32>() / (BINS as f32).log2();
+
+    let self_sim = {
+        let w4 = (width / 4).max(1);
+        let h4 = (height / 4).max(1);
+        if w4 < 2 || h4 < 2 {
+            0.5
+        } else {
+            let small: Vec<f32> = (0..h4)
+                .flat_map(|y| (0..w4).map(move |x| escape_times[y * 4 * width + x * 4]))
+                .collect();
+            let full_ent  = entropy_from_escape_times(escape_times, max_iter);
+            let small_ent = entropy_from_escape_times(&small, max_iter);
+            if full_ent > 0.5 { (small_ent / full_ent).min(1.0).max(0.0) } else { 0.0 }
+        }
+    };
+
+    let cool_frac = escape_times.iter()
+        .filter(|&&t| t > max * 0.05 && t < max * 0.40)
+        .count() as f32 / n as f32;
+    let cool_zone_score = (1.0 - ((cool_frac - 0.30) * 3.5).abs()).max(0.0);
+
+    let bd = BeautyBreakdown {
+        boundary: boundary_score,
+        edge:     edge_score,
+        entropy:  color_entropy,
+        self_sim,
+        cool_zone: cool_zone_score,
+    };
+    (bd.total(), bd)
+}
+
 /// Fractal beauty score in [0, 1].
 /// Tuned to correlate with CLIP aesthetic perception: edge density and color entropy
 /// are the strongest predictors of perceived visual quality.

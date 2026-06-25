@@ -157,6 +157,11 @@ pub struct Genome {
     /// Raw beauty score (no novelty inflation) at time of save; 0.0 if not yet saved.
     #[serde(default)]
     pub beauty: f32,
+    #[serde(default)] pub beauty_boundary:  f32,
+    #[serde(default)] pub beauty_edge:      f32,
+    #[serde(default)] pub beauty_entropy:   f32,
+    #[serde(default)] pub beauty_self_sim:  f32,
+    #[serde(default)] pub beauty_cool_zone: f32,
     pub id: u64,
     #[serde(default)]
     pub view_cx: f32,
@@ -205,6 +210,8 @@ impl Genome {
             latent,
             fitness: 0.0,
             beauty: 0.0,
+            beauty_boundary: 0.0, beauty_edge: 0.0, beauty_entropy: 0.0,
+            beauty_self_sim: 0.0, beauty_cool_zone: 0.0,
             id: rng.random(),
             view_cx,
             view_cy,
@@ -226,6 +233,8 @@ impl Genome {
             latent,
             fitness: 0.0,
             beauty: 0.0,
+            beauty_boundary: 0.0, beauty_edge: 0.0, beauty_entropy: 0.0,
+            beauty_self_sim: 0.0, beauty_cool_zone: 0.0,
             id: rng.random(),
             view_cx:   (a.view_cx + b.view_cx) * 0.5,
             view_cy:   (a.view_cy + b.view_cy) * 0.5,

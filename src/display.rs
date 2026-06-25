@@ -37,6 +37,7 @@ pub fn refresh(
     stagnant_gens: u64,
     best_ever_fitness: f32,
     aesthetic_line: Option<&str>,
+    sub_scores: Option<&[f32; 5]>,
 ) {
     let mut out = stdout();
     let _ = out.execute(MoveTo(0, 4));
@@ -76,6 +77,18 @@ pub fn refresh(
         " Aesthetic ▸ {:<57}",
         aesthetic_line.unwrap_or("")
     );
+    if let Some(s) = sub_scores {
+        fn bar(v: f32) -> String {
+            let filled = (v * 10.0).round() as usize;
+            format!("{:░<10}", "█".repeat(filled.min(10)))
+        }
+        println!(
+            " Beauty sub  bnd:{:.2}{} edg:{:.2}{} ent:{:.2}{} sim:{:.2}{} coo:{:.2}{}",
+            s[0], bar(s[0]), s[1], bar(s[1]), s[2], bar(s[2]), s[3], bar(s[3]), s[4], bar(s[4])
+        );
+    } else {
+        println!("{:72}", "");
+    }
     println!();
     println!(
         " {:>4}  {:>18}  {:>8}  {:<22}  {}",
