@@ -131,7 +131,10 @@ pub fn beauty_score_full(escape_times: &[f32], width: usize, max_iter: u32) -> (
     // Recalibrated target: 0.20 (was 0.55 which fit the old per-pixel NN architecture).
     let boundary_score = (1.0 - ((boundary_frac - 0.20) * 1.5_f32).abs()).max(0.0);
 
-    let edge_thresh = max * 0.03;
+    // Smooth-coloring produces fractional escape times; adjacent-pixel differences
+    // are typically 0.1–0.5 near the boundary. Old threshold (0.03*max=1.44) was
+    // too coarse — captured only ~1.7% of pairs. 0.008*max=0.38 catches fine detail.
+    let edge_thresh = max * 0.008;
     let mut edge_count = 0u32;
     let mut total_pairs = 0u32;
     for y in 0..height {
@@ -214,7 +217,10 @@ pub fn beauty_score(escape_times: &[f32], width: usize, max_iter: u32) -> f32 {
     // 2. Edge density: fraction of adjacent pixel pairs with a notable gradient.
     //    This is the #1 predictor of CLIP aesthetic score for fractals.
     //    Rich structure = many local transitions across the image.
-    let edge_thresh = max * 0.03;
+    // Smooth-coloring produces fractional escape times; adjacent-pixel differences
+    // are typically 0.1–0.5 near the boundary. Old threshold (0.03*max=1.44) was
+    // too coarse — captured only ~1.7% of pairs. 0.008*max=0.38 catches fine detail.
+    let edge_thresh = max * 0.008;
     let mut edge_count = 0u32;
     let mut total_pairs = 0u32;
     for y in 0..height {
