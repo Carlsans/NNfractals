@@ -74,9 +74,10 @@ pub fn transformer_forward_latent(
     let x_re: Vec<f32> = (0..d).map(|k| x_re[k] + ffo_re[k]).collect();
     let x_im: Vec<f32> = (0..d).map(|k| x_im[k] + ffo_im[k]).collect();
 
-    // Output: d_model → N_BASIS complex weights
+    // Output: d_model → N_BASIS complex weights, tanh-bounded to (-1,1) per component.
+    // Prevents the weighted basis sum from immediately escaping the bailout radius.
     let (out_re, out_im) = complex_matvec(&tw.output, &x_re, &x_im);
-    out_re.into_iter().zip(out_im).map(|(r, i)| (r, i)).collect()
+    out_re.into_iter().zip(out_im).map(|(r, i)| (r.tanh(), i.tanh())).collect()
 }
 
 // ── Tensor forward (autodiff backprop) ───────────────────────────────────────
@@ -127,8 +128,9 @@ pub fn transformer_forward_latent_tensor<B: Backend>(
     let x_re = x_re + ffo_re;
     let x_im = x_im + ffo_im;
 
-    // Output: d_model → N_BASIS
-    complex_linear(&x_re, &x_im, &tt.output)
+    // Output: d_model → N_BASIS, tanh-bounded to keep formula weights in (-1, 1).
+    let (fw_re, fw_im) = complex_linear(&x_re, &x_im, &tt.output);
+    (fw_re.tanh(), fw_im.tanh())
 }
 
 // ── Private helpers ──────────────────────────────────────────────────────────
