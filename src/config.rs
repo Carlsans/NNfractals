@@ -65,7 +65,14 @@ pub struct OptimizationConfig {
 pub struct OutputConfig {
     pub save_dir: PathBuf,
     pub population_dir: PathBuf,
-    /// Minimum beauty score [0, 1] for a fractal to be saved.
+    /// Minimum entropy score [0,1] for a genome to pass the fast prefilter (Stage 1).
+    #[serde(default = "default_min_entropy_prefilter")]
+    pub min_entropy_prefilter: f32,
+    /// Minimum CLIP aesthetic score [0,1] to save a fractal (Stage 2).
+    /// Only reached when entropy passes Stage 1. Falls back to min_beauty if CLIP unavailable.
+    #[serde(default = "default_min_clip_score")]
+    pub min_clip_score: f32,
+    /// Minimum beauty score [0, 1] for a fractal to be saved (fallback when CLIP unavailable).
     #[serde(default = "default_min_beauty")]
     pub min_beauty: f32,
     /// Minimum L2 distance between saved-image behavioral descriptors.
@@ -73,16 +80,16 @@ pub struct OutputConfig {
     pub min_save_distance: f32,
     // Legacy fields — kept for compat, ignored
     #[serde(default)]
-    pub min_entropy: f32,
-    #[serde(default)]
     pub min_png_size_kb: u64,
     #[serde(default)]
     pub min_smoothness: f32,
 }
 
-fn default_backprop_max_iter() -> u32 { 6 }
-fn default_min_beauty()        -> f32 { 0.45 }
-fn default_min_save_distance() -> f32 { 0.10 }
+fn default_backprop_max_iter()      -> u32 { 6 }
+fn default_min_beauty()             -> f32 { 0.45 }
+fn default_min_save_distance()      -> f32 { 0.10 }
+fn default_min_entropy_prefilter()  -> f32 { 0.20 }
+fn default_min_clip_score()         -> f32 { 0.50 }
 
 impl Config {
     pub fn load(path: &Path) -> anyhow::Result<Self> {

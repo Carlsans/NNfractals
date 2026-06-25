@@ -116,6 +116,23 @@ impl AestheticScorer {
         }
     }
 
+    /// Synchronous score: send image path, block until CLIP returns a score.
+    /// Returns None if scorer is not ready or scoring fails.
+    /// Clears any in-flight async request first.
+    pub fn score_blocking(&mut self, path: PathBuf) -> Option<f32> {
+        if !self.is_ready { return None; }
+        // Drain any stale pending result
+        while self.rx.try_recv().is_ok() {}
+        self.pending_gen = None;
+
+        if self.tx.send(path).is_err() { return None; }
+        // Block until the scorer responds (typically 50–100ms on GPU)
+        match self.rx.recv_timeout(std::time::Duration::from_secs(10)) {
+            Ok(score) => Some(score),
+            Err(_)    => None,
+        }
+    }
+
     /// Submit an image for scoring. No-op if scorer not ready or a request is already in flight.
     pub fn request(&mut self, path: PathBuf, generation: u64) {
         if self.is_ready && self.pending_gen.is_none() {

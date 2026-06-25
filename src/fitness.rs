@@ -1,3 +1,23 @@
+/// Fast single-component score for GA selection: normalised Shannon entropy of escape times.
+/// Range [0,1]; 0 = all pixels same escape time (degenerate), 1 = perfectly uniform histogram.
+/// Used as Stage-1 prefilter before the CLIP aesthetic scorer.
+pub fn entropy_score_fast(escape_times: &[f32], max_iter: u32) -> f32 {
+    const BINS: usize = 32;
+    let n = escape_times.len();
+    if n == 0 { return 0.0; }
+    let max = max_iter as f32;
+    let mut hist = [0u32; BINS];
+    for &t in escape_times {
+        let b = ((t / max) * (BINS as f32 - 1.0)) as usize;
+        hist[b.min(BINS - 1)] += 1;
+    }
+    let n_f = n as f32;
+    hist.iter()
+        .filter(|&&c| c > 0)
+        .map(|&c| { let p = c as f32 / n_f; -p * p.log2() })
+        .sum::<f32>() / (BINS as f32).log2()
+}
+
 /// Shannon entropy of escape-time values.
 pub fn entropy_from_escape_times(escape_times: &[f32], max_iter: u32) -> f32 {
     let mut bins = vec![0u32; (max_iter + 1) as usize];

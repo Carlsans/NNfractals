@@ -32,17 +32,18 @@ fn pixel_coords_raw<B: Backend>(
 }
 
 /// CPU fitness: (beauty, behavioral_descriptor).
+/// Stage-1 fitness evaluation: renders at low resolution, returns entropy score + descriptor.
+/// Entropy is the GA selection signal. CLIP (Stage 2) handles the final save decision.
 pub fn evaluate_fitness_full(genome: &Genome, config: &Config) -> (f32, Vec<f32>) {
-    let w = config.optimization.eval_width as usize;
     let escape_times = render_cpu_iter(
         genome, config,
         config.optimization.eval_width,
         config.optimization.eval_height,
         config.optimization.eval_max_iter,
     );
-    let beauty     = crate::fitness::beauty_score(&escape_times, w, config.optimization.eval_max_iter);
+    let entropy    = crate::fitness::entropy_score_fast(&escape_times, config.optimization.eval_max_iter);
     let descriptor = crate::fitness::behavior_descriptor(&escape_times, config.optimization.eval_max_iter);
-    (beauty, descriptor)
+    (entropy, descriptor)
 }
 
 /// CPU rendering — returns smooth escape times [H*W].

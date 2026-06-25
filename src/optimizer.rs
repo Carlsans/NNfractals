@@ -7,9 +7,9 @@ use std::time::Instant;
 use crate::config::Config;
 use crate::genome::{Genome, LayerData};
 use crate::transformer::{TransformerTensors, CLayer, transformer_forward_latent_tensor};
-use crate::fractal::{pixel_coords, evaluate_fitness_full, render_cpu, formula_step_tensor};
+use crate::fractal::{pixel_coords, evaluate_fitness_full, render_cpu, render_cpu_iter, formula_step_tensor};
 use crate::colormap::apply_colormap;
-use crate::fitness::{novelty_score, is_degenerate, behavior_descriptor, beauty_score, beauty_score_full};
+use crate::fitness::{novelty_score, is_degenerate, behavior_descriptor, beauty_score_full};
 use crate::io::{save_genome, save_png};
 use crate::display;
 use crate::aesthetic::AestheticScorer;
@@ -363,36 +363,58 @@ where
         let nn_path = self.config.output.save_dir.join(format!("{:016x}.nn", genome.id));
         if nn_path.exists() { return; }
 
-        let escape_times = render_cpu(genome, &self.config, w, h);
-        if is_degenerate(&escape_times) { return; }
+        // ── Stage 1: entropy prefilter at eval resolution (fast) ─────────
+        let eval_et = render_cpu_iter(genome, &self.config,
+            self.config.optimization.eval_width,
+            self.config.optimization.eval_height,
+            self.config.optimization.eval_max_iter);
+        if is_degenerate(&eval_et) { return; }
+        let entropy = crate::fitness::entropy_score_fast(&eval_et, self.config.optimization.eval_max_iter);
+        if entropy < self.config.output.min_entropy_prefilter { return; }
 
-        let (beauty, bd) = beauty_score_full(&escape_times, w as usize, self.config.rendering.max_iter);
-        if beauty < self.config.output.min_beauty { return; }
-
-        // Reject near-duplicates via behavioral descriptor L2 distance
-        let desc = behavior_descriptor(&escape_times, self.config.rendering.max_iter);
+        // ── Diversity gate ────────────────────────────────────────────────
+        let desc = behavior_descriptor(&eval_et, self.config.optimization.eval_max_iter);
         let min_dist = self.save_descriptors.iter()
             .map(|d| desc.iter().zip(d.iter()).map(|(a, b)| (a - b) * (a - b)).sum::<f32>().sqrt())
             .fold(f32::INFINITY, f32::min);
         if min_dist < self.config.output.min_save_distance { return; }
 
-        let rgb = apply_colormap(&escape_times, self.config.rendering.max_iter,
-                                 &self.config.rendering.colormap);
+        // ── Stage 2: render full image ────────────────────────────────────
+        let escape_times = render_cpu(genome, &self.config, w, h);
+        let rgb      = apply_colormap(&escape_times, self.config.rendering.max_iter,
+                                      &self.config.rendering.colormap);
         let name     = format!("{:016x}", genome.id);
         let png_path = self.config.output.save_dir.join(format!("{name}.png"));
         save_png(&rgb, w, h, &png_path).unwrap_or(());
 
+        // ── Stage 2: CLIP aesthetic score (pre-trained, image-only) ──────
+        let (beauty, bd) = beauty_score_full(&escape_times, w as usize, self.config.rendering.max_iter);
+        let clip_score = self.aesthetic.as_mut()
+            .and_then(|aes| aes.score_blocking(png_path.clone()));
+
+        let final_score = clip_score.unwrap_or(beauty);
+        let threshold = if clip_score.is_some() {
+            self.config.output.min_clip_score
+        } else {
+            self.config.output.min_beauty
+        };
+        if final_score < threshold {
+            // Remove the tentative PNG — didn't make the cut
+            std::fs::remove_file(&png_path).unwrap_or(());
+            return;
+        }
+
         let mut g = self.population[idx].clone();
-        g.beauty           = beauty;
+        g.beauty           = final_score;
         g.beauty_boundary  = bd.boundary;
         g.beauty_edge      = bd.edge;
-        g.beauty_entropy   = bd.entropy;
+        g.beauty_entropy   = entropy;
         g.beauty_self_sim  = bd.self_sim;
         g.beauty_cool_zone = bd.cool_zone;
-        g.fitness = beauty;
+        g.fitness = final_score;
         save_genome(&g, &nn_path).unwrap_or(());
         self.save_descriptors.push(desc);
-        display::print_save(&g, &png_path.display().to_string(), beauty);
+        display::print_save(&g, &png_path.display().to_string(), final_score);
         self.saved_count += 1;
     }
 

@@ -35,7 +35,9 @@ novelty_k                = 5
 archive_size             = 150
 
 [output]
-save_dir           = "./fractals"
-population_dir     = "./populations"
-min_beauty         = 0.42   # slightly relaxed from 0.45 to allow more diverse saves
-min_save_distance  = 0.10   # min L2 distance between saved-image descriptors
+save_dir                 = "./fractals"
+population_dir           = "./populations"
+min_entropy_prefilter    = 0.20   # Stage 1: fast entropy gate (low-res escape times)
+min_clip_score           = 0.50   # Stage 2: CLIP aesthetic threshold (pre-trained model)
+min_beauty               = 0.42   # Fallback if CLIP sidecar unavailable
+min_save_distance        = 0.10   # min L2 distance between saved-image descriptors
