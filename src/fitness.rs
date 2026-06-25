@@ -107,7 +107,9 @@ pub fn beauty_score_full(escape_times: &[f32], width: usize, max_iter: u32) -> (
     let boundary_frac = escape_times.iter()
         .filter(|&&t| t > max * 0.05 && t < max * 0.90)
         .count() as f32 / n as f32;
-    let boundary_score = (1.0 - ((boundary_frac - 0.55) * 2.0_f32).abs()).max(0.0);
+    // Holomorphic formulas produce thin high-contrast boundaries (~10-25% of pixels).
+    // Recalibrated target: 0.20 (was 0.55 which fit the old per-pixel NN architecture).
+    let boundary_score = (1.0 - ((boundary_frac - 0.20) * 1.5_f32).abs()).max(0.0);
 
     let edge_thresh = max * 0.03;
     let mut edge_count = 0u32;
@@ -158,7 +160,8 @@ pub fn beauty_score_full(escape_times: &[f32], width: usize, max_iter: u32) -> (
     let cool_frac = escape_times.iter()
         .filter(|&&t| t > max * 0.05 && t < max * 0.40)
         .count() as f32 / n as f32;
-    let cool_zone_score = (1.0 - ((cool_frac - 0.30) * 3.5).abs()).max(0.0);
+    // Recalibrated target: 0.12 (holomorphic formulas produce ~8-15% in cool band).
+    let cool_zone_score = (1.0 - ((cool_frac - 0.12) * 3.0).abs()).max(0.0);
 
     let bd = BeautyBreakdown {
         boundary: boundary_score,
@@ -184,7 +187,9 @@ pub fn beauty_score(escape_times: &[f32], width: usize, max_iter: u32) -> f32 {
     let boundary_frac = escape_times.iter()
         .filter(|&&t| t > max * 0.05 && t < max * 0.90)
         .count() as f32 / n as f32;
-    let boundary_score = (1.0 - ((boundary_frac - 0.55) * 2.0_f32).abs()).max(0.0);
+    // Holomorphic formulas produce thin high-contrast boundaries (~10-25% of pixels).
+    // Recalibrated target: 0.20 (was 0.55 which fit the old per-pixel NN architecture).
+    let boundary_score = (1.0 - ((boundary_frac - 0.20) * 1.5_f32).abs()).max(0.0);
 
     // 2. Edge density: fraction of adjacent pixel pairs with a notable gradient.
     //    This is the #1 predictor of CLIP aesthetic score for fractals.
@@ -245,7 +250,8 @@ pub fn beauty_score(escape_times: &[f32], width: usize, max_iter: u32) -> f32 {
     let cool_frac = escape_times.iter()
         .filter(|&&t| t > max * 0.05 && t < max * 0.40)
         .count() as f32 / n as f32;
-    let cool_zone_score = (1.0 - ((cool_frac - 0.30) * 3.5).abs()).max(0.0);
+    // Recalibrated target: 0.12 (holomorphic formulas produce ~8-15% in cool band).
+    let cool_zone_score = (1.0 - ((cool_frac - 0.12) * 3.0).abs()).max(0.0);
 
     0.20 * boundary_score + 0.25 * edge_score + 0.20 * color_entropy + 0.15 * self_sim + 0.20 * cool_zone_score
 }
