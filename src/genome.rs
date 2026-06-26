@@ -59,6 +59,9 @@ pub struct Genome {
     #[serde(default)] pub clip_score:  f32,
     /// LAION MLP aesthetic score [0,10] at save time; 0.0 if unavailable.
     #[serde(default)] pub laion_score: f32,
+    /// Zoom self-replication score [0,1]: how much the fractal reproduces its
+    /// whole-set structure under deep zoom (Mandelbrot-like). 0.0 if not measured.
+    #[serde(default)] pub self_replication: f32,
     pub id: u64,
     #[serde(default)]
     pub view_cx: f32,
@@ -109,6 +112,7 @@ impl Genome {
             beauty: 0.0,
             beauty_boundary: 0.0, beauty_edge: 0.0, beauty_entropy: 0.0,
             beauty_self_sim: 0.0, beauty_cool_zone: 0.0, clip_score: 0.0, laion_score: 0.0,
+            self_replication: 0.0,
             id: rng.random(),
             view_cx: view.0,
             view_cy: view.1,
