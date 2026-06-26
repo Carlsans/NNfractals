@@ -1,22 +1,17 @@
-mod config;
-mod cppn;
-mod formula;
-mod genome;
-mod transformer;
-mod fractal;
-mod colormap;
-mod fitness;
-mod io;
-mod display;
-mod optimizer;
-mod aesthetic;
-
+use std::fs::OpenOptions;
 use std::path::PathBuf;
+use std::process::{Command, Stdio};
+use std::thread;
+use std::time::Duration;
 use clap::Parser;
-use config::Config;
-use fractal::render_cpu;
-use colormap::apply_colormap;
-use io::{load_genome, save_png};
+use nnfractals::config::Config;
+use nnfractals::fractal::render_cpu;
+use nnfractals::colormap::apply_colormap;
+use nnfractals::io::{load_genome, save_png};
+use nnfractals::display;
+#[cfg(feature = "wgpu-backend")]
+use nnfractals::render_gpu;
+use nnfractals::optimizer;
 
 #[derive(Parser)]
 #[command(name = "nnfractals", about = "Neural-network fractal evolution")]
@@ -57,28 +52,71 @@ fn main() -> anyhow::Result<()> {
         eprintln!("Saved → {:?}", out_path);
     } else {
         // ── Evolution loop ───────────────────────────────────────────────
+        spawn_dedup_cleaner(&config);
         run_evolution(config);
     }
 
     Ok(())
 }
 
+/// Background thread: every `dedup.interval_hours`, run the near-duplicate cleaner
+/// over the save dir so the pool stays diverse while evolution runs. Output is
+/// redirected to `dedup.log` to avoid corrupting the live TUI. 0 hours disables it.
+fn spawn_dedup_cleaner(config: &Config) {
+    let hours = config.dedup.interval_hours;
+    if hours <= 0.0 {
+        return;
+    }
+    let interval   = Duration::from_secs_f64((hours * 3600.0) as f64);
+    let threshold  = config.dedup.similarity_threshold;
+    let save_dir   = config.output.save_dir.clone();
+    let exe        = std::env::current_exe().ok();
+
+    thread::spawn(move || {
+        loop {
+            thread::sleep(interval);
+
+            let log = OpenOptions::new()
+                .create(true).append(true)
+                .open("dedup.log")
+                .ok();
+            let (out, err) = match &log {
+                Some(f) => (
+                    Stdio::from(f.try_clone().expect("clone log handle")),
+                    Stdio::from(f.try_clone().expect("clone log handle")),
+                ),
+                None => (Stdio::null(), Stdio::null()),
+            };
+
+            let mut cmd = Command::new("python3");
+            cmd.arg("scripts/dedup.py")
+                .arg("--run")
+                .arg("--threshold").arg(format!("{threshold}"))
+                .arg("--dir").arg(&save_dir)
+                .stdout(out)
+                .stderr(err);
+            if let Some(exe) = &exe {
+                cmd.arg("--binary").arg(exe);
+            }
+            // Best-effort: a failed launch (e.g. no python3) is logged and the
+            // loop simply tries again next interval.
+            let _ = cmd.status();
+        }
+    });
+}
+
 #[cfg(feature = "wgpu-backend")]
 fn run_evolution(config: Config) {
-    use burn::backend::{Autodiff, wgpu::{Wgpu, WgpuDevice}};
-    type B = Autodiff<Wgpu>;
-    let device = WgpuDevice::default();
-    let mut opt = optimizer::Optimizer::<B>::new(config, device);
+    // Init fractal GPU renderer (wgpu compute; no burn/autodiff needed anymore).
+    render_gpu::init_gpu();
+    let mut opt = optimizer::Optimizer::new(config);
     ctrlc_cleanup();
     opt.run_forever();
 }
 
 #[cfg(all(not(feature = "wgpu-backend"), feature = "ndarray-backend"))]
 fn run_evolution(config: Config) {
-    use burn::backend::{Autodiff, ndarray::{NdArray, NdArrayDevice}};
-    type B = Autodiff<NdArray>;
-    let device = NdArrayDevice;
-    let mut opt = optimizer::Optimizer::<B>::new(config, device);
+    let mut opt = optimizer::Optimizer::new(config);
     ctrlc_cleanup();
     opt.run_forever();
 }

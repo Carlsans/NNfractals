@@ -1,0 +1,12 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=NNFractals Viewer
+Comment=Interactive fractal viewer for NNFractals genome files
+Exec=nnfractals-viewer %f
+Icon=nnfractals-viewer
+MimeType=application/x-nnfractals;
+Categories=Graphics;Science;
+Keywords=fractal;mathematics;generative;art;
+NoDisplay=false
+StartupNotify=false

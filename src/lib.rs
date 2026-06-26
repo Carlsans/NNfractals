@@ -1,0 +1,12 @@
+pub mod config;
+pub mod formula;
+pub mod genome;
+pub mod fractal;
+pub mod colormap;
+pub mod fitness;
+pub mod io;
+pub mod display;
+pub mod optimizer;
+pub mod aesthetic;
+#[cfg(feature = "wgpu-backend")]
+pub mod render_gpu;

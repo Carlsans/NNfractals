@@ -17,18 +17,3 @@ pub fn save_png(pixels: &[u8], width: u32, height: u32, path: &Path) -> Result<(
     image::save_buffer(path, pixels, width, height, image::ColorType::Rgb8)?;
     Ok(())
 }
-
-/// Encode to PNG in-memory and return the compressed byte size.
-pub fn measure_png_kb(pixels: &[u8], width: u32, height: u32) -> u64 {
-    let mut buf = std::io::Cursor::new(Vec::new());
-    image::write_buffer_with_format(
-        &mut buf,
-        pixels,
-        width,
-        height,
-        image::ColorType::Rgb8,
-        image::ImageFormat::Png,
-    )
-    .unwrap_or(());
-    buf.into_inner().len() as u64 / 1024
-}

@@ -1,158 +1,51 @@
 use rand::Rng;
 use serde::{Deserialize, Serialize};
 use crate::config::Config;
-use crate::cppn::ActivationType;
 use crate::formula::{N_BASIS, basis_name};
-use crate::transformer::transformer_forward_latent;
 
-/// Single weight matrix stored in row-major order.
-/// weights[o * in_size + i] = weight from input i to output o.
-/// Complex NN: weights_im holds the imaginary part; empty ⟹ zeros (old-file compat).
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct LayerData {
-    pub weights: Vec<f32>,
-    pub biases: Vec<f32>,
-    pub in_size: usize,
-    pub out_size: usize,
-    #[serde(default)]
-    pub weights_im: Vec<f32>,
-    #[serde(default)]
-    pub biases_im: Vec<f32>,
+/// Bounds on the number of active terms in a genome's formula.
+pub const MIN_TERMS: usize = 2;
+pub const MAX_TERMS: usize = 8;
+/// Per-mutation structural probabilities.
+const BASIS_SWAP_PROB: f32 = 0.18;
+const TERM_ADD_PROB:   f32 = 0.20;
+const TERM_DROP_PROB:  f32 = 0.15;
+
+/// One term of the iterated map: coeff · φ_basis(z, c), coeff = re + i·im.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+pub struct FormulaTerm {
+    pub basis: u8,   // index into the 0..N_BASIS basis functions
+    pub re: f32,
+    pub im: f32,
 }
 
-impl LayerData {
-    pub fn random(in_size: usize, out_size: usize, rng: &mut impl Rng) -> Self {
-        let scale = (2.0_f32 / (in_size + out_size) as f32).sqrt() * std::f32::consts::SQRT_2;
-        let n = in_size * out_size;
-        let mut rand_vec = |n: usize| -> Vec<f32> {
-            (0..n).map(|_| rng.random::<f32>() * 2.0 * scale - scale).collect()
-        };
-        LayerData {
-            weights:    rand_vec(n),
-            weights_im: rand_vec(n),
-            biases:     vec![0.0f32; out_size],
-            biases_im:  vec![0.0f32; out_size],
-            in_size,
-            out_size,
+impl FormulaTerm {
+    fn random(rng: &mut impl Rng) -> Self {
+        FormulaTerm {
+            basis: rng.random_range(0..N_BASIS as u8),
+            re: rng.random::<f32>() * 2.0 - 1.0,
+            im: rng.random::<f32>() * 2.0 - 1.0,
         }
     }
 
-    pub fn crossover(a: &Self, b: &Self, rng: &mut impl Rng) -> Self {
-        let mut c = a.clone();
-        for (cv, &bv) in c.weights.iter_mut().zip(b.weights.iter()) {
-            if rng.random_bool(0.5) { *cv = bv; }
-        }
-        for (cv, &bv) in c.weights_im.iter_mut().zip(b.weights_im.iter()) {
-            if rng.random_bool(0.5) { *cv = bv; }
-        }
-        for (cv, &bv) in c.biases.iter_mut().zip(b.biases.iter()) {
-            if rng.random_bool(0.5) { *cv = bv; }
-        }
-        for (cv, &bv) in c.biases_im.iter_mut().zip(b.biases_im.iter()) {
-            if rng.random_bool(0.5) { *cv = bv; }
-        }
-        c
-    }
-
-    pub fn mutate(&mut self, rate: f32, scale: f32, rng: &mut impl Rng) {
-        for w in self.weights.iter_mut() {
-            if rng.random::<f32>() < rate { *w += rng.random::<f32>() * 2.0 * scale - scale; }
-        }
-        for w in self.weights_im.iter_mut() {
-            if rng.random::<f32>() < rate { *w += rng.random::<f32>() * 2.0 * scale - scale; }
-        }
-        for b in self.biases.iter_mut() {
-            if rng.random::<f32>() < rate { *b += rng.random::<f32>() * 2.0 * scale - scale; }
-        }
-        for b in self.biases_im.iter_mut() {
-            if rng.random::<f32>() < rate { *b += rng.random::<f32>() * 2.0 * scale - scale; }
+    fn random_exotic(rng: &mut impl Rng) -> Self {
+        // Bases proven in top-CLIP genomes from archive analysis:
+        //   0=z²  18=sin  30=tan  46=|BS|(burning-ship)  51=z/(z²+1)  52=(z²-1)/(z²+1)  54=1/(z²+c)
+        // The latest record (0.5294) used [cosh, 52, 46, 52, (z-c)²] — |BS| is load-bearing.
+        const EXOTIC: &[u8] = &[0, 18, 30, 46, 51, 52, 54];
+        FormulaTerm {
+            basis: EXOTIC[rng.random_range(0..EXOTIC.len())],
+            re: rng.random::<f32>() * 2.0 - 1.0,
+            im: rng.random::<f32>() * 2.0 - 1.0,
         }
     }
 }
 
-/// All weights for one transformer block.
-/// embed_z and embed_c now map d_model → d_model (project full latent → two tokens).
-/// output maps d_model → N_BASIS (formula weights).
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct TransformerWeights {
-    /// Latent projection: d_model → d_model (was 1 → d_model)
-    pub embed_z: LayerData,
-    pub embed_c: LayerData,
-    /// Attention projections: d_model → d_model
-    pub w_q: LayerData,
-    pub w_k: LayerData,
-    pub w_v: LayerData,
-    pub w_o: LayerData,
-    /// Feed-forward: d_model → d_ff → d_model
-    pub ff1: LayerData,
-    pub ff2: LayerData,
-    /// Formula weight output: d_model → N_BASIS
-    pub output: LayerData,
-    pub ff_acts: Vec<ActivationType>,
-}
-
-impl TransformerWeights {
-    pub fn random(d_model: usize, d_ff: usize, pool: &[ActivationType], rng: &mut impl Rng) -> Self {
-        TransformerWeights {
-            embed_z: LayerData::random(d_model, d_model, rng),
-            embed_c: LayerData::random(d_model, d_model, rng),
-            w_q:     LayerData::random(d_model, d_model, rng),
-            w_k:     LayerData::random(d_model, d_model, rng),
-            w_v:     LayerData::random(d_model, d_model, rng),
-            w_o:     LayerData::random(d_model, d_model, rng),
-            ff1:     LayerData::random(d_model, d_ff,    rng),
-            ff2:     LayerData::random(d_ff,    d_model, rng),
-            output:  LayerData::random(d_model, N_BASIS, rng),
-            ff_acts: (0..d_ff).map(|_| {
-                if pool.is_empty() { ActivationType::Tanh }
-                else { pool[rng.random_range(0..pool.len())].clone() }
-            }).collect(),
-        }
-    }
-
-    pub fn crossover(a: &Self, b: &Self, rng: &mut impl Rng) -> Self {
-        let mut c = a.clone();
-        c.embed_z = LayerData::crossover(&a.embed_z, &b.embed_z, rng);
-        c.embed_c = LayerData::crossover(&a.embed_c, &b.embed_c, rng);
-        c.w_q     = LayerData::crossover(&a.w_q,     &b.w_q,     rng);
-        c.w_k     = LayerData::crossover(&a.w_k,     &b.w_k,     rng);
-        c.w_v     = LayerData::crossover(&a.w_v,     &b.w_v,     rng);
-        c.w_o     = LayerData::crossover(&a.w_o,     &b.w_o,     rng);
-        c.ff1     = LayerData::crossover(&a.ff1,     &b.ff1,     rng);
-        c.ff2     = LayerData::crossover(&a.ff2,     &b.ff2,     rng);
-        c.output  = LayerData::crossover(&a.output,  &b.output,  rng);
-        for (ca, ba) in c.ff_acts.iter_mut().zip(b.ff_acts.iter()) {
-            if rng.random_bool(0.5) { *ca = ba.clone(); }
-        }
-        c
-    }
-
-    pub fn mutate(&mut self, rate: f32, scale: f32, act_prob: f32, pool: &[ActivationType], rng: &mut impl Rng) {
-        self.embed_z.mutate(rate, scale, rng);
-        self.embed_c.mutate(rate, scale, rng);
-        self.w_q.mutate(rate, scale, rng);
-        self.w_k.mutate(rate, scale, rng);
-        self.w_v.mutate(rate, scale, rng);
-        self.w_o.mutate(rate, scale, rng);
-        self.ff1.mutate(rate, scale, rng);
-        self.ff2.mutate(rate, scale, rng);
-        self.output.mutate(rate, scale, rng);
-        if !pool.is_empty() {
-            for act in self.ff_acts.iter_mut() {
-                if rng.random::<f32>() < act_prob {
-                    *act = pool[rng.random_range(0..pool.len())].clone();
-                }
-            }
-        }
-    }
-}
-
+/// A fractal genome: the formula is evolved DIRECTLY as a sparse set of weighted
+/// basis terms (no transformer/latent indirection). z_new = Σ coeffᵢ · φ_basisᵢ(z, c).
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Genome {
-    pub transformer: TransformerWeights,
-    /// Latent code: d_model complex values evolved by GA.
-    /// Passed to the transformer to synthesize N_BASIS formula weights.
-    pub latent: Vec<(f32, f32)>,
+    pub terms: Vec<FormulaTerm>,
     pub fitness: f32,
     /// Raw beauty score (no novelty inflation) at time of save; 0.0 if not yet saved.
     #[serde(default)]
@@ -162,6 +55,10 @@ pub struct Genome {
     #[serde(default)] pub beauty_entropy:   f32,
     #[serde(default)] pub beauty_self_sim:  f32,
     #[serde(default)] pub beauty_cool_zone: f32,
+    /// CLIP zero-shot aesthetic score [0,1] at save time; 0.0 if unavailable.
+    #[serde(default)] pub clip_score:  f32,
+    /// LAION MLP aesthetic score [0,10] at save time; 0.0 if unavailable.
+    #[serde(default)] pub laion_score: f32,
     pub id: u64,
     #[serde(default)]
     pub view_cx: f32,
@@ -179,21 +76,20 @@ impl Genome {
         (self.view_cx - half, self.view_cx + half, self.view_cy - half, self.view_cy + half)
     }
 
-    pub fn random(config: &Config, rng: &mut impl Rng) -> Self {
-        let d_model = config.network.d_model;
-        let d_ff    = config.d_ff();
-        let pool    = ActivationType::all_from_config(&config.network.activation_pool);
+    /// Expand the sparse term set into the dense [N_BASIS] complex weight vector
+    /// consumed by `apply_formula` and the GPU shader. Terms sharing a basis sum.
+    pub fn formula_weights(&self) -> Vec<(f32, f32)> {
+        let mut w = vec![(0.0f32, 0.0f32); N_BASIS];
+        for t in &self.terms {
+            let i = (t.basis as usize).min(N_BASIS - 1);
+            w[i].0 += t.re;
+            w[i].1 += t.im;
+        }
+        w
+    }
 
-        // Latent: d_model complex values, small Gaussian
-        let latent: Vec<(f32, f32)> = (0..d_model)
-            .map(|_| {
-                let r = rng.random::<f32>() * 2.0 - 1.0;
-                let i = rng.random::<f32>() * 2.0 - 1.0;
-                (r * 0.5, i * 0.5)
-            })
-            .collect();
-
-        let (view_cx, view_cy, view_zoom) = if rng.random::<f32>() < 0.70 {
+    fn random_view(rng: &mut impl Rng) -> (f32, f32, f32) {
+        if rng.random::<f32>() < 0.70 {
             (0.0, 0.0, 1.0)
         } else {
             let z = 0.8 + rng.random::<f32>() * 2.2;
@@ -203,63 +99,95 @@ impl Genome {
                 (rng.random::<f32>() * 2.0 - 1.0) * pan,
                 z,
             )
-        };
+        }
+    }
 
+    fn new(terms: Vec<FormulaTerm>, view: (f32, f32, f32), rng: &mut impl Rng) -> Self {
         Genome {
-            transformer: TransformerWeights::random(d_model, d_ff, &pool, rng),
-            latent,
+            terms,
             fitness: 0.0,
             beauty: 0.0,
             beauty_boundary: 0.0, beauty_edge: 0.0, beauty_entropy: 0.0,
-            beauty_self_sim: 0.0, beauty_cool_zone: 0.0,
+            beauty_self_sim: 0.0, beauty_cool_zone: 0.0, clip_score: 0.0, laion_score: 0.0,
             id: rng.random(),
-            view_cx,
-            view_cy,
-            view_zoom,
+            view_cx: view.0,
+            view_cy: view.1,
+            view_zoom: view.2,
         }
+    }
+
+    pub fn random(_config: &Config, rng: &mut impl Rng) -> Self {
+        let n = rng.random_range(MIN_TERMS..=MAX_TERMS);
+        let terms = (0..n).map(|_| FormulaTerm::random(rng)).collect();
+        let view = Self::random_view(rng);
+        Self::new(terms, view, rng)
+    }
+
+    /// Like random(), but guarantees at least one term from the exotic basis range
+    /// (burning-ship, essential singularity, rational, conjugate). Forces the GA to
+    /// keep exploring visual regions it won't discover via uniform sampling.
+    pub fn random_exotic(config: &Config, rng: &mut impl Rng) -> Self {
+        let n = rng.random_range(MIN_TERMS..=MAX_TERMS);
+        let mut terms: Vec<FormulaTerm> = (0..n).map(|_| FormulaTerm::random(rng)).collect();
+        // Replace the first term with an exotic one.
+        if let Some(t) = terms.first_mut() {
+            *t = FormulaTerm::random_exotic(rng);
+        }
+        let view = Self::random_view(rng);
+        Self::new(terms, view, rng)
     }
 
     pub fn crossover(a: &Self, b: &Self, rng: &mut impl Rng) -> Self {
-        let latent = a.latent.iter().zip(b.latent.iter())
-            .map(|(&(ar, ai), &(br, bi))| {
-                let r = if rng.random_bool(0.5) { ar } else { br };
-                let i = if rng.random_bool(0.5) { ai } else { bi };
-                (r, i)
-            })
-            .collect();
-
-        Genome {
-            transformer: TransformerWeights::crossover(&a.transformer, &b.transformer, rng),
-            latent,
-            fitness: 0.0,
-            beauty: 0.0,
-            beauty_boundary: 0.0, beauty_edge: 0.0, beauty_entropy: 0.0,
-            beauty_self_sim: 0.0, beauty_cool_zone: 0.0,
-            id: rng.random(),
-            view_cx:   (a.view_cx + b.view_cx) * 0.5,
-            view_cy:   (a.view_cy + b.view_cy) * 0.5,
-            view_zoom: (a.view_zoom * b.view_zoom).sqrt(),
+        // Union of parents' terms, each kept with prob 0.5, clamped to [MIN, MAX].
+        let mut terms: Vec<FormulaTerm> = Vec::new();
+        for t in a.terms.iter().chain(b.terms.iter()) {
+            if rng.random_bool(0.5) { terms.push(*t); }
+            if terms.len() >= MAX_TERMS { break; }
         }
+        while terms.len() < MIN_TERMS {
+            // Pull a guaranteed term from a parent (or random) to stay above the floor.
+            let src = if rng.random_bool(0.5) { &a.terms } else { &b.terms };
+            if let Some(t) = src.get(rng.random_range(0..src.len().max(1))) {
+                terms.push(*t);
+            } else {
+                terms.push(FormulaTerm::random(rng));
+            }
+        }
+        let view = (
+            (a.view_cx + b.view_cx) * 0.5,
+            (a.view_cy + b.view_cy) * 0.5,
+            (a.view_zoom * b.view_zoom).sqrt(),
+        );
+        Self::new(terms, view, rng)
     }
 
     pub fn mutate(&self, config: &Config, rng: &mut impl Rng) -> Self {
-        let pool = ActivationType::all_from_config(&config.network.activation_pool);
-        let mr   = config.optimization.mutation_rate;
-        let ms   = config.optimization.mutation_scale;
-        let ap   = config.optimization.activation_mutation_prob;
+        let mr = config.optimization.mutation_rate;
+        let ms = config.optimization.mutation_scale;
 
         let mut child = self.clone();
         child.id      = rng.random();
         child.fitness = 0.0;
-        child.transformer.mutate(mr, ms, ap, &pool, rng);
 
-        // Gaussian mutation on latent (same rate/scale as transformer)
-        for (r, i) in child.latent.iter_mut() {
-            if rng.random::<f32>() < mr { *r += rng.random::<f32>() * 2.0 * ms - ms; }
-            if rng.random::<f32>() < mr { *i += rng.random::<f32>() * 2.0 * ms - ms; }
+        // Per-term: perturb coefficient and occasionally swap which basis function it uses.
+        for t in child.terms.iter_mut() {
+            if rng.random::<f32>() < mr { t.re += rng.random::<f32>() * 2.0 * ms - ms; }
+            if rng.random::<f32>() < mr { t.im += rng.random::<f32>() * 2.0 * ms - ms; }
+            if rng.random::<f32>() < BASIS_SWAP_PROB {
+                t.basis = rng.random_range(0..N_BASIS as u8);
+            }
         }
 
-        // View mutations
+        // Structural: grow / shrink the term set within bounds.
+        if child.terms.len() < MAX_TERMS && rng.random::<f32>() < TERM_ADD_PROB {
+            child.terms.push(FormulaTerm::random(rng));
+        }
+        if child.terms.len() > MIN_TERMS && rng.random::<f32>() < TERM_DROP_PROB {
+            let idx = rng.random_range(0..child.terms.len());
+            child.terms.remove(idx);
+        }
+
+        // View mutations (unchanged).
         if rng.random::<f32>() < 0.30 {
             let zoom_delta = if rng.random::<f32>() < 0.65 {
                 1.0 + rng.random::<f32>() * 1.0
@@ -277,31 +205,24 @@ impl Genome {
         child
     }
 
-    /// Label showing top-3 active basis functions by |weight|.
+    /// Top-3 active basis functions by |coeff|, plus zoom.
     pub fn formula_label(&self) -> String {
-        let fw = transformer_forward_latent(&self.transformer, &self.latent);
-        let mut indexed: Vec<(f32, usize)> = fw.iter()
-            .enumerate()
-            .map(|(i, &(r, im))| (r*r + im*im, i))
-            .collect();
-        indexed.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
-        let top3: Vec<String> = indexed.iter().take(3)
-            .map(|(_, i)| basis_name(*i).to_string())
-            .collect();
-        format!("{}  z={:.1}x", top3.join("+"), self.view_zoom)
+        let top = self.top_basis(3);
+        format!("{}  z={:.1}x", top.join("+"), self.view_zoom)
     }
 
-    /// Short identifier for formula diversity tracking.
+    /// Short identifier (top-2 basis functions) for formula diversity tracking.
     pub fn formula_ops_label(&self) -> String {
-        let fw = transformer_forward_latent(&self.transformer, &self.latent);
-        let mut indexed: Vec<(f32, usize)> = fw.iter()
-            .enumerate()
-            .map(|(i, &(r, im))| (r*r + im*im, i))
+        self.top_basis(2).join("+")
+    }
+
+    fn top_basis(&self, k: usize) -> Vec<String> {
+        let mut indexed: Vec<(f32, u8)> = self.terms.iter()
+            .map(|t| (t.re * t.re + t.im * t.im, t.basis))
             .collect();
         indexed.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
-        indexed.iter().take(2)
-            .map(|(_, i)| basis_name(*i).to_string())
-            .collect::<Vec<_>>()
-            .join("+")
+        indexed.iter().take(k)
+            .map(|(_, b)| basis_name(*b as usize).to_string())
+            .collect()
     }
 }

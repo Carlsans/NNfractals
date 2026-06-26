@@ -1,3 +1,5 @@
+use image;
+
 /// Fast single-component score for GA selection: normalised Shannon entropy of escape times.
 /// Range [0,1]; 0 = all pixels same escape time (degenerate), 1 = perfectly uniform histogram.
 /// Used as Stage-1 prefilter before the CLIP aesthetic scorer.
@@ -16,6 +18,66 @@ pub fn entropy_score_fast(escape_times: &[f32], max_iter: u32) -> f32 {
         .filter(|&&c| c > 0)
         .map(|&c| { let p = c as f32 / n_f; -p * p.log2() })
         .sum::<f32>() / (BINS as f32).log2()
+}
+
+/// Edge density: fraction of adjacent pixel pairs with a large escape-time jump.
+/// Targets fractals with rich boundary structure (alternating inside/outside pixels).
+/// Returns [0, 1]; score 1.0 ≈ 20% of pixel pairs are edges.
+pub fn edge_density_fast(escape_times: &[f32], width: usize, max_iter: u32) -> f32 {
+    if escape_times.len() < 4 { return 0.0; }
+    let height = escape_times.len() / width;
+    let max_val = escape_times.iter().cloned().fold(0.0_f32, f32::max);
+    let threshold = (max_val * 0.008).max(0.5);  // same threshold as beauty_score_full
+
+    let mut edge_pairs = 0u32;
+    let mut total = 0u32;
+
+    for y in 0..height {
+        for x in 0..width.saturating_sub(1) {
+            let a = escape_times[y * width + x];
+            let b = escape_times[y * width + x + 1];
+            if (a - b).abs() > threshold { edge_pairs += 1; }
+            total += 1;
+        }
+    }
+    for y in 0..height.saturating_sub(1) {
+        for x in 0..width {
+            let a = escape_times[y * width + x];
+            let b = escape_times[(y + 1) * width + x];
+            if (a - b).abs() > threshold { edge_pairs += 1; }
+            total += 1;
+        }
+    }
+    // 20% edge pairs → score 1.0; linear below, clamped above
+    let frac = edge_pairs as f32 / total.max(1) as f32;
+    (frac / 0.20).min(1.0)
+}
+
+/// PNG compression entropy: render fractal → apply colormap → encode PNG in memory.
+/// Returns bytes_per_pixel of the compressed PNG (higher = harder to compress = more visual detail).
+/// This is the primary fitness metric — it directly measures structural complexity as perceived
+/// by lossless compression, which correlates with what makes a fractal visually interesting.
+pub fn png_compression_entropy(
+    escape_times: &[f32],
+    width: u32,
+    height: u32,
+    max_iter: u32,
+    colormap: &str,
+) -> f32 {
+    let rgb = crate::colormap::apply_colormap(escape_times, max_iter, colormap);
+    let mut buf = std::io::Cursor::new(Vec::with_capacity(8192));
+    image::write_buffer_with_format(
+        &mut buf,
+        &rgb,
+        width,
+        height,
+        image::ColorType::Rgb8,
+        image::ImageFormat::Png,
+    )
+    .unwrap_or(());
+    let png_bytes = buf.into_inner().len() as f32;
+    let raw_bytes = (width * height * 3) as f32;
+    png_bytes / raw_bytes  // 0..1+ (>1 theoretically impossible; ~0.3 boring, ~0.9+ rich)
 }
 
 /// Shannon entropy of escape-time values.
@@ -63,33 +125,6 @@ pub fn novelty_score(descriptor: &[f32], archive: &[Vec<f32>], k: usize) -> f32 
     dists.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     let k = k.min(dists.len());
     dists[..k].iter().sum::<f32>() / k as f32
-}
-
-/// Fraction of adjacent pixel pairs with similar escape times (< 2-iteration difference).
-/// High score = smooth fractal boundaries; low score = granular/chaotic noise.
-/// A smooth Mandelbrot set scores ~0.85; a random noise image scores ~0.4.
-pub fn smoothness_score(escape_times: &[f32], width: usize) -> f32 {
-    let n = escape_times.len();
-    if n == 0 { return 0.0; }
-    let height = n / width;
-    let mut smooth = 0u32;
-    let mut total = 0u32;
-    let threshold = 3.0_f32; // smooth coloring gives fractional values, threshold in iterations
-
-    for y in 0..height {
-        for x in 0..width {
-            let t = escape_times[y * width + x];
-            if x + 1 < width {
-                if (t - escape_times[y * width + x + 1]).abs() < threshold { smooth += 1; }
-                total += 1;
-            }
-            if y + 1 < height {
-                if (t - escape_times[(y + 1) * width + x]).abs() < threshold { smooth += 1; }
-                total += 1;
-            }
-        }
-    }
-    smooth as f32 / total.max(1) as f32
 }
 
 /// Returns true when >95% of pixels have the same escape time — degenerate/boring.
@@ -280,21 +315,4 @@ pub fn beauty_score(escape_times: &[f32], width: usize, max_iter: u32) -> f32 {
     let cool_zone_score = (1.0 - ((cool_frac - 0.12) * 3.0).abs()).max(0.0);
 
     0.20 * boundary_score + 0.25 * edge_score + 0.20 * color_entropy + 0.15 * self_sim + 0.20 * cool_zone_score
-}
-
-/// Shannon entropy of |z|² magnitudes (legacy, unused in current fitness path).
-pub fn entropy_from_magnitudes(magnitudes: &[f32], eval_clamp: f32) -> f32 {
-    const N_BINS: usize = 64;
-    let max_val = (eval_clamp * eval_clamp).max(f32::EPSILON);
-    let mut bins = [0u32; N_BINS];
-    for &m in magnitudes {
-        let t = (m / max_val).clamp(0.0, 1.0);
-        let bin = ((t * (N_BINS - 1) as f32) as usize).min(N_BINS - 1);
-        bins[bin] += 1;
-    }
-    let n = magnitudes.len() as f32;
-    bins.iter()
-        .filter(|&&c| c > 0)
-        .map(|&c| { let p = c as f32 / n; -p * p.log2() })
-        .sum()
 }

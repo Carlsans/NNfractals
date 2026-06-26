@@ -21,6 +21,8 @@ for f in files:
             "entropy":  d.get("beauty_entropy",  None),
             "self_sim": d.get("beauty_self_sim",  None),
             "cool":     d.get("beauty_cool_zone", None),
+            "clip":     d.get("clip_score",  None) or None,
+            "laion":    d.get("laion_score", None) or None,
         })
     except Exception:
         pass
@@ -35,8 +37,8 @@ print("━" * 72)
 
 have_sub = any(r["boundary"] is not None for r in records)
 
-COLS = "  {:>4}  {:>6}  {:>5}  {:>5}  {:>5}  {:>5}  {:>5}  {}"
-HDR  = COLS.format("rank", "beauty", "bound", "edge", "entro", "sim", "cool", "file")
+COLS = "  {:>4}  {:>6}  {:>5}  {:>5}  {:>5}  {:>5}  {:>5}  {:>5}  {:>5}  {}"
+HDR  = COLS.format("rank", "beauty", "bound", "edge", "entro", "sim", "cool", "clip", "laion", "file")
 print()
 print(HDR)
 print("  " + "─" * 68)
@@ -44,6 +46,7 @@ print("  " + "─" * 68)
 sorted_r = sorted(records, key=lambda r: r["beauty"], reverse=True)
 for rank, r in enumerate(sorted_r[:15], 1):
     def fmt(v): return f"{v:.3f}" if v is not None else "  —  "
+    def fmtl(v): return f"{v:.2f}" if v is not None else "  —  "
     flag = " ✓" if r["beauty"] >= 0.42 else ""
     print(COLS.format(
         rank,
@@ -53,7 +56,9 @@ for rank, r in enumerate(sorted_r[:15], 1):
         fmt(r["entropy"]),
         fmt(r["self_sim"]),
         fmt(r["cool"]),
-        r["file"][:24] + flag,
+        fmt(r["clip"]),
+        fmtl(r["laion"]),
+        r["file"][:20] + flag,
     ))
 
 # --- Aggregate stats ---

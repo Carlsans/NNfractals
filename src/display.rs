@@ -38,6 +38,8 @@ pub fn refresh(
     best_ever_fitness: f32,
     aesthetic_line: Option<&str>,
     sub_scores: Option<&[f32; 5]>,
+    max_clip_score: f32,
+    max_laion_score: f32,
 ) {
     let mut out = stdout();
     let _ = out.execute(MoveTo(0, 4));
@@ -76,6 +78,10 @@ pub fn refresh(
     println!(
         " Aesthetic ▸ {:<57}",
         aesthetic_line.unwrap_or("")
+    );
+    println!(
+        " Max scores ▸  CLIP {:>6.4}   LAION {:>6.4}                        ",
+        max_clip_score, max_laion_score
     );
     if let Some(s) = sub_scores {
         fn bar(v: f32) -> String {

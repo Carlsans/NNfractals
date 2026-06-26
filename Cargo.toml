@@ -3,13 +3,27 @@ name = "nnfractals"
 version = "0.1.0"
 edition = "2024"
 
+[[bin]]
+name = "nnfractals"
+path = "src/main.rs"
+
+[[bin]]
+name = "nnfractals-viewer"
+path = "src/bin/viewer.rs"
+required-features = ["viewer", "wgpu-backend"]
+
 [features]
 default = ["wgpu-backend"]
-wgpu-backend = ["burn/wgpu"]
-ndarray-backend = ["burn/ndarray"]
+wgpu-backend = ["dep:wgpu", "dep:pollster"]
+ndarray-backend = []
+viewer = ["dep:winit", "dep:softbuffer", "dep:font8x8"]
 
 [dependencies]
-burn       = { version = "0.21", features = ["autodiff"] }
+wgpu       = { version = "29", optional = true }
+pollster   = { version = "0.3", optional = true }
+winit      = { version = "0.30", optional = true }
+softbuffer = { version = "0.4", optional = true }
+font8x8    = { version = "0.3", optional = true }
 image      = "0.25"
 colorous   = "1"
 clap       = { version = "4", features = ["derive"] }
@@ -21,3 +35,4 @@ rayon      = "1"
 crossterm  = "0.29"
 anyhow     = "1"
 ctrlc      = "3"
+
