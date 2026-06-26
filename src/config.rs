@@ -36,7 +36,13 @@ pub struct OptimizationConfig {
     pub novelty_weight: f32,
     pub novelty_k: usize,
     pub archive_size: usize,
+    /// How strongly to favour zoom-self-replicating fractals when ranking archive
+    /// seeds for the next epoch. seed_rank = beauty + weight · self_replication.
+    #[serde(default = "default_self_replication_weight")]
+    pub self_replication_weight: f32,
 }
+
+fn default_self_replication_weight() -> f32 { 0.35 }
 
 #[derive(Deserialize, Clone, Debug)]
 pub struct OutputConfig {

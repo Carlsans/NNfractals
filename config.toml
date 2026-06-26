@@ -23,6 +23,7 @@ restart_after_gens       = 30     # faster epoch cycle, reload archive seeds mor
 novelty_weight           = 0.45   # push hard toward unexplored visual regions
 novelty_k                = 5
 archive_size             = 150
+self_replication_weight  = 0.35   # favor Mandelbrot-like zoom self-replication in seed ranking
 
 [output]
 save_dir                 = "./fractals"

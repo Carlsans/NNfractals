@@ -872,6 +872,7 @@ fn default_config() -> Config {
             eval_width: 64, eval_height: 64, eval_max_iter: 128,
             restart_after_gens: 30, novelty_weight: 0.45,
             novelty_k: 5, archive_size: 150,
+            self_replication_weight: 0.35,
         },
         output: OutputConfig {
             save_dir: "./fractals".into(),

@@ -117,9 +117,11 @@ impl Optimizer {
                 let path = e.path();
                 if path.extension().and_then(|x| x.to_str()) != Some("nn") { continue; }
                 if let Ok(g) = load_genome(&path) {
-                    // Seed by CLIP score: top-CLIP genomes seed the next epoch directly,
-                    // keeping the GA anchored in the best-scoring visual region.
-                    let score = if g.clip_score > 0.0 { g.clip_score } else { g.beauty };
+                    // Seed by beauty PLUS a bonus for zoom self-replication, so the
+                    // next epoch is anchored in genomes that are both beautiful AND
+                    // Mandelbrot-like (reproduce structure under zoom).
+                    let beauty = if g.clip_score > 0.0 { g.clip_score } else { g.beauty };
+                    let score  = beauty + config.optimization.self_replication_weight * g.self_replication;
                     candidates.push((score, g));
                 }
             }
@@ -298,6 +300,7 @@ impl Optimizer {
         g.beauty_cool_zone  = bd.cool_zone;
         g.clip_score        = aesthetic_scores.as_ref().map(|s| s.clip).unwrap_or(0.0);
         g.laion_score       = aesthetic_scores.as_ref().map(|s| s.laion).unwrap_or(0.0);
+        g.self_replication  = crate::fractal::self_replication_score(&g, &self.config);
         if g.clip_score  > self.max_clip_score  { self.max_clip_score  = g.clip_score; }
         if g.laion_score > self.max_laion_score { self.max_laion_score = g.laion_score; }
         save_genome(&g, &nn_path).unwrap_or(());
@@ -461,6 +464,9 @@ impl Optimizer {
         g.beauty_cool_zone = bd.cool_zone;
         g.clip_score       = aesthetic_scores.as_ref().map(|s| s.clip).unwrap_or(0.0);
         g.laion_score      = aesthetic_scores.as_ref().map(|s| s.laion).unwrap_or(0.0);
+        // Measure zoom self-replication only for genomes that actually pass the gate
+        // (a handful per generation) — cheap, and it travels with the saved .nn.
+        g.self_replication = crate::fractal::self_replication_score(&g, &self.config);
         if g.clip_score  > self.max_clip_score  { self.max_clip_score  = g.clip_score; }
         if g.laion_score > self.max_laion_score { self.max_laion_score = g.laion_score; }
         g.fitness = final_score;
