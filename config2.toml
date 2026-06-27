@@ -30,7 +30,7 @@ formula_diversity_weight = 0.30   # per-gen bonus for structurally distinct form
 
 [output]
 save_dir                 = "./fractals"
-population_dir           = "./populations"
+population_dir           = "./populations2"
 min_entropy_prefilter    = 0.38  # widened: dedup cleans near-dups every 2h
 max_entropy_prefilter    = 0.70  # widened: dedup cleans near-dups every 2h
 min_clip_score           = 0.512 # relaxed from 0.520 — dedup handles near-dups; saves ~35% vs ~15%
