@@ -5,21 +5,26 @@ use crate::formula::apply_formula;
 #[cfg(feature = "wgpu-backend")]
 use crate::render_gpu;
 
-/// CPU fitness: (png_compression_entropy, behavioral_descriptor).
-/// Fitness = PNG compressed size / raw size at eval resolution.
-/// A fractal with rich visual structure compresses poorly → high score.
-/// This directly measures what makes fractals aesthetically interesting.
-pub fn evaluate_fitness_full(genome: &Genome, config: &Config) -> (f32, Vec<f32>) {
+/// CPU fitness: (raw_png_entropy, multiscale_structured_entropy, behavioral_descriptor).
+///
+/// raw_png_entropy  — used for save-gate thresholding (min/max_entropy_prefilter).
+/// multiscale_entropy — used for GA selection: geometric mean of fine (64px) and
+///   coarse (16px average-pool) PNG entropy. Penalises granular noise because noise
+///   averages to near-uniform at coarse scale; structured fractals stay complex at
+///   all scales. Replace the old single-scale fitness for selection only.
+pub fn evaluate_fitness_full(genome: &Genome, config: &Config) -> (f32, f32, Vec<f32>) {
     let ew = config.optimization.eval_width;
     let eh = config.optimization.eval_height;
-    let escape_times = render_cpu_iter(genome, config, ew, eh, config.optimization.eval_max_iter);
-    let fitness = crate::fitness::png_compression_entropy(
-        &escape_times, ew, eh,
-        config.optimization.eval_max_iter,
-        &config.rendering.colormap,
+    let emi = config.optimization.eval_max_iter;
+    let escape_times = render_cpu_iter(genome, config, ew, eh, emi);
+    let raw_png = crate::fitness::png_compression_entropy(
+        &escape_times, ew, eh, emi, &config.rendering.colormap,
     );
-    let descriptor = crate::fitness::behavior_descriptor(&escape_times, config.optimization.eval_max_iter);
-    (fitness, descriptor)
+    let structured = crate::fitness::multiscale_entropy(
+        &escape_times, ew, eh, emi, &config.rendering.colormap,
+    );
+    let descriptor = crate::fitness::behavior_descriptor(&escape_times, emi);
+    (raw_png, structured, descriptor)
 }
 
 /// CPU rendering — returns smooth escape times [H*W].
@@ -533,7 +538,7 @@ fn best_copy_match(
 pub fn evaluate_fitness_batch(
     genomes: &[crate::genome::Genome],
     config:  &Config,
-) -> Vec<(f32, Vec<f32>)> {
+) -> Vec<(f32, f32, Vec<f32>)> {
     let ew  = config.optimization.eval_width;
     let eh  = config.optimization.eval_height;
     let emi = config.optimization.eval_max_iter;
@@ -551,11 +556,10 @@ pub fn evaluate_fitness_batch(
 
     // Parallelize PNG encoding across all CPU cores while GPU is idle post-dispatch
     escape_batch.into_par_iter().map(|et| {
-        let fitness = crate::fitness::png_compression_entropy(
-            &et, ew, eh, emi, &config.rendering.colormap,
-        );
+        let raw_png   = crate::fitness::png_compression_entropy(&et, ew, eh, emi, &config.rendering.colormap);
+        let structured = crate::fitness::multiscale_entropy(&et, ew, eh, emi, &config.rendering.colormap);
         let desc = crate::fitness::behavior_descriptor(&et, emi);
-        (fitness, desc)
+        (raw_png, structured, desc)
     }).collect()
 }
 

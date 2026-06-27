@@ -168,7 +168,7 @@ impl Optimizer {
         let archive_snap: Vec<Vec<f32>> = self.behavior_archive.iter().cloned().collect();
 
         #[cfg(feature = "wgpu-backend")]
-        let fitnesses: Vec<(f32, Vec<f32>)> = if crate::render_gpu::gpu_available() {
+        let fitnesses: Vec<(f32, f32, Vec<f32>)> = if crate::render_gpu::gpu_available() {
             display::print_status(&format!("Gen {}  Evaluating {} genomes (GPU)...", self.generation, n_pop));
             evaluate_fitness_batch(&self.population, &self.config)
         } else {
@@ -177,7 +177,7 @@ impl Optimizer {
         };
 
         #[cfg(not(feature = "wgpu-backend"))]
-        let fitnesses: Vec<(f32, Vec<f32>)> = {
+        let fitnesses: Vec<(f32, f32, Vec<f32>)> = {
             display::print_status(&format!("Gen {}  Evaluating {} genomes...", self.generation, n_pop));
             self.population.par_iter().map(|genome| evaluate_fitness_full(genome, &self.config)).collect()
         };
@@ -185,22 +185,24 @@ impl Optimizer {
         let rpw = self.config.optimization.recursion_pred_weight;
         let fdw = self.config.optimization.formula_diversity_weight;
         let formula_snap: Vec<Vec<f32>> = self.formula_archive.iter().cloned().collect();
-        for (i, (png_ent, descriptor)) in fitnesses.into_iter().enumerate() {
-            // Track maximum PNG compression entropy seen — used for "near max" save gating
-            if png_ent > self.max_png_entropy { self.max_png_entropy = png_ent; }
+        for (i, fitness_result) in fitnesses.into_iter().enumerate() {
+            let (raw_png, structured_ent, descriptor) = fitness_result;
+            // raw_png → save-gate thresholding (beauty_entropy), thresholds unchanged.
+            // structured_ent → geometric mean(fine, coarse) PNG entropy: selection fitness.
+            //   Noise scores high at fine scale but near-zero at coarse (averages to uniform).
+            //   Structured fractals stay complex at all scales → both terms stay high.
+            if raw_png > self.max_png_entropy { self.max_png_entropy = raw_png; }
             let novelty = novelty_score(&descriptor, &archive_snap, nk);
-            // Formula-only predicted recursion — MAJOR criterion alongside PNG entropy.
             let pred_rec = self.recursion_model.as_ref()
                 .map(|m| m.predict(&self.population[i].recursion_features()))
                 .unwrap_or(0.0);
-            // Formula-space novelty: k-NN distance in normalised 58-dim basis-weight space.
-            // Rewards genomes whose formula family is structurally distinct from the archive.
             let formula_feats = self.population[i].formula_basis_normalized();
             let formula_div = novelty_score(&formula_feats, &formula_snap, nk);
-            self.population[i].beauty_entropy    = png_ent;
+            self.population[i].beauty_entropy    = raw_png;       // save gate uses raw
             self.population[i].pred_recursion    = pred_rec;
             self.population[i].formula_diversity = formula_div;
-            self.population[i].fitness = png_ent + nw * novelty + rpw * pred_rec + fdw * formula_div;
+            self.population[i].fitness =
+                structured_ent + nw * novelty + rpw * pred_rec + fdw * formula_div;
             if self.behavior_archive.len() >= archive_max { self.behavior_archive.pop_front(); }
             self.behavior_archive.push_back(descriptor);
             if self.formula_archive.len() >= archive_max { self.formula_archive.pop_front(); }
@@ -212,7 +214,7 @@ impl Optimizer {
             b.fitness.partial_cmp(&a.fitness).unwrap_or(std::cmp::Ordering::Equal));
 
         // ── Track best-ever (raw beauty, no novelty inflation) ───────────
-        let (current_beauty, _) = evaluate_fitness_full(&self.population[0], &self.config);
+        let (current_beauty, _, _) = evaluate_fitness_full(&self.population[0], &self.config);
         let best_ever_beauty    = self.best_ever.as_ref().map(|g| g.fitness).unwrap_or(0.0);
         if current_beauty > best_ever_beauty + 0.005 {
             let mut clone = self.population[0].clone();

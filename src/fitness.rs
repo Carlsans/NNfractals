@@ -80,6 +80,50 @@ pub fn png_compression_entropy(
     png_bytes / raw_bytes  // 0..1+ (>1 theoretically impossible; ~0.3 boring, ~0.9+ rich)
 }
 
+/// Multiscale structured entropy: geometric mean of fine-scale (full res) and
+/// coarse-scale (4× average-pool) PNG compression entropy.
+///
+/// Key property: noise averages to near-uniform at coarse scale → coarse PNG
+/// entropy collapses → geometric mean collapses. Structured fractals stay complex
+/// at every scale → both terms remain high → product stays high. This directly
+/// penalises granular noise while preserving reward for genuine visual complexity.
+pub fn multiscale_entropy(
+    escape_times: &[f32], width: u32, height: u32, max_iter: u32, colormap: &str,
+) -> f32 {
+    let w = width as usize;
+    let h = height as usize;
+
+    // Fine-scale: existing PNG metric
+    let fine = png_compression_entropy(escape_times, width, height, max_iter, colormap);
+
+    // Coarse-scale: 4× average-pool (64px → 16px)
+    const FACTOR: usize = 4;
+    let cw = (w / FACTOR).max(1);
+    let ch = (h / FACTOR).max(1);
+    let mut coarse = vec![0.0f32; cw * ch];
+    for ty in 0..ch {
+        for tx in 0..cw {
+            let mut sum = 0.0f32;
+            let mut count = 0u32;
+            for dy in 0..FACTOR {
+                for dx in 0..FACTOR {
+                    let py = (ty * FACTOR + dy).min(h.saturating_sub(1));
+                    let px = (tx * FACTOR + dx).min(w.saturating_sub(1));
+                    sum += escape_times[py * w + px];
+                    count += 1;
+                }
+            }
+            coarse[ty * cw + tx] = if count > 0 { sum / count as f32 } else { 0.0 };
+        }
+    }
+    let coarse_ent = png_compression_entropy(
+        &coarse, cw as u32, ch as u32, max_iter, colormap,
+    );
+
+    // Geometric mean: 0 if either scale is near-uniform, high only when both are rich
+    (fine * coarse_ent).sqrt()
+}
+
 /// Shannon entropy of escape-time values.
 pub fn entropy_from_escape_times(escape_times: &[f32], max_iter: u32) -> f32 {
     let mut bins = vec![0u32; (max_iter + 1) as usize];
