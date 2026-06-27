@@ -33,6 +33,7 @@ pub struct Optimizer {
     max_clip_score: f32,
     max_laion_score: f32,
     recursion_model: Option<crate::recursion_model::RecursionModel>,
+    clip_model:      Option<crate::recursion_model::RecursionModel>,
 }
 
 impl Optimizer {
@@ -108,6 +109,16 @@ impl Optimizer {
                 "Recursion predictor: no model file — recursion criterion inert this run"),
         }
 
+        let clip_model = crate::recursion_model::RecursionModel::load(
+            std::path::Path::new("clip_model.json"));
+        match &clip_model {
+            Some(m) => display::print_status(&format!(
+                "CLIP predictor:      loaded (n={}, cv_r={:.3}, weight={:.2})",
+                m.n_samples, m.cv_pearson, config.optimization.clip_pred_weight)),
+            None => display::print_status(
+                "CLIP predictor:      no model file — CLIP criterion inert this run"),
+        }
+
         Self {
             config,
             population,
@@ -126,6 +137,7 @@ impl Optimizer {
             max_clip_score: 0.0,
             max_laion_score: 0.0,
             recursion_model,
+            clip_model,
         }
     }
 
@@ -137,13 +149,16 @@ impl Optimizer {
                 let path = e.path();
                 if path.extension().and_then(|x| x.to_str()) != Some("nn") { continue; }
                 if let Ok(g) = load_genome(&path) {
-                    // Seed by beauty PLUS a bonus for zoom self-replication, so the
-                    // next epoch is anchored in genomes that are both beautiful AND
-                    // Mandelbrot-like (reproduce structure under zoom).
-                    let beauty = if g.clip_score > 0.0 { g.clip_score } else { g.beauty };
-                    let score  = beauty
-                        + config.optimization.self_replication_weight * g.self_replication
-                        + config.optimization.fractal_recursion_weight * g.fractal_recursion;
+                    // Seed primarily by aesthetic quality (CLIP+LAION), with smaller
+                    // bonuses for recursion/self-replication. Doubling CLIP weight
+                    // ensures epoch restarts inherit the most aesthetically successful
+                    // genomes, not just the most recursive ones.
+                    let clip = if g.clip_score > 0.0 { g.clip_score } else { g.beauty };
+                    let laion_norm = g.laion_score / 10.0;
+                    let score = 2.0 * clip
+                        + 0.15 * laion_norm
+                        + 0.20 * g.self_replication
+                        + 0.20 * g.fractal_recursion;
                     candidates.push((score, g));
                 }
             }
@@ -184,6 +199,7 @@ impl Optimizer {
 
         let rpw = self.config.optimization.recursion_pred_weight;
         let fdw = self.config.optimization.formula_diversity_weight;
+        let cpw = self.config.optimization.clip_pred_weight;
         let formula_snap: Vec<Vec<f32>> = self.formula_archive.iter().cloned().collect();
         for (i, fitness_result) in fitnesses.into_iter().enumerate() {
             let (raw_png, structured_ent, descriptor) = fitness_result;
@@ -193,16 +209,21 @@ impl Optimizer {
             //   Structured fractals stay complex at all scales → both terms stay high.
             if raw_png > self.max_png_entropy { self.max_png_entropy = raw_png; }
             let novelty = novelty_score(&descriptor, &archive_snap, nk);
+            let feats = self.population[i].recursion_features();
             let pred_rec = self.recursion_model.as_ref()
-                .map(|m| m.predict(&self.population[i].recursion_features()))
+                .map(|m| m.predict(&feats))
+                .unwrap_or(0.0);
+            let pred_clip_val = self.clip_model.as_ref()
+                .map(|m| m.predict(&feats))
                 .unwrap_or(0.0);
             let formula_feats = self.population[i].formula_basis_normalized();
             let formula_div = novelty_score(&formula_feats, &formula_snap, nk);
             self.population[i].beauty_entropy    = raw_png;       // save gate uses raw
             self.population[i].pred_recursion    = pred_rec;
+            self.population[i].pred_clip         = pred_clip_val;
             self.population[i].formula_diversity = formula_div;
             self.population[i].fitness =
-                structured_ent + nw * novelty + rpw * pred_rec + fdw * formula_div;
+                structured_ent + nw * novelty + rpw * pred_rec + fdw * formula_div + cpw * pred_clip_val;
             if self.behavior_archive.len() >= archive_max { self.behavior_archive.pop_front(); }
             self.behavior_archive.push_back(descriptor);
             if self.formula_archive.len() >= archive_max { self.formula_archive.pop_front(); }
@@ -455,7 +476,11 @@ impl Optimizer {
         if min_dist < self.config.output.min_save_distance { return "low_diversity"; }
 
         // ── Stage 2: render full image ────────────────────────────────────
-        let escape_times = render_cpu(genome, &self.config, w, h);
+        // Find the locally best view (3×3 grid, ±15%/zoom pan) using multiscale
+        // entropy as a fast composition proxy. CLIP scores the best-view render;
+        // the genome's own view params are not modified (archive keeps original).
+        let render_genome = crate::fractal::best_entropy_view(genome, &self.config);
+        let escape_times = render_cpu(&render_genome, &self.config, w, h);
         let rgb      = apply_colormap(&escape_times, self.config.rendering.max_iter,
                                       &self.config.rendering.colormap);
         let (beauty, bd) = beauty_score_full(&escape_times, w as usize, self.config.rendering.max_iter);

@@ -56,12 +56,19 @@ pub struct OptimizationConfig {
     /// 0 disables. Tuned across diversity loop iterations.
     #[serde(default = "default_formula_diversity_weight")]
     pub formula_diversity_weight: f32,
+    /// Per-generation bonus for genomes whose formula is predicted (by a
+    /// lightweight linear model trained on the archive) to produce high CLIP
+    /// aesthetic score. fitness += clip_pred_weight · pred_clip.
+    /// 0 disables. Set to 0 if clip_model.json is absent (criterion inert).
+    #[serde(default = "default_clip_pred_weight")]
+    pub clip_pred_weight: f32,
 }
 
 fn default_self_replication_weight()    -> f32 { 0.35 }
 fn default_fractal_recursion_weight()   -> f32 { 0.35 }
 fn default_recursion_pred_weight()      -> f32 { 0.60 }
 fn default_formula_diversity_weight()   -> f32 { 0.30 }
+fn default_clip_pred_weight()           -> f32 { 0.50 }
 
 #[derive(Deserialize, Clone, Debug)]
 pub struct OutputConfig {

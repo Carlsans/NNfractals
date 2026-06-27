@@ -69,6 +69,9 @@ pub struct Genome {
     /// Formula-only predicted recursion [0,1] from `RecursionModel` at eval time;
     /// drives selection. Tracked so retraining can compare predicted vs measured.
     #[serde(default)] pub pred_recursion: f32,
+    /// Formula-only predicted CLIP aesthetic score [0,1] from a linear model
+    /// trained on the saved archive. Drives selection toward beautiful formula families.
+    #[serde(default)] pub pred_clip: f32,
     /// Formula-space novelty [0,∞]: average L2 distance to k nearest archive
     /// genomes in normalised 58-dim basis-weight space. Higher = structurally
     /// distinct formula family. Drives selection when formula_diversity_weight > 0.
@@ -158,6 +161,7 @@ impl Genome {
             self_replication: 0.0,
             fractal_recursion: 0.0,
             pred_recursion: 0.0,
+            pred_clip: 0.0,
             formula_diversity: 0.0,
             id: rng.random(),
             view_cx: view.0,

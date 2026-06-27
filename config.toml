@@ -27,6 +27,7 @@ self_replication_weight  = 0.35   # favor Mandelbrot-like zoom self-replication 
 fractal_recursion_weight = 0.35   # favor embedded miniature copies of the whole set (baby-Mandelbrots)
 recursion_pred_weight    = 0.80   # MAJOR per-gen criterion: formula-only predicted recursion (recursion_model.json)
 formula_diversity_weight = 0.30   # per-gen bonus for structurally distinct formula families (k-NN in basis space)
+clip_pred_weight         = 0.50   # per-gen bonus for formula-predicted CLIP aesthetic (linear model on archive)
 
 [output]
 save_dir                 = "./fractals"

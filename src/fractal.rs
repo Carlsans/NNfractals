@@ -32,6 +32,38 @@ pub fn render_cpu(genome: &Genome, config: &Config, width: u32, height: u32) -> 
     render_cpu_iter(genome, config, width, height, config.rendering.max_iter)
 }
 
+/// Try a 3×3 grid of small view offsets around the genome's current view and
+/// return a clone with the view params that maximise multiscale_entropy.
+/// Used in try_save() so CLIP sees the best-composed version of each candidate.
+/// The genome stored in the archive is NOT modified — only the render view changes.
+pub fn best_entropy_view(genome: &Genome, config: &Config) -> Genome {
+    let ew  = config.optimization.eval_width;
+    let eh  = config.optimization.eval_height;
+    let emi = config.optimization.eval_max_iter;
+    // Search radius: ±15% of the current half-width (2/zoom), so the shift
+    // is proportional to zoom level and never wanders far from the evolved view.
+    let pan = 0.30 / genome.view_zoom.max(0.1);
+    let offsets: [(f32, f32); 9] = [
+        (-pan, -pan), (0.0, -pan), (pan, -pan),
+        (-pan,  0.0), (0.0,  0.0), (pan,  0.0),
+        (-pan,  pan), (0.0,  pan), (pan,  pan),
+    ];
+    let mut best_score = -1.0f32;
+    let mut best = genome.clone();
+    for (dx, dy) in offsets {
+        let mut candidate = genome.clone();
+        candidate.view_cx += dx;
+        candidate.view_cy += dy;
+        let et = render_cpu_iter(&candidate, config, ew, eh, emi);
+        let score = crate::fitness::multiscale_entropy(&et, ew, eh, emi, &config.rendering.colormap);
+        if score > best_score {
+            best_score = score;
+            best = candidate;
+        }
+    }
+    best
+}
+
 pub fn render_cpu_iter(
     genome: &Genome, config: &Config, width: u32, height: u32, max_iter: u32,
 ) -> Vec<f32> {
