@@ -1,6 +1,6 @@
 [rendering]
-default_width  = 800
-default_height = 600
+default_width  = 512
+default_height = 512
 max_iter       = 192     # was 128 — deeper iteration depth, richer saved fractal detail
 bailout        = 4.0
 colormap       = "turbo"    # turbo = cool-blue for low escape times; preferred by CLIP; earth | neon | inferno | viridis | plasma | magma
@@ -24,6 +24,7 @@ novelty_weight           = 0.45   # push hard toward unexplored visual regions
 novelty_k                = 5
 archive_size             = 150
 self_replication_weight  = 0.35   # favor Mandelbrot-like zoom self-replication in seed ranking
+fractal_recursion_weight = 0.35   # favor embedded miniature copies of the whole set (baby-Mandelbrots)
 
 [output]
 save_dir                 = "./fractals"

@@ -40,9 +40,15 @@ pub struct OptimizationConfig {
     /// seeds for the next epoch. seed_rank = beauty + weight · self_replication.
     #[serde(default = "default_self_replication_weight")]
     pub self_replication_weight: f32,
+    /// How strongly to favour fractals with embedded miniature copies of the whole
+    /// set (baby-Mandelbrots) when ranking archive seeds for the next epoch.
+    /// seed_rank += weight · fractal_recursion.
+    #[serde(default = "default_fractal_recursion_weight")]
+    pub fractal_recursion_weight: f32,
 }
 
 fn default_self_replication_weight() -> f32 { 0.35 }
+fn default_fractal_recursion_weight() -> f32 { 0.35 }
 
 #[derive(Deserialize, Clone, Debug)]
 pub struct OutputConfig {

@@ -873,6 +873,7 @@ fn default_config() -> Config {
             restart_after_gens: 30, novelty_weight: 0.45,
             novelty_k: 5, archive_size: 150,
             self_replication_weight: 0.35,
+            fractal_recursion_weight: 0.35,
         },
         output: OutputConfig {
             save_dir: "./fractals".into(),

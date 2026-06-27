@@ -121,7 +121,9 @@ impl Optimizer {
                     // next epoch is anchored in genomes that are both beautiful AND
                     // Mandelbrot-like (reproduce structure under zoom).
                     let beauty = if g.clip_score > 0.0 { g.clip_score } else { g.beauty };
-                    let score  = beauty + config.optimization.self_replication_weight * g.self_replication;
+                    let score  = beauty
+                        + config.optimization.self_replication_weight * g.self_replication
+                        + config.optimization.fractal_recursion_weight * g.fractal_recursion;
                     candidates.push((score, g));
                 }
             }
@@ -301,6 +303,7 @@ impl Optimizer {
         g.clip_score        = aesthetic_scores.as_ref().map(|s| s.clip).unwrap_or(0.0);
         g.laion_score       = aesthetic_scores.as_ref().map(|s| s.laion).unwrap_or(0.0);
         g.self_replication  = crate::fractal::self_replication_score(&g, &self.config);
+        g.fractal_recursion = crate::fractal::fractal_recursion_score(&g, &self.config);
         if g.clip_score  > self.max_clip_score  { self.max_clip_score  = g.clip_score; }
         if g.laion_score > self.max_laion_score { self.max_laion_score = g.laion_score; }
         save_genome(&g, &nn_path).unwrap_or(());
@@ -464,9 +467,10 @@ impl Optimizer {
         g.beauty_cool_zone = bd.cool_zone;
         g.clip_score       = aesthetic_scores.as_ref().map(|s| s.clip).unwrap_or(0.0);
         g.laion_score      = aesthetic_scores.as_ref().map(|s| s.laion).unwrap_or(0.0);
-        // Measure zoom self-replication only for genomes that actually pass the gate
-        // (a handful per generation) — cheap, and it travels with the saved .nn.
-        g.self_replication = crate::fractal::self_replication_score(&g, &self.config);
+        // Measure zoom self-replication and fractal recursion only for genomes that
+        // actually pass the gate (a handful per generation) — they travel with the .nn.
+        g.self_replication  = crate::fractal::self_replication_score(&g, &self.config);
+        g.fractal_recursion = crate::fractal::fractal_recursion_score(&g, &self.config);
         if g.clip_score  > self.max_clip_score  { self.max_clip_score  = g.clip_score; }
         if g.laion_score > self.max_laion_score { self.max_laion_score = g.laion_score; }
         g.fitness = final_score;

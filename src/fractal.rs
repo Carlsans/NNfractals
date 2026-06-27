@@ -137,6 +137,49 @@ fn structure_vec(field: &[f32], w: usize, h: usize, ps: usize) -> Vec<f32> {
     pooled.iter().map(|v| (v - mean) / std).collect()
 }
 
+/// Intricacy of an escape-time field in [0, 1]: the density of gradient sign-flips
+/// along horizontal and vertical scanlines — i.e. how often the field reverses
+/// direction (local maxima/minima encountered when sweeping a line across it).
+///
+/// A *fractal* field is non-monotone: it folds into iteration bands and weaving
+/// filaments, so a scanline reverses direction many times. A smooth monotone map
+/// (the trivial `z+c`, whose field is ≈`2/|c|` — a self-similar but featureless
+/// `1/r` radial ramp) reverses at most once per line. Self-similarity matching
+/// alone can't tell a fractal from such a degenerate scale-invariant ramp; this
+/// absolute gate can. (Pure noise also scores high here, but noise fails the copy
+/// match, so the two together still single out genuine recursion.)
+pub fn field_intricacy(field: &[f32], w: usize, h: usize) -> f32 {
+    if w < 3 || h < 3 { return 0.0; }
+    let n = field.len() as f32;
+    let mean = field.iter().sum::<f32>() / n;
+    let std  = (field.iter().map(|v| (v - mean).powi(2)).sum::<f32>() / n).sqrt();
+    if std < 1e-6 { return 0.0; }
+    let eps = std * 0.02; // treat sub-noise wiggles as flat (no flip)
+
+    let mut flips = 0u32;
+    let mut total = 0u32;
+    // Count direction reversals along a line of values via the running sign of
+    // significant consecutive differences.
+    let mut scan = |get: &dyn Fn(usize) -> f32, len: usize, t: &mut u32, f: &mut u32| {
+        let mut last_sign = 0i8;
+        for i in 1..len {
+            let d = get(i) - get(i - 1);
+            *t += 1;
+            if d.abs() <= eps { continue; }
+            let s = if d > 0.0 { 1i8 } else { -1i8 };
+            if last_sign != 0 && s != last_sign { *f += 1; }
+            last_sign = s;
+        }
+    };
+    for y in 0..h {
+        scan(&|x| field[y * w + x], w, &mut total, &mut flips);
+    }
+    for x in 0..w {
+        scan(&|y| field[y * w + x], h, &mut total, &mut flips);
+    }
+    flips as f32 / total.max(1) as f32
+}
+
 /// Pearson correlation of two equal-length z-scored vectors → [-1, 1].
 fn correlation(a: &[f32], b: &[f32]) -> f32 {
     if a.len() != b.len() || a.is_empty() { return 0.0; }
@@ -261,6 +304,171 @@ pub fn self_replication_score(genome: &Genome, config: &Config) -> f32 {
     // Persistence is the dominant signal (it directly measures "stays complex at
     // depth"); shape correlation refines it. Weighted blend, clamped to [0,1].
     (0.65 * persist + 0.35 * corr).clamp(0.0, 1.0)
+}
+
+/// The 8 dihedral (square-symmetry) orientations of a `ps×ps` field, as flat
+/// vectors. A z-scored field stays z-scored under any of these (they only permute
+/// the entries), so the variants can be fed straight into `correlation`. Used to
+/// match miniature copies that appear rotated or mirrored relative to the whole.
+fn dihedral_variants(v: &[f32], ps: usize) -> Vec<Vec<f32>> {
+    // (row, col) -> source (row, col) for each of the 8 transforms.
+    let maps: [fn(usize, usize, usize) -> (usize, usize); 8] = [
+        |r, c, _| (r, c),                       // identity
+        |r, c, n| (c, n - 1 - r),               // rot 90
+        |r, c, n| (n - 1 - r, n - 1 - c),       // rot 180
+        |r, c, n| (n - 1 - c, r),               // rot 270
+        |r, c, n| (r, n - 1 - c),               // flip horizontal
+        |r, c, n| (n - 1 - r, c),               // flip vertical
+        |r, c, _| (c, r),                       // transpose
+        |r, c, n| (n - 1 - c, n - 1 - r),       // anti-transpose
+    ];
+    maps.iter().map(|m| {
+        let mut out = vec![0.0f32; ps * ps];
+        for r in 0..ps {
+            for c in 0..ps {
+                let (sr, sc) = m(r, c, ps);
+                out[r * ps + c] = v[sr * ps + sc];
+            }
+        }
+        out
+    }).collect()
+}
+
+/// Localised edge density within a rectangular cell of `field`.
+fn cell_edge_density(field: &[f32], w: usize, x0: usize, x1: usize, y0: usize, y1: usize) -> f32 {
+    let maxv = field.iter().cloned().fold(0.0_f32, f32::max).max(1.0);
+    let thr  = maxv * 0.01;
+    let (mut edges, mut total) = (0u32, 0u32);
+    for y in y0..y1 {
+        for x in x0..x1 {
+            let t = field[y * w + x];
+            if x + 1 < x1 { if (t - field[y * w + x + 1]).abs() > thr { edges += 1; } total += 1; }
+            if y + 1 < y1 { if (t - field[(y + 1) * w + x]).abs() > thr { edges += 1; } total += 1; }
+        }
+    }
+    edges as f32 / total.max(1) as f32
+}
+
+/// Candidate centres likely to hold an embedded copy of the whole set.
+///
+/// A baby-Mandelbrot is a small *interior island* (pixels that never escape)
+/// wrapped in *boundary structure*. We grid the frame and rank each cell by
+/// `local_edge_density · (1 + 2·island_bonus)`, where the island bonus rewards a
+/// cell that holds some — but not all — interior. Returns up to `k` cell-centre
+/// pixel coordinates, best first.
+fn recursion_candidates(
+    field: &[f32], w: usize, h: usize, max_iter: u32, grid: usize, k: usize,
+) -> Vec<(usize, usize)> {
+    let interior_thr = max_iter as f32 * 0.95;
+    let mut scored: Vec<(f32, usize, usize)> = Vec::with_capacity(grid * grid);
+    for gy in 0..grid {
+        for gx in 0..grid {
+            let x0 = gx * w / grid;
+            let x1 = ((gx + 1) * w / grid).max(x0 + 1).min(w);
+            let y0 = gy * h / grid;
+            let y1 = ((gy + 1) * h / grid).max(y0 + 1).min(h);
+            let (mut interior, mut cnt) = (0u32, 0u32);
+            for y in y0..y1 {
+                for x in x0..x1 {
+                    if field[y * w + x] >= interior_thr { interior += 1; }
+                    cnt += 1;
+                }
+            }
+            let island = interior as f32 / cnt.max(1) as f32;
+            // Reward a partial island (a contained body), ignore solid/empty cells.
+            let island_bonus = if island > 0.01 && island < 0.70 { island } else { 0.0 };
+            let ed = cell_edge_density(field, w, x0, x1, y0, y1);
+            let score = ed * (1.0 + 2.0 * island_bonus);
+            scored.push((score, (x0 + x1) / 2, (y0 + y1) / 2));
+        }
+    }
+    scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+    scored.into_iter().take(k).filter(|s| s.0 > 0.0).map(|(_, x, y)| (x, y)).collect()
+}
+
+/// Fractal-recursion score in [0, 1] — "a fractal inside a fractal".
+///
+/// Detects *embedded miniature copies of the whole set* (the baby-Mandelbrot
+/// phenomenon), which is what makes a fractal feel infinitely self-referential.
+///
+/// This is deliberately distinct from [`self_replication_score`]: that one asks
+/// whether boundary *detail persists* as you zoom (correlating **consecutive**
+/// scales). This one asks whether a **complete small copy of the entire
+/// structure** reappears somewhere inside it — by matching the global whole-set
+/// template against re-rendered sub-windows at several smaller scales and
+/// locations, across all 8 dihedral orientations.
+///
+/// Method:
+///  1. Render the base view; build the global template (contrast-normalised).
+///  2. Pick candidate centres that look like contained copies (interior island
+///     wrapped in boundary structure), plus the richest boundary point.
+///  3. For each candidate × scale, render the sub-window and correlate it with
+///     the global template (best orientation). The peak correlation is the score.
+///
+/// A non-recursive map yields sub-windows that look nothing like the whole (≈0);
+/// a Mandelbrot-like map, whose mini-copies recur at depth, approaches 1.
+pub fn fractal_recursion_score(genome: &Genome, config: &Config) -> f32 {
+    const BASE_RES: u32 = 128;
+    const WIN_RES:  u32 = 96;
+    const PS:  usize = 24;
+    const GRID: usize = 6;     // 6×6 candidate cells over the base frame
+    const K:    usize = 4;     // re-render the 4 most copy-like cells
+    const SCALES: [f32; 3] = [6.0, 14.0, 30.0]; // sub-window = base half-width / scale
+
+    let fw = genome.formula_weights();
+    let mi = config.rendering.max_iter;
+    let (bw, bh) = (BASE_RES as usize, BASE_RES as usize);
+
+    let (x0, x1, y0, y1) = genome.view_bounds();
+    let bhalf = (x1 - x0) * 0.5;
+
+    let base = render_bounds(&fw, config, BASE_RES, BASE_RES, mi, x0, x1, y0, y1);
+    let base_ed = edge_density(&base, bw, bh);
+    if base_ed < 0.01 { return 0.0; } // whole set is essentially featureless
+
+    // Intricacy gate: the whole set must be a genuine (non-monotone) fractal, not a
+    // smooth scale-invariant ramp like `z+c` whose windows trivially correlate with
+    // the whole. Below LO → degenerate/monotone, no credit; ramp to full credit at HI.
+    const INTRIC_LO: f32 = 0.010;
+    const INTRIC_HI: f32 = 0.030;
+    let intric = field_intricacy(&base, bw, bh);
+    let gate = ((intric - INTRIC_LO) / (INTRIC_HI - INTRIC_LO)).clamp(0.0, 1.0);
+    if gate <= 0.0 { return 0.0; }
+
+    // Match shape on the raw (contrast-normalised) template — it carries the
+    // mid-frequency "looks like the whole set" signal that a pure Laplacian throws
+    // away. The roughness gate above is what rejects smooth gradients.
+    let global = structure_vec(&base, bw, bh, PS);
+    if global.iter().all(|v| *v == 0.0) { return 0.0; } // flat → no template to match
+    let global_orients = dihedral_variants(&global, PS);
+
+    // Candidate centres: most copy-like cells, plus the single richest boundary point.
+    let mut centres = recursion_candidates(&base, bw, bh, mi, GRID, K);
+    if let Some(p) = richest_boundary_point(&base, bw, bh) { centres.push(p); }
+    if centres.is_empty() { return 0.0; }
+
+    let wf = (bw - 1).max(1) as f32;
+    let hf = (bh - 1).max(1) as f32;
+
+    let mut best = 0.0f32;
+    for &(px, py) in &centres {
+        let cx = (x0) + (px as f32 / wf) * (2.0 * bhalf);
+        let cy = (y0) + (py as f32 / hf) * (2.0 * bhalf);
+        for scale in SCALES {
+            let half = bhalf / scale;
+            let win  = render_bounds(&fw, config, WIN_RES, WIN_RES, mi,
+                                     cx - half, cx + half, cy - half, cy + half);
+            // A window that has smoothed out can't host a copy of a structured whole.
+            if edge_density(&win, WIN_RES as usize, WIN_RES as usize) < base_ed * 0.15 { continue; }
+            let wv = structure_vec(&win, WIN_RES as usize, WIN_RES as usize, PS);
+            if wv.iter().all(|v| *v == 0.0) { continue; }
+            for g in &global_orients {
+                let c = correlation(&wv, g);
+                if c > best { best = c; }
+            }
+        }
+    }
+    (best * gate).clamp(0.0, 1.0)
 }
 
 /// Batch-evaluate all genomes in ONE GPU dispatch with per-genome view bounds.

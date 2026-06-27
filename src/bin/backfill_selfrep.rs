@@ -1,7 +1,8 @@
-// One-off: compute self_replication for every saved .nn that lacks it, re-save.
+// One-off: compute self_replication AND fractal_recursion for every saved .nn
+// that lacks either metric, then re-save.
 use nnfractals::config::Config;
 use nnfractals::io::{load_genome, save_genome};
-use nnfractals::fractal::self_replication_score;
+use nnfractals::fractal::{self_replication_score, fractal_recursion_score};
 use nnfractals::render_gpu;
 use std::path::Path;
 
@@ -14,10 +15,17 @@ fn main() {
         if p.extension().and_then(|x| x.to_str()) != Some("nn") { continue; }
         n += 1;
         let Ok(mut g) = load_genome(&p) else { continue };
-        if g.self_replication > 0.0 { continue; }
-        g.self_replication = self_replication_score(&g, &cfg);
-        if save_genome(&g, &p).is_ok() { done += 1; }
-        if done % 25 == 0 { eprintln!("  {done} scored…"); }
+        let mut changed = false;
+        if g.self_replication == 0.0 {
+            g.self_replication = self_replication_score(&g, &cfg);
+            changed = true;
+        }
+        if g.fractal_recursion == 0.0 {
+            g.fractal_recursion = fractal_recursion_score(&g, &cfg);
+            changed = true;
+        }
+        if changed && save_genome(&g, &p).is_ok() { done += 1; }
+        if done > 0 && done % 25 == 0 { eprintln!("  {done} scored…"); }
     }
-    eprintln!("Backfilled self_replication for {done}/{n} genomes.");
+    eprintln!("Backfilled metrics for {done}/{n} genomes.");
 }

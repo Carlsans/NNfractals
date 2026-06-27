@@ -43,7 +43,7 @@ impl FormulaTerm {
 
 /// A fractal genome: the formula is evolved DIRECTLY as a sparse set of weighted
 /// basis terms (no transformer/latent indirection). z_new = Σ coeffᵢ · φ_basisᵢ(z, c).
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Genome {
     pub terms: Vec<FormulaTerm>,
     pub fitness: f32,
@@ -62,6 +62,10 @@ pub struct Genome {
     /// Zoom self-replication score [0,1]: how much the fractal reproduces its
     /// whole-set structure under deep zoom (Mandelbrot-like). 0.0 if not measured.
     #[serde(default)] pub self_replication: f32,
+    /// Fractal-recursion score [0,1]: how strongly a *complete miniature copy of
+    /// the whole set* (a baby-Mandelbrot) reappears embedded inside it. 0.0 if not
+    /// measured. Distinct from `self_replication` (boundary-detail persistence).
+    #[serde(default)] pub fractal_recursion: f32,
     pub id: u64,
     #[serde(default)]
     pub view_cx: f32,
@@ -113,6 +117,7 @@ impl Genome {
             beauty_boundary: 0.0, beauty_edge: 0.0, beauty_entropy: 0.0,
             beauty_self_sim: 0.0, beauty_cool_zone: 0.0, clip_score: 0.0, laion_score: 0.0,
             self_replication: 0.0,
+            fractal_recursion: 0.0,
             id: rng.random(),
             view_cx: view.0,
             view_cy: view.1,
