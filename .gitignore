@@ -12,3 +12,4 @@ dedup.log
 evolution.log
 evolution.pid
 loop_state.json
+recursion_loop_state.json
