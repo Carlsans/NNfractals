@@ -25,6 +25,7 @@ novelty_k                = 5
 archive_size             = 150
 self_replication_weight  = 0.35   # favor Mandelbrot-like zoom self-replication in seed ranking
 fractal_recursion_weight = 0.35   # favor embedded miniature copies of the whole set (baby-Mandelbrots)
+recursion_pred_weight    = 0.80   # MAJOR per-gen criterion: formula-only predicted recursion (recursion_model.json)
 
 [output]
 save_dir                 = "./fractals"

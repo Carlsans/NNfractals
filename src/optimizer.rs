@@ -31,6 +31,7 @@ pub struct Optimizer {
     max_png_entropy: f32,               // max PNG compression ratio seen across all evaluations
     max_clip_score: f32,
     max_laion_score: f32,
+    recursion_model: Option<crate::recursion_model::RecursionModel>,
 }
 
 impl Optimizer {
@@ -90,6 +91,16 @@ impl Optimizer {
             display::print_status("Aesthetic scorer: spawning Python sidecar...");
         }
 
+        let recursion_model = crate::recursion_model::RecursionModel::load(
+            std::path::Path::new("recursion_model.json"));
+        match &recursion_model {
+            Some(m) => display::print_status(&format!(
+                "Recursion predictor: loaded (n={}, cv_r={:.3}, weight={:.2})",
+                m.n_samples, m.cv_pearson, config.optimization.recursion_pred_weight)),
+            None => display::print_status(
+                "Recursion predictor: no model file — recursion criterion inert this run"),
+        }
+
         Self {
             config,
             population,
@@ -106,6 +117,7 @@ impl Optimizer {
             max_png_entropy: 0.0,
             max_clip_score: 0.0,
             max_laion_score: 0.0,
+            recursion_model,
         }
     }
 
@@ -162,12 +174,20 @@ impl Optimizer {
             self.population.par_iter().map(|genome| evaluate_fitness_full(genome, &self.config)).collect()
         };
 
+        let rpw = self.config.optimization.recursion_pred_weight;
         for (i, (png_ent, descriptor)) in fitnesses.into_iter().enumerate() {
             // Track maximum PNG compression entropy seen — used for "near max" save gating
             if png_ent > self.max_png_entropy { self.max_png_entropy = png_ent; }
             let novelty = novelty_score(&descriptor, &archive_snap, nk);
+            // Formula-only predicted recursion — a MAJOR selection criterion alongside
+            // file-size (PNG-compression) entropy. Cheap: a dot product over formula
+            // features, no rendering. Empty model → 0 (criterion inert).
+            let pred_rec = self.recursion_model.as_ref()
+                .map(|m| m.predict(&self.population[i].recursion_features()))
+                .unwrap_or(0.0);
             self.population[i].beauty_entropy = png_ent;   // raw metric travels with the sort
-            self.population[i].fitness = png_ent + nw * novelty;
+            self.population[i].pred_recursion = pred_rec;
+            self.population[i].fitness = png_ent + nw * novelty + rpw * pred_rec;
             if self.behavior_archive.len() >= archive_max { self.behavior_archive.pop_front(); }
             self.behavior_archive.push_back(descriptor);
         }

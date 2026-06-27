@@ -66,6 +66,9 @@ pub struct Genome {
     /// the whole set* (a baby-Mandelbrot) reappears embedded inside it. 0.0 if not
     /// measured. Distinct from `self_replication` (boundary-detail persistence).
     #[serde(default)] pub fractal_recursion: f32,
+    /// Formula-only predicted recursion [0,1] from `RecursionModel` at eval time;
+    /// drives selection. Tracked so retraining can compare predicted vs measured.
+    #[serde(default)] pub pred_recursion: f32,
     pub id: u64,
     #[serde(default)]
     pub view_cx: f32,
@@ -81,6 +84,24 @@ impl Genome {
     pub fn view_bounds(&self) -> (f32, f32, f32, f32) {
         let half = 2.0 / self.view_zoom;
         (self.view_cx - half, self.view_cx + half, self.view_cy - half, self.view_cy + half)
+    }
+
+    /// Formula-only feature vector for the recursion predictor. MUST stay
+    /// byte-for-byte aligned with `features()` in scripts/fit_recursion_model.py:
+    ///   [0..N_BASIS)  Σ |coeff| of terms on each basis
+    ///   [N_BASIS]     num_terms
+    ///   [N_BASIS+1]   total |coeff|
+    ///   [N_BASIS+2]   c · z-power interaction (basis7 · Σ basis0..3)
+    pub fn recursion_features(&self) -> Vec<f32> {
+        let mut f = vec![0.0f32; N_BASIS + 3];
+        for t in &self.terms {
+            let b = (t.basis as usize).min(N_BASIS - 1);
+            f[b] += (t.re * t.re + t.im * t.im).sqrt();
+        }
+        f[N_BASIS]     = self.terms.len() as f32;
+        f[N_BASIS + 1] = f[..N_BASIS].iter().sum();
+        f[N_BASIS + 2] = f[7] * (f[0] + f[1] + f[2] + f[3]);
+        f
     }
 
     /// Expand the sparse term set into the dense [N_BASIS] complex weight vector
@@ -118,6 +139,7 @@ impl Genome {
             beauty_self_sim: 0.0, beauty_cool_zone: 0.0, clip_score: 0.0, laion_score: 0.0,
             self_replication: 0.0,
             fractal_recursion: 0.0,
+            pred_recursion: 0.0,
             id: rng.random(),
             view_cx: view.0,
             view_cy: view.1,

@@ -45,10 +45,16 @@ pub struct OptimizationConfig {
     /// seed_rank += weight · fractal_recursion.
     #[serde(default = "default_fractal_recursion_weight")]
     pub fractal_recursion_weight: f32,
+    /// Major per-generation selection weight on the formula-only predicted
+    /// recursion (RecursionModel). fitness = png_entropy + novelty·nw +
+    /// recursion_pred_weight · predicted_recursion. 0 disables.
+    #[serde(default = "default_recursion_pred_weight")]
+    pub recursion_pred_weight: f32,
 }
 
 fn default_self_replication_weight() -> f32 { 0.35 }
 fn default_fractal_recursion_weight() -> f32 { 0.35 }
+fn default_recursion_pred_weight() -> f32 { 0.6 }
 
 #[derive(Deserialize, Clone, Debug)]
 pub struct OutputConfig {
