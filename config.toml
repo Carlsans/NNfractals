@@ -3,7 +3,7 @@ default_width  = 512
 default_height = 512
 max_iter       = 192     # was 128 — deeper iteration depth, richer saved fractal detail
 bailout        = 4.0
-colormap       = "turbo"    # turbo = cool-blue for low escape times; preferred by CLIP; earth | neon | inferno | viridis | plasma | magma
+colormap       = "earth"    # turbo = cool-blue for low escape times; preferred by CLIP; earth | neon | inferno | viridis | plasma | magma
 view_x_min     = -2.0
 view_x_max     =  2.0
 view_y_min     = -2.0

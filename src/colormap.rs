@@ -15,9 +15,15 @@ pub fn apply_colormap(escape_times: &[f32], max_iter: u32, colormap_name: &str) 
 
 fn color_at(name: &str, t: f64) -> (u8, u8, u8) {
     match name {
-        "earth"     => earth_color(t),
-        "bone"      => bone_color(t),
-        "neon"      => neon_color(t),
+        "earth"   => earth_color(t),
+        "bone"    => bone_color(t),
+        "neon"    => neon_color(t),
+        "lava"    => lava_color(t),
+        "aurora"  => aurora_color(t),
+        "galaxy"  => galaxy_color(t),
+        "sunset"  => sunset_color(t),
+        "arctic"  => arctic_color(t),
+        "ember"   => ember_color(t),
         _ => { let c = pick_gradient(name).eval_continuous(t); (c.r, c.g, c.b) }
     }
 }
@@ -73,6 +79,88 @@ fn neon_color(t: f64) -> (u8, u8, u8) {
         (0.800, [80, 255,  50]),
         (0.900, [255,220,   0]),
         (1.000, [255,255, 255]),
+    ];
+    lerp_stops(STOPS, t)
+}
+
+// Molten lava: black → deep crimson → fiery orange → bright yellow → white-hot
+fn lava_color(t: f64) -> (u8, u8, u8) {
+    const STOPS: &[(f64, [u8; 3])] = &[
+        (0.000, [0,   0,   0]),
+        (0.200, [100,  0,   0]),
+        (0.420, [200,  30,  0]),
+        (0.620, [240, 100,  0]),
+        (0.800, [255, 200,  0]),
+        (0.920, [255, 240, 120]),
+        (1.000, [255, 255, 240]),
+    ];
+    lerp_stops(STOPS, t)
+}
+
+// Northern lights: black → deep teal → electric green → violet → white
+fn aurora_color(t: f64) -> (u8, u8, u8) {
+    const STOPS: &[(f64, [u8; 3])] = &[
+        (0.000, [0,   0,   15]),
+        (0.200, [0,   80,  80]),
+        (0.380, [0,  200,  80]),
+        (0.560, [20, 255, 120]),
+        (0.720, [120, 60, 220]),
+        (0.880, [200, 80, 255]),
+        (1.000, [240, 240, 255]),
+    ];
+    lerp_stops(STOPS, t)
+}
+
+// Deep space: midnight navy → royal purple → rose → gold → cream
+fn galaxy_color(t: f64) -> (u8, u8, u8) {
+    const STOPS: &[(f64, [u8; 3])] = &[
+        (0.000, [5,   5,  30]),
+        (0.200, [30,  10,  90]),
+        (0.380, [100, 20, 160]),
+        (0.560, [200, 60, 140]),
+        (0.720, [240, 140,  60]),
+        (0.880, [250, 220, 120]),
+        (1.000, [255, 250, 230]),
+    ];
+    lerp_stops(STOPS, t)
+}
+
+// Dusk: deep indigo → magenta → coral → saffron → pale gold
+fn sunset_color(t: f64) -> (u8, u8, u8) {
+    const STOPS: &[(f64, [u8; 3])] = &[
+        (0.000, [10,   5,  50]),
+        (0.220, [100,  10, 150]),
+        (0.420, [220,  40, 120]),
+        (0.600, [240, 100,  40]),
+        (0.780, [250, 190,  30]),
+        (1.000, [255, 245, 180]),
+    ];
+    lerp_stops(STOPS, t)
+}
+
+// Arctic ice: deep navy → polar blue → ice cyan → glacial white
+fn arctic_color(t: f64) -> (u8, u8, u8) {
+    const STOPS: &[(f64, [u8; 3])] = &[
+        (0.000, [0,   10,  40]),
+        (0.200, [0,   50, 130]),
+        (0.420, [0,  140, 200]),
+        (0.620, [60, 210, 235]),
+        (0.800, [160, 235, 245]),
+        (1.000, [240, 250, 255]),
+    ];
+    lerp_stops(STOPS, t)
+}
+
+// Glowing embers: charcoal → deep burgundy → brick red → burnt orange → amber
+fn ember_color(t: f64) -> (u8, u8, u8) {
+    const STOPS: &[(f64, [u8; 3])] = &[
+        (0.000, [10,   5,   5]),
+        (0.180, [60,   8,   8]),
+        (0.360, [150,  20,  10]),
+        (0.560, [210,  70,  10]),
+        (0.750, [235, 150,  20]),
+        (0.900, [245, 210,  80]),
+        (1.000, [255, 245, 180]),
     ];
     lerp_stops(STOPS, t)
 }
