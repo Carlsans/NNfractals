@@ -442,33 +442,90 @@ pub fn fractal_recursion_score(genome: &Genome, config: &Config) -> f32 {
     if global.iter().all(|v| *v == 0.0) { return 0.0; } // flat → no template to match
     let global_orients = dihedral_variants(&global, PS);
 
-    // Candidate centres: most copy-like cells, plus the single richest boundary point.
-    let mut centres = recursion_candidates(&base, bw, bh, mi, GRID, K);
-    if let Some(p) = richest_boundary_point(&base, bw, bh) { centres.push(p); }
+    // Boundary descent: search for copies of the whole at the base view, then
+    // follow the richest boundary point down a few zoom levels and keep searching.
+    // The global template stays fixed (a baby-Mandelbrot deep in the boundary is a
+    // copy of the TOP-level whole set); descending just reaches the scale at which
+    // the copy is large enough to resolve — without it, full-view multibrots whose
+    // copies are sub-pixel score ~0.
+    const DESCENT_LEVELS: usize = 3;
+    const DESCENT_STEP:   f32   = 8.0;
+
+    let mut cx_l   = (x0 + x1) * 0.5;
+    let mut cy_l   = (y0 + y1) * 0.5;
+    let mut half_l = bhalf;
+    let mut best   = 0.0f32;
+
+    for level in 0..DESCENT_LEVELS {
+        // Reuse the base render at level 0; render the zoomed view deeper.
+        let field = if level == 0 {
+            base.clone()
+        } else {
+            render_bounds(&fw, config, BASE_RES, BASE_RES, mi,
+                          cx_l - half_l, cx_l + half_l, cy_l - half_l, cy_l + half_l)
+        };
+        best = best.max(best_copy_match(
+            &fw, config, mi, &field, BASE_RES,
+            cx_l, cy_l, half_l, base_ed, &global_orients,
+            GRID, K, WIN_RES, PS, &SCALES,
+        ));
+
+        // Re-centre on the richest boundary point for the next, deeper level.
+        if level + 1 < DESCENT_LEVELS {
+            match richest_boundary_point(&field, bw, bh) {
+                Some((px, py)) => {
+                    let wf = (bw - 1).max(1) as f32;
+                    let hf = (bh - 1).max(1) as f32;
+                    cx_l   = (cx_l - half_l) + (px as f32 / wf) * (2.0 * half_l);
+                    cy_l   = (cy_l - half_l) + (py as f32 / hf) * (2.0 * half_l);
+                    half_l /= DESCENT_STEP;
+                }
+                None => break, // boundary smoothed out → nothing deeper to find
+            }
+        }
+    }
+    (best * gate).clamp(0.0, 1.0)
+}
+
+/// Best correlation of any candidate sub-window (at the given centre/scale grid)
+/// against the fixed global whole-set template orientations, for one rendered
+/// `field` covering `[cx±half, cy±half]`. Factored out so the recursion search can
+/// run it at several boundary-descent depths against the same global template.
+#[allow(clippy::too_many_arguments)]
+fn best_copy_match(
+    fw: &[(f32, f32)], config: &Config, mi: u32,
+    field: &[f32], res: u32, cx: f32, cy: f32, half: f32,
+    base_ed: f32, global_orients: &[Vec<f32>],
+    grid: usize, k: usize, win_res: u32, ps: usize, scales: &[f32],
+) -> f32 {
+    let (w, h) = (res as usize, res as usize);
+    let mut centres = recursion_candidates(field, w, h, mi, grid, k);
+    if let Some(p) = richest_boundary_point(field, w, h) { centres.push(p); }
     if centres.is_empty() { return 0.0; }
 
-    let wf = (bw - 1).max(1) as f32;
-    let hf = (bh - 1).max(1) as f32;
+    let wf = (w - 1).max(1) as f32;
+    let hf = (h - 1).max(1) as f32;
+    let (x0, y0) = (cx - half, cy - half);
 
     let mut best = 0.0f32;
     for &(px, py) in &centres {
-        let cx = (x0) + (px as f32 / wf) * (2.0 * bhalf);
-        let cy = (y0) + (py as f32 / hf) * (2.0 * bhalf);
-        for scale in SCALES {
-            let half = bhalf / scale;
-            let win  = render_bounds(&fw, config, WIN_RES, WIN_RES, mi,
-                                     cx - half, cx + half, cy - half, cy + half);
+        let wcx = x0 + (px as f32 / wf) * (2.0 * half);
+        let wcy = y0 + (py as f32 / hf) * (2.0 * half);
+        for &scale in scales {
+            let wh  = half / scale;
+            let win = render_bounds(fw, config, win_res, win_res, mi,
+                                    wcx - wh, wcx + wh, wcy - wh, wcy + wh);
             // A window that has smoothed out can't host a copy of a structured whole.
-            if edge_density(&win, WIN_RES as usize, WIN_RES as usize) < base_ed * 0.15 { continue; }
-            let wv = structure_vec(&win, WIN_RES as usize, WIN_RES as usize, PS);
+            if edge_density(&win, win_res as usize, win_res as usize) < base_ed * 0.15 { continue; }
+            let wv = structure_vec(&win, win_res as usize, win_res as usize, ps);
             if wv.iter().all(|v| *v == 0.0) { continue; }
-            for g in &global_orients {
+            for g in global_orients {
                 let c = correlation(&wv, g);
                 if c > best { best = c; }
             }
         }
     }
-    (best * gate).clamp(0.0, 1.0)
+    best
 }
 
 /// Batch-evaluate all genomes in ONE GPU dispatch with per-genome view bounds.

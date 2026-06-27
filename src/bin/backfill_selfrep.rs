@@ -15,16 +15,13 @@ fn main() {
         if p.extension().and_then(|x| x.to_str()) != Some("nn") { continue; }
         n += 1;
         let Ok(mut g) = load_genome(&p) else { continue };
-        let mut changed = false;
         if g.self_replication == 0.0 {
             g.self_replication = self_replication_score(&g, &cfg);
-            changed = true;
         }
-        if g.fractal_recursion == 0.0 {
-            g.fractal_recursion = fractal_recursion_score(&g, &cfg);
-            changed = true;
-        }
-        if changed && save_genome(&g, &p).is_ok() { done += 1; }
+        // Always recompute fractal_recursion: its definition evolves (boundary
+        // descent, intricacy gate), so stored values must track the current metric.
+        g.fractal_recursion = fractal_recursion_score(&g, &cfg);
+        if save_genome(&g, &p).is_ok() { done += 1; }
         if done > 0 && done % 25 == 0 { eprintln!("  {done} scored…"); }
     }
     eprintln!("Backfilled metrics for {done}/{n} genomes.");
