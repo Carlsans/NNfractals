@@ -500,10 +500,11 @@ impl Optimizer {
             None => None,
         };
 
-        // Save gate: require BOTH clip and laion above their thresholds, or fall back to Rust beauty
+        // Save gate: pass if EITHER clip OR laion exceeds its threshold (OR logic).
+        // Privileges fractals that are excellent on at least one aesthetic dimension.
         let passes = match &aesthetic_scores {
             Some(s) => s.clip  >= self.config.output.min_clip_score
-                    && s.laion >= self.config.output.min_laion_score,
+                    || s.laion >= self.config.output.min_laion_score,
             None    => beauty  >= self.config.output.min_beauty,
         };
         if !passes {
