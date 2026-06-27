@@ -25,6 +25,7 @@ pub struct Optimizer {
     best_ever: Option<Genome>,
     stagnant_gens: u64,
     behavior_archive: VecDeque<Vec<f32>>,
+    formula_archive:  VecDeque<Vec<f32>>,
     save_descriptors: Vec<Vec<f32>>,
     aesthetic: Option<AestheticScorer>,
     last_sub_scores: Option<[f32; 5]>,  // [boundary, edge, entropy, self_sim, cool_zone]
@@ -70,6 +71,12 @@ impl Optimizer {
             }
         }
 
+        // Prime the formula archive with basis-weight vectors of the starting population,
+        // mirroring the behavior_archive priming logic below.
+        let formula_archive: VecDeque<Vec<f32>> = population.iter()
+            .map(|g| g.formula_basis_normalized())
+            .collect();
+
         // Prime the novelty archive with the initial population's OWN behavioral descriptors.
         // Without this the archive is empty on gen 1, so novelty_score() is near-maximal for
         // every genome (≈1.0) — a flat ~+novelty_weight bonus that inflates generation-1
@@ -112,6 +119,7 @@ impl Optimizer {
             best_ever: None,
             stagnant_gens: 0,
             behavior_archive,
+            formula_archive,
             aesthetic,
             last_sub_scores: None,
             max_png_entropy: 0.0,
@@ -175,21 +183,28 @@ impl Optimizer {
         };
 
         let rpw = self.config.optimization.recursion_pred_weight;
+        let fdw = self.config.optimization.formula_diversity_weight;
+        let formula_snap: Vec<Vec<f32>> = self.formula_archive.iter().cloned().collect();
         for (i, (png_ent, descriptor)) in fitnesses.into_iter().enumerate() {
             // Track maximum PNG compression entropy seen — used for "near max" save gating
             if png_ent > self.max_png_entropy { self.max_png_entropy = png_ent; }
             let novelty = novelty_score(&descriptor, &archive_snap, nk);
-            // Formula-only predicted recursion — a MAJOR selection criterion alongside
-            // file-size (PNG-compression) entropy. Cheap: a dot product over formula
-            // features, no rendering. Empty model → 0 (criterion inert).
+            // Formula-only predicted recursion — MAJOR criterion alongside PNG entropy.
             let pred_rec = self.recursion_model.as_ref()
                 .map(|m| m.predict(&self.population[i].recursion_features()))
                 .unwrap_or(0.0);
-            self.population[i].beauty_entropy = png_ent;   // raw metric travels with the sort
-            self.population[i].pred_recursion = pred_rec;
-            self.population[i].fitness = png_ent + nw * novelty + rpw * pred_rec;
+            // Formula-space novelty: k-NN distance in normalised 58-dim basis-weight space.
+            // Rewards genomes whose formula family is structurally distinct from the archive.
+            let formula_feats = self.population[i].formula_basis_normalized();
+            let formula_div = novelty_score(&formula_feats, &formula_snap, nk);
+            self.population[i].beauty_entropy    = png_ent;
+            self.population[i].pred_recursion    = pred_rec;
+            self.population[i].formula_diversity = formula_div;
+            self.population[i].fitness = png_ent + nw * novelty + rpw * pred_rec + fdw * formula_div;
             if self.behavior_archive.len() >= archive_max { self.behavior_archive.pop_front(); }
             self.behavior_archive.push_back(descriptor);
+            if self.formula_archive.len() >= archive_max { self.formula_archive.pop_front(); }
+            self.formula_archive.push_back(formula_feats);
         }
 
         // ── Sort best → worst ─────────────────────────────────────────────

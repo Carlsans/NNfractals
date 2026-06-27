@@ -50,11 +50,18 @@ pub struct OptimizationConfig {
     /// recursion_pred_weight · predicted_recursion. 0 disables.
     #[serde(default = "default_recursion_pred_weight")]
     pub recursion_pred_weight: f32,
+    /// Per-generation bonus for genomes whose formula is structurally distant
+    /// from the recent archive (k-NN in normalised 58-dim basis-weight space).
+    /// fitness += formula_diversity_weight · formula_diversity.
+    /// 0 disables. Tuned across diversity loop iterations.
+    #[serde(default = "default_formula_diversity_weight")]
+    pub formula_diversity_weight: f32,
 }
 
-fn default_self_replication_weight() -> f32 { 0.35 }
-fn default_fractal_recursion_weight() -> f32 { 0.35 }
-fn default_recursion_pred_weight() -> f32 { 0.6 }
+fn default_self_replication_weight()    -> f32 { 0.35 }
+fn default_fractal_recursion_weight()   -> f32 { 0.35 }
+fn default_recursion_pred_weight()      -> f32 { 0.60 }
+fn default_formula_diversity_weight()   -> f32 { 0.30 }
 
 #[derive(Deserialize, Clone, Debug)]
 pub struct OutputConfig {

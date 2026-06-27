@@ -69,6 +69,10 @@ pub struct Genome {
     /// Formula-only predicted recursion [0,1] from `RecursionModel` at eval time;
     /// drives selection. Tracked so retraining can compare predicted vs measured.
     #[serde(default)] pub pred_recursion: f32,
+    /// Formula-space novelty [0,∞]: average L2 distance to k nearest archive
+    /// genomes in normalised 58-dim basis-weight space. Higher = structurally
+    /// distinct formula family. Drives selection when formula_diversity_weight > 0.
+    #[serde(default)] pub formula_diversity: f32,
     pub id: u64,
     #[serde(default)]
     pub view_cx: f32,
@@ -84,6 +88,20 @@ impl Genome {
     pub fn view_bounds(&self) -> (f32, f32, f32, f32) {
         let half = 2.0 / self.view_zoom;
         (self.view_cx - half, self.view_cx + half, self.view_cy - half, self.view_cy + half)
+    }
+
+    /// Normalised 58-dim basis-weight vector for formula-diversity k-NN scoring.
+    /// Each element is Σ|coeff| on that basis, then divided by the L2 norm so
+    /// the metric is direction-sensitive (which bases dominate) not scale-sensitive.
+    pub fn formula_basis_normalized(&self) -> Vec<f32> {
+        let mut v = vec![0.0f32; N_BASIS];
+        for t in &self.terms {
+            let b = (t.basis as usize).min(N_BASIS - 1);
+            v[b] += (t.re * t.re + t.im * t.im).sqrt();
+        }
+        let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt().max(1e-9);
+        v.iter_mut().for_each(|x| *x /= norm);
+        v
     }
 
     /// Formula-only feature vector for the recursion predictor. MUST stay
@@ -140,6 +158,7 @@ impl Genome {
             self_replication: 0.0,
             fractal_recursion: 0.0,
             pred_recursion: 0.0,
+            formula_diversity: 0.0,
             id: rng.random(),
             view_cx: view.0,
             view_cy: view.1,

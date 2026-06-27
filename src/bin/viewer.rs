@@ -875,6 +875,7 @@ fn default_config() -> Config {
             self_replication_weight: 0.35,
             fractal_recursion_weight: 0.35,
             recursion_pred_weight: 0.60,
+            formula_diversity_weight: 0.30,
         },
         output: OutputConfig {
             save_dir: "./fractals".into(),
