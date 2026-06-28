@@ -13,6 +13,7 @@ view_y_max     =  2.0
 # (Transformer + backprop removed — they fought the GA and drove elites to noise.)
 [optimization]
 population_size          = 40
+formula_system           = "dag"   # A/B experiment: instance 2 runs the expression-DAG system
 elitism_count            = 6
 mutation_rate            = 0.20   # per-coefficient perturbation probability
 mutation_scale           = 0.08   # coefficient perturbation magnitude
@@ -30,7 +31,7 @@ formula_diversity_weight = 0.30   # per-gen bonus for structurally distinct form
 clip_pred_weight         = 0.50   # per-gen bonus for formula-predicted CLIP aesthetic (linear model on archive)
 
 [output]
-save_dir                 = "./fractals"
+save_dir                 = "./fractals_dag"   # separate pool: keeps DAG experiment from contaminating the legacy archive/warm-start
 population_dir           = "./populations2"
 min_entropy_prefilter    = 0.38  # widened: dedup cleans near-dups every 2h
 max_entropy_prefilter    = 0.70  # widened: dedup cleans near-dups every 2h
