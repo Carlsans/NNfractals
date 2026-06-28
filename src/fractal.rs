@@ -70,9 +70,15 @@ pub fn render_cpu_iter(
     let bailout_sq = config.rendering.bailout * config.rendering.bailout;
     let (xmin, xmax, ymin, ymax) = genome.view_bounds();
 
-    // Expression-DAG genomes evaluate via eval_program. The GPU register-VM is
-    // not yet wired, so program genomes take the CPU path for now.
+    // Expression-DAG genomes evaluate via the register VM (GPU when available,
+    // else the Rayon CPU fallback below).
     if genome.uses_program() {
+        #[cfg(feature = "wgpu-backend")]
+        if render_gpu::gpu_available() {
+            return render_gpu::render_batch_dag(
+                &[&genome.program], &[(xmin, xmax, ymin, ymax)], width, height, max_iter, bailout_sq,
+            ).into_iter().next().unwrap_or_default();
+        }
         let prog = &genome.program;
         let wf = (width.saturating_sub(1)).max(1) as f32;
         let hf = (height.saturating_sub(1)).max(1) as f32;
@@ -605,15 +611,24 @@ pub fn evaluate_fitness_batch(
     let emi = config.optimization.eval_max_iter;
     let bsq = config.rendering.bailout * config.rendering.bailout;
 
-    let fw_vecs: Vec<Vec<(f32,f32)>> = genomes.iter()
-        .map(|g| g.formula_weights())
-        .collect();
     let views: Vec<(f32,f32,f32,f32)> = genomes.iter()
         .map(|g| { let (a,b,c,d) = g.view_bounds(); (a,b,c,d) })
         .collect();
 
-    let fw_refs: Vec<&[(f32,f32)]> = fw_vecs.iter().map(|v| v.as_slice()).collect();
-    let escape_batch = render_gpu::render_batch(&fw_refs, &views, ew, eh, emi, bsq);
+    // Dispatch by formula system. A batch is uniform in practice (whole
+    // population is one system); a mixed batch falls back to per-genome CPU.
+    let all_dag = !genomes.is_empty() && genomes.iter().all(|g| g.uses_program());
+    let any_dag = genomes.iter().any(|g| g.uses_program());
+    let escape_batch = if all_dag {
+        let progs: Vec<&[crate::formula::OpNode]> = genomes.iter().map(|g| g.program.as_slice()).collect();
+        render_gpu::render_batch_dag(&progs, &views, ew, eh, emi, bsq)
+    } else if any_dag {
+        genomes.iter().map(|g| render_cpu_iter(g, config, ew, eh, emi)).collect()
+    } else {
+        let fw_vecs: Vec<Vec<(f32,f32)>> = genomes.iter().map(|g| g.formula_weights()).collect();
+        let fw_refs: Vec<&[(f32,f32)]> = fw_vecs.iter().map(|v| v.as_slice()).collect();
+        render_gpu::render_batch(&fw_refs, &views, ew, eh, emi, bsq)
+    };
 
     // Parallelize PNG encoding across all CPU cores while GPU is idle post-dispatch
     escape_batch.into_par_iter().map(|et| {

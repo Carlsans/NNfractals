@@ -9,7 +9,7 @@ struct Params {
     max_iter:     u32,
     genome_count: u32,
     bailout_sq:   f32,
-    _pad:         f32,
+    use_dag:      u32,   // 0 = legacy 58-basis sum, 1 = expression-DAG VM
     _pad2:        f32,
     _pad3:        f32,
 }
@@ -156,6 +156,57 @@ fn apply_formula(z: vec2f, c: vec2f, fw_offset: u32) -> vec2f {
     return vec2f(rx, ry);
 }
 
+// ── Expression-DAG register VM ─────────────────────────────────────────────────
+// Mirrors eval_program() in formula.rs byte-for-byte. Program stored as up to
+// N_SLOTS nodes of 5 f32s [op, a, b, kre, kim] at all_fw[prog_base..]. op==255
+// terminates. Returns the last evaluated register (the root).
+const N_SLOTS: u32 = 24u;
+fn eval_program(z: vec2f, c: vec2f, prog_base: u32) -> vec2f {
+    var reg: array<vec2f, 24>;
+    var last: u32 = 0u;
+    for (var i = 0u; i < N_SLOTS; i++) {
+        let nb  = prog_base + i * 5u;
+        let o   = u32(all_fw[nb]);
+        if (o == 255u) { break; }
+        let ai  = u32(all_fw[nb + 1u]);
+        let bi  = u32(all_fw[nb + 2u]);
+        let kre = all_fw[nb + 3u];
+        let kim = all_fw[nb + 4u];
+        var av = vec2f(0.0, 0.0);
+        var bv = vec2f(0.0, 0.0);
+        if (ai < i) { av = reg[ai]; }
+        if (bi < i) { bv = reg[bi]; }
+        var r = vec2f(0.0, 0.0);
+        switch o {
+            case 0u  { r = z; }                                                   // Z
+            case 1u  { r = c; }                                                   // C
+            case 2u  { r = vec2f(kre, kim); }                                     // CONST
+            case 3u  { r = vec2f(av.x*av.x - av.y*av.y, 2.0*av.x*av.y); }         // SQR
+            case 4u  { let a2=av.x*av.x; let b2=av.y*av.y; r = vec2f(av.x*(a2-3.0*b2), av.y*(3.0*a2-b2)); } // CUBE
+            case 5u  { let a2=av.x*av.x; let b2=av.y*av.y; r = vec2f(a2*a2-6.0*a2*b2+b2*b2, 4.0*av.x*av.y*(a2-b2)); } // QUART
+            case 6u  { r = cinv(av); }                                            // RECIP
+            case 7u  { r = csin(av); }                                            // SIN
+            case 8u  { r = ccos(av); }                                            // COS
+            case 9u  { r = cexp(av); }                                            // EXP
+            case 10u { r = clog(av); }                                            // LOG
+            case 11u { let x2=2.0*av.x; let y2=2.0*av.y; let d=cosh(x2)+cos(y2)+EPS; r=vec2f(sinh(x2)/d, sin(y2)/d); } // TANH
+            case 12u { r = vec2f(av.x, -av.y); }                                  // CONJ
+            case 13u { r = vec2f(abs(av.x), abs(av.y)); }                         // ABSFOLD
+            case 14u { r = vec2f(abs(av.x), av.y); }                              // ABSRE
+            case 15u { r = vec2f(av.x, abs(av.y)); }                              // ABSIM
+            case 16u { let m=sqrt(av.x*av.x+av.y*av.y)+EPS; r=vec2f(av.x/m, av.y/m); } // NORMZ
+            case 17u { r = av + bv; }                                             // ADD
+            case 18u { r = av - bv; }                                             // SUB
+            case 19u { r = cmul(av, bv); }                                        // MUL
+            case 20u { r = cmul(av, cinv(bv)); }                                  // DIV
+            default  { r = vec2f(0.0, 0.0); }
+        }
+        reg[i] = r;
+        last = i;
+    }
+    return reg[last];
+}
+
 // Dispatch: (ceil(w*h/256), 1, genome_count) — Z = genome index.
 @compute @workgroup_size(256)
 fn main(@builtin(global_invocation_id) gid: vec3u) {
@@ -180,14 +231,18 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
     let cy  = ymin + (f32(py) / hf) * (ymax - ymin);
     let c   = vec2f(cx, cy);
 
-    let fw_offset  = genome_idx * 116u;
     let out_offset = genome_idx * pixels;
+    // Per-genome stride differs by mode: 116 legacy weights vs 120 program floats.
+    let prog_base  = genome_idx * 120u;
+    let fw_offset  = genome_idx * 116u;
+    let dag        = params.use_dag != 0u;
 
     var z     = vec2f(0.0, 0.0);
     var etime = f32(params.max_iter);
 
     for (var iter = 0u; iter < params.max_iter; iter++) {
-        z = apply_formula(z, c, fw_offset);
+        if (dag) { z = eval_program(z, c, prog_base); }
+        else     { z = apply_formula(z, c, fw_offset); }
         let ms = dot(z, z);
         if ms > params.bailout_sq {
             let nu = log2(log2(sqrt(ms) + 1e-10));
