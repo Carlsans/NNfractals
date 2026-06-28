@@ -200,7 +200,10 @@ impl Optimizer {
         let rpw = self.config.optimization.recursion_pred_weight;
         let fdw = self.config.optimization.formula_diversity_weight;
         let cpw = self.config.optimization.clip_pred_weight;
+        let oodw = self.config.optimization.ood_weight;
         let formula_snap: Vec<Vec<f32>> = self.formula_archive.iter().cloned().collect();
+        // Snapshot of already-saved behavioral descriptors for OOD novelty.
+        let saved_snap: Vec<Vec<f32>> = if oodw != 0.0 { self.save_descriptors.clone() } else { Vec::new() };
         for (i, fitness_result) in fitnesses.into_iter().enumerate() {
             let (raw_png, structured_ent, descriptor) = fitness_result;
             // raw_png → save-gate thresholding (beauty_entropy), thresholds unchanged.
@@ -223,12 +226,20 @@ impl Optimizer {
             // is the other backstop). Legacy genomes have no program → no penalty.
             const COMPLEXITY_PENALTY: f32 = 0.012;
             let cxpen = COMPLEXITY_PENALTY * self.population[i].program.len() as f32;
+            // OOD novelty: distance to the NEAREST already-saved genome's behavior.
+            // High = unlike anything saved → drives "completely unusual" fractals.
+            let ood = if saved_snap.is_empty() { 0.0 } else {
+                saved_snap.iter()
+                    .map(|d| descriptor.iter().zip(d).map(|(a, b)| (a - b) * (a - b)).sum::<f32>().sqrt())
+                    .fold(f32::INFINITY, f32::min)
+            };
             self.population[i].beauty_entropy    = raw_png;       // save gate uses raw
             self.population[i].pred_recursion    = pred_rec;
             self.population[i].pred_clip         = pred_clip_val;
             self.population[i].formula_diversity = formula_div;
             self.population[i].fitness =
-                structured_ent + nw * novelty + rpw * pred_rec + fdw * formula_div + cpw * pred_clip_val - cxpen;
+                structured_ent + nw * novelty + rpw * pred_rec + fdw * formula_div
+                + cpw * pred_clip_val + oodw * ood - cxpen;
             if self.behavior_archive.len() >= archive_max { self.behavior_archive.pop_front(); }
             self.behavior_archive.push_back(descriptor);
             if self.formula_archive.len() >= archive_max { self.formula_archive.pop_front(); }

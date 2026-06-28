@@ -14,6 +14,7 @@ view_y_max     =  2.0
 [optimization]
 population_size          = 40
 formula_system           = "dag"   # A/B experiment: instance 2 runs the expression-DAG system
+ood_weight               = 0.25   # reward fractals unlike anything already saved (drives unusual)
 elitism_count            = 6
 mutation_rate            = 0.20   # per-coefficient perturbation probability
 mutation_scale           = 0.08   # coefficient perturbation magnitude

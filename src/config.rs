@@ -72,6 +72,11 @@ pub struct OptimizationConfig {
     /// Max depth of an evolved DAG program (tameness vs wildness dial).
     #[serde(default = "default_max_depth")]
     pub max_depth: usize,
+    /// Out-of-distribution novelty weight: bonus for genomes whose rendered
+    /// behavior is far from ALL already-saved genomes (min-distance), pushing
+    /// evolution toward fractals unlike anything in the collection. 0 disables.
+    #[serde(default = "default_ood_weight")]
+    pub ood_weight: f32,
 }
 
 fn default_self_replication_weight()    -> f32 { 0.35 }
@@ -82,6 +87,7 @@ fn default_clip_pred_weight()           -> f32 { 0.50 }
 fn default_formula_system()             -> String { "legacy".to_string() }
 fn default_max_nodes()                  -> usize { 14 }
 fn default_max_depth()                  -> usize { 5 }
+fn default_ood_weight()                 -> f32 { 0.0 }
 
 #[derive(Deserialize, Clone, Debug)]
 pub struct OutputConfig {
