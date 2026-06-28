@@ -144,6 +144,24 @@ impl Genome {
     /// True when this genome uses the expression-DAG formula system.
     pub fn uses_program(&self) -> bool { !self.program.is_empty() }
 
+    /// Representation-aware formula descriptor for k-NN formula-diversity scoring:
+    /// normalized opcode histogram (DAG) or normalized basis-weight vector (legacy).
+    /// Two genomes of the same representation are directly comparable; transitional
+    /// mixed populations compare on the shorter common prefix (acceptable).
+    pub fn formula_descriptor(&self) -> Vec<f32> {
+        if self.uses_program() {
+            let mut v = vec![0.0f32; op::N_OPS];
+            for n in &self.program {
+                v[(n.op as usize).min(op::N_OPS - 1)] += 1.0;
+            }
+            let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt().max(1e-9);
+            v.iter_mut().for_each(|x| *x /= norm);
+            v
+        } else {
+            self.formula_basis_normalized()
+        }
+    }
+
     /// Convert the legacy flat basis-sum into an equivalent expression-DAG
     /// program: z_new = Σ coeffᵢ·basisᵢ(z,c) → a DAG of the new primitives.
     /// Returns None if the result would exceed N_SLOTS or uses a basis the new
@@ -203,17 +221,36 @@ impl Genome {
         }
     }
 
-    pub fn random(_config: &Config, rng: &mut impl Rng) -> Self {
+    /// True when the GA should produce expression-DAG genomes.
+    fn dag_mode(config: &Config) -> bool {
+        config.optimization.formula_system == "dag"
+    }
+
+    pub fn random(config: &Config, rng: &mut impl Rng) -> Self {
+        if Self::dag_mode(config) {
+            let prog = random_program(rng, config.optimization.max_nodes, config.optimization.max_depth, false);
+            let view = Self::random_view(rng);
+            let mut g = Self::new(Vec::new(), view, rng);
+            g.program = prog;
+            return g;
+        }
         let n = rng.random_range(MIN_TERMS..=MAX_TERMS);
         let terms = (0..n).map(|_| FormulaTerm::random(rng)).collect();
         let view = Self::random_view(rng);
         Self::new(terms, view, rng)
     }
 
-    /// Like random(), but guarantees at least one term from the exotic basis range
-    /// (burning-ship, essential singularity, rational, conjugate). Forces the GA to
-    /// keep exploring visual regions it won't discover via uniform sampling.
+    /// Like random(), but biases in rare/exotic primitives (DAG: transcendental
+    /// ops; legacy: exotic bases). Forces the GA to keep exploring visual regions
+    /// it won't discover via uniform sampling.
     pub fn random_exotic(config: &Config, rng: &mut impl Rng) -> Self {
+        if Self::dag_mode(config) {
+            let prog = random_program(rng, config.optimization.max_nodes, config.optimization.max_depth, true);
+            let view = Self::random_view(rng);
+            let mut g = Self::new(Vec::new(), view, rng);
+            g.program = prog;
+            return g;
+        }
         let n = rng.random_range(MIN_TERMS..=MAX_TERMS);
         let mut terms: Vec<FormulaTerm> = (0..n).map(|_| FormulaTerm::random(rng)).collect();
         // Replace the first term with an exotic one.
@@ -224,7 +261,19 @@ impl Genome {
         Self::new(terms, view, rng)
     }
 
-    pub fn crossover(a: &Self, b: &Self, rng: &mut impl Rng) -> Self {
+    pub fn crossover(a: &Self, b: &Self, config: &Config, rng: &mut impl Rng) -> Self {
+        // DAG crossover when both parents carry programs (avoids mixed-rep children).
+        if a.uses_program() && b.uses_program() {
+            let prog = crossover_program(&a.program, &b.program, rng, config.optimization.max_nodes);
+            let view = (
+                (a.view_cx + b.view_cx) * 0.5,
+                (a.view_cy + b.view_cy) * 0.5,
+                (a.view_zoom * b.view_zoom).sqrt(),
+            );
+            let mut g = Self::new(Vec::new(), view, rng);
+            g.program = prog;
+            return g;
+        }
         // Union of parents' terms, each kept with prob 0.5, clamped to [MIN, MAX].
         let mut terms: Vec<FormulaTerm> = Vec::new();
         for t in a.terms.iter().chain(b.terms.iter()) {
@@ -256,6 +305,16 @@ impl Genome {
         child.id      = rng.random();
         child.fitness = 0.0;
 
+        // DAG genomes mutate their program; legacy genomes mutate their terms.
+        if self.uses_program() {
+            child.program = mutate_program(
+                &self.program, rng,
+                config.optimization.max_nodes, config.optimization.max_depth,
+            );
+            child.mutate_view(rng);
+            return child;
+        }
+
         // Per-term: perturb coefficient and occasionally swap which basis function it uses.
         for t in child.terms.iter_mut() {
             if rng.random::<f32>() < mr { t.re += rng.random::<f32>() * 2.0 * ms - ms; }
@@ -274,33 +333,54 @@ impl Genome {
             child.terms.remove(idx);
         }
 
-        // View mutations (unchanged).
+        child.mutate_view(rng);
+        child
+    }
+
+    /// In-place stochastic zoom/pan mutation, shared by legacy and DAG paths.
+    fn mutate_view(&mut self, rng: &mut impl Rng) {
         if rng.random::<f32>() < 0.30 {
             let zoom_delta = if rng.random::<f32>() < 0.65 {
                 1.0 + rng.random::<f32>() * 1.0
             } else {
                 1.0 / (1.0 + rng.random::<f32>() * 0.3)
             };
-            child.view_zoom = (child.view_zoom * zoom_delta).clamp(0.5, 25.0);
+            self.view_zoom = (self.view_zoom * zoom_delta).clamp(0.5, 25.0);
         }
         if rng.random::<f32>() < 0.30 {
-            let pan = 0.5 / child.view_zoom;
-            child.view_cx = (child.view_cx + (rng.random::<f32>() * 2.0 - 1.0) * pan).clamp(-2.5, 2.5);
-            child.view_cy = (child.view_cy + (rng.random::<f32>() * 2.0 - 1.0) * pan).clamp(-2.5, 2.5);
+            let pan = 0.5 / self.view_zoom;
+            self.view_cx = (self.view_cx + (rng.random::<f32>() * 2.0 - 1.0) * pan).clamp(-2.5, 2.5);
+            self.view_cy = (self.view_cy + (rng.random::<f32>() * 2.0 - 1.0) * pan).clamp(-2.5, 2.5);
         }
-
-        child
     }
 
-    /// Top-3 active basis functions by |coeff|, plus zoom.
+    /// Human-readable formula label (basis names or DAG ops), plus zoom.
     pub fn formula_label(&self) -> String {
+        if self.uses_program() {
+            return format!("{}  z={:.1}x", self.program_ops_label(), self.view_zoom);
+        }
         let top = self.top_basis(3);
         format!("{}  z={:.1}x", top.join("+"), self.view_zoom)
     }
 
-    /// Short identifier (top-2 basis functions) for formula diversity tracking.
+    /// Short structural identifier for formula-diversity tracking. For DAG genomes
+    /// this is the sorted set of non-leaf ops; for legacy, the top-2 bases.
     pub fn formula_ops_label(&self) -> String {
+        if self.uses_program() {
+            return self.program_ops_label();
+        }
         self.top_basis(2).join("+")
+    }
+
+    /// Sorted distinct non-leaf op names of a DAG program (its "shape").
+    fn program_ops_label(&self) -> String {
+        let mut ops: Vec<&str> = self.program.iter()
+            .map(|n| op::name(n.op))
+            .filter(|s| !matches!(*s, "z" | "c" | "k"))
+            .collect();
+        ops.sort_unstable();
+        ops.dedup();
+        ops.join("+")
     }
 
     fn top_basis(&self, k: usize) -> Vec<String> {
@@ -336,6 +416,48 @@ impl ProgramBuilder {
 
     pub fn into_nodes(self) -> Vec<OpNode> { self.nodes }
     pub fn len(&self) -> usize { self.nodes.len() }
+}
+
+#[cfg(test)]
+mod gp_op_tests {
+    use super::*;
+    use rand::SeedableRng;
+    use rand::rngs::StdRng;
+
+    fn is_valid(prog: &[OpNode]) -> bool {
+        if prog.is_empty() || prog.len() > N_SLOTS { return false; }
+        for (i, n) in prog.iter().enumerate() {
+            if (n.op as usize) >= op::N_OPS { return false; }
+            let ar = op::arity(n.op);
+            if ar >= 1 && (n.a as usize) >= i { return false; } // input must precede
+            if ar >= 2 && (n.b as usize) >= i { return false; }
+        }
+        true
+    }
+
+    // random/mutate/crossover always yield valid topological DAGs within caps,
+    // and eval_program stays finite over a range of inputs.
+    #[test]
+    fn gp_operators_preserve_validity() {
+        let mut rng = StdRng::seed_from_u64(42);
+        let (max_nodes, max_depth) = (14usize, 5usize);
+        for _ in 0..500 {
+            let exotic = rng.random_bool(0.5);
+            let a = random_program(&mut rng, max_nodes, max_depth, exotic);
+            let b = random_program(&mut rng, max_nodes, max_depth, false);
+            assert!(is_valid(&a), "random invalid: {a:?}");
+            assert!(is_valid(&b));
+            let m = mutate_program(&a, &mut rng, max_nodes, max_depth);
+            assert!(is_valid(&m), "mutate invalid: {m:?}");
+            let x = crossover_program(&a, &b, &mut rng, max_nodes);
+            assert!(is_valid(&x), "crossover invalid: {x:?}");
+            // eval stays finite (NaN/inf is allowed to be produced but must not panic;
+            // here we just confirm it returns without UB and is usually finite).
+            for &(zx, zy, cx, cy) in &[(0.3f32,0.4,-0.5,0.6),(1.2,-0.7,0.1,0.2)] {
+                let _ = crate::formula::eval_program(&x, zx, zy, cx, cy);
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -397,6 +519,159 @@ mod legacy_conv_tests {
                 "genome mismatch: dag=({px},{py}) legacy=({lx},{ly})");
         }
     }
+}
+
+// ── Genetic-programming operators on flat topological DAG arrays ────────────────
+
+const UNARY_OPS: [u8; 14] = [
+    op::SQR, op::CUBE, op::QUART, op::RECIP, op::SIN, op::COS, op::EXP, op::LOG,
+    op::TANH, op::CONJ, op::ABSFOLD, op::ABSRE, op::ABSIM, op::NORMZ,
+];
+const BINARY_OPS: [u8; 4] = [op::ADD, op::SUB, op::MUL, op::DIV];
+// Rare/transcendental ops that produce unusual fractals — biased in via "exotic".
+const EXOTIC_OPS: [u8; 6] = [op::SIN, op::EXP, op::RECIP, op::NORMZ, op::ABSFOLD, op::LOG];
+
+fn rand_const(rng: &mut impl Rng) -> OpNode {
+    OpNode { op: op::CONST, a: 0, b: 0, kre: re_k(rng), kim: im_k(rng) }
+}
+fn re_k(rng: &mut impl Rng) -> f32 { rng.random::<f32>() * 2.0 - 1.0 }
+fn im_k(rng: &mut impl Rng) -> f32 { rng.random::<f32>() * 2.0 - 1.0 }
+
+/// Grow a random valid topological DAG: leaves first, then unary/binary nodes
+/// referencing earlier nodes, respecting depth/node caps. The root (last node)
+/// is forced non-trivial. `exotic` biases in a rare transcendental op.
+pub fn random_program(rng: &mut impl Rng, max_nodes: usize, max_depth: usize, exotic: bool) -> Vec<OpNode> {
+    let cap = max_nodes.clamp(4, N_SLOTS);
+    let mut nodes: Vec<OpNode> = Vec::new();
+    let mut depth: Vec<u8> = Vec::new();
+    let mut push = |nodes: &mut Vec<OpNode>, depth: &mut Vec<u8>, n: OpNode, d: u8| {
+        nodes.push(n); depth.push(d);
+    };
+    push(&mut nodes, &mut depth, OpNode { op: op::Z, a: 0, b: 0, kre: 0.0, kim: 0.0 }, 0);
+    push(&mut nodes, &mut depth, OpNode { op: op::C, a: 0, b: 0, kre: 0.0, kim: 0.0 }, 0);
+    if rng.random_bool(0.5) {
+        let k = rand_const(rng);
+        push(&mut nodes, &mut depth, k, 0);
+    }
+
+    let target = rng.random_range(4..=cap);
+    let mut tries = 0usize;
+    while nodes.len() < target && tries < target * 6 {
+        tries += 1;
+        let r = rng.random::<f32>();
+        if r < 0.60 {
+            let a = rng.random_range(0..nodes.len());
+            let b = rng.random_range(0..nodes.len());
+            let d = 1 + depth[a].max(depth[b]);
+            if d as usize > max_depth { continue; }
+            let opc = BINARY_OPS[rng.random_range(0..BINARY_OPS.len())];
+            push(&mut nodes, &mut depth, OpNode { op: opc, a: a as u8, b: b as u8, kre: 0.0, kim: 0.0 }, d);
+        } else if r < 0.95 {
+            let a = rng.random_range(0..nodes.len());
+            let d = 1 + depth[a];
+            if d as usize > max_depth { continue; }
+            let opc = if exotic && rng.random_bool(0.5) {
+                EXOTIC_OPS[rng.random_range(0..EXOTIC_OPS.len())]
+            } else {
+                UNARY_OPS[rng.random_range(0..UNARY_OPS.len())]
+            };
+            push(&mut nodes, &mut depth, OpNode { op: opc, a: a as u8, b: 0, kre: 0.0, kim: 0.0 }, d);
+        } else if nodes.len() < cap {
+            let k = rand_const(rng);
+            push(&mut nodes, &mut depth, k, 0);
+        }
+    }
+
+    // Force a non-leaf root that mixes two earlier nodes (so the map isn't trivial).
+    if op::arity(nodes[nodes.len() - 1].op) == 0 && nodes.len() < N_SLOTS {
+        let a = (nodes.len() - 1) as u8;
+        let b = if nodes.len() >= 2 { (nodes.len() - 2) as u8 } else { 0 };
+        let opc = BINARY_OPS[rng.random_range(0..BINARY_OPS.len())];
+        nodes.push(OpNode { op: opc, a, b, kre: 0.0, kim: 0.0 });
+    }
+    nodes
+}
+
+/// Mutate a DAG program: perturb a constant, swap an op (arity-fixing inputs),
+/// rewire an input, grow a node on top, or drop the root — all topology-safe.
+pub fn mutate_program(prog: &[OpNode], rng: &mut impl Rng, max_nodes: usize, max_depth: usize) -> Vec<OpNode> {
+    let mut p = prog.to_vec();
+    if p.len() < 2 { return random_program(rng, max_nodes, max_depth, false); }
+    let cap = max_nodes.clamp(4, N_SLOTS);
+
+    // 1–2 edits per mutation.
+    let edits = rng.random_range(1..=2);
+    for _ in 0..edits {
+        match rng.random_range(0..5) {
+            0 => { // perturb a constant (or convert a leaf to const)
+                let i = rng.random_range(0..p.len());
+                if p[i].op == op::CONST {
+                    p[i].kre += re_k(rng) * 0.3;
+                    p[i].kim += im_k(rng) * 0.3;
+                } else if op::arity(p[i].op) == 0 {
+                    p[i] = rand_const(rng);
+                }
+            }
+            1 => { // swap op, fixing inputs to satisfy new arity
+                let i = rng.random_range(1..p.len());
+                let new_op = if rng.random_bool(0.5) {
+                    UNARY_OPS[rng.random_range(0..UNARY_OPS.len())]
+                } else {
+                    BINARY_OPS[rng.random_range(0..BINARY_OPS.len())]
+                };
+                let ar = op::arity(new_op);
+                p[i].op = new_op;
+                if ar >= 1 { p[i].a = rng.random_range(0..i) as u8; }
+                if ar >= 2 { p[i].b = rng.random_range(0..i) as u8; }
+            }
+            2 => { // rewire an input to another earlier node
+                let i = rng.random_range(1..p.len());
+                if op::arity(p[i].op) >= 1 { p[i].a = rng.random_range(0..i) as u8; }
+                if op::arity(p[i].op) >= 2 { p[i].b = rng.random_range(0..i) as u8; }
+            }
+            3 => { // grow: new root combining old root with a random earlier node
+                if p.len() < cap {
+                    let root = (p.len() - 1) as u8;
+                    let other = rng.random_range(0..p.len()) as u8;
+                    let opc = if rng.random_bool(0.5) {
+                        BINARY_OPS[rng.random_range(0..BINARY_OPS.len())]
+                    } else { op::ADD };
+                    p.push(OpNode { op: opc, a: root, b: other, kre: 0.0, kim: 0.0 });
+                }
+            }
+            _ => { // prune the root (shrink) if it leaves a usable program
+                if p.len() > 3 { p.pop(); }
+            }
+        }
+    }
+    let _ = max_depth;
+    p
+}
+
+/// Crossover two DAG programs: child = combine(rootA, rootB) by concatenating
+/// B's nodes after A's (index-remapped) and adding a binary combiner as the new
+/// root. Topology-safe. Falls back to mutating the smaller parent if over cap.
+pub fn crossover_program(a: &[OpNode], b: &[OpNode], rng: &mut impl Rng, max_nodes: usize) -> Vec<OpNode> {
+    let cap = max_nodes.clamp(4, N_SLOTS);
+    if a.is_empty() { return b.to_vec(); }
+    if b.is_empty() { return a.to_vec(); }
+    if a.len() + b.len() + 1 > cap {
+        let (small, _) = if a.len() <= b.len() { (a, b) } else { (b, a) };
+        return mutate_program(small, rng, max_nodes, 5);
+    }
+    let mut child = a.to_vec();
+    let off = child.len() as u8;
+    let root_a = (child.len() - 1) as u8;
+    for n in b {
+        let mut m = *n;
+        if op::arity(m.op) >= 1 { m.a = m.a.saturating_add(off); }
+        if op::arity(m.op) >= 2 { m.b = m.b.saturating_add(off); }
+        child.push(m);
+    }
+    let root_b = (child.len() - 1) as u8;
+    let opc = BINARY_OPS[rng.random_range(0..BINARY_OPS.len())];
+    child.push(OpNode { op: opc, a: root_a, b: root_b, kre: 0.0, kim: 0.0 });
+    child
 }
 
 /// Build a subtree computing legacy basis `i` over leaf nodes `z` and `c`,

@@ -75,7 +75,7 @@ impl Optimizer {
         // Prime the formula archive with basis-weight vectors of the starting population,
         // mirroring the behavior_archive priming logic below.
         let formula_archive: VecDeque<Vec<f32>> = population.iter()
-            .map(|g| g.formula_basis_normalized())
+            .map(|g| g.formula_descriptor())
             .collect();
 
         // Prime the novelty archive with the initial population's OWN behavioral descriptors.
@@ -216,14 +216,19 @@ impl Optimizer {
             let pred_clip_val = self.clip_model.as_ref()
                 .map(|m| m.predict(&feats))
                 .unwrap_or(0.0);
-            let formula_feats = self.population[i].formula_basis_normalized();
+            let formula_feats = self.population[i].formula_descriptor();
             let formula_div = novelty_score(&formula_feats, &formula_snap, nk);
+            // Anti-bloat: small penalty on DAG program size so the GA prefers
+            // compact expressions over ones that pad to noise (multiscale entropy
+            // is the other backstop). Legacy genomes have no program → no penalty.
+            const COMPLEXITY_PENALTY: f32 = 0.012;
+            let cxpen = COMPLEXITY_PENALTY * self.population[i].program.len() as f32;
             self.population[i].beauty_entropy    = raw_png;       // save gate uses raw
             self.population[i].pred_recursion    = pred_rec;
             self.population[i].pred_clip         = pred_clip_val;
             self.population[i].formula_diversity = formula_div;
             self.population[i].fitness =
-                structured_ent + nw * novelty + rpw * pred_rec + fdw * formula_div + cpw * pred_clip_val;
+                structured_ent + nw * novelty + rpw * pred_rec + fdw * formula_div + cpw * pred_clip_val - cxpen;
             if self.behavior_archive.len() >= archive_max { self.behavior_archive.pop_front(); }
             self.behavior_archive.push_back(descriptor);
             if self.formula_archive.len() >= archive_max { self.formula_archive.pop_front(); }
@@ -584,7 +589,7 @@ impl Optimizer {
                 } else {
                     self.rng.random_range(0..elite_count)
                 };
-                Genome::crossover(a, &self.population[b_idx], &mut self.rng)
+                Genome::crossover(a, &self.population[b_idx], &self.config, &mut self.rng)
                     .mutate(&self.config, &mut self.rng)
             } else {
                 a.mutate(&self.config, &mut self.rng)
