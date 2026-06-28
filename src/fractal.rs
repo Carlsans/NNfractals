@@ -97,6 +97,36 @@ pub fn dag_escape_pixel(
     max_iter as f32
 }
 
+/// f64 (deep-zoom) version of `dag_escape_pixel` — same dynamics, double
+/// precision, for the viewer's deep-zoom CPU path. Genome dynamics (f32) are
+/// widened to f64. Mirrors `dag_escape_pixel` exactly.
+#[allow(clippy::too_many_arguments)]
+pub fn dag_escape_pixel_f64(
+    prog: &[crate::formula::OpNode], warp: &[crate::formula::OpNode],
+    julia: bool, jc: (f64, f64), phoenix: (f64, f64), bailout_sq: f64,
+    px: f64, py: f64, max_iter: u32,
+) -> f32 {
+    use crate::formula::f64_impl::eval_program;
+    let (mut ix, mut iy) = (px, py);
+    if !warp.is_empty() {
+        let (wx, wy) = eval_program(warp, px, py, px, py);
+        ix = wx; iy = wy;
+    }
+    let (mut zx, mut zy, cx, cy) = if julia { (ix, iy, jc.0, jc.1) } else { (0.0, 0.0, ix, iy) };
+    let (mut pzx, mut pzy) = (0.0f64, 0.0f64);
+    for it in 0..max_iter {
+        let (fx, fy) = eval_program(prog, zx, zy, cx, cy);
+        let nx = fx + phoenix.0 * pzx - phoenix.1 * pzy;
+        let ny = fy + phoenix.0 * pzy + phoenix.1 * pzx;
+        pzx = zx; pzy = zy;
+        zx = nx; zy = ny;
+        let ms = zx * zx + zy * zy;
+        if ms > bailout_sq { return ((it as f64 + 1.0) - (ms.log2() * 0.5).log2()).max(0.0) as f32; }
+        if !zx.is_finite() || !zy.is_finite() { return it as f32; }
+    }
+    max_iter as f32
+}
+
 pub fn render_cpu_iter(
     genome: &Genome, config: &Config, width: u32, height: u32, max_iter: u32,
 ) -> Vec<f32> {
@@ -666,3 +696,33 @@ pub fn evaluate_fitness_batch(
     }).collect()
 }
 
+
+#[cfg(test)]
+mod dag_f64_tests {
+    use crate::formula::{op, OpNode};
+
+    // f64 deep-zoom DAG iteration must closely track the f32 one (same logic,
+    // higher precision) — compare on a grid, allowing boundary-chaos slack.
+    #[test]
+    fn dag_escape_f32_vs_f64_track() {
+        // (z² + c) with phoenix + julia
+        let prog = vec![
+            OpNode { op: op::Z,   a: 0, b: 0, kre: 0.0, kim: 0.0 },
+            OpNode { op: op::C,   a: 0, b: 0, kre: 0.0, kim: 0.0 },
+            OpNode { op: op::SQR, a: 0, b: 0, kre: 0.0, kim: 0.0 },
+            OpNode { op: op::ADD, a: 2, b: 1, kre: 0.0, kim: 0.0 },
+        ];
+        let (julia, jc, ph, bsq) = (true, (-0.4, 0.6), (0.1, -0.05), 16.0);
+        let (n, mut agree) = (40usize, 0usize);
+        for gy in 0..n { for gx in 0..n {
+            let px = -1.8 + 3.6 * gx as f64 / n as f64;
+            let py = -1.8 + 3.6 * gy as f64 / n as f64;
+            let a = super::dag_escape_pixel(&prog, &[], julia, (jc.0 as f32, jc.1 as f32),
+                (ph.0 as f32, ph.1 as f32), bsq as f32, px as f32, py as f32, 128);
+            let b = super::dag_escape_pixel_f64(&prog, &[], julia, jc, ph, bsq, px, py, 128);
+            if (a - b).abs() < 1.0 { agree += 1; }
+        }}
+        let frac = agree as f32 / (n * n) as f32;
+        assert!(frac > 0.95, "f32/f64 DAG escape disagree on {:.1}% of pixels", (1.0 - frac) * 100.0);
+    }
+}

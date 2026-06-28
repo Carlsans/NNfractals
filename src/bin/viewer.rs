@@ -92,6 +92,8 @@ fn render_cpu(
 ) -> Vec<u8> {
     let color_iter = config.rendering.max_iter;
 
+    let dag = genome.uses_program();
+
     // ── Deep-zoom path: f64 CPU iteration ────────────────────────────────────
     if use_f64 {
         use rayon::prelude::*;
@@ -99,22 +101,34 @@ fn render_cpu(
         let half   = 2.0 / view64.2;
         let (xmin, xmax) = (view64.0 - half, view64.0 + half);
         let (ymin, ymax) = (view64.1 - half, view64.1 + half);
-        let fw: Vec<(f64, f64)> = genome.formula_weights()
-            .iter().map(|&(r, i)| (r as f64, i as f64)).collect();
-        let bailout_sq = (config.rendering.bailout * config.rendering.bailout) as f64;
         let wf = (w.saturating_sub(1)).max(1) as f64;
         let hf = (h.saturating_sub(1)).max(1) as f64;
+        // DAG genomes use the f64 expression-VM with their evolved dynamics;
+        // legacy genomes use the f64 basis-sum. Bailout is per-genome for DAG.
+        let fw: Vec<(f64, f64)> = if dag { Vec::new() } else {
+            genome.formula_weights().iter().map(|&(r, i)| (r as f64, i as f64)).collect()
+        };
+        let legacy_bsq = (config.rendering.bailout * config.rendering.bailout) as f64;
+        let dag_bsq = (genome.bailout_radius * genome.bailout_radius) as f64;
+        let jc = (genome.julia_cre as f64, genome.julia_cim as f64);
+        let phoenix = (genome.phoenix_re as f64, genome.phoenix_im as f64);
         let escape_times: Vec<f32> = (0..(w * h) as usize)
             .into_par_iter()
             .map(|idx| {
                 let cx = xmin + (idx % w as usize) as f64 / wf * (xmax - xmin);
                 let cy = ymin + (idx / w as usize) as f64 / hf * (ymax - ymin);
+                if dag {
+                    return nnfractals::fractal::dag_escape_pixel_f64(
+                        &genome.program, &genome.warp, genome.julia_mode, jc, phoenix,
+                        dag_bsq, cx, cy, compute_iter,
+                    );
+                }
                 let (mut zx, mut zy) = (0.0f64, 0.0f64);
                 for iter in 0..compute_iter {
                     let (nx, ny) = nnfractals::formula::f64_impl::apply_formula(&fw, zx, zy, cx, cy);
                     zx = nx; zy = ny;
                     let ms = zx * zx + zy * zy;
-                    if ms > bailout_sq {
+                    if ms > legacy_bsq {
                         return (iter as f64 + 1.0 - (ms.log2() * 0.5).log2()).max(0.0) as f32;
                     }
                     if !zx.is_finite() || !zy.is_finite() { return iter as f32; }
@@ -126,20 +140,29 @@ fn render_cpu(
     }
 
     let (xmin, xmax, ymin, ymax) = view.bounds();
-    let fw         = genome.formula_weights();
     let bailout_sq = config.rendering.bailout * config.rendering.bailout;
 
     // GPU path — much faster for interactive use.
     #[cfg(feature = "wgpu-backend")]
     if render_gpu::gpu_available() {
-        let escape_times = render_gpu::render_fractal(
-            &fw, w, h, compute_iter, xmin, xmax, ymin, ymax, bailout_sq,
-        );
+        let escape_times = if dag {
+            // DAG genome: expression-VM with warp/julia/phoenix/per-genome bailout.
+            let item = render_gpu::dag_item(genome);
+            render_gpu::render_batch_dag(std::slice::from_ref(&item), &[(xmin, xmax, ymin, ymax)], w, h, compute_iter)
+                .into_iter().next().unwrap_or_default()
+        } else {
+            let fw = genome.formula_weights();
+            render_gpu::render_fractal(&fw, w, h, compute_iter, xmin, xmax, ymin, ymax, bailout_sq)
+        };
         return apply_colormap(&escape_times, color_iter, &config.rendering.colormap);
     }
 
     // CPU fallback (f32).
     use rayon::prelude::*;
+    let fw         = genome.formula_weights();
+    let dag_bsq    = genome.bailout_radius * genome.bailout_radius;
+    let jc         = (genome.julia_cre, genome.julia_cim);
+    let phoenix    = (genome.phoenix_re, genome.phoenix_im);
     let wf = (w.saturating_sub(1)).max(1) as f32;
     let hf = (h.saturating_sub(1)).max(1) as f32;
     let escape_times: Vec<f32> = (0..(w * h) as usize)
@@ -147,6 +170,12 @@ fn render_cpu(
         .map(|idx| {
             let cx = xmin + (idx % w as usize) as f32 / wf * (xmax - xmin);
             let cy = ymin + (idx / w as usize) as f32 / hf * (ymax - ymin);
+            if dag {
+                return nnfractals::fractal::dag_escape_pixel(
+                    &genome.program, &genome.warp, genome.julia_mode, jc, phoenix,
+                    dag_bsq, cx, cy, compute_iter,
+                );
+            }
             let (mut zx, mut zy) = (0.0f32, 0.0f32);
             for iter in 0..compute_iter {
                 let (nx, ny) = apply_formula(&fw, zx, zy, cx, cy);
