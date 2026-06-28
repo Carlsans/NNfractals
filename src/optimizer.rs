@@ -369,6 +369,7 @@ impl Optimizer {
         g.fractal_recursion = crate::fractal::fractal_recursion_score(&g, &self.config);
         if g.clip_score  > self.max_clip_score  { self.max_clip_score  = g.clip_score; }
         if g.laion_score > self.max_laion_score { self.max_laion_score = g.laion_score; }
+        g.formula_readable = g.formula_expr();   // human-readable comment in the .nn
         save_genome(&g, &nn_path).unwrap_or(());
         display::print_save(&g, &png_path.display().to_string(), final_beauty);
         self.saved_count += 1;
@@ -542,6 +543,7 @@ impl Optimizer {
         if g.clip_score  > self.max_clip_score  { self.max_clip_score  = g.clip_score; }
         if g.laion_score > self.max_laion_score { self.max_laion_score = g.laion_score; }
         g.fitness = final_score;
+        g.formula_readable = g.formula_expr();   // human-readable comment in the .nn
         save_genome(&g, &nn_path).unwrap_or(());
         self.save_descriptors.push(desc);
         display::print_save(&g, &png_path.display().to_string(), final_score);

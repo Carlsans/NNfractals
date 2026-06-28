@@ -45,6 +45,9 @@ impl FormulaTerm {
 /// basis terms (no transformer/latent indirection). z_new = Σ coeffᵢ · φ_basisᵢ(z, c).
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Genome {
+    /// Human-readable rendering of the formula — a comment for people reading the
+    /// .nn JSON (JSON has no real comments). Set at save time; ignored on load.
+    #[serde(default)] pub formula_readable: String,
     pub terms: Vec<FormulaTerm>,
     pub fitness: f32,
     /// Raw beauty score (no novelty inflation) at time of save; 0.0 if not yet saved.
@@ -144,6 +147,21 @@ impl Genome {
     /// True when this genome uses the expression-DAG formula system.
     pub fn uses_program(&self) -> bool { !self.program.is_empty() }
 
+    /// Human-readable formula string. DAG genomes render as an infix expression
+    /// from the root (z_{n+1} = …); legacy genomes as the weighted basis sum.
+    pub fn formula_expr(&self) -> String {
+        if self.uses_program() {
+            if self.program.is_empty() { return "z".into(); }
+            format!("z_next = {}", render_node(&self.program, self.program.len() - 1, 0))
+        } else {
+            let parts: Vec<String> = self.terms.iter()
+                .map(|t| format!("{}·{}", fmt_c(t.re, t.im), basis_name(t.basis as usize)))
+                .collect();
+            let body = if parts.is_empty() { "0".into() } else { parts.join(" + ") };
+            format!("z_next = {body}")
+        }
+    }
+
     /// Representation-aware formula descriptor for k-NN formula-diversity scoring:
     /// normalized opcode histogram (DAG) or normalized basis-weight vector (legacy).
     /// Two genomes of the same representation are directly comparable; transitional
@@ -203,6 +221,7 @@ impl Genome {
 
     fn new(terms: Vec<FormulaTerm>, view: (f32, f32, f32), rng: &mut impl Rng) -> Self {
         Genome {
+            formula_readable: String::new(),
             terms,
             fitness: 0.0,
             beauty: 0.0,
@@ -518,6 +537,49 @@ mod legacy_conv_tests {
             assert!((px - lx).abs() < 1e-4 && (py - ly).abs() < 1e-4,
                 "genome mismatch: dag=({px},{py}) legacy=({lx},{ly})");
         }
+    }
+}
+
+/// Format a complex coefficient compactly for the readable formula string.
+fn fmt_c(re: f32, im: f32) -> String {
+    if im.abs() < 1e-4 { format!("{:.2}", re) }
+    else if re.abs() < 1e-4 { format!("{:.2}i", im) }
+    else if im < 0.0 { format!("({:.2}-{:.2}i)", re, -im) }
+    else { format!("({:.2}+{:.2}i)", re, im) }
+}
+
+/// Render a DAG node as an infix/functional expression string. Shared nodes are
+/// expanded (the program is a DAG; the readable form is a tree). Depth-guarded.
+fn render_node(prog: &[OpNode], i: usize, depth: usize) -> String {
+    if depth > 14 || i >= prog.len() { return "…".into(); }
+    let n = prog[i];
+    let a = (n.a as usize).min(i.saturating_sub(1));
+    let b = (n.b as usize).min(i.saturating_sub(1));
+    let ra = || render_node(prog, a, depth + 1);
+    let rb = || render_node(prog, b, depth + 1);
+    match n.op {
+        op::Z       => "z".into(),
+        op::C       => "c".into(),
+        op::CONST   => fmt_c(n.kre, n.kim),
+        op::SQR     => format!("({})²", ra()),
+        op::CUBE    => format!("({})³", ra()),
+        op::QUART   => format!("({})⁴", ra()),
+        op::RECIP   => format!("1/({})", ra()),
+        op::SIN     => format!("sin({})", ra()),
+        op::COS     => format!("cos({})", ra()),
+        op::EXP     => format!("exp({})", ra()),
+        op::LOG     => format!("log({})", ra()),
+        op::TANH    => format!("tanh({})", ra()),
+        op::CONJ    => format!("conj({})", ra()),
+        op::ABSFOLD => format!("|{}|ʙs", ra()),
+        op::ABSRE   => format!("absRe({})", ra()),
+        op::ABSIM   => format!("absIm({})", ra()),
+        op::NORMZ   => format!("({})/|·|", ra()),
+        op::ADD     => format!("({} + {})", ra(), rb()),
+        op::SUB     => format!("({} - {})", ra(), rb()),
+        op::MUL     => format!("{}·{}", ra(), rb()),
+        op::DIV     => format!("({} / {})", ra(), rb()),
+        _           => "?".into(),
     }
 }
 
