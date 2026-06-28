@@ -83,6 +83,22 @@ pub struct Genome {
     /// replaces the flat `terms` basis-sum: z_{n+1} = eval_program(program,z,c).
     /// Empty ⇒ legacy genome that still evaluates via `terms`/`formula_weights`.
     #[serde(default)] pub program: Vec<crate::formula::OpNode>,
+    // ── Phase-3 iteration dynamics (DAG genomes only) ───────────────────────────
+    /// Julia mode: the pixel coordinate becomes the initial iterate z₀ and `c`
+    /// is held at the constant (julia_cre, julia_cim) — yields Julia-set families
+    /// instead of Mandelbrot-style parameter-plane fractals.
+    #[serde(default)] pub julia_mode: bool,
+    #[serde(default)] pub julia_cre: f32,
+    #[serde(default)] pub julia_cim: f32,
+    /// Phoenix memory: z_{n+1} = program(z,c) + p·z_{n-1}. p=(0,0) disables it.
+    #[serde(default)] pub phoenix_re: f32,
+    #[serde(default)] pub phoenix_im: f32,
+    /// Per-genome escape radius (evolved). Affects boundary texture/detail.
+    #[serde(default = "default_bailout_radius")] pub bailout_radius: f32,
+    // ── Phase-4 coordinate warp (DAG genomes only) ──────────────────────────────
+    /// Optional warp program applied once to the pixel coordinate before iterating
+    /// (c ← warp(pixel)). Empty = identity. Bends the plane (spirals/folds).
+    #[serde(default)] pub warp: Vec<crate::formula::OpNode>,
     pub id: u64,
     #[serde(default)]
     pub view_cx: f32,
@@ -93,6 +109,7 @@ pub struct Genome {
 }
 
 fn default_view_zoom() -> f32 { 1.0 }
+fn default_bailout_radius() -> f32 { 4.0 }
 
 impl Genome {
     pub fn view_bounds(&self) -> (f32, f32, f32, f32) {
@@ -152,7 +169,18 @@ impl Genome {
     pub fn formula_expr(&self) -> String {
         if self.uses_program() {
             if self.program.is_empty() { return "z".into(); }
-            format!("z_next = {}", render_node(&self.program, self.program.len() - 1, 0))
+            let mut s = format!("z_next = {}", render_node(&self.program, self.program.len() - 1, 0));
+            if self.phoenix_re != 0.0 || self.phoenix_im != 0.0 {
+                s.push_str(&format!(" + {}·z_prev", fmt_c(self.phoenix_re, self.phoenix_im)));
+            }
+            if !self.warp.is_empty() {
+                s.push_str(&format!("   [warp: c={}]", render_node(&self.warp, self.warp.len() - 1, 0)));
+            }
+            if self.julia_mode {
+                s.push_str(&format!("   [julia c={}, z0=pixel]", fmt_c(self.julia_cre, self.julia_cim)));
+            }
+            s.push_str(&format!("   [bailout r={:.1}]", self.bailout_radius));
+            s
         } else {
             let parts: Vec<String> = self.terms.iter()
                 .map(|t| format!("{}·{}", fmt_c(t.re, t.im), basis_name(t.basis as usize)))
@@ -233,10 +261,38 @@ impl Genome {
             pred_clip: 0.0,
             formula_diversity: 0.0,
             program: Vec::new(),
+            julia_mode: false,
+            julia_cre: 0.0,
+            julia_cim: 0.0,
+            phoenix_re: 0.0,
+            phoenix_im: 0.0,
+            bailout_radius: default_bailout_radius(),
+            warp: Vec::new(),
             id: rng.random(),
             view_cx: view.0,
             view_cy: view.1,
             view_zoom: view.2,
+        }
+    }
+
+    /// Randomize Phase-3/4 iteration dynamics for a fresh DAG genome. Most
+    /// genomes stay standard (Mandelbrot-style, no phoenix, no warp); a minority
+    /// get Julia mode / phoenix memory / a coordinate warp to seed unusual families.
+    fn randomize_dynamics(&mut self, rng: &mut impl Rng) {
+        if rng.random_bool(0.30) {
+            self.julia_mode = true;
+            self.julia_cre = re_k(rng) * 0.9;
+            self.julia_cim = im_k(rng) * 0.9;
+        }
+        if rng.random_bool(0.25) {
+            self.phoenix_re = re_k(rng) * 0.5;
+            self.phoenix_im = im_k(rng) * 0.5;
+        }
+        self.bailout_radius = 2.0 + rng.random::<f32>() * 8.0; // [2, 10]
+        if rng.random_bool(0.30) {
+            // a small warp program bends the input plane
+            let wexotic = rng.random_bool(0.5);
+            self.warp = random_program(rng, 8, 4, wexotic);
         }
     }
 
@@ -251,6 +307,7 @@ impl Genome {
             let view = Self::random_view(rng);
             let mut g = Self::new(Vec::new(), view, rng);
             g.program = prog;
+            g.randomize_dynamics(rng);
             return g;
         }
         let n = rng.random_range(MIN_TERMS..=MAX_TERMS);
@@ -268,6 +325,7 @@ impl Genome {
             let view = Self::random_view(rng);
             let mut g = Self::new(Vec::new(), view, rng);
             g.program = prog;
+            g.randomize_dynamics(rng);
             return g;
         }
         let n = rng.random_range(MIN_TERMS..=MAX_TERMS);
@@ -291,6 +349,7 @@ impl Genome {
             );
             let mut g = Self::new(Vec::new(), view, rng);
             g.program = prog;
+            g.inherit_dynamics(a, b, rng);
             return g;
         }
         // Union of parents' terms, each kept with prob 0.5, clamped to [MIN, MAX].
@@ -330,6 +389,7 @@ impl Genome {
                 &self.program, rng,
                 config.optimization.max_nodes, config.optimization.max_depth,
             );
+            child.mutate_dynamics(rng);
             child.mutate_view(rng);
             return child;
         }
@@ -354,6 +414,50 @@ impl Genome {
 
         child.mutate_view(rng);
         child
+    }
+
+    /// In-place mutation of Phase-3/4 iteration dynamics (DAG genomes).
+    fn mutate_dynamics(&mut self, rng: &mut impl Rng) {
+        if rng.random_bool(0.10) {
+            self.julia_mode = !self.julia_mode;
+            if self.julia_mode && self.julia_cre == 0.0 && self.julia_cim == 0.0 {
+                self.julia_cre = re_k(rng) * 0.9;
+                self.julia_cim = im_k(rng) * 0.9;
+            }
+        }
+        if self.julia_mode && rng.random_bool(0.40) {
+            self.julia_cre += re_k(rng) * 0.2;
+            self.julia_cim += im_k(rng) * 0.2;
+        }
+        if rng.random_bool(0.20) {
+            self.phoenix_re += re_k(rng) * 0.2;
+            self.phoenix_im += im_k(rng) * 0.2;
+        }
+        if rng.random_bool(0.15) { self.phoenix_re = 0.0; self.phoenix_im = 0.0; }
+        if rng.random_bool(0.30) {
+            let f = 0.8 + rng.random::<f32>() * 0.5;
+            self.bailout_radius = (self.bailout_radius * f).clamp(2.0, 16.0);
+        }
+        if rng.random_bool(0.15) {
+            if self.warp.is_empty() {
+                self.warp = random_program(rng, 8, 4, false);
+            } else if rng.random_bool(0.30) {
+                self.warp.clear();
+            } else {
+                self.warp = mutate_program(&self.warp, rng, 8, 4);
+            }
+        }
+    }
+
+    /// Inherit dynamics from one of two parents per field (crossover helper).
+    fn inherit_dynamics(&mut self, a: &Self, b: &Self, rng: &mut impl Rng) {
+        let pick = |rng: &mut dyn rand::RngCore| rng.random_bool(0.5);
+        if pick(rng) { self.julia_mode = a.julia_mode; self.julia_cre = a.julia_cre; self.julia_cim = a.julia_cim; }
+        else         { self.julia_mode = b.julia_mode; self.julia_cre = b.julia_cre; self.julia_cim = b.julia_cim; }
+        if pick(rng) { self.phoenix_re = a.phoenix_re; self.phoenix_im = a.phoenix_im; }
+        else         { self.phoenix_re = b.phoenix_re; self.phoenix_im = b.phoenix_im; }
+        self.bailout_radius = (a.bailout_radius + b.bailout_radius) * 0.5;
+        self.warp = if pick(rng) { a.warp.clone() } else { b.warp.clone() };
     }
 
     /// In-place stochastic zoom/pan mutation, shared by legacy and DAG paths.

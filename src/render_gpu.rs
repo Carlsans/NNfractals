@@ -9,8 +9,8 @@ use std::sync::{OnceLock, Mutex};
 const SHADER_SRC: &str = include_str!("fractal.wgsl");
 const WG_SIZE: u32 = 256;
 const FW_F32S:   usize = 116; // 58 complex weights (legacy stride)
-const PROG_F32S: usize = 120; // N_SLOTS(24) × 5 [op,a,b,kre,kim] (DAG stride)
-const STRIDE_F32S: usize = 120; // max(FW_F32S, PROG_F32S): shared fw_buf sizing
+const PROG_F32S: usize = 248; // DAG stride: 120 main + 120 warp + 8 dynamics
+const STRIDE_F32S: usize = 248; // max(FW_F32S, PROG_F32S): shared fw_buf sizing
 const VIEW_F32S: usize = 4;   // xmin, xmax, ymin, ymax
 
 pub struct GpuRenderer {
@@ -105,10 +105,38 @@ pub fn render_cpu_seq(
 
 // ── Expression-DAG GPU path ────────────────────────────────────────────────────
 
-/// Encode a program into the 120-f32 GPU layout: up to N_SLOTS nodes of
-/// [op, a, b, kre, kim]; op==255 terminates. Mirrors the WGSL VM's reader.
-pub fn encode_program(prog: &[crate::formula::OpNode]) -> Vec<f32> {
-    let mut out = vec![255.0f32; PROG_F32S]; // sentinel-filled
+// Per-genome DAG upload layout (f32), DAG_F32S total = 248:
+//   [0..120)    main program  (24 nodes × 5: op,a,b,kre,kim; op==255 terminates)
+//   [120..240)  warp program  (same encoding; empty ⇒ first op == 255)
+//   [240]       julia (0/1)   [241] julia_cre  [242] julia_cim
+//   [243] phoenix_re  [244] phoenix_im  [245] bailout_sq  [246,247] reserved
+const NODE_BLOCK: usize = 120; // N_SLOTS(24) × 5
+
+/// A DAG genome's render inputs (borrowed from a Genome).
+pub struct DagItem<'a> {
+    pub prog:    &'a [crate::formula::OpNode],
+    pub warp:    &'a [crate::formula::OpNode],
+    pub julia:   bool,
+    pub jc:      (f32, f32),
+    pub phoenix: (f32, f32),
+    pub bailout_sq: f32,
+}
+
+/// Build a DagItem borrowing a genome's program/warp + dynamics.
+pub fn dag_item(g: &crate::genome::Genome) -> DagItem<'_> {
+    DagItem {
+        prog: &g.program,
+        warp: &g.warp,
+        julia: g.julia_mode,
+        jc: (g.julia_cre, g.julia_cim),
+        phoenix: (g.phoenix_re, g.phoenix_im),
+        bailout_sq: g.bailout_radius * g.bailout_radius,
+    }
+}
+
+/// Encode one node block (120 f32, sentinel-terminated).
+fn encode_nodes(prog: &[crate::formula::OpNode]) -> [f32; NODE_BLOCK] {
+    let mut out = [255.0f32; NODE_BLOCK];
     let n = prog.len().min(crate::formula::N_SLOTS);
     for (i, node) in prog.iter().take(n).enumerate() {
         let b = i * 5;
@@ -121,42 +149,50 @@ pub fn encode_program(prog: &[crate::formula::OpNode]) -> Vec<f32> {
     out
 }
 
-/// Batched render of expression-DAG genomes. `progs[i]` is genome i's program.
+/// Encode a full DAG item into the 248-f32 GPU layout.
+fn encode_dag_item(item: &DagItem) -> Vec<f32> {
+    let mut out = Vec::with_capacity(PROG_F32S);
+    out.extend_from_slice(&encode_nodes(item.prog));
+    out.extend_from_slice(&encode_nodes(item.warp));
+    out.push(if item.julia { 1.0 } else { 0.0 });
+    out.push(item.jc.0); out.push(item.jc.1);
+    out.push(item.phoenix.0); out.push(item.phoenix.1);
+    out.push(item.bailout_sq);
+    out.push(0.0); out.push(0.0); // reserved
+    debug_assert_eq!(out.len(), PROG_F32S);
+    out
+}
+
+/// Batched render of expression-DAG genomes.
 pub fn render_batch_dag(
-    progs: &[&[crate::formula::OpNode]],
+    items: &[DagItem],
     views: &[(f32,f32,f32,f32)],
-    w: u32, h: u32, mi: u32, bsq: f32,
+    w: u32, h: u32, mi: u32,
 ) -> Vec<Vec<f32>> {
-    assert_eq!(progs.len(), views.len());
+    assert_eq!(items.len(), views.len());
     if let Some(Some(m)) = GPU.get() {
         if let Ok(mut r) = m.lock() {
-            return r.dispatch_dag(progs, views, w, h, mi, bsq);
+            return r.dispatch_dag(items, views, w, h, mi);
         }
     }
-    progs.iter().zip(views).map(|(p, &(xmin,xmax,ymin,ymax))| {
-        render_cpu_seq_dag(p, w, h, mi, xmin, xmax, ymin, ymax, bsq)
+    items.iter().zip(views).map(|(it, &(xmin,xmax,ymin,ymax))| {
+        render_cpu_seq_dag(it, w, h, mi, xmin, xmax, ymin, ymax)
     }).collect()
 }
 
 pub fn render_cpu_seq_dag(
-    prog: &[crate::formula::OpNode], w: u32, h: u32, mi: u32,
-    xmin: f32, xmax: f32, ymin: f32, ymax: f32, bsq: f32,
+    item: &DagItem, w: u32, h: u32, mi: u32,
+    xmin: f32, xmax: f32, ymin: f32, ymax: f32,
 ) -> Vec<f32> {
-    use crate::formula::eval_program;
     let wf = (w.saturating_sub(1)).max(1) as f32;
     let hf = (h.saturating_sub(1)).max(1) as f32;
     (0..(w*h) as usize).map(|i| {
         let cx = xmin + (i%w as usize) as f32 / wf * (xmax-xmin);
         let cy = ymin + (i/w as usize) as f32 / hf * (ymax-ymin);
-        let (mut zx, mut zy) = (0.0f32, 0.0f32);
-        for it in 0..mi {
-            let (nx,ny) = eval_program(prog, zx, zy, cx, cy);
-            zx = nx; zy = ny;
-            let ms = zx*zx+zy*zy;
-            if ms > bsq { return ((it as f32+1.0)-(ms.log2()*0.5).log2()).max(0.0); }
-            if !zx.is_finite() || !zy.is_finite() { return it as f32; }
-        }
-        mi as f32
+        crate::fractal::dag_escape_pixel(
+            item.prog, item.warp, item.julia, item.jc, item.phoenix, item.bailout_sq,
+            cx, cy, mi,
+        )
     }).collect()
 }
 
@@ -187,9 +223,11 @@ mod gpu_dag_tests {
         let mut fw = vec![(0.0f32, 0.0f32); 58];
         fw[0] = (1.0, 0.0); fw[7] = (1.0, 0.0);
 
-        let gpu_dag    = render_batch_dag(&[&prog], &[view], w, h, mi, bsq).remove(0);
+        // Plain Mandelbrot DAG item: no warp, no julia, no phoenix, bailout²=16.
+        let item = DagItem { prog: &prog, warp: &[], julia: false, jc: (0.0,0.0), phoenix: (0.0,0.0), bailout_sq: bsq };
+        let gpu_dag    = render_batch_dag(std::slice::from_ref(&item), &[view], w, h, mi).remove(0);
         let gpu_legacy = render_batch(&[&fw], &[view], w, h, mi, bsq).remove(0);
-        let cpu_dag    = render_cpu_seq_dag(&prog, w, h, mi, view.0, view.1, view.2, view.3, bsq);
+        let cpu_dag    = render_cpu_seq_dag(&item, w, h, mi, view.0, view.1, view.2, view.3);
         let cpu_legacy = render_cpu_seq(&fw, w, h, mi, view.0, view.1, view.2, view.3, bsq);
 
         // Within-hardware parity: the VM must reproduce the legacy basis path on
@@ -201,6 +239,38 @@ mod gpu_dag_tests {
         eprintln!("[parity] gpu_dag↔gpu_legacy max={gpu_diff}  cpu_dag↔cpu_legacy max={cpu_diff}");
         assert!(gpu_diff < 1e-3, "GPU register-VM diverges from legacy basis path: {gpu_diff}");
         assert!(cpu_diff < 1e-3, "CPU eval_program diverges from legacy apply_formula: {cpu_diff}");
+    }
+
+    // Dynamics path (Julia + phoenix + warp): GPU and CPU must agree on the bulk
+    // of pixels (boundary pixels are chaotic under f32, so compare the fraction
+    // that match closely rather than the max).
+    #[test]
+    fn gpu_dag_dynamics_parity() {
+        init_gpu();
+        if !gpu_available() { eprintln!("[test] no GPU — skipping"); return; }
+        let (w, h, mi) = (96u32, 96u32, 128u32);
+        let view = (-1.8f32, 1.8, -1.8, 1.8);
+        let prog = mandelbrot_prog();
+        // warp: sin(pixel) — bends the plane
+        let warp = vec![
+            OpNode { op: op::Z, a: 0, b: 0, kre: 0.0, kim: 0.0 },
+            OpNode { op: op::SIN, a: 0, b: 0, kre: 0.0, kim: 0.0 },
+        ];
+        let item = DagItem {
+            prog: &prog, warp: &warp, julia: true, jc: (-0.4, 0.6),
+            phoenix: (0.15, -0.05), bailout_sq: 16.0,
+        };
+        let gpu = render_batch_dag(std::slice::from_ref(&item), &[view], w, h, mi).remove(0);
+        let cpu = render_cpu_seq_dag(&item, w, h, mi, view.0, view.1, view.2, view.3);
+        let n = gpu.len();
+        let close = gpu.iter().zip(&cpu).filter(|(a,b)| (**a - **b).abs() < 1.0).count();
+        let frac = close as f32 / n as f32;
+        // not degenerate: escape times must actually vary
+        let mx = cpu.iter().cloned().fold(0.0f32, f32::max);
+        let mn = cpu.iter().cloned().fold(f32::INFINITY, f32::min);
+        eprintln!("[dyn-parity] {frac:.3} of pixels agree (<1.0); range [{mn},{mx}]");
+        assert!(frac > 0.90, "GPU/CPU dynamics disagree on {:.1}% of pixels", (1.0-frac)*100.0);
+        assert!(mx - mn > 1.0, "degenerate render (no structure)");
     }
 }
 
@@ -379,15 +449,15 @@ impl GpuRenderer {
         (0..fw_batch.len()).map(|i| all[i*p..(i+1)*p].to_vec()).collect()
     }
 
-    /// Expression-DAG dispatch: same pipeline as `dispatch` but uploads programs
-    /// (120 f32/genome) and sets params.use_dag = 1 so the shader runs the VM.
+    /// Expression-DAG dispatch: same pipeline as `dispatch` but uploads full DAG
+    /// items (248 f32/genome: main+warp programs + dynamics) and sets use_dag=1.
     fn dispatch_dag(
         &mut self,
-        progs: &[&[crate::formula::OpNode]],
+        items: &[DagItem],
         views: &[(f32,f32,f32,f32)],
-        w: u32, h: u32, mi: u32, bsq: f32,
+        w: u32, h: u32, mi: u32,
     ) -> Vec<Vec<f32>> {
-        let gc  = progs.len() as u32;
+        let gc  = items.len() as u32;
         let pix = w * h;
 
         if gc > self.max_genomes {
@@ -411,13 +481,14 @@ impl GpuRenderer {
         let p32 = |b: &mut [u8], o: usize, v: u32| b[o..o+4].copy_from_slice(&v.to_le_bytes());
         let pf  = |b: &mut [u8], o: usize, v: f32| b[o..o+4].copy_from_slice(&v.to_le_bytes());
         p32(&mut pb, 0, w); p32(&mut pb, 4, h); p32(&mut pb, 8, mi); p32(&mut pb, 12, gc);
-        pf(&mut pb, 16, bsq); p32(&mut pb, 20, 1);
+        // bailout_sq is per-genome for DAG (read from each block); params slot unused.
+        pf(&mut pb, 16, 16.0); p32(&mut pb, 20, 1);
         self.queue.write_buffer(&self.params_buf, 0, &pb);
 
-        // Program data: 120 f32 per genome
+        // DAG item data: 248 f32 per genome (main program + warp program + dynamics)
         let mut prog_bytes = Vec::with_capacity(gc as usize * PROG_F32S * 4);
-        for p in progs {
-            for v in encode_program(p) { prog_bytes.extend_from_slice(&v.to_le_bytes()); }
+        for it in items {
+            for v in encode_dag_item(it) { prog_bytes.extend_from_slice(&v.to_le_bytes()); }
         }
         self.queue.write_buffer(&self.fw_buf, 0, &prog_bytes);
 
@@ -461,6 +532,6 @@ impl GpuRenderer {
         self.staging_buf.unmap();
 
         let p = pix as usize;
-        (0..progs.len()).map(|i| all[i*p..(i+1)*p].to_vec()).collect()
+        (0..items.len()).map(|i| all[i*p..(i+1)*p].to_vec()).collect()
     }
 }

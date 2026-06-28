@@ -64,6 +64,39 @@ pub fn best_entropy_view(genome: &Genome, config: &Config) -> Genome {
     best
 }
 
+/// Escape-time for one pixel under the DAG iteration with Phase-3/4 dynamics:
+/// optional coordinate warp, Julia vs Mandelbrot initialization, and phoenix
+/// memory z_{n+1} = f(z,c) + p·z_{n-1}. Mirrors the WGSL main loop.
+#[allow(clippy::too_many_arguments)]
+pub fn dag_escape_pixel(
+    prog: &[crate::formula::OpNode], warp: &[crate::formula::OpNode],
+    julia: bool, jc: (f32, f32), phoenix: (f32, f32), bailout_sq: f32,
+    px: f32, py: f32, max_iter: u32,
+) -> f32 {
+    use crate::formula::eval_program;
+    // Coordinate warp bends the pixel-derived input plane.
+    let (mut ix, mut iy) = (px, py);
+    if !warp.is_empty() {
+        let (wx, wy) = eval_program(warp, px, py, px, py);
+        ix = wx; iy = wy;
+    }
+    // Julia: pixel → z₀, c = constant. Mandelbrot: z₀ = 0, c = pixel.
+    let (mut zx, mut zy, cx, cy) = if julia { (ix, iy, jc.0, jc.1) } else { (0.0, 0.0, ix, iy) };
+    let (mut pzx, mut pzy) = (0.0f32, 0.0f32);
+    for it in 0..max_iter {
+        let (fx, fy) = eval_program(prog, zx, zy, cx, cy);
+        // + phoenix·z_prev  (complex multiply)
+        let nx = fx + phoenix.0 * pzx - phoenix.1 * pzy;
+        let ny = fy + phoenix.0 * pzy + phoenix.1 * pzx;
+        pzx = zx; pzy = zy;
+        zx = nx; zy = ny;
+        let ms = zx * zx + zy * zy;
+        if ms > bailout_sq { return ((it as f32 + 1.0) - (ms.log2() * 0.5).log2()).max(0.0); }
+        if !zx.is_finite() || !zy.is_finite() { return it as f32; }
+    }
+    max_iter as f32
+}
+
 pub fn render_cpu_iter(
     genome: &Genome, config: &Config, width: u32, height: u32, max_iter: u32,
 ) -> Vec<f32> {
@@ -75,11 +108,17 @@ pub fn render_cpu_iter(
     if genome.uses_program() {
         #[cfg(feature = "wgpu-backend")]
         if render_gpu::gpu_available() {
+            let item = render_gpu::dag_item(genome);
             return render_gpu::render_batch_dag(
-                &[&genome.program], &[(xmin, xmax, ymin, ymax)], width, height, max_iter, bailout_sq,
+                &[item], &[(xmin, xmax, ymin, ymax)], width, height, max_iter,
             ).into_iter().next().unwrap_or_default();
         }
         let prog = &genome.program;
+        let warp = &genome.warp;
+        let julia = genome.julia_mode;
+        let jc = (genome.julia_cre, genome.julia_cim);
+        let phoenix = (genome.phoenix_re, genome.phoenix_im);
+        let bsq = genome.bailout_radius * genome.bailout_radius;
         let wf = (width.saturating_sub(1)).max(1) as f32;
         let hf = (height.saturating_sub(1)).max(1) as f32;
         let n  = (width * height) as usize;
@@ -88,19 +127,7 @@ pub fn render_cpu_iter(
             let py = idx / width as usize;
             let cx = xmin + (px as f32 / wf) * (xmax - xmin);
             let cy = ymin + (py as f32 / hf) * (ymax - ymin);
-            let mut zx = 0.0f32;
-            let mut zy = 0.0f32;
-            for iter in 0..max_iter {
-                let (nzx, nzy) = crate::formula::eval_program(prog, zx, zy, cx, cy);
-                zx = nzx; zy = nzy;
-                let mod_sq = zx * zx + zy * zy;
-                if mod_sq > bailout_sq {
-                    let nu = (mod_sq.log2() * 0.5).log2();
-                    return (iter as f32 + 1.0 - nu).max(0.0);
-                }
-                if !zx.is_finite() || !zy.is_finite() { return iter as f32; }
-            }
-            max_iter as f32
+            dag_escape_pixel(prog, warp, julia, jc, phoenix, bsq, cx, cy, max_iter)
         }).collect();
     }
 
@@ -620,8 +647,8 @@ pub fn evaluate_fitness_batch(
     let all_dag = !genomes.is_empty() && genomes.iter().all(|g| g.uses_program());
     let any_dag = genomes.iter().any(|g| g.uses_program());
     let escape_batch = if all_dag {
-        let progs: Vec<&[crate::formula::OpNode]> = genomes.iter().map(|g| g.program.as_slice()).collect();
-        render_gpu::render_batch_dag(&progs, &views, ew, eh, emi, bsq)
+        let items: Vec<render_gpu::DagItem> = genomes.iter().map(render_gpu::dag_item).collect();
+        render_gpu::render_batch_dag(&items, &views, ew, eh, emi)
     } else if any_dag {
         genomes.iter().map(|g| render_cpu_iter(g, config, ew, eh, emi)).collect()
     } else {

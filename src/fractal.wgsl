@@ -232,26 +232,59 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
     let c   = vec2f(cx, cy);
 
     let out_offset = genome_idx * pixels;
-    // Per-genome stride differs by mode: 116 legacy weights vs 120 program floats.
-    let prog_base  = genome_idx * 120u;
-    let fw_offset  = genome_idx * 116u;
     let dag        = params.use_dag != 0u;
-
-    var z     = vec2f(0.0, 0.0);
     var etime = f32(params.max_iter);
 
-    for (var iter = 0u; iter < params.max_iter; iter++) {
-        if (dag) { z = eval_program(z, c, prog_base); }
-        else     { z = apply_formula(z, c, fw_offset); }
-        let ms = dot(z, z);
-        if ms > params.bailout_sq {
-            let nu = log2(log2(sqrt(ms) + 1e-10));
-            etime = max(0.0, f32(iter) + 1.0 - nu);
-            break;
+    if (dag) {
+        // DAG layout: 248 f32/genome = main(120) + warp(120) + dynamics(8).
+        let pbase     = genome_idx * 248u;
+        let warp_base = pbase + 120u;
+        let julia   = all_fw[pbase + 240u] != 0.0;
+        let jc      = vec2f(all_fw[pbase + 241u], all_fw[pbase + 242u]);
+        let phoenix = vec2f(all_fw[pbase + 243u], all_fw[pbase + 244u]);
+        let bsq     = all_fw[pbase + 245u];
+
+        // Coordinate warp bends the pixel-derived input plane (identity if empty).
+        var inp = c;
+        if (all_fw[warp_base] != 255.0) { inp = eval_program(inp, inp, warp_base); }
+
+        // Julia: pixel → z₀, c = constant. Mandelbrot: z₀ = 0, c = pixel.
+        var z: vec2f;
+        var cc: vec2f;
+        if (julia) { z = inp; cc = jc; } else { z = vec2f(0.0, 0.0); cc = inp; }
+        var zprev = vec2f(0.0, 0.0);
+
+        for (var iter = 0u; iter < params.max_iter; iter++) {
+            let f  = eval_program(z, cc, pbase);
+            let zn = f + cmul(phoenix, zprev);   // phoenix memory
+            zprev = z;
+            z = zn;
+            let ms = dot(z, z);
+            if ms > bsq {
+                let nu = log2(log2(sqrt(ms) + 1e-10));
+                etime = max(0.0, f32(iter) + 1.0 - nu);
+                break;
+            }
+            if z.x != z.x || z.y != z.y || abs(z.x) > 1e15 || abs(z.y) > 1e15 {
+                etime = f32(iter);
+                break;
+            }
         }
-        if z.x != z.x || z.y != z.y || abs(z.x) > 1e15 || abs(z.y) > 1e15 {
-            etime = f32(iter);
-            break;
+    } else {
+        let fw_offset = genome_idx * 116u;
+        var z = vec2f(0.0, 0.0);
+        for (var iter = 0u; iter < params.max_iter; iter++) {
+            z = apply_formula(z, c, fw_offset);
+            let ms = dot(z, z);
+            if ms > params.bailout_sq {
+                let nu = log2(log2(sqrt(ms) + 1e-10));
+                etime = max(0.0, f32(iter) + 1.0 - nu);
+                break;
+            }
+            if z.x != z.x || z.y != z.y || abs(z.x) > 1e15 || abs(z.y) > 1e15 {
+                etime = f32(iter);
+                break;
+            }
         }
     }
     output[out_offset + pixel_idx] = etime;
