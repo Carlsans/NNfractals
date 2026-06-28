@@ -877,6 +877,9 @@ fn default_config() -> Config {
             recursion_pred_weight: 0.60,
             formula_diversity_weight: 0.30,
             clip_pred_weight: 0.50,
+            formula_system: "legacy".to_string(),
+            max_nodes: 14,
+            max_depth: 5,
         },
         output: OutputConfig {
             save_dir: "./fractals".into(),

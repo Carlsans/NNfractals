@@ -1,0 +1,100 @@
+{
+  "task": "colormap-4h-experiment",
+  "colormaps": [
+    "earth",
+    "lava",
+    "aurora",
+    "galaxy",
+    "sunset",
+    "arctic",
+    "ember",
+    "neon",
+    "inferno",
+    "viridis",
+    "plasma",
+    "magma",
+    "turbo"
+  ],
+  "current_index": 7,
+  "started_at": 1782574409.3877838,
+  "ends_at": 1782588809.3877838,
+  "interval_secs": 1800,
+  "window_start_at": 1782588156.3296235,
+  "next_switch_at": 1782589956.3296235,
+  "history": [
+    {
+      "colormap": "earth",
+      "saves": 3,
+      "laion_mean": 5.1696,
+      "laion_max": 5.1873,
+      "clip_mean": 0.4875,
+      "rec_mean": 0.4663
+    },
+    {
+      "colormap": "lava",
+      "saves": 8,
+      "laion_mean": 5.3014,
+      "laion_max": 5.3358,
+      "clip_mean": 0.5189,
+      "rec_mean": 0.6158
+    },
+    {
+      "colormap": "aurora",
+      "saves": 2,
+      "laion_mean": 5.2473,
+      "laion_max": 5.3156,
+      "clip_mean": 0.5018,
+      "rec_mean": 0.5096
+    },
+    {
+      "colormap": "galaxy",
+      "saves": 2,
+      "laion_mean": 5.1563,
+      "laion_max": 5.1585,
+      "clip_mean": 0.4839,
+      "rec_mean": 0.3969
+    },
+    {
+      "colormap": "sunset",
+      "saves": 1,
+      "laion_mean": 5.2041,
+      "laion_max": 5.2041,
+      "clip_mean": 0.4961,
+      "rec_mean": 0.6436
+    },
+    {
+      "colormap": "arctic",
+      "saves": 4,
+      "laion_mean": 5.2987,
+      "laion_max": 5.37,
+      "clip_mean": 0.5131,
+      "rec_mean": 0.5974
+    },
+    {
+      "colormap": "ember",
+      "saves": 2,
+      "laion_mean": 5.2443,
+      "laion_max": 5.3315,
+      "clip_mean": 0.504,
+      "rec_mean": 0.506
+    },
+    {
+      "colormap": "turbo (baseline)",
+      "saves": 382,
+      "laion_mean": 5.3323,
+      "laion_max": 5.3978,
+      "clip_mean": 0.5227,
+      "rec_mean": 0.7259
+    },
+    {
+      "colormap": "neon",
+      "saves": 9,
+      "laion_mean": 5.2655,
+      "laion_max": 5.3481,
+      "clip_mean": 0.5085,
+      "rec_mean": 0.6431
+    }
+  ],
+  "finalize_script": "bash scripts/colormap_finalize.sh",
+  "chart_out": "colormap_scores.png"
+}

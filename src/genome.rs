@@ -1,7 +1,7 @@
 use rand::Rng;
 use serde::{Deserialize, Serialize};
 use crate::config::Config;
-use crate::formula::{N_BASIS, basis_name};
+use crate::formula::{N_BASIS, basis_name, op, OpNode, N_SLOTS};
 
 /// Bounds on the number of active terms in a genome's formula.
 pub const MIN_TERMS: usize = 2;
@@ -76,6 +76,10 @@ pub struct Genome {
     /// genomes in normalised 58-dim basis-weight space. Higher = structurally
     /// distinct formula family. Drives selection when formula_diversity_weight > 0.
     #[serde(default)] pub formula_diversity: f32,
+    /// Expression-DAG program (Phase-1 formula system). When non-empty, this
+    /// replaces the flat `terms` basis-sum: z_{n+1} = eval_program(program,z,c).
+    /// Empty ⇒ legacy genome that still evaluates via `terms`/`formula_weights`.
+    #[serde(default)] pub program: Vec<crate::formula::OpNode>,
     pub id: u64,
     #[serde(default)]
     pub view_cx: f32,
@@ -137,6 +141,34 @@ impl Genome {
         w
     }
 
+    /// True when this genome uses the expression-DAG formula system.
+    pub fn uses_program(&self) -> bool { !self.program.is_empty() }
+
+    /// Convert the legacy flat basis-sum into an equivalent expression-DAG
+    /// program: z_new = Σ coeffᵢ·basisᵢ(z,c) → a DAG of the new primitives.
+    /// Returns None if the result would exceed N_SLOTS or uses a basis the new
+    /// op set can't represent exactly (then the genome stays on the legacy path).
+    /// Used for archive migration and as a cross-check oracle against `apply_formula`.
+    pub fn legacy_to_program(&self) -> Option<Vec<OpNode>> {
+        let mut b = ProgramBuilder::new();
+        let z = b.push(op::Z, 0, 0, 0.0, 0.0)?;
+        let c = b.push(op::C, 0, 0, 0.0, 0.0)?;
+        let mut term_roots: Vec<u8> = Vec::new();
+        for t in &self.terms {
+            let base = build_basis(&mut b, t.basis, z, c)?;
+            let k = b.push(op::CONST, 0, 0, t.re, t.im)?;
+            let scaled = b.push(op::MUL, k, base, 0.0, 0.0)?;
+            term_roots.push(scaled);
+        }
+        if term_roots.is_empty() { return None; }
+        let mut acc = term_roots[0];
+        for &r in &term_roots[1..] {
+            acc = b.push(op::ADD, acc, r, 0.0, 0.0)?;
+        }
+        let _ = acc;
+        Some(b.into_nodes())
+    }
+
     fn random_view(rng: &mut impl Rng) -> (f32, f32, f32) {
         if rng.random::<f32>() < 0.70 {
             (0.0, 0.0, 1.0)
@@ -163,6 +195,7 @@ impl Genome {
             pred_recursion: 0.0,
             pred_clip: 0.0,
             formula_diversity: 0.0,
+            program: Vec::new(),
             id: rng.random(),
             view_cx: view.0,
             view_cy: view.1,
@@ -278,5 +311,162 @@ impl Genome {
         indexed.iter().take(k)
             .map(|(_, b)| basis_name(*b as usize).to_string())
             .collect()
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// Expression-DAG construction helpers (legacy conversion + program building).
+// ════════════════════════════════════════════════════════════════════════════
+
+/// Accumulates OpNodes in topological order, returning the index of each pushed
+/// node. Refuses to grow past N_SLOTS (returns None), so callers can bail out of
+/// conversions that wouldn't fit the register file.
+pub struct ProgramBuilder { nodes: Vec<OpNode> }
+
+impl ProgramBuilder {
+    pub fn new() -> Self { ProgramBuilder { nodes: Vec::new() } }
+
+    /// Push a node; returns its index (u8) or None if the program is full.
+    pub fn push(&mut self, op: u8, a: u8, b: u8, kre: f32, kim: f32) -> Option<u8> {
+        if self.nodes.len() >= N_SLOTS { return None; }
+        let idx = self.nodes.len() as u8;
+        self.nodes.push(OpNode { op, a, b, kre, kim });
+        Some(idx)
+    }
+
+    pub fn into_nodes(self) -> Vec<OpNode> { self.nodes }
+    pub fn len(&self) -> usize { self.nodes.len() }
+}
+
+#[cfg(test)]
+mod legacy_conv_tests {
+    use super::*;
+    use crate::formula::{eval_basis, eval_program};
+
+    // Every basis that build_basis claims to cover must, once wrapped in a
+    // program, evaluate identically to the trusted eval_basis across sample points.
+    #[test]
+    fn each_basis_subtree_matches_eval_basis() {
+        let pts = [(0.3f32,0.4,-0.5,0.6),(1.1,-0.7,0.2,0.3),(-0.8,0.25,0.5,-0.4),(0.05,-0.9,-0.3,0.7)];
+        let mut covered = 0;
+        for i in 0..N_BASIS as u8 {
+            let mut b = ProgramBuilder::new();
+            let z = b.push(op::Z, 0, 0, 0.0, 0.0).unwrap();
+            let c = b.push(op::C, 0, 0, 0.0, 0.0).unwrap();
+            let root = match build_basis(&mut b, i, z, c) {
+                Some(r) => r,
+                None => continue, // uncovered (31 sinh, 32 cosh, 49 z|z|) — fine
+            };
+            // build_basis returns the root index; ensure it's the last node so
+            // eval_program returns it. If not, append an identity ADD(root,const0).
+            let mut prog = b.into_nodes();
+            if root as usize != prog.len() - 1 {
+                // wrap: tie root to the tail via a no-op MUL by 1
+                let one = prog.len() as u8;
+                prog.push(OpNode { op: op::CONST, a: 0, b: 0, kre: 1.0, kim: 0.0 });
+                prog.push(OpNode { op: op::MUL, a: root, b: one, kre: 0.0, kim: 0.0 });
+            }
+            for &(zx, zy, cx, cy) in &pts {
+                let (px, py) = eval_program(&prog, zx, zy, cx, cy);
+                let (ex, ey) = eval_basis(i as usize, zx, zy, cx, cy);
+                assert!((px - ex).abs() < 1e-4 && (py - ey).abs() < 1e-4,
+                    "basis {i} mismatch at ({zx},{zy},{cx},{cy}): dag=({px},{py}) eval_basis=({ex},{ey})");
+            }
+            covered += 1;
+        }
+        assert!(covered >= 50, "expected ≥50 bases covered, got {covered}");
+    }
+
+    // A full legacy genome converts to a program that renders identically.
+    #[test]
+    fn legacy_genome_to_program_matches() {
+        let g = Genome {
+            terms: vec![
+                FormulaTerm { basis: 0,  re: 1.0,  im: 0.0 },  // z²
+                FormulaTerm { basis: 7,  re: 1.0,  im: 0.0 },  // c
+                FormulaTerm { basis: 52, re: 0.3, im: -0.2 },  // (z²−1)/(z²+1)
+            ],
+            ..Default::default()
+        };
+        let prog = g.legacy_to_program().expect("should fit");
+        let fw = g.formula_weights();
+        for &(zx, zy, cx, cy) in &[(0.4f32,0.3,-0.2,0.5),(0.9,-0.6,0.1,0.4)] {
+            let (px, py) = eval_program(&prog, zx, zy, cx, cy);
+            let (lx, ly) = crate::formula::apply_formula(&fw, zx, zy, cx, cy);
+            assert!((px - lx).abs() < 1e-4 && (py - ly).abs() < 1e-4,
+                "genome mismatch: dag=({px},{py}) legacy=({lx},{ly})");
+        }
+    }
+}
+
+/// Build a subtree computing legacy basis `i` over leaf nodes `z` and `c`,
+/// returning the root index. None if basis `i` isn't exactly representable in
+/// the new op set or the program overflows. Mirrors `eval_basis` in formula.rs.
+fn build_basis(b: &mut ProgramBuilder, i: u8, z: u8, c: u8) -> Option<u8> {
+    use op::*;
+    const PI: f32 = std::f32::consts::PI;
+    let one = |b: &mut ProgramBuilder| b.push(CONST, 0, 0, 1.0, 0.0);
+    let negz = |b: &mut ProgramBuilder, z: u8| -> Option<u8> {
+        let m = b.push(CONST, 0, 0, -1.0, 0.0)?;
+        b.push(MUL, m, z, 0.0, 0.0)
+    };
+    match i {
+        0  => b.push(SQR, z, 0, 0.0, 0.0),                                  // z²
+        1  => b.push(CUBE, z, 0, 0.0, 0.0),                                 // z³
+        2  => b.push(QUART, z, 0, 0.0, 0.0),                                // z⁴
+        3  => { let q = b.push(QUART, z, 0, 0.0, 0.0)?; b.push(MUL, q, z, 0.0, 0.0) }, // z⁵
+        4  => Some(z),                                                       // z
+        5  => b.push(RECIP, z, 0, 0.0, 0.0),                               // 1/z
+        6  => { let z2 = b.push(SQR, z, 0, 0.0, 0.0)?; b.push(RECIP, z2, 0, 0.0, 0.0) }, // 1/z²
+        7  => Some(c),                                                       // c
+        8  => b.push(SQR, c, 0, 0.0, 0.0),                                  // c²
+        9  => b.push(CUBE, c, 0, 0.0, 0.0),                                 // c³
+        10 => b.push(MUL, z, c, 0.0, 0.0),                                  // zc
+        11 => { let z2 = b.push(SQR, z, 0, 0.0, 0.0)?; b.push(MUL, z2, c, 0.0, 0.0) }, // z²c
+        12 => { let c2 = b.push(SQR, c, 0, 0.0, 0.0)?; b.push(MUL, z, c2, 0.0, 0.0) }, // zc²
+        13 => { let z2 = b.push(SQR, z, 0, 0.0, 0.0)?; let c2 = b.push(SQR, c, 0, 0.0, 0.0)?; b.push(MUL, z2, c2, 0.0, 0.0) }, // z²c²
+        14 => b.push(DIV, c, z, 0.0, 0.0),                                  // c/z
+        15 => { let s = b.push(ADD, z, c, 0.0, 0.0)?; b.push(SQR, s, 0, 0.0, 0.0) }, // (z+c)²
+        16 => { let s = b.push(SUB, z, c, 0.0, 0.0)?; b.push(SQR, s, 0, 0.0, 0.0) }, // (z−c)²
+        17 => { let s = b.push(MUL, z, c, 0.0, 0.0)?; b.push(SQR, s, 0, 0.0, 0.0) }, // (zc)²
+        18 => b.push(SIN, z, 0, 0.0, 0.0),                                  // sin(z)
+        19 => b.push(COS, z, 0, 0.0, 0.0),                                  // cos(z)
+        20 => { let p = b.push(CONST, 0, 0, PI, 0.0)?; let pz = b.push(MUL, p, z, 0.0, 0.0)?; b.push(SIN, pz, 0, 0.0, 0.0) }, // sin(πz)
+        21 => { let p = b.push(CONST, 0, 0, PI, 0.0)?; let pz = b.push(MUL, p, z, 0.0, 0.0)?; b.push(COS, pz, 0, 0.0, 0.0) }, // cos(πz)
+        22 => { let z2 = b.push(SQR, z, 0, 0.0, 0.0)?; b.push(SIN, z2, 0, 0.0, 0.0) }, // sin(z²)
+        23 => { let z2 = b.push(SQR, z, 0, 0.0, 0.0)?; b.push(COS, z2, 0, 0.0, 0.0) }, // cos(z²)
+        24 => { let s = b.push(ADD, z, c, 0.0, 0.0)?; b.push(SIN, s, 0, 0.0, 0.0) }, // sin(z+c)
+        25 => { let s = b.push(ADD, z, c, 0.0, 0.0)?; b.push(COS, s, 0, 0.0, 0.0) }, // cos(z+c)
+        26 => { let s = b.push(MUL, z, c, 0.0, 0.0)?; b.push(SIN, s, 0, 0.0, 0.0) }, // sin(zc)
+        27 => { let s = b.push(MUL, z, c, 0.0, 0.0)?; b.push(COS, s, 0, 0.0, 0.0) }, // cos(zc)
+        28 => { let s = b.push(SIN, z, 0, 0.0, 0.0)?; b.push(MUL, z, s, 0.0, 0.0) }, // z·sin(z)
+        29 => { let s = b.push(COS, z, 0, 0.0, 0.0)?; b.push(MUL, z, s, 0.0, 0.0) }, // z·cos(z)
+        30 => { let s = b.push(SIN, z, 0, 0.0, 0.0)?; let cs = b.push(COS, z, 0, 0.0, 0.0)?; b.push(DIV, s, cs, 0.0, 0.0) }, // tan(z)
+        33 => b.push(TANH, z, 0, 0.0, 0.0),                                 // tanh(z)
+        34 => b.push(EXP, z, 0, 0.0, 0.0),                                  // exp(z)
+        35 => { let nz = negz(b, z)?; b.push(EXP, nz, 0, 0.0, 0.0) },        // exp(−z)
+        36 => { let s = b.push(MUL, z, c, 0.0, 0.0)?; b.push(EXP, s, 0, 0.0, 0.0) }, // exp(zc)
+        37 => { let e = b.push(EXP, z, 0, 0.0, 0.0)?; b.push(MUL, z, e, 0.0, 0.0) }, // z·exp(z)
+        38 => { let e = b.push(EXP, z, 0, 0.0, 0.0)?; b.push(MUL, e, c, 0.0, 0.0) }, // exp(z)·c
+        39 => { let o = one(b)?; let s = b.push(ADD, z, o, 0.0, 0.0)?; b.push(LOG, s, 0, 0.0, 0.0) }, // log(z+1)
+        40 => { let z2 = b.push(SQR, z, 0, 0.0, 0.0)?; let o = one(b)?; let s = b.push(ADD, z2, o, 0.0, 0.0)?; b.push(LOG, s, 0, 0.0, 0.0) }, // log(z²+1)
+        41 => { let o = one(b)?; let s = b.push(ADD, z, o, 0.0, 0.0)?; let l = b.push(LOG, s, 0, 0.0, 0.0)?; b.push(MUL, z, l, 0.0, 0.0) }, // z·log(z+1)
+        42 => { let r = b.push(RECIP, z, 0, 0.0, 0.0)?; b.push(SIN, r, 0, 0.0, 0.0) }, // sin(1/z)
+        43 => { let r = b.push(RECIP, z, 0, 0.0, 0.0)?; b.push(EXP, r, 0, 0.0, 0.0) }, // exp(1/z)
+        44 => b.push(ABSRE, z, 0, 0.0, 0.0),                               // |Re|+iIm
+        45 => b.push(ABSIM, z, 0, 0.0, 0.0),                               // Re+i|Im|
+        46 => b.push(ABSFOLD, z, 0, 0.0, 0.0),                             // |BS|
+        47 => b.push(CONJ, z, 0, 0.0, 0.0),                               // conj
+        48 => { let cj = b.push(CONJ, z, 0, 0.0, 0.0)?; b.push(SQR, cj, 0, 0.0, 0.0) }, // conj(z)²
+        50 => b.push(NORMZ, z, 0, 0.0, 0.0),                              // z/|z|
+        51 => { let z2 = b.push(SQR, z, 0, 0.0, 0.0)?; let o = one(b)?; let d = b.push(ADD, z2, o, 0.0, 0.0)?; b.push(DIV, z, d, 0.0, 0.0) }, // z/(z²+1)
+        52 => { let z2 = b.push(SQR, z, 0, 0.0, 0.0)?; let o1 = one(b)?; let nr = b.push(SUB, z2, o1, 0.0, 0.0)?; let o2 = one(b)?; let dr = b.push(ADD, z2, o2, 0.0, 0.0)?; b.push(DIV, nr, dr, 0.0, 0.0) }, // (z²−1)/(z²+1)
+        53 => { let z2 = b.push(SQR, z, 0, 0.0, 0.0)?; let o = one(b)?; let d = b.push(SUB, z, o, 0.0, 0.0)?; b.push(DIV, z2, d, 0.0, 0.0) }, // z²/(z−1)
+        54 => { let z2 = b.push(SQR, z, 0, 0.0, 0.0)?; let d = b.push(ADD, z2, c, 0.0, 0.0)?; b.push(RECIP, d, 0, 0.0, 0.0) }, // 1/(z²+c)
+        55 => { let z2 = b.push(SQR, z, 0, 0.0, 0.0)?; let z2c = b.push(MUL, z2, c, 0.0, 0.0)?; let d = b.push(ADD, z, c, 0.0, 0.0)?; b.push(DIV, z2c, d, 0.0, 0.0) }, // z²c/(z+c)
+        56 => b.push(CONST, 0, 0, 1.0, 0.0),                              // 1
+        57 => b.push(CONST, 0, 0, 0.0, 1.0),                              // i
+        // 31 sinh, 32 cosh, 49 z·|z| — no exact single-op equivalent → bail.
+        _  => None,
     }
 }

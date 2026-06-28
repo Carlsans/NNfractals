@@ -62,6 +62,16 @@ pub struct OptimizationConfig {
     /// 0 disables. Set to 0 if clip_model.json is absent (criterion inert).
     #[serde(default = "default_clip_pred_weight")]
     pub clip_pred_weight: f32,
+    /// Formula representation: "legacy" (flat 58-basis weighted sum) or "dag"
+    /// (evolvable expression-DAG / genetic programming). Phase-1 rollout flag.
+    #[serde(default = "default_formula_system")]
+    pub formula_system: String,
+    /// Max nodes in an evolved DAG program (≤ N_SLOTS=16).
+    #[serde(default = "default_max_nodes")]
+    pub max_nodes: usize,
+    /// Max depth of an evolved DAG program (tameness vs wildness dial).
+    #[serde(default = "default_max_depth")]
+    pub max_depth: usize,
 }
 
 fn default_self_replication_weight()    -> f32 { 0.35 }
@@ -69,6 +79,9 @@ fn default_fractal_recursion_weight()   -> f32 { 0.35 }
 fn default_recursion_pred_weight()      -> f32 { 0.60 }
 fn default_formula_diversity_weight()   -> f32 { 0.30 }
 fn default_clip_pred_weight()           -> f32 { 0.50 }
+fn default_formula_system()             -> String { "legacy".to_string() }
+fn default_max_nodes()                  -> usize { 14 }
+fn default_max_depth()                  -> usize { 5 }
 
 #[derive(Deserialize, Clone, Debug)]
 pub struct OutputConfig {

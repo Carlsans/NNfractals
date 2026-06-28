@@ -1,0 +1,43 @@
+{
+  "task": "formula-diversity 3x2h loop",
+  "iterations_total": 3,
+  "hours_per_iter": 2,
+  "iteration": 4,
+  "iter_start": 1782612393.9685755,
+  "started_at": 1782590076.8973155,
+  "formula_diversity_weight_history": [
+    0.3,
+    0.3,
+    0.3,
+    0.3
+  ],
+  "history": [
+    {
+      "iteration": 1,
+      "saves": 311,
+      "laion_mean": 5.33,
+      "laion_max": 5.3973,
+      "clip_mean": 0.5218,
+      "fdiv_mean": 0.701,
+      "formula_diversity_weight": 0.3
+    },
+    {
+      "iteration": 2,
+      "saves": 797,
+      "laion_mean": 5.289,
+      "laion_max": 5.3871,
+      "clip_mean": 0.5157,
+      "fdiv_mean": 0.8019,
+      "formula_diversity_weight": 0.3
+    },
+    {
+      "iteration": 3,
+      "saves": 421,
+      "laion_mean": 5.314,
+      "laion_max": 5.4043,
+      "clip_mean": 0.5153,
+      "fdiv_mean": 0.869,
+      "formula_diversity_weight": 0.3
+    }
+  ]
+}

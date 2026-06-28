@@ -69,6 +69,35 @@ pub fn render_cpu_iter(
 ) -> Vec<f32> {
     let bailout_sq = config.rendering.bailout * config.rendering.bailout;
     let (xmin, xmax, ymin, ymax) = genome.view_bounds();
+
+    // Expression-DAG genomes evaluate via eval_program. The GPU register-VM is
+    // not yet wired, so program genomes take the CPU path for now.
+    if genome.uses_program() {
+        let prog = &genome.program;
+        let wf = (width.saturating_sub(1)).max(1) as f32;
+        let hf = (height.saturating_sub(1)).max(1) as f32;
+        let n  = (width * height) as usize;
+        return (0..n).into_par_iter().map(|idx| {
+            let px = idx % width as usize;
+            let py = idx / width as usize;
+            let cx = xmin + (px as f32 / wf) * (xmax - xmin);
+            let cy = ymin + (py as f32 / hf) * (ymax - ymin);
+            let mut zx = 0.0f32;
+            let mut zy = 0.0f32;
+            for iter in 0..max_iter {
+                let (nzx, nzy) = crate::formula::eval_program(prog, zx, zy, cx, cy);
+                zx = nzx; zy = nzy;
+                let mod_sq = zx * zx + zy * zy;
+                if mod_sq > bailout_sq {
+                    let nu = (mod_sq.log2() * 0.5).log2();
+                    return (iter as f32 + 1.0 - nu).max(0.0);
+                }
+                if !zx.is_finite() || !zy.is_finite() { return iter as f32; }
+            }
+            max_iter as f32
+        }).collect();
+    }
+
     let fw = genome.formula_weights();
 
     // Try GPU first (batch API, but single-genome path).
