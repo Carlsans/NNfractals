@@ -13,3 +13,8 @@ evolution.log
 evolution.pid
 loop_state.json
 recursion_loop_state.json
+fractals_dag/
+populations2/
+evolution2.pid
+diversity_loop_state.json
+colormap_loop_state.json
