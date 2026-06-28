@@ -1,338 +1,600 @@
-# NNfractals — Principles & Design Reference
+# NNfractals — Complete Principles & Design Reference
 
 *Last updated: 2026-06-28. Audience: developers and AI agents resuming work on this codebase.*
 
----
-
-## What This Program Does
-
-NNfractals is a **genetic algorithm that autonomously evolves mathematical fractal formulas** and saves the most aesthetically beautiful results. It runs indefinitely as a background daemon, generating and scoring fractal images, keeping only those that pass aesthetic quality gates.
-
-The core loop: evolve formulas → render images → score aesthetics → save the beautiful ones → repeat.
+This document is the authoritative explanation of **every principle in action** in NNfractals — what each mechanism does, the exact numbers it uses, *why* it exists, and what was tried and rejected. It is written to be read end-to-end by a human or loaded as ground truth by an AI agent. Line references point into `src/`.
 
 ---
 
-## The Formula Representation
+## Table of Contents
 
-Every fractal is defined by a **sparse iterated map**:
+1. [What This Program Does](#1-what-this-program-does)
+2. [The Formula Representation](#2-the-formula-representation)
+3. [The 58 Basis Functions](#3-the-58-basis-functions)
+4. [Rendering: Escape-Time Iteration](#4-rendering-escape-time-iteration)
+5. [Colormaps and Why Turbo Won](#5-colormaps-and-why-turbo-won)
+6. [The Genetic Algorithm](#6-the-genetic-algorithm)
+7. [The Per-Generation Fitness Function](#7-the-per-generation-fitness-function)
+8. [The Aesthetic Scorer (CLIP + LAION)](#8-the-aesthetic-scorer-clip--laion)
+9. [The Save Gate](#9-the-save-gate)
+10. [Measured-at-Save Scores: Recursion & Self-Replication](#10-measured-at-save-scores-recursion--self-replication)
+11. [The Formula-Only Proxy Models](#11-the-formula-only-proxy-models)
+12. [Epoch Restart & Archive Seeding](#12-epoch-restart--archive-seeding)
+13. [Deduplication](#13-deduplication)
+14. [Dual Instances & The Daemon](#14-dual-instances--the-daemon)
+15. [Configuration Reference](#15-configuration-reference)
+16. [What Was Tried and Removed](#16-what-was-tried-and-removed)
+17. [File Map](#17-file-map)
+18. [Key Invariants](#18-key-invariants)
+19. [Operations Playbook](#19-operations-playbook)
+20. [What to Try Next](#20-what-to-try-next)
+
+---
+
+## 1. What This Program Does
+
+NNfractals is a **genetic algorithm that autonomously evolves mathematical fractal formulas** and saves only the most aesthetically beautiful results, judged by neural aesthetic models (CLIP + LAION). It runs indefinitely as a background daemon.
+
+The core loop, repeated every generation:
 
 ```
-z_new = Σ coeff_i · φ_basis_i(z, c)
+evolve formulas → render images on GPU → score complexity/novelty/aesthetics
+   → rank → save the beautiful ones → mutate/crossover the best → repeat
+```
+
+Two independent daemon instances run in parallel, both feeding a shared pool of saved fractals (`fractals/`). A periodic dedup pass keeps the pool free of near-duplicates.
+
+The program is **fully self-contained and unsupervised** once started: it warm-starts from previously saved fractals, evolves continuously, and self-prunes. Human/agent intervention is limited to tuning weights and retraining the proxy models.
+
+---
+
+## 2. The Formula Representation
+
+Every fractal is defined by a **sparse iterated complex map**:
+
+```
+z₀ = 0
+z_{n+1} = Σ_i coeff_i · φ_{basis_i}(z_n, c)
 ```
 
 where:
-- `z` is the current complex iterate, `c` is the parameter point
-- `φ_basis_i` is one of **58 holomorphic basis functions** (powers, trig, exp, rational, etc.)
-- Each genome carries **2–8 terms**, each term = `(basis_index, re, im)` — a complex coefficient on one basis function
-- The genome is **sparse**: most of the 58 bases are absent; only a handful drive each fractal's character
+- `z` is the current complex iterate, `c` is the per-pixel parameter (the complex-plane coordinate of that pixel)
+- `φ_{basis_i}` is one of **58 holomorphic basis functions** (`src/formula.rs`)
+- `coeff_i = re + i·im` is a complex coefficient
+- A genome carries **2 to 8 terms** (`MIN_TERMS=2`, `MAX_TERMS=8` in `src/genome.rs:7-8`), each `(basis_index, re, im)`
 
-The 58 bases include: `z`, `z²`, `z³`, `z⁴`, `c`, `zc`, `z²c`, `1/(z²+c)`, `sin(z)`, `cos(z)`, `tan(z)`, `exp(z)`, `(z²−1)/(z²+1)`, `cosh`, `sinh`, `log(z)`, and ~40 more holomorphic combinations.
+The genome is **sparse**: of 58 possible bases, only 2–8 are active in any fractal. Terms sharing a basis are summed when expanded to the dense weight vector (`Genome::formula_weights()`, `src/genome.rs:130`).
 
-**Why sparse?** Dense weight vectors would make all fractals similar. Sparse evolution naturally produces different formula families (Mandelbrot-variants, Julia-like sets, rational maps, etc.) that look visually distinct.
+### Genome Struct (`src/genome.rs:46-86`)
+
+| Field | Type | Meaning |
+|-------|------|---------|
+| `terms` | `Vec<FormulaTerm>` | The sparse formula (2–8 terms) |
+| `fitness` | f32 | GA selection score (composite, recomputed each gen) |
+| `beauty` | f32 | Stored final score at save (LAION/10 or fallback) |
+| `beauty_boundary/edge/entropy/self_sim/cool_zone` | f32 | 5-component beauty breakdown |
+| `clip_score` | f32 [0,1] | CLIP aesthetic, measured at save |
+| `laion_score` | f32 [0,10] | LAION aesthetic, measured at save |
+| `self_replication` | f32 [0,1] | Zoom self-similarity, measured at save |
+| `fractal_recursion` | f32 [0,1] | Embedded baby-copies, measured at save |
+| `pred_recursion` | f32 [0,1] | Formula-predicted recursion, every gen |
+| `pred_clip` | f32 [0,1] | Formula-predicted CLIP, every gen |
+| `formula_diversity` | f32 | k-NN distance in basis-space, every gen |
+| `id` | u64 | Random unique id (hex filename) |
+| `view_cx/cy/zoom` | f32 | Per-genome viewport (center + zoom) |
+
+**Why sparse direct evolution?** An earlier architecture used a transformer with a latent code and backpropagation. It fought the GA and drove elites toward noise (see §16). Direct sparse evolution naturally produces *distinct formula families* — Mandelbrot variants, Julia-like sets, rational maps, transcendental maps — because different basis combinations yield visually different fractals.
+
+### Per-Genome Viewport (`src/genome.rs:91-94`)
+
+Each genome carries its own view window: `view_bounds()` returns `(cx − 2/zoom, cx + 2/zoom, cy − 2/zoom, cy + 2/zoom)`. So `zoom=1` shows the standard `[-2,2]²` window; higher zoom shows a tighter region. View params are evolved (mutated/crossed) alongside the formula. The `[rendering] view_*` fields in config.toml apply only to the standalone viewer/CLI render, not the GA.
 
 ---
 
-## Genetic Algorithm Structure
+## 3. The 58 Basis Functions
+
+Full list from `basis_name()` (`src/formula.rs:227-248`). These are the holomorphic (and a few non-holomorphic, e.g. conjugate / burning-ship) building blocks the GA composes:
+
+| Idx | φ | Idx | φ | Idx | φ | Idx | φ |
+|-----|-----|-----|-----|-----|-----|-----|-----|
+| 0 | z² | 15 | (z+c)² | 30 | tan | 45 | Re+\|Im\| |
+| 1 | z³ | 16 | (z−c)² | 31 | sinh | 46 | \|BS\| (burning-ship) |
+| 2 | z⁴ | 17 | (zc)² | 32 | cosh | 47 | conj |
+| 3 | z⁵ | 18 | sin | 33 | tanh | 48 | conj² |
+| 4 | z | 19 | cos | 34 | exp | 49 | z\|z\| |
+| 5 | 1/z | 20 | sin(π) | 35 | exp(−z) | 50 | z/\|z\| |
+| 6 | 1/z² | 21 | cos(π) | 36 | exp(zc) | 51 | z/(z²+1) |
+| 7 | c | 22 | sin(z²) | 37 | z·exp | 52 | (z²−1)/(z²+1) |
+| 8 | c² | 23 | cos(z²) | 38 | exp·c | 53 | z²/(z−1) |
+| 9 | c³ | 24 | sin(z+c) | 39 | log(z+1) | 54 | 1/(z²+c) |
+| 10 | zc | 25 | cos(z+c) | 40 | log(z²+1) | 55 | z²c/(z+c) |
+| 11 | z²c | 26 | sin(zc) | 41 | z·log | 56 | 1 (constant) |
+| 12 | zc² | 27 | cos(zc) | 42 | sin(1/z) | 57 | i (constant) |
+| 13 | z²c² | 28 | z·sin | 43 | exp(1/z) | | |
+| 14 | c/z | 29 | z·cos | 44 | \|Re\|+Im | | |
+
+**Basis index 7 (`c`) and indices 0–3 (`z²…z⁵`) are special**: their interaction `f[7]·(f[0]+f[1]+f[2]+f[3])` is feature 61 in the recursion predictor — a Mandelbrot-like map needs both a `c` term and a `z`-power term to produce self-replication (see §11).
+
+### Exotic Bases (`src/genome.rs:31-41`)
+
+A curated subset proven to score well on CLIP, force-injected during restarts:
+```
+EXOTIC = [0:z², 18:sin, 30:tan, 46:|BS|, 51:z/(z²+1), 52:(z²−1)/(z²+1), 54:1/(z²+c)]
+```
+The current record genome (CLIP 0.5294) used `[cosh, (z²−1)/(z²+1), |BS|, (z²−1)/(z²+1), (z−c)²]` — the burning-ship absolute-value basis is load-bearing for top scores.
+
+---
+
+## 4. Rendering: Escape-Time Iteration
+
+**Implementation:** `render_cpu_iter()` (`src/fractal.rs:67`), GPU path in `src/render_gpu.rs`.
+
+For each pixel, `c` = its complex coordinate, `z` starts at 0. Iterate `z ← Σ coeff·φ(z,c)` up to `max_iter` times. If `|z|² > bailout²` (bailout=4.0 → bailout²=16), the pixel "escapes". The escape time uses **smooth (continuous) coloring**:
+
+```
+escape_time = iter + 1 − log₂(log₂|z|)     (src/fractal.rs:99-101)
+```
+
+This fractional value eliminates the banding that integer iteration counts produce, giving smooth gradients essential for the aesthetic scorers. If `z` goes non-finite, the raw iteration count is returned. Pixels that never escape return `max_iter` (interior points).
+
+**Two resolutions:**
+- **Eval** (64×64, `eval_max_iter=128`): fast, used every generation for fitness — 4096 pixels/genome × 40 genomes/gen
+- **Full** (512×512, `max_iter=192`): used only when saving a genome — richer detail in the final PNG
+
+**GPU batching:** All 40 genomes per generation are rendered in a single GPU dispatch via wgpu/Vulkan (`evaluate_fitness_batch`). If no GPU, Rayon parallelizes CPU rendering across all cores. The same `apply_formula` math runs in both the WGSL shader and the Rust CPU path — they must stay in sync.
+
+---
+
+## 5. Colormaps and Why Turbo Won
+
+**Implementation:** `apply_colormap()` (`src/colormap.rs:3`). Escape time is normalized to `[0,1]` via `t/max_iter`, then mapped to RGB.
+
+Available colormaps: built-in gradients (turbo, viridis, plasma, magma, inferno via the `colorous` crate) plus 9 hand-written ones (earth, bone, neon, lava, aurora, galaxy, sunset, arctic, ember).
+
+### The Colormap Experiment (4h, 13 colormaps, 30-min windows)
+
+**Turbo dominated decisively:**
+
+| Colormap | Saves/window | CLIP mean | LAION mean |
+|----------|-------------|-----------|------------|
+| **turbo** | **382** | **0.5227** | **5.332** |
+| lava | 8 | 0.5189 | 5.301 |
+| arctic | 4 | 0.5131 | 5.299 |
+| neon | 9 | 0.5085 | 5.265 |
+| aurora | 2 | 0.5018 | 5.247 |
+| ember | 2 | 0.5040 | 5.244 |
+| sunset | 1 | 0.4961 | 5.204 |
+| earth | 3 | 0.4875 | 5.170 |
+| galaxy | 2 | 0.4839 | 5.156 |
+
+**Why turbo wins:** Turbo maps low escape times (the majority of pixels in most fractals) to **blue/cyan**. CLIP ViT-L/14 was trained on photographs and associates cool blue tones with high-quality imagery (ocean, sky, professional photography). Warm palettes (lava, sunset, ember) read as "graphic art" and drop CLIP below the 0.520 save threshold. All 9 custom colormaps failed below 0.520. **Turbo is now permanently fixed in config.** Chart: `colormap_scores.png`.
+
+This is also why `beauty_score`'s "cool-zone" component (`src/fitness.rs:351-359`) rewards pixels in the 5–40% escape band — that band is blue/cyan under turbo.
+
+---
+
+## 6. The Genetic Algorithm
+
+**Implementation:** `Optimizer` (`src/optimizer.rs`).
 
 ### Population
-- 40 individuals, evolved in discrete generations
-- **Elitism**: top 6 by fitness survive unchanged each generation
-- **Mutation**: 20% per-coefficient perturbation probability, scale 0.08 (small steps in coefficient space)
-- **Crossover**: mix of basis terms from two parents + re-centering
-- **Epoch restart**: after 30 stagnant generations (fitness not improving by >0.005), restart the population with archive seeds + fresh randoms
+- **40 individuals**, evolved in discrete generations (`population_size=40`)
+- Each generation: evaluate all 40 → rank by fitness → attempt saves → evolve
 
-### Epoch Restart Seeding
-When an epoch stagnates, the new population is seeded from:
-1. **6 archive seeds** — ranked by `2·clip_score + 0.15·(laion/10) + 0.20·self_replication + 0.20·fractal_recursion`. Aesthetic quality (CLIP) is weighted 2× to bias restarts toward the most beautiful formula families.
-2. **8 random injections**: 8 "exotic" genomes forced to use rare basis functions (z², sin, tan, abs, 1/(z²+1), (z²−1)/(z²+1)), promoting exploration.
-3. **Remainder**: mutations of the seeds.
+### Selection & Reproduction (`evolve()`, `src/optimizer.rs:547`)
 
-**Why aesthetic-first seeding?** Early epochs used recursion-heavy seeding. Beautiful-but-non-recursive genomes were deprioritized. Doubling the CLIP weight ensures restarts start from genuinely beautiful ancestors, not just technically impressive ones.
+1. **Formula-diverse elitism**: instead of taking the top-6 by raw fitness, take one representative per *unique formula signature* (top-2 basis label, `formula_ops_label()`). This prevents the elite pool from collapsing into 6 near-identical formulas. Fills to `elitism_count=6` with remaining best if fewer than 6 unique types exist.
+2. **Continuous random injection**: 3 fresh random genomes every generation (`N_RANDOM_PER_GEN=3`). This sustained trickle — not just the restart bursts — is what broke the historical CLIP plateau (best rose past 0.50).
+3. **Crossover + mutation**: fill the rest of the population. 50% chance of crossover between two *different-formula* elites then mutate; 50% chance of pure mutation of one elite.
+
+### Crossover (`Genome::crossover`, `src/genome.rs:194`)
+Union of both parents' terms, each kept with probability 0.5, clamped to `[2,8]` terms. View = average of centers, **geometric mean** of zooms (`sqrt(zoom_a · zoom_b)`).
+
+### Mutation (`Genome::mutate`, `src/genome.rs:218`)
+- **Coefficient perturbation**: each term's `re`/`im` perturbed by ±`mutation_scale` (0.08) with probability `mutation_rate` (0.20)
+- **Basis swap**: each term swaps to a random basis with probability `BASIS_SWAP_PROB=0.18`
+- **Term grow/shrink**: add a random term (prob `TERM_ADD_PROB=0.20`, if < 8 terms); drop a random term (prob `TERM_DROP_PROB=0.15`, if > 2 terms)
+- **View mutation**: 30% chance to multiply zoom by a delta (mostly zoom-in, clamped `[0.5, 25]`); 30% chance to pan (clamped `[-2.5, 2.5]`)
+
+### Best-Ever Tracking & Stagnation (`src/optimizer.rs:237-247`)
+The single best genome by **raw beauty** (re-evaluated without novelty inflation) is tracked. If it doesn't improve by > 0.005 for `restart_after_gens=30` generations, an epoch restart fires (see §12).
 
 ---
 
-## Fitness Function (per generation)
+## 7. The Per-Generation Fitness Function
 
-Every generation, all 40 genomes are evaluated and ranked by:
+This is the heart of the system. Every generation, all 40 genomes get a composite fitness (`src/optimizer.rs:225-226`):
 
 ```
 fitness = multiscale_entropy
-        + 0.45 · visual_novelty
-        + 0.80 · pred_recursion
-        + 0.30 · formula_diversity
-        + 0.50 · pred_clip
+        + 0.45 · visual_novelty       (novelty_weight)
+        + 0.80 · pred_recursion       (recursion_pred_weight)
+        + 0.30 · formula_diversity    (formula_diversity_weight)
+        + 0.50 · pred_clip            (clip_pred_weight)
 ```
 
-Each term explained below.
+The five terms operate in **different spaces** — image complexity, rendering-behavior space, formula-structure space, and learned-aesthetic space — so they don't redundantly reward the same thing.
 
-### 1. Multiscale Entropy (primary — unlabeled weight = 1.0)
+### Term 1 — Multiscale Entropy (implicit weight 1.0)
 
-**What:** Geometric mean of PNG compression entropy at two scales:
-- **Fine** (64×64): `compressed_size / raw_size` of the colormap-rendered eval image
-- **Coarse** (16×16 average-pool of the 64×64): same metric after 4× spatial downsampling
+**`multiscale_entropy()` (`src/fitness.rs:90`).** The primary complexity signal. Geometric mean of PNG-compression entropy at two scales:
 
-**Formula:** `sqrt(fine_entropy × coarse_entropy)`
+- **Fine** (64×64): `png_compression_entropy()` = `compressed_PNG_bytes / raw_bytes`. Higher = harder to compress = more structural detail. (~0.3 boring, ~0.9+ rich.)
+- **Coarse** (16×16): the 64×64 escape field 4×-average-pooled (`FACTOR=4`), then the same PNG metric.
 
-**Why geometric mean, not just fine entropy?** Pure fine-scale entropy rewards salt-and-pepper noise (noise compresses poorly → high entropy → high score). Noise averages to near-uniform at coarse scale (coarse entropy → 0). Structured fractals with genuine detail stay complex at both scales. The geometric mean collapses when either scale is uninformative — punishing noise while rewarding structure.
+```
+multiscale_entropy = sqrt(fine_entropy × coarse_entropy)
+```
 
-**Implementation:** `src/fitness.rs: multiscale_entropy()`
+**Why geometric mean of two scales?** This is the **anti-noise mechanism**. Pure fine-scale entropy rewards salt-and-pepper noise just as much as genuine structure (noise compresses poorly → high entropy). But noise averages to near-uniform when downsampled 4× → coarse entropy collapses toward 0 → the geometric mean collapses. A genuinely structured fractal stays complex at *both* scales, so the product stays high. This single change is what stops the GA from drifting toward granular noise.
 
-### 2. Visual Novelty (weight 0.45)
+### Term 2 — Visual Novelty (weight 0.45)
 
-**What:** Average L2 distance to the k=5 nearest neighbors in a 32-bin escape-time histogram space.
+**`novelty_score()` over `behavior_descriptor()` (`src/fitness.rs:143,157`).** Each genome's escape times are binned into a **32-bin normalized histogram** (its "behavioral descriptor" — the distribution of escape depths). Novelty = average L2 distance to the **k=5 nearest neighbors** in a rolling archive of the 150 most recently evaluated descriptors (`archive_size=150`, `novelty_k=5`).
 
-**How:** Each genome's escape-time distribution (how many pixels escape at each iteration depth) forms a 32-bin histogram — its behavioral descriptor. Novelty = mean distance to the 5 most similar already-seen genomes in this descriptor space.
+**Why:** Without novelty pressure the GA converges to one visual family. Novelty rewards genomes whose escape-time *behavior* differs from what's been seen recently — pushing exploration of distinct fractal appearances (spirals, webs, bubbles, dendrites).
 
-**Archive:** Rolling window of 150 most recently evaluated descriptors.
+The archive is **primed on init** with the starting population's own descriptors (`src/optimizer.rs:81-95`) to avoid a generation-1 novelty spike (empty archive → everything scores ≈1.0).
 
-**Why:** Without novelty pressure, the GA converges to one formula family. Novelty forces exploration of visually distinct fractal types (spirals, web-like, bubble-like, recursive, etc.).
+### Term 3 — Predicted Recursion (weight 0.80, the largest)
 
-**Implementation:** `src/fitness.rs: behavior_descriptor()`, `novelty_score()`
+**Linear model `recursion_model.json` via `RecursionModel::predict()` (`src/recursion_model.rs:33`).** A formula-only estimate of `fractal_recursion` (how strongly the set contains embedded baby-copies of itself). Computed in microseconds from formula structure — no rendering. See §11 for the model. Largest weight because recursion (baby-Mandelbrots) is the single most prized visual property.
 
-### 3. Predicted Recursion (weight 0.80)
+### Term 4 — Formula Diversity (weight 0.30)
 
-**What:** A formula-only linear predictor of how strongly the fractal contains embedded miniature copies of the whole set (baby-Mandelbrots / fractal recursion).
+**`novelty_score()` over `formula_basis_normalized()` (`src/genome.rs:99`).** Same k-NN novelty mechanism as Term 2, but in **formula-structure space** instead of rendering space. Each genome maps to a 58-dim vector where element `i` = Σ|coeff| on basis `i`, L2-normalized (direction-sensitive: *which* bases dominate, not how large the coefficients are). Novelty = avg L2 distance to k=5 nearest in a rolling 150-entry formula archive.
 
-**How:** Ridge regression (`recursion_model.json`) trained on 2088 saved genomes with measured `fractal_recursion` scores. Feature vector (61-dim):
-- `f[0..58]`: Σ |coeff| for each basis (how strongly each basis drives the formula)
+**Why separate from visual novelty?** Two formulas with different basis mixes can render to similar escape-time histograms (Term 2 wouldn't distinguish them), and vice versa. Term 4 explicitly rewards genuinely different *formula families*, preventing the population from converging on one basis combination even if it explores view/coefficient variations.
+
+**Validated by a 3×2h tuning loop:** formula diversity rose 0.70 → 0.80 → 0.87 across iterations with 96–97% unique formula signatures per window, while LAION held ~5.31. Weight 0.30 was stable throughout — no auto-tuning needed.
+
+### Term 5 — Predicted CLIP (weight 0.50)
+
+**Linear model `clip_model.json`, same `RecursionModel` struct.** A formula-only estimate of the CLIP aesthetic score. This is the **aesthetic feedback loop**: before this term, CLIP/LAION were only a binary save gate, so the GA had no aesthetic signal in its fitness and scores were stationary. Term 5 lets the GA actively steer toward formula families that historically produce CLIP-beautiful images. See §11.
+
+---
+
+## 8. The Aesthetic Scorer (CLIP + LAION)
+
+**Rust side:** `AestheticScorer` (`src/aesthetic.rs`). **Python side:** `aesthetic_scorer.py`.
+
+A persistent Python sidecar process is spawned once at startup. It loads two models (~30–60s on first run) then prints `READY`. The Rust side communicates over stdin/stdout: send one image file path per line, receive `"clip_score laion_score"` back.
+
+### CLIP Zero-Shot Score → [0,1] (`aesthetic_scorer.py:96-99`)
+
+CLIP **ViT-L/14** encodes the image. The score is a contrast between two prompt sets:
+```
+clip_score = (good_similarity − bad_similarity + 1.0) / 2.0
+```
+- **GOOD prompts**: "a beautiful fractal with intricate self-similar patterns", "stunning abstract fractal art with vibrant colors and rich detail", "award-winning generative art with deep fractal complexity", etc.
+- **BAD prompts**: "a boring uniform black image", "an ugly noisy pattern with no structure", "a degenerate fractal that looks like random noise", etc.
+
+So CLIP measures: *does this look more like beautiful fractal art than like noise/emptiness, per a vision-language model trained on millions of captioned images?*
+
+### LAION Aesthetic Score → [0,10] (`aesthetic_scorer.py:42-58`)
+
+An MLP head (768→1024→128→64→16→1) trained on human aesthetic ratings (the `sac+logos+ava1-l14-linearMSE` LAION aesthetic predictor), fed the normalized CLIP ViT-L/14 embedding. This is a direct learned predictor of *human-rated visual appeal*, sharing CLIP's image embedding so both scores come from one encode.
+
+**Cost:** ~0.5–2s/image on GPU, with a 15s blocking timeout. Far too slow to run on all 40 genomes/generation — hence it's used only at the save gate (a handful of candidates per generation) and as an occasional async "probe" every 3 generations for the live display.
+
+---
+
+## 9. The Save Gate
+
+**`try_save()` (`src/optimizer.rs:446`).** A genome is persisted (`{id}.png` + `{id}.nn`) only after clearing four stages, in increasing cost order. Each generation, candidates are tried in descending raw-PNG-entropy order until `elitism_count=6` *real* attempts are spent ("exists" hits are free).
+
+### Stage 1 — PNG Entropy Prefilter (fast, Rust) — `src/optimizer.rs:454-469`
+- `is_degenerate()` rejects if > 95% of pixels share an escape time
+- `min_entropy_prefilter=0.38 ≤ raw_fine_PNG_entropy ≤ max_entropy_prefilter=0.70`
+- Below 0.38 → "low_png" (too uniform/boring); above 0.70 → "noise" (salt-and-pepper)
+- **Note:** this uses **raw fine-scale** entropy, *not* multiscale. Multiscale is for selection ranking; the raw band is the save filter.
+
+### Stage 2 — Diversity Gate (fast, Rust) — `src/optimizer.rs:471-476`
+Min L2 distance from this genome's behavioral descriptor to **all** previously saved descriptors must be ≥ `min_save_distance=0.05`. Else "low_diversity". The 300 most-recent save descriptors persist across epoch restarts so the same view isn't re-saved each epoch.
+
+### Stage 3 — Best-View Search (fast, Rust) — `best_entropy_view()` (`src/fractal.rs:43-65`)
+Before the expensive full render, search a **3×3 grid of view offsets** (±`0.30/zoom` pan in each axis, 9 candidates) at 64×64, scoring each by multiscale entropy. Render the *winning* view at full 512×512 for CLIP. **The genome's stored view params are unchanged** — only the render uses the optimized composition. This recovers CLIP that would be lost because the GA evolves view params for fitness, not for CLIP framing.
+
+### Stage 4 — Aesthetic OR Gate (expensive, Python) — `src/optimizer.rs:503-512`
+Render 512×512 → save temp PNG → CLIP+LAION score. Pass if:
+```
+clip_score ≥ 0.522   OR   laion_score ≥ 5.30
+```
+
+**Why OR, not AND?** OR privileges fractals that are **excellent on at least one** aesthetic axis. A fractal with CLIP 0.525 but mediocre LAION 5.22 saves (CLIP excels); one with CLIP 0.515 but LAION 5.35 also saves (LAION excels). The previous AND gate blocked both. (History: AND at 0.520/5.30 was the long-standing default; a brief relaxed-AND experiment at 0.512/5.20 over-saturated the pool with ~1000 saves/2h; the OR gate at 0.522/5.30 is the current best balance of quality and throughput.)
+
+If the scorer is unavailable, fall back to Rust `beauty_score ≥ min_beauty=0.35`.
+
+### After Passing
+The permanent PNG is written, then the genome's `self_replication` and `fractal_recursion` are measured (§10) and stored in the `.nn` JSON along with all scores. Stored `beauty`/`fitness` = `laion_score/10`.
+
+---
+
+## 10. Measured-at-Save Scores: Recursion & Self-Replication
+
+These two render-based measurements are too expensive for the per-generation loop, so they're computed only for the handful of genomes that pass the save gate. They travel with the `.nn` file and feed archive seed ranking (§12) and proxy-model training (§11).
+
+### Self-Replication Score (`self_replication_score`, `src/fractal.rs:278`)
+
+*"Does the fractal keep reproducing rich structure as you zoom into its boundary?"* — the defining Mandelbrot property.
+
+Method (5 zoom levels, 5× each → ~625× total depth, 96×96 each):
+1. Render the base view; record edge density and a 32×32 contrast-normalized (z-scored) **structure vector**
+2. Re-center on the **richest boundary point** (highest-gradient pixel in central 70%) and zoom in 5×; repeat
+3. **Persistence** = average retained edge density at each deeper level vs base (does structure survive zoom or smooth away?)
+4. **Self-similarity** = mean positive correlation between consecutive levels' structure vectors
+5. Score = `0.65·persistence + 0.35·self_similarity`, clamped [0,1]
+
+Z-scoring the structure vector makes it invariant to the escape-time offset that rises with zoom depth — what survives is the *shape*. A smooth/degenerate map collapses to ≈0; a true fractal approaches 1.
+
+### Fractal Recursion Score (`fractal_recursion_score`, ~`src/fractal.rs:396+`)
+
+*"Does a complete miniature copy of the whole set (a baby-Mandelbrot) appear embedded inside it?"* — distinct from self-replication (which is boundary-detail persistence).
+
+Method: grid the frame, rank cells by `local_edge_density · (1 + 2·island_bonus)` where the island bonus rewards a cell holding *some but not all* interior (a contained body wrapped in boundary). Descend into top candidate cells and **template-match** the local structure against the whole-set template across all **8 dihedral orientations** (`dihedral_variants`, `src/fractal.rs:350`) — so rotated/mirrored copies still match. Gated by `field_intricacy()` (density of gradient sign-flips along scanlines) to reject smooth radial ramps and require genuine non-monotone structure. (Pure noise also scores high on intricacy but fails the copy-match, so the two together single out true recursion.)
+
+---
+
+## 11. The Formula-Only Proxy Models
+
+Both `pred_recursion` and `pred_clip` use the **identical** `RecursionModel` struct (`src/recursion_model.rs`) and the **identical** 61-dim feature vector — only the training target differs. This is a deliberate reuse: the linear model is generic, "RecursionModel" is just the historical name.
+
+### The Feature Vector (`recursion_features()`, `src/genome.rs:116`)
+
+61 dimensions, which **must stay byte-for-byte aligned** with the `features()` function in both Python training scripts:
+- `f[0..58)`: Σ|coeff| per basis (which bases drive the formula, and how hard)
 - `f[58]`: number of terms
-- `f[59]`: total coefficient magnitude
-- `f[60]`: `basis7 × (basis0 + basis1 + basis2 + basis3)` — a c×z-power interaction term that correlates with Mandelbrot-like self-similarity
+- `f[59]`: total |coeff| across all terms
+- `f[60]`: `f[7] · (f[0]+f[1]+f[2]+f[3])` = `c × z-power` interaction (a Mandelbrot-like map needs both `c` and a z-power present)
 
-**Why formula-only?** Rendering 40 genomes per generation to measure true recursion would be slow. The linear predictor approximates it from formula structure in microseconds. Cross-validated Pearson r ≈ 0.51 — weak individually, but meaningful as a population-level bias.
+### The Model (`RecursionModel::predict`, `src/recursion_model.rs:33`)
 
-**Measured at save time:** The actual `fractal_recursion` score (template-matching with dihedral variants + boundary descent) is only computed for genomes that pass the save gate. This label is what the predictor was trained on.
-
-**Implementation:** `src/recursion_model.rs`, `src/genome.rs: recursion_features()`, `scripts/fit_recursion_model.py`
-
-### 4. Formula Diversity (weight 0.30)
-
-**What:** Average L2 distance to k=5 nearest neighbors in a **normalized 58-dim basis-weight space** — same k-NN novelty mechanism as visual novelty, but in formula structure space rather than rendering space.
-
-**How:** Each genome's formula is projected to a 58-dim vector where each element = Σ|coeff| on that basis, then L2-normalized. This captures which basis functions dominate the formula (direction-sensitive, not scale-sensitive).
-
-**Archive:** Rolling window of 150 most recently evaluated formula vectors.
-
-**Why a separate diversity metric from visual novelty?** Visual novelty operates in rendering space (escape-time histograms). Two formulas that render to different escape-time statistics could still be structurally similar (same basis mix, different coefficients). Formula diversity rewards genuinely different formula families.
-
-**Result of 3×2h diversity loop:** Formula diversity improved from 0.70 → 0.87 across iterations, with 96–97% unique formula signatures in each window. Weight 0.30 was stable throughout.
-
-**Implementation:** `src/genome.rs: formula_basis_normalized()`, `src/optimizer.rs`
-
-### 5. Predicted CLIP Score (weight 0.50)
-
-**What:** A formula-only linear predictor of the CLIP aesthetic score, trained on the 3000+ saved archive genomes.
-
-**How:** Same infrastructure as pred_recursion (`clip_model.json`, same Ridge regression, same 61-dim feature vector). Trained with stronger regularization (λ=10 vs λ=5) because CLIP scores vary in a narrow band [0.47, 0.53] — harder to predict than recursion [0, 1].
-
-**Cross-validated Pearson r ≈ 0.45** — the formula partially predicts CLIP quality. The GA uses this to steer toward formula families that historically produce beautiful images.
-
-**Why add this?** CLIP and LAION scores were stationary — the GA had no aesthetic signal in its fitness function. These were only a binary save gate. Adding pred_clip closes the loop: the GA now actively selects for formula families that CLIP prefers.
-
-**Implementation:** `src/recursion_model.rs` (same struct), `scripts/fit_clip_model.py`
-
----
-
-## GPU Evaluation
-
-All 40 genomes per generation are batch-rendered on the GPU (Vulkan via wgpu) at 64×64 resolution in a single dispatch. The GPU shader evaluates the iterated map `z_new = Σ coeff_i · φ_i(z, c)` for every pixel simultaneously.
-
-**Fallback:** If GPU is unavailable, Rayon parallelizes CPU rendering across threads.
-
-**Implementation:** `src/render_gpu.rs`, `src/fractal.rs: evaluate_fitness_batch()`
-
----
-
-## Save Gate (what gets saved)
-
-A genome is saved as a PNG + JSON file only if it passes all stages:
-
-### Stage 1 — PNG Entropy Prefilter (fast, Rust)
+Standardized linear regression:
 ```
-min_entropy_prefilter = 0.38  ≤  raw_fine_png_entropy  ≤  max_entropy_prefilter = 0.70
+predict(feats) = clamp( bias + Σ_i weight_i · (feats_i − mean_i) / std_i , 0, 1)
 ```
-Rejects boring uniform fractals (below 0.38) and salt-and-pepper noise (above 0.70). Note: this uses **raw fine-scale** entropy, not multiscale — the noise rejection at coarse scale is for selection fitness, not save filtering.
+Trained offline by Ridge regression with 5-fold cross-validation. If `clip_model.json` / `recursion_model.json` is missing or malformed, `load()` returns `None` and that fitness term silently becomes 0 (criterion inert) — the GA still runs.
 
-### Stage 2 — Diversity Gate (fast, Rust)
-Minimum L2 distance to all previously saved behavioral descriptors: `min_save_distance = 0.05`. Prevents saving near-duplicate fractals within a run. Dedup (every 2h) handles the rest.
+### Current Trained Models
 
-### Stage 3 — Best-View Search (fast, Rust)
-Before rendering the full 512×512 image, the save candidate undergoes a **3×3 view search**: 9 candidate views (±15%/zoom offset in both axes) are rendered at 64×64 and scored by multiscale entropy. The view with the highest score is used for the full render and CLIP scoring.
+| Model | Script | Target | n | cv_pearson | λ | Weight |
+|-------|--------|--------|---|-----------|---|--------|
+| `recursion_model.json` | `fit_recursion_model.py` | `fractal_recursion` [0,1] | 2088 | 0.513 | 5.0 | 0.80 |
+| `clip_model.json` | `fit_clip_model.py` | `clip_score` [0,1] | 2985 | 0.452 | 10.0 | 0.50 |
 
-**Why:** The GA evolves view params (view_cx, view_cy, view_zoom) to maximize fitness, not CLIP composition. This search finds the locally best composition before the expensive CLIP call. The genome's own view params are unchanged — only the render changes.
+CLIP uses stronger regularization (λ=10) because its target range is narrow ([0.47, 0.53]) and easy to overfit. cv_pearson ≈ 0.45 is a weak *individual* predictor but a meaningful *population-level* bias — exactly how the recursion predictor (0.51) proved effective. Both should be retrained as the archive grows (see §19).
 
-**Implementation:** `src/fractal.rs: best_entropy_view()`
-
-### Stage 4 — Full Render + Aesthetic Scoring (expensive, Python sidecar)
-The 512×512 image is rendered, saved to a temp file, and scored by a persistent Python sidecar process (`aesthetic_scorer.py`) that runs:
-- **CLIP ViT-L/14**: zero-shot aesthetic classification → `clip_score ∈ [0, 1]`
-- **LAION MLP**: trained on human aesthetic ratings, fed CLIP embeddings → `laion_score ∈ [0, 10]`
-
-### Stage 4 — OR Gate
-```
-passes = clip_score ≥ 0.522  OR  laion_score ≥ 5.30
-```
-A fractal saves if it is excellent on **either** metric. This privileges:
-- Fractals with strong CLIP aesthetics (cool-blue, structured, photographic quality)
-- Fractals with strong LAION ratings (human-preferred aesthetics, sometimes warmer)
-
-Previously AND logic — changed to OR so high-LAION fractals aren't blocked by borderline CLIP, and vice versa.
+**Why formula-only?** Rendering + CLIP-scoring all 40 genomes/gen would be ~40× slower. The linear model approximates the expensive label from formula structure alone in microseconds, so the bias can be applied every generation to every genome.
 
 ---
 
-## Colormap: Turbo (Fixed)
+## 12. Epoch Restart & Archive Seeding
 
-After a 4-hour experiment cycling through 13 colormaps (30-min windows each), **turbo** was decisive:
+### Warm-Start at Launch (`Optimizer::new`, `src/optimizer.rs:40`)
+On startup, load up to **12 archive seeds** (best saved genomes) + 8 fresh randoms, fill the rest with seed mutations. So a fresh process resumes from the best prior fractals, not from scratch.
 
-| Colormap | Saves (90 min) | CLIP mean |
-|----------|---------------|-----------|
-| **turbo** | **382** | **0.5227** |
-| lava | 8 | 0.5189 |
-| neon | 9 | 0.5085 |
-| aurora | 2 | 0.5018 |
-| galaxy | 2 | 0.4839 |
+### Stagnation Restart (`restart_population`, `src/optimizer.rs:378`)
+After `restart_after_gens=30` generations without best-ever improvement:
+1. Force-save the current best-ever if not already saved
+2. Reload **6 archive seeds** (fewer than warm-start — keep top genomes in play without over-constraining)
+3. Inject **18 random genomes**, of which the first **8 are "exotic"** (forced to use a proven-good rare basis from the EXOTIC set)
+4. Fill the rest with seed mutations
+5. Retain the 300 most-recent save descriptors so the diversity gate keeps blocking already-saved regions
 
-**Why turbo wins with CLIP:** Turbo maps low escape times (most of the image) to blue/cyan. CLIP ViT-L/14 — trained on photographic images — associates cool blues with high-quality imagery (ocean, sky). Warm palettes (lava, sunset) drop CLIP below 0.520 because they look more like graphic art than photographic subjects.
-
-All 6 custom colormaps (lava, aurora, galaxy, sunset, arctic, ember) were also tested and all failed below 0.520 CLIP.
-
----
-
-## Deduplication
-
-Every 2 hours, `scripts/dedup.py` runs automatically and removes near-duplicate fractals from `fractals/`. Similarity is measured as a geometric mean of DCT-based similarity at 3 scales (16×16, 32×32, 64×64 grayscale). Pairs with similarity ≥ 0.97 are deduplicated (weaker-LAION copy deleted).
-
-This allows a **relaxed save gate** (min_save_distance=0.05 instead of 0.08) while keeping the pool clean.
+### Archive Seed Ranking (`load_archive_seeds`, `src/optimizer.rs:144`)
+Seeds are ranked by an **aesthetic-first** score:
+```
+seed_score = 2.0·clip_score + 0.15·(laion/10) + 0.20·self_replication + 0.20·fractal_recursion
+```
+(Falls back to `beauty` if `clip_score` is 0.) **CLIP is weighted 2×** so epoch restarts inherit the most aesthetically successful ancestors. The earlier formula (`clip + 0.35·self_rep + 0.35·fractal_rec`) let recursion dominate and deprioritized beautiful-but-non-recursive genomes — changed to fix exactly that.
 
 ---
 
-## Two Parallel Instances
+## 13. Deduplication
 
-Two evolution daemons run simultaneously, managed by `scripts/evo_daemon.sh`:
+**`scripts/dedup.py`**, auto-triggered every `interval_hours=2.0` from within the evolution process (`spawn_dedup_cleaner` in `src/main.rs`). Similarity = geometric mean of DCT-based perceptual similarity at three scales (16×16, 32×32, 64×64 grayscale). Pairs above `similarity_threshold=0.97` are deduplicated (the weaker-LAION copy is deleted).
 
-| Instance | Config | Population dir |
-|----------|--------|---------------|
-| 1 | `config.toml` | `populations/` |
-| 2 | `config2.toml` | `populations2/` |
+Dedup is what lets the save gate be *relaxed* (`min_save_distance=0.05` instead of 0.08): the per-run diversity gate is fast/approximate, dedup is the thorough cross-run cleanup. Both daemon instances trigger it independently.
 
-Both instances write saves to the shared `fractals/` directory. Independent populations explore different formula families simultaneously. Dedup reconciles any near-duplicates.
+---
 
-**Daemon commands:**
+## 14. Dual Instances & The Daemon
+
+**`scripts/evo_daemon.sh`** manages two parallel evolution processes:
+
+| Instance | Config | Population dir | PID file |
+|----------|--------|---------------|----------|
+| 1 | `config.toml` | `populations/` | `evolution.pid` |
+| 2 | `config2.toml` | `populations2/` | `evolution2.pid` |
+
+Both write saves to the **shared** `fractals/` directory. The two populations evolve independently (different RNG, different stagnation timing), exploring different formula families simultaneously, roughly doubling throughput. Dedup reconciles any cross-instance near-duplicates. The configs are identical except `population_dir`.
+
+Both are launched with `setsid` so they survive terminal/agent disconnection (resilient to usage-limit interruptions).
+
 ```bash
-bash scripts/evo_daemon.sh status    # show pids for both instances
-bash scripts/evo_daemon.sh ensure    # start any instance not running
-bash scripts/evo_daemon.sh restart   # stop+start both (e.g. after rebuild)
-bash scripts/evo_daemon.sh stop      # stop both
+bash scripts/evo_daemon.sh status     # pids for both instances
+bash scripts/evo_daemon.sh ensure     # start any instance not running
+bash scripts/evo_daemon.sh restart    # stop+start both (after a rebuild)
+bash scripts/evo_daemon.sh stop       # stop both
 ```
 
 ---
 
-## Measured Scores at Save Time
+## 15. Configuration Reference
 
-Beyond the GA fitness signals, each saved genome carries measurements made only once, at save time:
+From `config.toml` (config2.toml is identical except `population_dir`).
 
-### Fractal Recursion Score
-Boundary descent: render at base zoom → find richest boundary point → zoom in 3 levels (8× each) searching for template matches with dihedral variants of the whole-set template. Score = best match found.
+### `[rendering]`
+| Key | Value | Meaning |
+|-----|-------|---------|
+| `default_width/height` | 512 | Full-render (save) resolution |
+| `max_iter` | 192 | Full-render iteration depth |
+| `bailout` | 4.0 | Escape radius (\|z\|>4 → escaped) |
+| `colormap` | "turbo" | Fixed winner; maps low escapes to blue/cyan |
+| `view_*` | ±2.0 | Viewer/CLI window only (not GA) |
 
-### Self-Replication Score
-Render the fractal at two consecutive zoom levels; compare boundary complexity persistence. A Mandelbrot-like set maintains complex boundaries under zoom; simpler formulas decay.
+### `[optimization]`
+| Key | Value | Meaning |
+|-----|-------|---------|
+| `population_size` | 40 | Genomes per generation |
+| `elitism_count` | 6 | Survivors + save-scan budget |
+| `mutation_rate` | 0.20 | Per-coefficient perturbation prob |
+| `mutation_scale` | 0.08 | Perturbation magnitude |
+| `eval_width/height` | 64 | Fitness-eval resolution |
+| `eval_max_iter` | 128 | Fitness-eval iteration depth |
+| `restart_after_gens` | 30 | Stagnation → epoch restart |
+| `novelty_weight` | 0.45 | Visual-novelty fitness weight |
+| `novelty_k` | 5 | k-NN neighbors for novelty |
+| `archive_size` | 150 | Rolling novelty/formula archive size |
+| `self_replication_weight` | 0.35 | (legacy seed-rank knob) |
+| `fractal_recursion_weight` | 0.35 | (legacy seed-rank knob) |
+| `recursion_pred_weight` | 0.80 | **pred_recursion fitness weight** |
+| `formula_diversity_weight` | 0.30 | **formula_diversity fitness weight** |
+| `clip_pred_weight` | 0.50 | **pred_clip fitness weight** |
 
-Both scores travel with the `.nn` JSON file and are used in archive seed ranking but not in per-generation GA fitness (too expensive to compute for all 40 genomes).
+### `[output]`
+| Key | Value | Meaning |
+|-----|-------|---------|
+| `min/max_entropy_prefilter` | 0.38 / 0.70 | Stage-1 raw PNG entropy band |
+| `min_clip_score` | 0.522 | OR-gate CLIP threshold |
+| `min_laion_score` | 5.30 | OR-gate LAION threshold |
+| `min_beauty` | 0.35 | Fallback gate if scorer down |
+| `min_save_distance` | 0.05 | Stage-2 diversity gate |
+
+### `[dedup]`
+| Key | Value | Meaning |
+|-----|-------|---------|
+| `similarity_threshold` | 0.97 | DCT similarity cutoff |
+| `interval_hours` | 2.0 | Auto-dedup cadence |
 
 ---
 
-## What Was Tried and Removed
+## 16. What Was Tried and Removed
 
 | Approach | Why removed |
 |----------|-------------|
-| **Transformer + backprop** | Fought the GA; drove elites toward noise (escape-variance objective misaligned with beauty); ~7× slowdown. Removed in early development. |
-| **Single-scale PNG entropy as fitness** | Rewards salt-and-pepper noise as strongly as structured fractals. Replaced with multiscale entropy (geometric mean fine×coarse). |
-| **AND gate for CLIP+LAION** | Too restrictive — CLIP-excellent fractals blocked by borderline LAION and vice versa. Changed to OR logic. |
-| **Relaxed AND gate (0.512/5.20)** | Too permissive — ~1000 saves/2h, quality diluted. Replaced with OR gate at original thresholds (0.522/5.30). |
-| **Recursion-heavy seed ranking** | Deprioritized beautiful non-recursive genomes as seeds. Changed to 2×CLIP + LAION + small recursion bonus. |
+| **Transformer + backprop** | A transformer mapped a latent code → formula, trained by backprop on an escape-variance objective. It fought the GA, drove elites toward noise (the objective was misaligned with beauty), and was ~7× slower. Removing it for direct sparse GA evolution was a major simplification. |
+| **Single-scale PNG entropy as fitness** | Rewards salt-and-pepper noise as strongly as structure. Replaced with multiscale entropy (geometric mean fine×coarse), which collapses on noise. |
+| **AND gate (clip AND laion)** | Too restrictive — a CLIP-excellent fractal was blocked by borderline LAION and vice versa. Changed to OR. |
+| **Relaxed AND gate (0.512 / 5.20)** | Too permissive — ~1000 saves/2h diluted quality. Replaced with OR at 0.522/5.30. |
+| **Recursion-heavy seed ranking** (`clip + 0.35·self_rep + 0.35·rec`) | Deprioritized beautiful non-recursive genomes as epoch seeds. Changed to `2·clip + 0.15·laion + 0.20·self_rep + 0.20·rec`. |
+| **Near-max PNG entropy save criterion** | A single noisy genome set `max` very high, blocking all structured-but-compressible beautiful fractals. Replaced with a flat band [0.38, 0.70]. |
+| **Old boundary/cool-zone calibration targets (0.55)** | Fit the old per-pixel NN architecture; holomorphic formulas produce thin boundaries (~10–25%). Recalibrated to 0.20 / 0.12. |
 
 ---
 
-## File Map
+## 17. File Map
 
 ```
 src/
-  main.rs              — CLI entry point (--config, --render flags)
-  optimizer.rs         — GA loop: step(), try_save(), load_archive_seeds()
-  genome.rs            — Genome struct, mutation, crossover, feature vectors
-  fractal.rs           — render_cpu(), evaluate_fitness_full(), best_entropy_view()
-  fitness.rs           — multiscale_entropy(), behavior_descriptor(), novelty_score(), beauty_score_full()
-  formula.rs           — apply_formula() macro, N_BASIS=58, basis_name()
-  recursion_model.rs   — RecursionModel struct: load(), predict() [used for both recursion + CLIP]
-  config.rs            — Config structs for all toml fields
-  aesthetic.rs         — AestheticScorer: Python sidecar management, score_blocking()
-  colormap.rs          — apply_colormap(), turbo + custom colormaps
-  render_gpu.rs        — GPU batch rendering via wgpu/Vulkan
-  bin/viewer.rs        — Interactive fractal viewer (separate binary)
+  main.rs              CLI entry (--config, --render); spawns dedup cleaner + run_evolution
+  optimizer.rs         GA core: step(), evolve(), try_save(), restart_population(),
+                       load_archive_seeds(), force_save(). The Optimizer struct + all weights.
+  genome.rs            Genome + FormulaTerm; mutate(), crossover(), random_exotic();
+                       feature vectors: formula_basis_normalized(), recursion_features(),
+                       formula_weights(); view_bounds(); basis labels.
+  fractal.rs           render_cpu_iter()/render_bounds() (escape-time iteration, GPU+CPU);
+                       evaluate_fitness_full()/_batch(); best_entropy_view();
+                       self_replication_score(); fractal_recursion_score(); field_intricacy();
+                       dihedral_variants(); structure_vec(); recursion_candidates().
+  fitness.rs           png_compression_entropy(); multiscale_entropy(); behavior_descriptor();
+                       novelty_score(); is_degenerate(); beauty_score_full()/beauty_score()
+                       (5-component: boundary/edge/entropy/self_sim/cool_zone); edge_density_fast().
+  formula.rs           apply_formula() (the 58-basis evaluator, macro for f32/f64 + WGSL parity);
+                       N_BASIS=58; basis_name().
+  recursion_model.rs   RecursionModel: load() + predict() — used for BOTH pred_recursion & pred_clip.
+  config.rs            Config structs + serde defaults for every toml field.
+  aesthetic.rs         AestheticScorer: Python sidecar lifecycle, score_blocking(), poll/request,
+                       status_line().
+  colormap.rs          apply_colormap(); turbo + 9 hand-written colormaps; smooth t/max_iter mapping.
+  render_gpu.rs        wgpu/Vulkan batch renderer; gpu_available(); WGSL shader (mirrors apply_formula).
+  display.rs           Terminal TUI (generation status, save log, score readouts).
+  io.rs                save_genome()/load_genome() (.nn JSON), save_png().
+  bin/viewer.rs        Standalone interactive viewer (drag-zoom, pan); inline Config literal.
+
+aesthetic_scorer.py    Python sidecar: CLIP ViT-L/14 zero-shot + LAION MLP. stdin path → stdout scores.
 
 scripts/
-  evo_daemon.sh        — Manage 2 parallel daemon instances (start/stop/restart/ensure/status)
-  fit_recursion_model.py — Train recursion predictor on archive → recursion_model.json
-  fit_clip_model.py    — Train CLIP predictor on archive → clip_model.json
-  dedup.py             — Near-duplicate removal (multi-scale DCT similarity)
-  analyze_diversity.py — Formula diversity analysis (Shannon entropy, pairwise distance, unique signatures)
-  diversity_reapply.sh — Auto-tune formula_diversity_weight at iteration boundaries
-  colormap_chart.py    — Generate colormap comparison bar chart
+  evo_daemon.sh        Manage 2 parallel daemon instances (start/ensure/stop/restart/status).
+  fit_recursion_model.py  Train recursion predictor → recursion_model.json (Ridge + 5-fold CV).
+  fit_clip_model.py    Train CLIP predictor → clip_model.json (Ridge λ=10 + 5-fold CV).
+  dedup.py             Multi-scale DCT near-duplicate removal.
+  analyze_diversity.py Formula diversity report (Shannon basis entropy, pairwise distance, unique sigs).
+  diversity_reapply.sh Auto-tune formula_diversity_weight at loop boundaries.
+  colormap_chart.py / colormap_switch.py / colormap_finalize.sh   Colormap experiment tooling.
+  loop_analyze.py / loop_report.py / LOOP_RUNBOOK.md              Long-run loop tooling.
 
-config.toml            — Instance 1 config (populations/ dir)
-config2.toml           — Instance 2 config (populations2/ dir)
-recursion_model.json   — Trained recursion predictor (n=2088, cv_pearson=0.513)
-clip_model.json        — Trained CLIP predictor (n=2985, cv_pearson=0.452)
-fractals/              — Saved genomes: {id}.nn (JSON) + {id}.png
-populations/           — Instance 1 population checkpoint
-populations2/          — Instance 2 population checkpoint
+config.toml            Instance 1 config (populations/).
+config2.toml           Instance 2 config (populations2/).
+recursion_model.json   Trained recursion predictor (n=2088, cv_pearson=0.513).
+clip_model.json        Trained CLIP predictor (n=2985, cv_pearson=0.452).
+fractals/              Saved genomes: {id}.nn (JSON genome+scores) + {id}.png (512×512).
+populations/ , populations2/   Per-instance population checkpoints.
+colormap_scores.png    Colormap experiment result chart.
 ```
 
 ---
 
-## Current Archive Stats (2026-06-28)
+## 18. Key Invariants
 
-- **Total saved genomes:** 3457
-- **LAION:** mean 5.317, max 5.414, min 5.147
-- **CLIP:** mean 0.519, max 0.532, min 0.475
-- **Formula diversity (fdiv_mean):** ~0.87 across recent saves
-- **Unique formula signatures:** ~96% of saves have distinct top-3 basis combinations
+These must remain true; breaking them silently corrupts behavior.
 
----
-
-## Key Invariants
-
-1. **The save gate uses raw fine PNG entropy**, not multiscale. The coarse scale is for selection fitness only.
-2. **The genome's view params are unchanged by best_entropy_view()**. The archive keeps the evolved view; only the CLIP render uses the optimized view.
-3. **pred_clip and pred_recursion use the same 61-dim feature vector** (`recursion_features()`). Both models are stored in `RecursionModel` structs; only the training target differs.
-4. **Dedup runs inside the evolution loop** (via subprocess every 2h), not as an external cron. Both instances trigger it independently from their `spawn_dedup_cleaner()` call.
-5. **The recursion model was trained on 2088 genomes** from an earlier phase; clip_model was trained on 2985. Both should be periodically retrained as the archive grows.
+1. **`recursion_features()` (Rust) ≡ `features()` (both Python scripts)** — byte-for-byte, same 61 dims in the same order. Any change to one must change all three, and both models must be retrained.
+2. **`apply_formula` (Rust CPU) ≡ WGSL shader (GPU)** — the 58-basis math must match, or GPU and CPU renders diverge.
+3. **Save gate uses raw fine PNG entropy** (`beauty_entropy`), not multiscale. Multiscale is selection-only.
+4. **`best_entropy_view()` never mutates the stored genome** — only the CLIP render uses the optimized view; the archived `.nn` keeps the evolved view params.
+5. **`pred_clip` and `pred_recursion` share one struct and one feature vector** — only `clip_model.json` vs `recursion_model.json` (and thus the trained weights) differ.
+6. **Missing model JSON ⇒ that fitness term = 0**, GA still runs. Never assume a model is present.
+7. **Both daemon instances write to the same `fractals/`** but separate `populations*/`. Dedup must run (it's the only thing keeping the shared pool clean under relaxed gates).
+8. **Turbo colormap is load-bearing for CLIP.** Changing it will drop CLIP below the save threshold and collapse the save rate.
 
 ---
 
-## How to Retrain the Proxy Models
+## 19. Operations Playbook
 
+### Check status
 ```bash
-# Retrain CLIP predictor (do this when archive grows by ~500+ genomes)
-python3 scripts/fit_clip_model.py
-# → overwrites clip_model.json, prints cv_pearson
-
-# Retrain recursion predictor
-python3 scripts/fit_recursion_model.py
-# → overwrites recursion_model.json, prints cv_pearson
-
-# Restart daemons to pick up new models (no rebuild needed — models are JSON)
-bash scripts/evo_daemon.sh restart
+bash scripts/evo_daemon.sh status
 ```
+
+### After any Rust change
+```bash
+cargo build --release && bash scripts/evo_daemon.sh restart
+```
+
+### Retrain the proxy models (do when archive grows ~500+ genomes)
+```bash
+python3 scripts/fit_clip_model.py        # → clip_model.json, prints cv_pearson
+python3 scripts/fit_recursion_model.py   # → recursion_model.json
+bash scripts/evo_daemon.sh restart       # models are JSON; no rebuild needed
+```
+If a model's `cv_pearson < 0.20`, set its weight to 0 in config (the structure no longer predicts the target).
+
+### Inspect recent quality
+```bash
+python3 - <<'PY'
+import glob, json, os, statistics
+recs = [json.load(open(f)) for f in glob.glob('fractals/*.nn')]
+laion=[r['laion_score'] for r in recs if r.get('laion_score')]
+clip =[r['clip_score']  for r in recs if r.get('clip_score')]
+print(f"n={len(recs)}  LAION μ={statistics.mean(laion):.4f} max={max(laion):.4f}"
+      f"  CLIP μ={statistics.mean(clip):.4f} max={max(clip):.4f}")
+PY
+```
+
+### Current archive snapshot (2026-06-28)
+- **3457 saved genomes**; LAION μ 5.317 (max 5.414), CLIP μ 0.519 (max 0.532)
+- Formula diversity ~0.87; ~96% unique formula signatures
 
 ---
 
-## What to Try Next
+## 20. What to Try Next
 
-Hypotheses worth testing, roughly in order of expected impact:
+Hypotheses, roughly by expected impact:
 
-1. **Retrain clip_model.json periodically** — archive is now 3457 genomes (was 2985 when last trained). More data = better predictor.
-2. **Periodic formula-space reseeding** — run `fit_clip_model.py` + `fit_recursion_model.py` on a cron-like cadence (every 500 saves) and restart without human intervention.
-3. **LAION predictor** — train a separate `laion_model.json` targeting `laion_score/10` (more variance than CLIP → may be more learnable). Add `laion_pred_weight` to fitness.
-4. **Adaptive mutation scale** — if CLIP/LAION variance in recent saves is low (population converged aesthetically), increase `mutation_scale` temporarily to explore.
-5. **View parameter evolution pressure** — currently view_cx/cy/zoom are mutated randomly. Adding a small fitness signal toward views with higher multiscale entropy would help the genome evolve better default compositions, not just better formulas.
+1. **Retrain `clip_model.json` on the now-3457-genome archive** (last trained at 2985). More data → better aesthetic steering.
+2. **Automate proxy retraining** — cron-like retrain of both models every ~500 saves + daemon restart, fully unsupervised.
+3. **Add a LAION predictor** (`laion_model.json` targeting `laion/10`). LAION has more variance than CLIP → potentially more learnable; add `laion_pred_weight` to fitness.
+4. **Evolve view params toward higher entropy** — currently view_cx/cy/zoom mutate randomly. A small fitness signal toward higher-multiscale-entropy views would make genomes evolve better default framing, not just better formulas (today only the save-time best-view search compensates).
+5. **Adaptive mutation scale** — when recent-save aesthetic variance is low (population converged), temporarily raise `mutation_scale` to re-explore.
+6. **Curriculum on `bailout`/`max_iter`** — deeper iteration late in an epoch could surface finer recursion the shallow eval pass misses.
