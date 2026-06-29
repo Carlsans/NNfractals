@@ -11,6 +11,8 @@
 //!   H / ?                 Toggle help
 //!   Ctrl+S                Save PNG
 //!   Q / Esc               Quit
+use std::io::{Read as _, Write as _};
+use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::thread;
@@ -316,10 +318,17 @@ struct App {
 
     prefs:      ViewerPrefs,
     prefs_path: PathBuf,
+
+    // Single-instance IPC: new genome paths arrive here when another launch delegates to us
+    ipc_rx: mpsc::Receiver<PathBuf>,
+
+    // Auto-palette: background thread sends winner palette index when done
+    auto_pal_rx:   Option<mpsc::Receiver<usize>>,
+    auto_pal_busy: bool,
 }
 
 impl App {
-    fn new(cc: &eframe::CreationContext, nn_path: PathBuf) -> anyhow::Result<Self> {
+    fn new(cc: &eframe::CreationContext, nn_path: PathBuf, ipc_rx: mpsc::Receiver<PathBuf>) -> anyhow::Result<Self> {
         let config = Config::load(Path::new("config.toml"))
             .unwrap_or_else(|_| default_config());
         let genome = load_genome(&nn_path)?;
@@ -433,6 +442,9 @@ impl App {
             ymax_str: format!("{:.6}", ymax),
             sync_xy: false,
             prefs, prefs_path,
+            ipc_rx,
+            auto_pal_rx: None,
+            auto_pal_busy: false,
         };
         // Set initial aspect ratio from prefs
         app.apply_ratio(ratio_idx, false);
@@ -522,6 +534,52 @@ impl App {
             }
         }
         got
+    }
+
+    // Load a new genome into the viewer (IPC single-instance path).
+    fn load_new_genome(&mut self, path: PathBuf) {
+        match load_genome(&path) {
+            Ok(genome) => {
+                self.genome = genome;
+                let dv = View::new_square(
+                    self.genome.view_cx as f64,
+                    self.genome.view_cy as f64,
+                    self.genome.view_zoom.max(0.1) as f64,
+                );
+                self.nn_path = path;
+                self.default_view = dv.clone();
+                self.view = dv;
+                self.view.aspect = self.current_aspect();
+                self.view_stack.clear();
+                self.sync_xy = true;
+                self.request_render(false);
+            }
+            Err(e) => eprintln!("[viewer] IPC load failed: {e}"),
+        }
+    }
+
+    // Spawn a thread that renders the fractal at 64×64 with every palette and
+    // picks the winner by gradient energy (sum of squared pixel differences).
+    fn start_auto_palette(&mut self) {
+        if self.auto_pal_busy { return; }
+        let (tx, rx) = mpsc::channel::<usize>();
+        let genome = self.genome.clone();
+        let mut config = self.config.clone();
+        let view = self.view.clone();
+        self.auto_pal_busy = true;
+        self.auto_pal_rx = Some(rx);
+        thread::spawn(move || {
+            let iter = config.rendering.max_iter.min(128);
+            let mut best_idx = 0usize;
+            let mut best_score = f32::NEG_INFINITY;
+            for (i, &cmap) in COLORMAPS.iter().enumerate() {
+                config.rendering.colormap = cmap.to_string();
+                let rgb = render_cpu(&genome, &config, &view, 64, 64, iter, false);
+                let score = auto_palette_score(&rgb, 64, 64);
+                if score > best_score { best_score = score; best_idx = i; }
+            }
+            let _ = tx.send(best_idx);
+        });
     }
 
     fn show_toolbar(&mut self, ui: &mut egui::Ui) {
@@ -664,6 +722,14 @@ impl App {
                         ui.label(COLORMAPS[self.colormap_idx]);
                         if ui.button("▷").on_hover_text("→ — next palette").clicked() {
                             self.set_colormap((self.colormap_idx + 1) % COLORMAPS.len());
+                        }
+                        if self.auto_pal_busy {
+                            ui.colored_label(Color32::YELLOW, "⟳");
+                        } else if ui.button("✦")
+                            .on_hover_text("Auto: pick best palette by visual gradient score")
+                            .clicked()
+                        {
+                            self.start_auto_palette();
                         }
 
                         ui.separator();
@@ -991,6 +1057,22 @@ impl App {
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+
+        // IPC: load new genome if another launch delegated to us
+        while let Ok(path) = self.ipc_rx.try_recv() {
+            self.load_new_genome(path);
+            ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+        }
+
+        // Auto-palette: apply result when background scoring finishes
+        if let Some(ref rx) = self.auto_pal_rx {
+            if let Ok(best) = rx.try_recv() {
+                self.set_colormap(best);
+                self.auto_pal_busy = false;
+                self.auto_pal_rx = None;
+            }
+        }
+
         self.poll_render(&ctx);
         self.handle_keyboard(&ctx);
         self.show_toolbar(ui);
@@ -1034,6 +1116,25 @@ fn selection_rect(start: egui::Pos2, cur: egui::Pos2, aspect: f32) -> (egui::Rec
     let x1 = if dx >= 0.0 { start.x } else { start.x - sw };
     let y1 = if dy >= 0.0 { start.y } else { start.y - sh };
     (egui::Rect::from_min_size(egui::Pos2::new(x1, y1), egui::Vec2::new(sw, sh)), true)
+}
+
+/// Gradient energy of an RGB image: sum of squared pixel differences along x and y.
+/// Higher = more visual detail visible with this palette — used by auto-palette.
+fn auto_palette_score(rgb: &[u8], w: usize, h: usize) -> f32 {
+    let mut sum = 0.0f64;
+    for y in 0..h.saturating_sub(1) {
+        for x in 0..w.saturating_sub(1) {
+            let i = (y * w + x) * 3;
+            let r = (y * w + x + 1) * 3;  // right neighbour
+            let d = ((y + 1) * w + x) * 3; // down neighbour
+            for c in 0..3 {
+                let dx = rgb[r + c] as f64 - rgb[i + c] as f64;
+                let dy = rgb[d + c] as f64 - rgb[i + c] as f64;
+                sum += dx * dx + dy * dy;
+            }
+        }
+    }
+    (sum / (w * h) as f64) as f32
 }
 
 /// Returns the WASD / arrow-key step multiplier for the given modifiers.
@@ -1083,6 +1184,33 @@ fn default_config() -> Config {
     }
 }
 
+// ── IPC — single-instance socket ─────────────────────────────────────────────
+
+/// Cleans up the Unix socket file on drop (best-effort).
+struct SocketGuard(PathBuf);
+impl Drop for SocketGuard {
+    fn drop(&mut self) { let _ = std::fs::remove_file(&self.0); }
+}
+
+fn socket_path() -> PathBuf {
+    let tag = std::env::var("USER")
+        .or_else(|_| std::env::var("LOGNAME"))
+        .unwrap_or_else(|_| "user".into());
+    std::env::temp_dir().join(format!("nnfractals-viewer-{tag}.sock"))
+}
+
+/// Try to connect to a running viewer and hand it the new path.
+/// Returns true if delegated successfully (caller should exit).
+fn try_delegate(sock: &Path, path: &Path) -> bool {
+    match UnixStream::connect(sock) {
+        Ok(mut s) => {
+            let _ = s.write_all(path.to_string_lossy().as_bytes());
+            true
+        }
+        Err(_) => false,
+    }
+}
+
 // ── Entry point ───────────────────────────────────────────────────────────────
 
 fn main() -> anyhow::Result<()> {
@@ -1090,6 +1218,35 @@ fn main() -> anyhow::Result<()> {
         anyhow::anyhow!("Usage: nnfractals-viewer <genome.nn>")
     })?;
 
+    // ── Single-instance IPC ───────────────────────────────────────────────────
+    let sock_path = socket_path();
+    if try_delegate(&sock_path, &nn_path) {
+        eprintln!("[viewer] Delegated to running instance.");
+        return Ok(());
+    }
+    // No existing instance — become the server.
+    let _ = std::fs::remove_file(&sock_path); // remove any stale socket
+    let (ipc_tx, ipc_rx) = mpsc::channel::<PathBuf>();
+    let _sock_guard = match UnixListener::bind(&sock_path) {
+        Ok(listener) => {
+            let tx = ipc_tx;
+            thread::spawn(move || {
+                for stream in listener.incoming() {
+                    if let Ok(mut s) = stream {
+                        let mut buf = String::new();
+                        if s.read_to_string(&mut buf).is_ok() {
+                            let p = PathBuf::from(buf.trim());
+                            if p.exists() { let _ = tx.send(p); }
+                        }
+                    }
+                }
+            });
+            Some(SocketGuard(sock_path))
+        }
+        Err(e) => { eprintln!("[viewer] IPC unavailable: {e}"); None }
+    };
+
+    // ── GPU init ──────────────────────────────────────────────────────────────
     #[cfg(feature = "wgpu-backend")]
     {
         render_gpu::init_gpu();
@@ -1114,7 +1271,7 @@ fn main() -> anyhow::Result<()> {
         "NNFractals Viewer",
         options,
         Box::new(move |cc| {
-            Ok(Box::new(App::new(cc, nn_path).expect("Failed to load genome")))
+            Ok(Box::new(App::new(cc, nn_path, ipc_rx).expect("Failed to load genome")))
         }),
     ).map_err(|e| anyhow::anyhow!("{e}"))?;
 
