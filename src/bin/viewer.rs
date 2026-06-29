@@ -226,6 +226,8 @@ struct RenderRequest {
     preview:    bool,
     generation: u64,
     colormap:   String,
+    // Set when the genome itself changed (IPC load); otherwise None = keep current.
+    genome:     Option<Genome>,
 }
 
 struct RenderResult {
@@ -358,17 +360,20 @@ impl App {
         let (res_tx, res_rx) = mpsc::sync_channel::<RenderResult>(4);
 
         {
-            let genome     = genome.clone();
-            let base_config = config.clone();
+            let base_genome  = genome.clone();
+            let base_config  = config.clone();
             thread::spawn(move || {
                 let full_iter  = base_config.rendering.max_iter;
                 let full_steps: &[u32] = &[8, 24, 64, full_iter];
-                let mut config = base_config; // mutable so colormap can be updated per-request
+                let mut config = base_config; // mutable: colormap + iter updated per-request
+                let mut genome = base_genome; // mutable: replaced when IPC loads a new file
                 let mut pending = req_rx.recv().ok();
                 while let Some(req) = pending.take() {
                     let mut latest = req;
                     while let Ok(newer) = req_rx.try_recv() { latest = newer; }
 
+                    // Update genome when a new file was loaded via IPC
+                    if let Some(new_g) = latest.genome { genome = new_g; }
                     // Apply the palette from this request (may have changed since startup)
                     config.rendering.colormap = latest.colormap.clone();
 
@@ -461,6 +466,7 @@ impl App {
             view: self.view.clone(), w, h, preview,
             generation: self.render_gen,
             colormap: self.config.rendering.colormap.clone(),
+            genome: None,
         });
     }
 
@@ -552,10 +558,24 @@ impl App {
                 self.view.aspect = self.current_aspect();
                 self.view_stack.clear();
                 self.sync_xy = true;
-                self.request_render(false);
+                // Send genome alongside the render request so the thread picks it up
+                self.request_render_genome(false);
             }
             Err(e) => eprintln!("[viewer] IPC load failed: {e}"),
         }
+    }
+
+    fn request_render_genome(&mut self, preview: bool) {
+        let w = self.frac_rect.width().round() as u32;
+        let h = self.frac_rect.height().round() as u32;
+        if w == 0 || h == 0 { return; }
+        self.render_gen += 1;
+        let _ = self.req_tx.try_send(RenderRequest {
+            view: self.view.clone(), w, h, preview,
+            generation: self.render_gen,
+            colormap: self.config.rendering.colormap.clone(),
+            genome: Some(self.genome.clone()),
+        });
     }
 
     // Spawn a thread that renders the fractal at 64×64 with every palette and
@@ -610,29 +630,29 @@ impl App {
                 egui::ScrollArea::horizontal().show(ui, |ui| {
                     ui.horizontal_centered(|ui| {
                         // ── Translation arrows ──────────────────────────────
-                        if ui.button("◀").on_hover_text("A — left (Shift=2×, Alt=½)").clicked() {
+                        if ui.button("←").on_hover_text("A — left (Shift=2×, Alt=½)").clicked() {
                             self.do_translate(-1.0, 0.0);
                         }
-                        if ui.button("▲").on_hover_text("W — up").clicked() {
+                        if ui.button("↑").on_hover_text("W — up").clicked() {
                             self.do_translate(0.0, -1.0);
                         }
-                        if ui.button("▼").on_hover_text("S — down").clicked() {
+                        if ui.button("↓").on_hover_text("S — down").clicked() {
                             self.do_translate(0.0, 1.0);
                         }
-                        if ui.button("▶").on_hover_text("D — right").clicked() {
+                        if ui.button("→").on_hover_text("D — right").clicked() {
                             self.do_translate(1.0, 0.0);
                         }
 
                         ui.separator();
 
                         // ── Zoom / reset ────────────────────────────────────
-                        if ui.button("⊕").on_hover_text("↑ — zoom in").clicked() {
+                        if ui.button("+").on_hover_text("Up — zoom in").clicked() {
                             self.do_zoom(true, 1.0);
                         }
-                        if ui.button("⊖").on_hover_text("↓ — zoom out").clicked() {
+                        if ui.button("-").on_hover_text("Down — zoom out").clicked() {
                             self.do_zoom(false, 1.0);
                         }
-                        if ui.button("⟳").on_hover_text("R — reset view").clicked() {
+                        if ui.button("R").on_hover_text("R — reset view").clicked() {
                             self.view = self.default_view.clone();
                             self.view.aspect = self.current_aspect();
                             self.view_stack.clear();
@@ -715,18 +735,18 @@ impl App {
                         ui.separator();
 
                         // ── Palette ─────────────────────────────────────────
-                        if ui.button("◁").on_hover_text("← — previous palette").clicked() {
+                        if ui.button("<").on_hover_text("Left — previous palette").clicked() {
                             let n = COLORMAPS.len();
                             self.set_colormap((self.colormap_idx + n - 1) % n);
                         }
                         ui.label(COLORMAPS[self.colormap_idx]);
-                        if ui.button("▷").on_hover_text("→ — next palette").clicked() {
+                        if ui.button(">").on_hover_text("Right — next palette").clicked() {
                             self.set_colormap((self.colormap_idx + 1) % COLORMAPS.len());
                         }
                         if self.auto_pal_busy {
-                            ui.colored_label(Color32::YELLOW, "⟳");
-                        } else if ui.button("✦")
-                            .on_hover_text("Auto: pick best palette by visual gradient score")
+                            ui.colored_label(Color32::YELLOW, "...");
+                        } else if ui.button("auto")
+                            .on_hover_text("Pick best palette by visual gradient score")
                             .clicked()
                         {
                             self.start_auto_palette();
@@ -735,18 +755,18 @@ impl App {
                         ui.separator();
 
                         // ── Help / Save ─────────────────────────────────────
-                        let help_label = if self.show_help { "✕ Help" } else { "? Help" };
+                        let help_label = if self.show_help { "x Help" } else { "? Help" };
                         if ui.button(help_label).clicked() {
                             self.show_help = !self.show_help;
                         }
-                        if ui.button("💾 Save").on_hover_text("Ctrl+S").clicked() {
+                        if ui.button("Save").on_hover_text("Ctrl+S").clicked() {
                             self.show_save = true;
                         }
 
                         // Status indicator (right-aligned)
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             if !self.render_complete || self.displayed_gen < self.render_gen {
-                                ui.colored_label(Color32::YELLOW, "⟳ rendering…");
+                                ui.colored_label(Color32::YELLOW, "rendering...");
                             } else {
                                 let w = self.frac_rect.width() as u32;
                                 if needs_f64(&self.view, w) {
