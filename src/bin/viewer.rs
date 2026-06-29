@@ -1,27 +1,22 @@
-/// NNFractals interactive viewer.
-///
-/// Controls:
-///   Drag box     Zoom into selected region (square)
-///   Right-click  Zoom out 2×
-///   Backspace    Undo last zoom
-///   R            Reset to default view
-///   S            Save PNG (prompts for resolution)
-///   H / ? badge  Toggle help overlay
-///   Q / Esc      Quit
-use std::num::NonZeroU32;
+//! NNFractals interactive viewer (egui/eframe).
+//!
+//! Keyboard shortcuts:
+//!   W/A/S/D               Translate view (+Shift=2×, +Alt=½, +Ctrl+Shift=10 radii, +Ctrl+Alt=1/10 radius)
+//!   Up/Down arrows        Zoom in/out (same modifiers as WASD)
+//!   Left/Right arrows     Cycle palette
+//!   Drag (left btn)       Zoom into selection (aspect-locked)
+//!   Right-click           Zoom out ×2
+//!   Backspace / Ctrl+Z    Undo zoom
+//!   R                     Reset view
+//!   H / ?                 Toggle help
+//!   Ctrl+S                Save PNG
+//!   Q / Esc               Quit
 use std::path::{Path, PathBuf};
-use std::rc::Rc;
 use std::sync::mpsc;
 use std::thread;
 
-use font8x8::UnicodeFonts;
-use softbuffer::{Context, Surface};
-use winit::application::ApplicationHandler;
-use winit::dpi::{LogicalSize, PhysicalPosition};
-use winit::event::{ElementState, MouseButton, WindowEvent};
-use winit::event_loop::{ActiveEventLoop, EventLoop, EventLoopProxy};
-use winit::keyboard::{Key, NamedKey};
-use winit::window::{Window, WindowId};
+use eframe::egui::{self, Color32, ColorImage, Key, TextureHandle, TextureOptions};
+use serde::{Deserialize, Serialize};
 
 use nnfractals::colormap::apply_colormap;
 use nnfractals::config::Config;
@@ -31,90 +26,85 @@ use nnfractals::io::{load_genome, save_png};
 #[cfg(feature = "wgpu-backend")]
 use nnfractals::render_gpu;
 
+// ── Constants ─────────────────────────────────────────────────────────────────
+
+const MAX_UNDO: usize = 20;
+const MIN_SEL_PX: f32 = 12.0;
+
+const RATIOS: &[(&str, f64, f64)] = &[
+    ("1:1",  1.0, 1.0),
+    ("4:3",  4.0, 3.0),
+    ("3:2",  3.0, 2.0),
+    ("16:9", 16.0, 9.0),
+    ("2:1",  2.0, 1.0),
+];
+
+const COLORMAPS: &[&str] = &[
+    "turbo", "inferno", "viridis", "plasma", "magma", "earth", "neon",
+];
+
 // ── View ──────────────────────────────────────────────────────────────────────
 
 #[derive(Clone)]
-// Center + zoom are f64 so the view RETAINS precision under deep zoom. Storing
-// these as f32 caps effective zoom at the f32 limit (~10^6) regardless of how
-// precise the iteration is — you can't widen back digits that were never stored.
+// Center + zoom stored as f64 for precision at deep zoom. `aspect` = xrange/yrange
+// so non-square ratios are first-class; 1.0 = square (legacy default).
 struct View {
-    cx: f64,
-    cy: f64,
-    zoom: f64,
+    cx:     f64,
+    cy:     f64,
+    zoom:   f64,   // vertical: half_y = 2.0 / zoom
+    aspect: f64,   // xrange / yrange
 }
 
 impl View {
-    fn bounds(&self) -> (f64, f64, f64, f64) {
-        let half = 2.0 / self.zoom;
-        (self.cx - half, self.cx + half, self.cy - half, self.cy + half)
+    fn new_square(cx: f64, cy: f64, zoom: f64) -> Self {
+        View { cx, cy, zoom, aspect: 1.0 }
     }
 
-    fn pixel_to_fractal(&self, px: f64, py: f64, w: u32, h: u32) -> (f64, f64) {
+    fn bounds(&self) -> (f64, f64, f64, f64) {
+        let half_y = 2.0 / self.zoom;
+        let half_x = half_y * self.aspect;
+        (self.cx - half_x, self.cx + half_x, self.cy - half_y, self.cy + half_y)
+    }
+
+    fn pixel_to_fractal(&self, px: f64, py: f64, w: f64, h: f64) -> (f64, f64) {
         let (xmin, xmax, ymin, ymax) = self.bounds();
         (
-            xmin + (px / w as f64) * (xmax - xmin),
-            ymin + (py / h as f64) * (ymax - ymin),
+            xmin + (px / w) * (xmax - xmin),
+            ymin + (py / h) * (ymax - ymin),
         )
     }
 }
 
-// ── Interaction mode ──────────────────────────────────────────────────────────
-
-enum Mode {
-    Normal,
-    Selecting { anchor: (f64, f64) },
-    ResInput  { digits: String },
-}
-
-// ── CPU renderer ──────────────────────────────────────────────────────────────
-
-/// Returns true when the per-pixel coordinate step has shrunk below what f32 can
-/// resolve at this view's location — i.e. the GPU/f32 render would show blocky
-/// pixelation and we must fall back to the f64 CPU path.
 fn needs_f64(view: &View, w: u32) -> bool {
-    let span      = 4.0 / view.zoom;                       // xmax - xmin
+    let (xmin, xmax, _, _) = view.bounds();
+    let span       = xmax - xmin;
     let pixel_step = span / w.max(1) as f64;
-    // Absolute f32 resolution near the view centre (magnitude × machine epsilon).
-    let coord_mag = view.cx.abs().max(view.cy.abs()).max(1.0);
-    let f32_ulp   = coord_mag * f32::EPSILON as f64;       // ≈ coord_mag · 1.19e-7
-    // Switch a bit before artifacts become visible (≈ 64 ulps per pixel).
+    let coord_mag  = view.cx.abs().max(view.cy.abs()).max(1.0);
+    let f32_ulp    = coord_mag * f32::EPSILON as f64;
     pixel_step < f32_ulp * 64.0
 }
 
-/// `compute_iter` controls how deep the iteration loop goes (used for fast
-/// progressive passes). Colour normalisation ALWAYS uses the full
-/// `config.rendering.max_iter`, so progressive passes only add boundary detail —
-/// they never shift the palette. This keeps the first rough pass colour-matched
-/// to the final image (and to the saved PNG).
-///
-/// When `use_f64` is set, the iteration runs in double precision on the CPU —
-/// this is the deep-zoom path that eliminates f32 pixelation (WGSL/GPU is f32-only).
+// ── Render helpers ────────────────────────────────────────────────────────────
+
 fn render_cpu(
-    genome: &Genome, config: &Config, view: &View, w: u32, h: u32,
-    compute_iter: u32, use_f64: bool,
+    genome: &Genome, config: &Config, view: &View,
+    w: u32, h: u32, compute_iter: u32, use_f64: bool,
 ) -> Vec<u8> {
     let color_iter = config.rendering.max_iter;
-
     let dag = genome.uses_program();
 
-    // ── Deep-zoom path: f64 CPU iteration ────────────────────────────────────
     if use_f64 {
         use rayon::prelude::*;
-        let view64 = (view.cx, view.cy, view.zoom);
-        let half   = 2.0 / view64.2;
-        let (xmin, xmax) = (view64.0 - half, view64.0 + half);
-        let (ymin, ymax) = (view64.1 - half, view64.1 + half);
+        let (xmin, xmax, ymin, ymax) = view.bounds();
         let wf = (w.saturating_sub(1)).max(1) as f64;
         let hf = (h.saturating_sub(1)).max(1) as f64;
-        // DAG genomes use the f64 expression-VM with their evolved dynamics;
-        // legacy genomes use the f64 basis-sum. Bailout is per-genome for DAG.
         let fw: Vec<(f64, f64)> = if dag { Vec::new() } else {
             genome.formula_weights().iter().map(|&(r, i)| (r as f64, i as f64)).collect()
         };
         let legacy_bsq = (config.rendering.bailout * config.rendering.bailout) as f64;
-        let dag_bsq = (genome.bailout_radius * genome.bailout_radius) as f64;
-        let jc = (genome.julia_cre as f64, genome.julia_cim as f64);
-        let phoenix = (genome.phoenix_re as f64, genome.phoenix_im as f64);
+        let dag_bsq    = (genome.bailout_radius * genome.bailout_radius) as f64;
+        let jc         = (genome.julia_cre as f64, genome.julia_cim as f64);
+        let phoenix    = (genome.phoenix_re as f64, genome.phoenix_im as f64);
         let escape_times: Vec<f32> = (0..(w * h) as usize)
             .into_par_iter()
             .map(|idx| {
@@ -142,20 +132,17 @@ fn render_cpu(
         return apply_colormap(&escape_times, color_iter, &config.rendering.colormap);
     }
 
-    // Shallow-zoom path (GPU f32 or CPU f32 fallback): f32 bounds are sufficient
-    // here because needs_f64() already routed deep views to the f64 branch above.
     let (bxmin, bxmax, bymin, bymax) = view.bounds();
     let (xmin, xmax, ymin, ymax) = (bxmin as f32, bxmax as f32, bymin as f32, bymax as f32);
     let bailout_sq = config.rendering.bailout * config.rendering.bailout;
 
-    // GPU path — much faster for interactive use.
     #[cfg(feature = "wgpu-backend")]
     if render_gpu::gpu_available() {
         let escape_times = if dag {
-            // DAG genome: expression-VM with warp/julia/phoenix/per-genome bailout.
             let item = render_gpu::dag_item(genome);
-            render_gpu::render_batch_dag(std::slice::from_ref(&item), &[(xmin, xmax, ymin, ymax)], w, h, compute_iter)
-                .into_iter().next().unwrap_or_default()
+            render_gpu::render_batch_dag(
+                std::slice::from_ref(&item), &[(xmin, xmax, ymin, ymax)], w, h, compute_iter,
+            ).into_iter().next().unwrap_or_default()
         } else {
             let fw = genome.formula_weights();
             render_gpu::render_fractal(&fw, w, h, compute_iter, xmin, xmax, ymin, ymax, bailout_sq)
@@ -163,12 +150,11 @@ fn render_cpu(
         return apply_colormap(&escape_times, color_iter, &config.rendering.colormap);
     }
 
-    // CPU fallback (f32).
     use rayon::prelude::*;
-    let fw         = genome.formula_weights();
-    let dag_bsq    = genome.bailout_radius * genome.bailout_radius;
-    let jc         = (genome.julia_cre, genome.julia_cim);
-    let phoenix    = (genome.phoenix_re, genome.phoenix_im);
+    let fw      = genome.formula_weights();
+    let dag_bsq = genome.bailout_radius * genome.bailout_radius;
+    let jc      = (genome.julia_cre, genome.julia_cim);
+    let phoenix = (genome.phoenix_re, genome.phoenix_im);
     let wf = (w.saturating_sub(1)).max(1) as f32;
     let hf = (h.saturating_sub(1)).max(1) as f32;
     let escape_times: Vec<f32> = (0..(w * h) as usize)
@@ -192,93 +178,41 @@ fn render_cpu(
                 }
                 if !zx.is_finite() || !zy.is_finite() { return iter as f32; }
             }
-            // Not yet escaped at this depth → treat as "inside" using the full
-            // colour range so unfinished pixels match the final pass's interior.
             color_iter as f32
         })
         .collect();
     apply_colormap(&escape_times, color_iter, &config.rendering.colormap)
 }
 
-fn rgb_to_xrgb(rgb: &[u8], out: &mut Vec<u32>) {
-    out.clear();
-    out.reserve(rgb.len() / 3);
-    for px in rgb.chunks_exact(3) {
-        out.push(((px[0] as u32) << 16) | ((px[1] as u32) << 8) | (px[2] as u32));
-    }
-}
+/// Render at W×H with letterboxing to preserve the view's coordinate aspect ratio.
+fn render_save(genome: &Genome, config: &Config, view: &View, w: u32, h: u32) -> Vec<u8> {
+    let (xmin, xmax, ymin, ymax) = view.bounds();
+    let view_ratio = (xmax - xmin) / (ymax - ymin);
+    let img_ratio  = w as f64 / h as f64;
 
-fn stretch_blit(src: &[u32], sw: usize, sh: usize, dst: &mut [u32], dw: usize, dh: usize) {
-    for dy in 0..dh {
-        let sy = (dy * sh / dh).min(sh.saturating_sub(1));
-        for dx in 0..dw {
-            let sx = (dx * sw / dw).min(sw.saturating_sub(1));
-            dst[dy * dw + dx] = src[sy * sw + sx];
+    let (fw, fh) = if img_ratio >= view_ratio {
+        let fw = (h as f64 * view_ratio).round() as u32;
+        (fw.max(1), h.max(1))
+    } else {
+        let fh = (w as f64 / view_ratio).round() as u32;
+        (w.max(1), fh.max(1))
+    };
+
+    let use_f64 = needs_f64(view, fw);
+    let fractal = render_cpu(genome, config, view, fw, fh, config.rendering.max_iter, use_f64);
+
+    let mut canvas = vec![0u8; (w * h * 3) as usize];
+    let ox = (w - fw) / 2;
+    let oy = (h - fh) / 2;
+    for row in 0..fh {
+        let src = (row * fw * 3) as usize;
+        let dst = ((oy + row) * w * 3 + ox * 3) as usize;
+        let len = (fw * 3) as usize;
+        if dst + len <= canvas.len() && src + len <= fractal.len() {
+            canvas[dst..dst + len].copy_from_slice(&fractal[src..src + len]);
         }
     }
-}
-
-// ── Pixel drawing helpers ─────────────────────────────────────────────────────
-
-fn draw_char(buf: &mut [u32], stride: usize, x: usize, y: usize, ch: char, fg: u32, scale: usize) {
-    let ch = if ch.is_ascii() { ch } else { '?' };
-    if let Some(glyph) = font8x8::BASIC_FONTS.get(ch) {
-        for (row, &bits) in glyph.iter().enumerate() {
-            for col in 0..8usize {
-                if bits & (1u8 << col) != 0 {
-                    for sy in 0..scale {
-                        for sx in 0..scale {
-                            let px = x + col * scale + sx;
-                            let py = y + row * scale + sy;
-                            let idx = py * stride + px;
-                            if idx < buf.len() { buf[idx] = fg; }
-                        }
-                    }
-                }
-            }
-        }
-    }
-}
-
-fn draw_text(buf: &mut [u32], stride: usize, x: usize, y: usize, text: &str, fg: u32, scale: usize) {
-    let cw = 8 * scale;
-    for (i, ch) in text.chars().enumerate() {
-        draw_char(buf, stride, x + i * cw, y, ch, fg, scale);
-    }
-}
-
-/// Multiply every pixel in the region by `factor/255` (fade toward black).
-fn darken_rect(buf: &mut [u32], stride: usize, x: usize, y: usize, w: usize, h: usize, factor: u32) {
-    if stride == 0 || w == 0 || h == 0 { return; }
-    let max_x = (x + w).min(stride);
-    let rows   = buf.len() / stride;
-    let max_y  = (y + h).min(rows);
-    for row in y..max_y {
-        for col in x..max_x {
-            let idx = row * stride + col;
-            let p = buf[idx];
-            let r = (((p >> 16) & 0xFF) * factor / 255) << 16;
-            let g = (((p >>  8) & 0xFF) * factor / 255) <<  8;
-            let b =   (p        & 0xFF) * factor / 255;
-            buf[idx] = r | g | b;
-        }
-    }
-}
-
-fn draw_rect_outline(buf: &mut [u32], stride: usize, x: usize, y: usize, w: usize, h: usize, color: u32) {
-    if w == 0 || h == 0 { return; }
-    for col in 0..w {
-        let t = y * stride + x + col;
-        let b = (y + h - 1) * stride + x + col;
-        if t < buf.len() { buf[t] = color; }
-        if b < buf.len() { buf[b] = color; }
-    }
-    for row in 0..h {
-        let l = (y + row) * stride + x;
-        let r = (y + row) * stride + x + w - 1;
-        if l < buf.len() { buf[l] = color; }
-        if r < buf.len() { buf[r] = color; }
-    }
+    canvas
 }
 
 // ── Render channel ────────────────────────────────────────────────────────────
@@ -287,104 +221,149 @@ struct RenderRequest {
     view:       View,
     w:          u32,
     h:          u32,
-    /// true → render at 1/4 res for fast exploration feedback; auto-upgrades when idle.
     preview:    bool,
     generation: u64,
 }
 
 struct RenderResult {
-    pixels:     Vec<u32>,
+    pixels:     Vec<u8>,  // RGB flat (3 bytes/pixel)
     w:          u32,
     h:          u32,
-    /// true = 1/4-res low-quality preview
     is_preview: bool,
-    /// false = more progressive passes coming for this generation
     complete:   bool,
     generation: u64,
 }
 
-// ── Constants ─────────────────────────────────────────────────────────────────
+// ── Preferences ───────────────────────────────────────────────────────────────
 
-const MIN_SEL_PX: f64  = 12.0;
-const MAX_UNDO:   usize = 20;
-const BADGE_W:    usize = 60;
-const BADGE_H:    usize = 18;
+#[derive(Serialize, Deserialize)]
+struct ViewerPrefs {
+    last_save_width:  u32,
+    last_save_height: u32,
+    ratio_label:      String,
+    colormap:         String,
+    window_width:     u32,
+    window_height:    u32,
+}
+
+impl Default for ViewerPrefs {
+    fn default() -> Self {
+        Self {
+            last_save_width:  1920,
+            last_save_height: 1080,
+            ratio_label:      "1:1".into(),
+            colormap:         "turbo".into(),
+            window_width:     1024,
+            window_height:    768,
+        }
+    }
+}
+
+impl ViewerPrefs {
+    fn load(path: &Path) -> Self {
+        std::fs::read_to_string(path)
+            .ok()
+            .and_then(|s| toml::from_str(&s).ok())
+            .unwrap_or_default()
+    }
+
+    fn save(&self, path: &Path) {
+        if let Ok(s) = toml::to_string_pretty(self) {
+            let _ = std::fs::write(path, s);
+        }
+    }
+}
 
 // ── Application ───────────────────────────────────────────────────────────────
 
 struct App {
-    window:  Option<Rc<Window>>,
-    surface: Option<Surface<Rc<Window>, Rc<Window>>>,
-    sb_ctx:  Option<Context<Rc<Window>>>,
-
-    genome:  Genome,
-    config:  Config,
-    nn_path: PathBuf,
+    genome:       Genome,
+    config:       Config,
+    nn_path:      PathBuf,
 
     view:         View,
     default_view: View,
     view_stack:   Vec<View>,
 
-    mouse_pos:       PhysicalPosition<f64>,
-    mode:            Mode,
-    show_help:       bool,
-    save_resolution: u32,
+    req_tx:          mpsc::SyncSender<RenderRequest>,
+    res_rx:          mpsc::Receiver<RenderResult>,
+    render_gen:      u64,
+    displayed_gen:   u64,
+    render_complete: bool,
 
-    current_pixels:   Vec<u32>,
-    current_w:        u32,
-    current_h:        u32,
-    current_preview:  bool,
-    render_complete:  bool,   // false while progressive passes are still arriving
-    render_gen:       u64,
-    displayed_gen:    u64,
+    texture: Option<TextureHandle>,
+    // fractal display area within the window, updated each frame
+    frac_rect:  egui::Rect,
+    prev_frac_dims: (u32, u32),  // track size changes to avoid redundant re-renders
 
-    req_tx: mpsc::SyncSender<RenderRequest>,
-    res_rx: mpsc::Receiver<RenderResult>,
-    proxy:  EventLoopProxy<()>,
+    drag_start: Option<egui::Pos2>,
+
+    show_help: bool,
+    show_save: bool,
+    save_w_str: String,
+    save_h_str: String,
+
+    ratio_idx:    usize,
+    colormap_idx: usize,
+
+    // XY bound fields — stored so they survive across frames while being edited
+    xmin_str:  String,
+    xmax_str:  String,
+    ymin_str:  String,
+    ymax_str:  String,
+    sync_xy:   bool,  // true = view changed externally, refresh strings next frame
+
+    prefs:      ViewerPrefs,
+    prefs_path: PathBuf,
 }
 
 impl App {
-    fn new(nn_path: PathBuf, proxy: EventLoopProxy<()>) -> anyhow::Result<Self> {
+    fn new(cc: &eframe::CreationContext, nn_path: PathBuf) -> anyhow::Result<Self> {
         let config = Config::load(Path::new("config.toml"))
             .unwrap_or_else(|_| default_config());
         let genome = load_genome(&nn_path)?;
 
-        let default_view = View {
-            cx:   genome.view_cx as f64,
-            cy:   genome.view_cy as f64,
-            zoom: genome.view_zoom.max(0.1) as f64,
-        };
+        let default_view = View::new_square(
+            genome.view_cx as f64,
+            genome.view_cy as f64,
+            genome.view_zoom.max(0.1) as f64,
+        );
 
-        // Capacity 2 allows a preview + a full-quality request to queue simultaneously.
+        let prefs_path = nn_path.parent().unwrap_or(Path::new("."))
+            .join("viewer_prefs.toml");
+        let prefs = ViewerPrefs::load(&prefs_path);
+
+        // Find colormap index from prefs
+        let colormap_idx = COLORMAPS.iter().position(|&c| c == prefs.colormap)
+            .unwrap_or(0);
+        let ratio_idx = RATIOS.iter().position(|(label, _, _)| *label == prefs.ratio_label)
+            .unwrap_or(0);
+
+        // Sync config colormap from prefs
+        let mut config = config;
+        config.rendering.colormap = COLORMAPS[colormap_idx].to_string();
+
+        let ctx = cc.egui_ctx.clone();
         let (req_tx, req_rx) = mpsc::sync_channel::<RenderRequest>(2);
         let (res_tx, res_rx) = mpsc::sync_channel::<RenderResult>(4);
 
         {
-            let genome     = genome.clone();
-            let config     = config.clone();
-            let wake_proxy = proxy.clone();
+            let genome  = genome.clone();
+            let config  = config.clone();
             thread::spawn(move || {
-                // Progressive iteration steps for full-quality renders.
-                // Each step sends an intermediate result immediately so the window
-                // shows something long before max_iter is reached.
-                let full_iter = config.rendering.max_iter;
+                let full_iter  = config.rendering.max_iter;
                 let full_steps: &[u32] = &[8, 24, 64, full_iter];
-
-                // `pending` carries a request that interrupted progressive refinement
-                // so it gets rendered next instead of being discarded.
                 let mut pending = req_rx.recv().ok();
                 while let Some(req) = pending.take() {
                     let mut latest = req;
                     while let Ok(newer) = req_rx.try_recv() { latest = newer; }
 
-                    // Deep zoom past f32 precision → use the f64 CPU path. It's slower,
-                    // so cap its resolution (long side ≤ 720) and let stretch_blit upscale;
-                    // structure, not pixel count, is what matters at depth.
                     let use_f64 = !latest.preview && needs_f64(&latest.view, latest.w);
 
                     let (rw, rh) = if latest.preview {
                         ((latest.w / 4).max(1), (latest.h / 4).max(1))
                     } else if use_f64 {
+                        // cap resolution for f64 CPU path; egui scales texture up
                         let long = latest.w.max(latest.h).max(1);
                         if long > 720 {
                             ((latest.w * 720 / long).max(1), (latest.h * 720 / long).max(1))
@@ -395,40 +374,25 @@ impl App {
                         (latest.w, latest.h)
                     };
 
-                    // Previews (1/4-res) are already tiny — one pass at full depth.
-                    // Full-quality renders use progressive steps to show results fast.
-                    let steps: &[u32] = if latest.preview {
-                        &[full_iter]
-                    } else {
-                        full_steps
-                    };
+                    let steps: &[u32] = if latest.preview { &[full_iter] } else { full_steps };
 
-                    for (i, &max_iter) in steps.iter().enumerate() {
-                        let max_iter  = max_iter.min(full_iter);
-                        let is_last   = i == steps.len() - 1;
-                        let rgb       = render_cpu(&genome, &config, &latest.view, rw, rh, max_iter, use_f64);
-                        let mut pixels = Vec::new();
-                        rgb_to_xrgb(&rgb, &mut pixels);
+                    for (i, &iter) in steps.iter().enumerate() {
+                        let is_last = i == steps.len() - 1;
+                        let pixels  = render_cpu(&genome, &config, &latest.view,
+                                                 rw, rh, iter.min(full_iter), use_f64);
                         if res_tx.send(RenderResult {
                             pixels, w: rw, h: rh,
                             is_preview: latest.preview,
-                            complete:   is_last,
+                            complete: is_last,
                             generation: latest.generation,
                         }).is_err() { return; }
-                        // Wake the event loop so the result is displayed immediately,
-                        // without waiting for the next user input event.
-                        wake_proxy.send_event(()).ok();
-
+                        ctx.request_repaint();
                         if is_last { break; }
-                        // If a newer request arrived, stop refining this (stale) view and
-                        // render the newer one next — but DON'T discard it.
                         if let Ok(newer) = req_rx.try_recv() {
                             pending = Some(newer);
                             break;
                         }
                     }
-
-                    // If progressive refinement finished cleanly, block for the next request.
                     if pending.is_none() {
                         pending = req_rx.recv().ok();
                     }
@@ -436,54 +400,50 @@ impl App {
             });
         }
 
-        Ok(Self {
-            window: None, surface: None, sb_ctx: None,
+        let initial_rect = egui::Rect::from_min_size(
+            egui::Pos2::ZERO,
+            egui::Vec2::new(prefs.window_width as f32, prefs.window_height as f32),
+        );
+
+        let (xmin, xmax, ymin, ymax) = default_view.bounds();
+        let mut app = Self {
             genome, config, nn_path,
             view: default_view.clone(),
             default_view,
             view_stack: Vec::new(),
-            mouse_pos: PhysicalPosition::new(0.0, 0.0),
-            mode: Mode::Normal,
+            req_tx, res_rx,
+            render_gen: 0, displayed_gen: 0, render_complete: true,
+            texture: None,
+            frac_rect: initial_rect,
+            prev_frac_dims: (0, 0),
+            drag_start: None,
             show_help: false,
-            save_resolution: 2048,
-            current_pixels: Vec::new(),
-            current_w: 0, current_h: 0,
-            current_preview: false,
-            render_complete: true,
-            render_gen: 0, displayed_gen: 0,
-            req_tx, res_rx, proxy,
-        })
-    }
-
-    fn win_size(&self) -> (u32, u32) {
-        self.window.as_ref()
-            .map(|w| { let s = w.inner_size(); (s.width.max(1), s.height.max(1)) })
-            .unwrap_or((800, 800))
+            show_save: false,
+            save_w_str: prefs.last_save_width.to_string(),
+            save_h_str: prefs.last_save_height.to_string(),
+            ratio_idx, colormap_idx,
+            xmin_str: format!("{:.6}", xmin),
+            xmax_str: format!("{:.6}", xmax),
+            ymin_str: format!("{:.6}", ymin),
+            ymax_str: format!("{:.6}", ymax),
+            sync_xy: false,
+            prefs, prefs_path,
+        };
+        // Set initial aspect ratio from prefs
+        app.apply_ratio(ratio_idx, false);
+        app.request_render(false);
+        Ok(app)
     }
 
     fn request_render(&mut self, preview: bool) {
-        let (w, h) = self.win_size();
+        let w = self.frac_rect.width().round() as u32;
+        let h = self.frac_rect.height().round() as u32;
+        if w == 0 || h == 0 { return; }
         self.render_gen += 1;
         let _ = self.req_tx.try_send(RenderRequest {
             view: self.view.clone(), w, h, preview,
             generation: self.render_gen,
         });
-    }
-
-    fn poll_render(&mut self) -> bool {
-        let mut got = false;
-        while let Ok(res) = self.res_rx.try_recv() {
-            if res.generation >= self.displayed_gen {
-                self.current_pixels  = res.pixels;
-                self.current_w       = res.w;
-                self.current_h       = res.h;
-                self.current_preview = res.is_preview;
-                self.render_complete = res.complete;
-                self.displayed_gen   = res.generation;
-                got = true;
-            }
-        }
-        got
     }
 
     fn push_view(&mut self) {
@@ -492,405 +452,594 @@ impl App {
         self.view_stack.push(old);
     }
 
-    fn commit_selection(&mut self, anchor: (f64, f64)) {
-        let (ax, ay) = anchor;
-        let (cx, cy) = (self.mouse_pos.x, self.mouse_pos.y);
-        let dx = cx - ax;
-        let dy = cy - ay;
-        let size = dx.abs().min(dy.abs());
-        if size < MIN_SEL_PX { return; }
-
-        let ex = ax + size * if dx >= 0.0 { 1.0 } else { -1.0 };
-        let ey = ay + size * if dy >= 0.0 { 1.0 } else { -1.0 };
-        let x1 = ax.min(ex);
-        let y1 = ay.min(ey);
-        let x2 = ax.max(ex);
-        let y2 = ay.max(ey);
-
-        let (w, h) = self.win_size();
-        let (fx1, fy1) = self.view.pixel_to_fractal(x1, y1, w, h);
-        let (fx2, fy2) = self.view.pixel_to_fractal(x2, y2, w, h);
-        let new_cx   = (fx1 + fx2) * 0.5;
-        let new_cy   = (fy1 + fy2) * 0.5;
-        let new_zoom = self.view.zoom * (w as f64 / size);
-
-        self.push_view();
-        self.view = View {
-            cx:   new_cx,
-            cy:   new_cy,
-            // f64 keeps coordinates precise to ~10^13 zoom (mantissa-limited);
-            // beyond that needs extended precision (twofloat/perturbation).
-            zoom: new_zoom.clamp(0.05, 1.0e13),
-        };
-        self.request_render(true); // fast 1/4-res preview; about_to_wait upgrades to full
+    fn undo_zoom(&mut self) {
+        if let Some(prev) = self.view_stack.pop() {
+            self.view = prev;
+            self.sync_xy = true;
+            self.request_render(true);
+        }
     }
 
     fn zoom_out(&mut self) {
         self.push_view();
         self.view.zoom = (self.view.zoom * 0.5).max(0.05);
+        self.sync_xy = true;
         self.request_render(true);
     }
 
-    fn undo_zoom(&mut self) {
-        if let Some(prev) = self.view_stack.pop() {
-            self.view = prev;
-            self.request_render(true);
-            if let Some(w) = &self.window { w.request_redraw(); }
+    fn current_aspect(&self) -> f64 {
+        let (_, rw, rh) = RATIOS[self.ratio_idx];
+        rw / rh
+    }
+
+    // Change the display aspect ratio, keeping cy and the y range.
+    fn apply_ratio(&mut self, idx: usize, save_prefs: bool) {
+        self.ratio_idx = idx;
+        let (_, rw, rh) = RATIOS[idx];
+        let new_asp = rw / rh;
+        self.view.aspect = new_asp;
+        self.sync_xy = true;
+        if save_prefs {
+            self.prefs.ratio_label = RATIOS[idx].0.to_string();
+            self.prefs.save(&self.prefs_path);
         }
     }
 
-    fn badge_origin(&self) -> (usize, usize) {
-        let (w, h) = self.win_size();
-        (w as usize - BADGE_W - 4, h as usize - BADGE_H - 4)
-    }
-
-    fn is_badge(&self, px: f64, py: f64) -> bool {
-        let (bx, by) = self.badge_origin();
-        px >= bx as f64 && px <= (bx + BADGE_W) as f64
-            && py >= by as f64 && py <= (by + BADGE_H) as f64
-    }
-
-    fn selection_screen_rect(&self) -> Option<(usize, usize, usize, usize)> {
-        let anchor = match &self.mode {
-            Mode::Selecting { anchor } => *anchor,
-            _ => return None,
-        };
-        let (ax, ay) = anchor;
-        let (cx, cy) = (self.mouse_pos.x, self.mouse_pos.y);
-        let dx = cx - ax;
-        let dy = cy - ay;
-        let size = dx.abs().min(dy.abs());
-        if size < MIN_SEL_PX { return None; }
-        let ex = ax + size * if dx >= 0.0 { 1.0 } else { -1.0 };
-        let ey = ay + size * if dy >= 0.0 { 1.0 } else { -1.0 };
-        let (ww, wh) = self.win_size();
-        let x1 = ax.min(ex).max(0.0) as usize;
-        let y1 = ay.min(ey).max(0.0) as usize;
-        let x2 = (ax.max(ex) as usize).min(ww as usize);
-        let y2 = (ay.max(ey) as usize).min(wh as usize);
-        Some((x1, y1, x2, y2))
-    }
-
-    fn blit(&mut self) {
-        // Pre-compute self-borrowed values before the surface buffer mutable borrow.
-        let sel_rect   = self.selection_screen_rect();
-        let badge      = self.badge_origin();
-        let show_help  = self.show_help;
-        let save_res   = self.save_resolution;
-        let res_digits = if let Mode::ResInput { ref digits } = self.mode {
-            Some(digits.clone())
-        } else { None };
-        let view_title = {
-            let (xmin, xmax, _, _) = self.view.bounds();
-            match &self.mode {
-                Mode::ResInput { digits } => format!(
-                    "NNFractals — save size: {digits}  (Enter=confirm  Esc=cancel)"
-                ),
-                _ => {
-                    let spin = if !self.render_complete || self.displayed_gen < self.render_gen {
-                        "  [rendering…]"
-                    } else { "" };
-                    let (w, _) = self.win_size();
-                    let prec = if needs_f64(&self.view, w) { "  [f64]" } else { "" };
-                    format!(
-                        "NNFractals  ({:.4}, {:.4})  zoom {:.1}×  range {:.5}{}{}",
-                        self.view.cx, self.view.cy, self.view.zoom, xmax - xmin, prec, spin
-                    )
-                }
-            }
-        };
-
-        let Some(surface) = self.surface.as_mut() else { return };
-        let Some(window)  = self.window.as_ref()  else { return };
-        let s = window.inner_size();
-        let (w, h) = (s.width.max(1), s.height.max(1));
-        let (nw, nh) = match (NonZeroU32::try_from(w), NonZeroU32::try_from(h)) {
-            (Ok(nw), Ok(nh)) => (nw, nh),
-            _ => return,
-        };
-        if surface.resize(nw, nh).is_err() { return; }
-        let Ok(mut buf) = surface.buffer_mut() else { return };
-        let stride = w as usize;
-        let bh     = h as usize;
-
-        // ── 1. Fractal pixels ─────────────────────────────────────────────────
-        let (sw, sh) = (self.current_w as usize, self.current_h as usize);
-        if sw == 0 || sh == 0 {
-            buf.fill(0);
-        } else if sw == stride && sh == bh {
-            buf.copy_from_slice(&self.current_pixels);
-        } else {
-            stretch_blit(&self.current_pixels, sw, sh, &mut buf, stride, bh);
-        }
-
-        // ── 2. Selection rectangle ────────────────────────────────────────────
-        if let Some((x1, y1, x2, y2)) = sel_rect {
-            let sw2 = x2.saturating_sub(x1).max(1);
-            let sh2 = y2.saturating_sub(y1).max(1);
-            if y1 > 0  { darken_rect(&mut buf, stride, 0,  0,  stride,      y1,       160); }
-            if y2 < bh { darken_rect(&mut buf, stride, 0,  y2, stride,      bh - y2,  160); }
-            if x1 > 0  { darken_rect(&mut buf, stride, 0,  y1, x1,          sh2,      160); }
-            if x2 < stride { darken_rect(&mut buf, stride, x2, y1, stride - x2, sh2,  160); }
-            draw_rect_outline(&mut buf, stride, x1, y1, sw2, sh2, 0xFFFFFF);
-            if sw2 > 2 && sh2 > 2 {
-                draw_rect_outline(&mut buf, stride, x1+1, y1+1, sw2-2, sh2-2, 0xFFCC00);
-            }
-        }
-
-        // ── 3. Help overlay ───────────────────────────────────────────────────
-        if show_help {
-            const LINES: &[(&str, u32)] = &[
-                (" CONTROLS           ", 0xFFFF88),
-                ("                    ", 0x000000),
-                (" Drag box  Zoom in  ", 0xDDDDDD),
-                (" R-click   Zoom out ", 0xDDDDDD),
-                (" Bksp      Undo     ", 0xDDDDDD),
-                (" R         Reset    ", 0xDDDDDD),
-                (" S         Save PNG ", 0xDDDDDD),
-                (" H or ?    Help     ", 0xDDDDDD),
-                (" Q / Esc   Quit     ", 0xDDDDDD),
-            ];
-            let scale = 2usize;
-            let cw    = 8 * scale;
-            let lh    = 8 * scale + 2;
-            let pad   = 8usize;
-            let max_c = LINES.iter().map(|(t, _)| t.len()).max().unwrap_or(0);
-            let bx    = 8usize;
-            let by    = 8usize;
-            let bw    = max_c * cw + pad * 2;
-            let bh2   = LINES.len() * lh + pad * 2;
-            darken_rect(&mut buf, stride, bx, by, bw, bh2, 30);
-            draw_rect_outline(&mut buf, stride, bx, by, bw, bh2, 0x666666);
-            for (i, (text, color)) in LINES.iter().enumerate() {
-                draw_text(&mut buf, stride, bx + pad, by + pad + i * lh, text, *color, scale);
-            }
-        }
-
-        // ── 4. Resolution input prompt ────────────────────────────────────────
-        if let Some(ref digits) = res_digits {
-            let prompt = format!(
-                "  {}x{} (was {}) Enter=save Esc=cancel  ",
-                digits, digits, save_res
-            );
-            let scale = 2usize;
-            let cw    = 8 * scale;
-            let ch    = 8 * scale;
-            let pad   = 10usize;
-            let bw    = prompt.len() * cw + pad * 2;
-            let bh2   = ch + pad * 2;
-            let bx    = stride.saturating_sub(bw) / 2;
-            let by2   = bh.saturating_sub(bh2) / 2;
-            darken_rect(&mut buf, stride, bx, by2, bw, bh2, 25);
-            draw_rect_outline(&mut buf, stride, bx, by2, bw, bh2, 0xFFFF88);
-            draw_text(&mut buf, stride, bx + pad, by2 + pad, &prompt, 0xFFFF88, scale);
-        }
-
-        // ── 5. "? Help" badge ─────────────────────────────────────────────────
-        {
-            let (bx, by) = badge;
-            let active   = show_help;
-            darken_rect(&mut buf, stride, bx, by, BADGE_W, BADGE_H,
-                if active { 80 } else { 20 });
-            draw_rect_outline(&mut buf, stride, bx, by, BADGE_W, BADGE_H,
-                if active { 0xFFFF88 } else { 0x666666 });
-            let label = if active { "X HELP" } else { "? HELP" };
-            let fg    = if active { 0xFFFF88 } else { 0x999999 };
-            // scale=1: 8px tall chars, 6 chars × 8px = 48px. bx+6 centers in BADGE_W=60.
-            draw_text(&mut buf, stride, bx + 6, by + 5, label, fg, 1);
-        }
-
-        // ── 6. Title bar ──────────────────────────────────────────────────────
-        window.set_title(&view_title);
-        let _ = buf.present();
-    }
-}
-
-impl ApplicationHandler<()> for App {
-    fn resumed(&mut self, el: &ActiveEventLoop) {
-        let attr = Window::default_attributes()
-            .with_title("NNFractals Viewer")
-            .with_inner_size(LogicalSize::new(800u32, 800u32));
-        let win = Rc::new(el.create_window(attr).expect("create window"));
-        let ctx = Context::new(win.clone()).expect("softbuffer context");
-        let suf = Surface::new(&ctx, win.clone()).expect("softbuffer surface");
-        self.window  = Some(win);
-        self.sb_ctx  = Some(ctx);
-        self.surface = Some(suf);
-        // Go straight to the progressive full-res render: its first pass (8 iters)
-        // is already ~20 ms, so a separate 1/4-res preview adds nothing but churn.
+    fn set_colormap(&mut self, idx: usize) {
+        self.colormap_idx = idx;
+        self.config.rendering.colormap = COLORMAPS[idx].to_string();
+        self.prefs.colormap = COLORMAPS[idx].to_string();
+        self.prefs.save(&self.prefs_path);
         self.request_render(false);
-        if let Some(w) = &self.window { w.request_redraw(); }
     }
 
-    fn window_event(&mut self, el: &ActiveEventLoop, _: WindowId, event: WindowEvent) {
-        match event {
-            WindowEvent::CloseRequested => el.exit(),
+    fn update_view_from_bounds(&mut self, xmin: f64, xmax: f64, ymin: f64, ymax: f64) {
+        if xmax <= xmin || ymax <= ymin { return; }
+        self.view.cx     = (xmin + xmax) / 2.0;
+        self.view.cy     = (ymin + ymax) / 2.0;
+        let yrange       = ymax - ymin;
+        let xrange       = xmax - xmin;
+        self.view.zoom   = (4.0 / yrange).clamp(0.05, 1.0e13);
+        self.view.aspect = xrange / yrange;
+        self.sync_xy = true;
+    }
 
-            WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed => {
-                // ── Resolution input mode ─────────────────────────────────────
-                if matches!(self.mode, Mode::ResInput { .. }) {
-                    let digits = if let Mode::ResInput { ref digits } = self.mode {
-                        digits.clone()
-                    } else { unreachable!() };
+    fn poll_render(&mut self, ctx: &egui::Context) -> bool {
+        let mut got = false;
+        while let Ok(res) = self.res_rx.try_recv() {
+            if res.generation >= self.displayed_gen {
+                let image = ColorImage::from_rgb([res.w as usize, res.h as usize], &res.pixels);
+                self.texture = Some(ctx.load_texture("fractal", image, TextureOptions::LINEAR));
+                self.render_complete = res.complete;
+                self.displayed_gen   = res.generation;
+                got = true;
+            }
+        }
+        got
+    }
 
-                    match &event.logical_key {
-                        Key::Named(NamedKey::Escape) => {
-                            self.mode = Mode::Normal;
+    fn show_toolbar(&mut self, ui: &mut egui::Ui) {
+        let win_h = ui.ctx().input(|i| i.viewport_rect().height());
+        let toolbar_h = (win_h * 0.055).clamp(28.0, 58.0);
+        let font_size = (toolbar_h * 0.55).clamp(12.0, 28.0);
+
+        egui::Panel::top("toolbar")
+            .exact_size(toolbar_h)
+            .show(ui, |ui| {
+                // Scale all button text to match toolbar height
+                {
+                    let style = ui.style_mut();
+                    style.text_styles.insert(
+                        egui::TextStyle::Button,
+                        egui::FontId::proportional(font_size),
+                    );
+                    style.text_styles.insert(
+                        egui::TextStyle::Body,
+                        egui::FontId::proportional(font_size * 0.85),
+                    );
+                    style.text_styles.insert(
+                        egui::TextStyle::Monospace,
+                        egui::FontId::monospace(font_size * 0.80),
+                    );
+                }
+
+                egui::ScrollArea::horizontal().show(ui, |ui| {
+                    ui.horizontal_centered(|ui| {
+                        // ── Translation arrows ──────────────────────────────
+                        if ui.button("◀").on_hover_text("A — left (Shift=2×, Alt=½)").clicked() {
+                            self.do_translate(-1.0, 0.0);
                         }
-                        Key::Named(NamedKey::Enter) => {
-                            let res = digits.trim().parse::<u32>()
-                                .ok().filter(|&r| r >= 64)
-                                .unwrap_or(self.save_resolution);
-                            self.save_resolution = res;
-                            let genome = self.genome.clone();
-                            let config = self.config.clone();
-                            let view   = self.view.clone();
-                            let path   = self.nn_path.clone();
-                            self.mode  = Mode::Normal;
-                            thread::spawn(move || {
-                                eprintln!("Rendering {}×{} PNG…", res, res);
-                                // Save at full requested resolution; use f64 when the
-                                // zoom is deep enough that f32 would pixelate.
-                                let save_f64 = needs_f64(&view, res);
-                                let rgb = render_cpu(&genome, &config, &view, res, res, config.rendering.max_iter, save_f64);
-                                let stem = path.file_stem()
-                                    .and_then(|s| s.to_str()).unwrap_or("fractal");
-                                let out = path.parent().unwrap_or(Path::new("."))
-                                    .join(format!(
-                                        "{stem}_cx{:.4}_cy{:.4}_z{:.2}_{res}px.png",
-                                        view.cx, view.cy, view.zoom
-                                    ));
-                                match save_png(&rgb, res, res, &out) {
-                                    Ok(_)  => eprintln!("Saved → {}", out.display()),
-                                    Err(e) => eprintln!("Save error: {e}"),
+                        if ui.button("▲").on_hover_text("W — up").clicked() {
+                            self.do_translate(0.0, -1.0);
+                        }
+                        if ui.button("▼").on_hover_text("S — down").clicked() {
+                            self.do_translate(0.0, 1.0);
+                        }
+                        if ui.button("▶").on_hover_text("D — right").clicked() {
+                            self.do_translate(1.0, 0.0);
+                        }
+
+                        ui.separator();
+
+                        // ── Zoom / reset ────────────────────────────────────
+                        if ui.button("⊕").on_hover_text("↑ — zoom in").clicked() {
+                            self.do_zoom(true, 1.0);
+                        }
+                        if ui.button("⊖").on_hover_text("↓ — zoom out").clicked() {
+                            self.do_zoom(false, 1.0);
+                        }
+                        if ui.button("⟳").on_hover_text("R — reset view").clicked() {
+                            self.view = self.default_view.clone();
+                            self.view.aspect = self.current_aspect();
+                            self.view_stack.clear();
+                            self.sync_xy = true;
+                            self.request_render(false);
+                        }
+
+                        ui.separator();
+
+                        // ── XY coordinate fields ────────────────────────────
+                        let (xmin, xmax, ymin, ymax) = self.view.bounds();
+                        if self.sync_xy {
+                            self.xmin_str = format!("{:.6}", xmin);
+                            self.xmax_str = format!("{:.6}", xmax);
+                            self.ymin_str = format!("{:.6}", ymin);
+                            self.ymax_str = format!("{:.6}", ymax);
+                            self.sync_xy = false;
+                        }
+
+                        let field_w = font_size * 5.5;
+                        ui.label("x:");
+                        let rx = ui.add(egui::TextEdit::singleline(&mut self.xmin_str)
+                            .desired_width(field_w).font(egui::TextStyle::Monospace));
+                        if rx.lost_focus() {
+                            if let Ok(v) = self.xmin_str.trim().parse::<f64>() {
+                                let (_, cx, cy, cy2) = self.view.bounds();
+                                self.push_view();
+                                self.update_view_from_bounds(v, cx, cy, cy2);
+                                self.request_render(false);
+                            }
+                        }
+                        let rx = ui.add(egui::TextEdit::singleline(&mut self.xmax_str)
+                            .desired_width(field_w).font(egui::TextStyle::Monospace));
+                        if rx.lost_focus() {
+                            if let Ok(v) = self.xmax_str.trim().parse::<f64>() {
+                                let (cx, _, cy, cy2) = self.view.bounds();
+                                self.push_view();
+                                self.update_view_from_bounds(cx, v, cy, cy2);
+                                self.request_render(false);
+                            }
+                        }
+
+                        ui.label("y:");
+                        let ry = ui.add(egui::TextEdit::singleline(&mut self.ymin_str)
+                            .desired_width(field_w).font(egui::TextStyle::Monospace));
+                        if ry.lost_focus() {
+                            if let Ok(v) = self.ymin_str.trim().parse::<f64>() {
+                                let (cx, cx2, _, cy2) = self.view.bounds();
+                                self.push_view();
+                                self.update_view_from_bounds(cx, cx2, v, cy2);
+                                self.request_render(false);
+                            }
+                        }
+                        let ry = ui.add(egui::TextEdit::singleline(&mut self.ymax_str)
+                            .desired_width(field_w).font(egui::TextStyle::Monospace));
+                        if ry.lost_focus() {
+                            if let Ok(v) = self.ymax_str.trim().parse::<f64>() {
+                                let (cx, cx2, cy, _) = self.view.bounds();
+                                self.push_view();
+                                self.update_view_from_bounds(cx, cx2, cy, v);
+                                self.request_render(false);
+                            }
+                        }
+
+                        ui.separator();
+
+                        // ── Aspect ratio ────────────────────────────────────
+                        let ratio_label = RATIOS[self.ratio_idx].0;
+                        egui::ComboBox::from_id_salt("ratio")
+                            .selected_text(ratio_label)
+                            .show_ui(ui, |ui| {
+                                for (i, (label, _, _)) in RATIOS.iter().enumerate() {
+                                    if ui.selectable_label(i == self.ratio_idx, *label).clicked() {
+                                        self.apply_ratio(i, true);
+                                        self.request_render(false);
+                                    }
                                 }
                             });
+
+                        ui.separator();
+
+                        // ── Palette ─────────────────────────────────────────
+                        if ui.button("◁").on_hover_text("← — previous palette").clicked() {
+                            let n = COLORMAPS.len();
+                            self.set_colormap((self.colormap_idx + n - 1) % n);
                         }
-                        Key::Named(NamedKey::Backspace) => {
-                            let mut d = digits;
-                            d.pop();
-                            self.mode = Mode::ResInput { digits: d };
+                        ui.label(COLORMAPS[self.colormap_idx]);
+                        if ui.button("▷").on_hover_text("→ — next palette").clicked() {
+                            self.set_colormap((self.colormap_idx + 1) % COLORMAPS.len());
                         }
-                        Key::Character(s) => {
-                            let mut d = digits;
-                            for ch in s.chars() {
-                                if ch.is_ascii_digit() && d.len() < 6 { d.push(ch); }
-                            }
-                            self.mode = Mode::ResInput { digits: d };
-                        }
-                        _ => {}
-                    }
-                    if let Some(w) = &self.window { w.request_redraw(); }
-                    return;
-                }
 
-                // ── Normal mode ───────────────────────────────────────────────
-                match &event.logical_key {
-                    Key::Character(s) if matches!(s.as_str(), "q" | "Q") => el.exit(),
-                    Key::Named(NamedKey::Escape) => el.exit(),
+                        ui.separator();
 
-                    Key::Character(s) if matches!(s.as_str(), "r" | "R") => {
-                        self.view = self.default_view.clone();
-                        self.view_stack.clear();
-                        self.request_render(false);
-                        if let Some(w) = &self.window { w.request_redraw(); }
-                    }
-                    Key::Character(s) if matches!(s.as_str(), "h" | "H") => {
-                        self.show_help = !self.show_help;
-                        if let Some(w) = &self.window { w.request_redraw(); }
-                    }
-                    Key::Character(s) if matches!(s.as_str(), "s" | "S") => {
-                        self.mode = Mode::ResInput {
-                            digits: self.save_resolution.to_string(),
-                        };
-                        if let Some(w) = &self.window { w.request_redraw(); }
-                    }
-                    Key::Named(NamedKey::Backspace) => {
-                        self.undo_zoom();
-                    }
-                    _ => {}
-                }
-            }
-
-            WindowEvent::CursorMoved { position, .. } => {
-                self.mouse_pos = position;
-                if matches!(self.mode, Mode::Selecting { .. }) {
-                    if let Some(w) = &self.window { w.request_redraw(); }
-                }
-            }
-
-            WindowEvent::MouseInput { button: MouseButton::Left, state, .. } => {
-                match state {
-                    ElementState::Pressed => {
-                        if self.is_badge(self.mouse_pos.x, self.mouse_pos.y) {
+                        // ── Help / Save ─────────────────────────────────────
+                        let help_label = if self.show_help { "✕ Help" } else { "? Help" };
+                        if ui.button(help_label).clicked() {
                             self.show_help = !self.show_help;
-                            if let Some(w) = &self.window { w.request_redraw(); }
-                        } else {
-                            self.mode = Mode::Selecting {
-                                anchor: (self.mouse_pos.x, self.mouse_pos.y),
-                            };
                         }
-                    }
-                    ElementState::Released => {
-                        let anchor = match &self.mode {
-                            Mode::Selecting { anchor } => Some(*anchor),
-                            _ => None,
-                        };
-                        if let Some(anchor) = anchor {
-                            self.mode = Mode::Normal;
-                            self.commit_selection(anchor);
-                            if let Some(w) = &self.window { w.request_redraw(); }
+                        if ui.button("💾 Save").on_hover_text("Ctrl+S").clicked() {
+                            self.show_save = true;
                         }
+
+                        // Status indicator (right-aligned)
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if !self.render_complete || self.displayed_gen < self.render_gen {
+                                ui.colored_label(Color32::YELLOW, "⟳ rendering…");
+                            } else {
+                                let w = self.frac_rect.width() as u32;
+                                if needs_f64(&self.view, w) {
+                                    ui.colored_label(Color32::from_rgb(100, 200, 255), "f64");
+                                }
+                            }
+                        });
+                    });
+                });
+            });
+    }
+
+    fn show_fractal_panel(&mut self, ui: &mut egui::Ui) {
+        egui::CentralPanel::default()
+            .frame(egui::Frame::new().fill(Color32::BLACK))
+            .show(ui, |ui| {
+                let avail = ui.available_size();
+                let asp   = self.current_aspect() as f32;
+                let (fw, fh) = if avail.x / avail.y >= asp {
+                    (avail.y * asp, avail.y)
+                } else {
+                    (avail.x, avail.x / asp)
+                };
+
+                let offset_x = (avail.x - fw) / 2.0;
+                let offset_y = (avail.y - fh) / 2.0;
+                let panel_min = ui.min_rect().min;
+                let frac_min = egui::Pos2::new(panel_min.x + offset_x, panel_min.y + offset_y);
+                let new_rect = egui::Rect::from_min_size(frac_min, egui::Vec2::new(fw, fh));
+
+                // Trigger re-render if fractal area dimensions changed
+                let new_dims = (fw.round() as u32, fh.round() as u32);
+                if new_dims != self.prev_frac_dims && new_dims.0 > 0 && new_dims.1 > 0 {
+                    self.frac_rect = new_rect;
+                    self.prev_frac_dims = new_dims;
+                    self.request_render(false);
+                }
+                self.frac_rect = new_rect;
+
+                // Draw fractal texture
+                if let Some(tex) = &self.texture {
+                    let uv  = egui::Rect::from_min_max(egui::Pos2::ZERO, egui::Pos2::new(1.0, 1.0));
+                    ui.painter().image(tex.id(), new_rect, uv, Color32::WHITE);
+                }
+
+                // Interaction area (drag + click)
+                let resp = ui.allocate_rect(
+                    new_rect,
+                    egui::Sense::click_and_drag(),
+                );
+
+                // Right-click → zoom out
+                if resp.secondary_clicked() {
+                    self.zoom_out();
+                }
+
+                // Drag → selection rectangle
+                if resp.drag_started() {
+                    if let Some(p) = resp.interact_pointer_pos() {
+                        self.drag_start = Some(p);
                     }
                 }
+                if resp.drag_stopped() {
+                    if let (Some(start), Some(end)) = (self.drag_start.take(), resp.interact_pointer_pos()) {
+                        self.commit_selection(start, end, fw, fh);
+                    }
+                    self.drag_start = None;
+                }
+
+                // Draw selection overlay
+                if let (Some(start), Some(cur)) = (self.drag_start, ui.ctx().input(|i| i.pointer.latest_pos())) {
+                    let (sel_rect, ok) = selection_rect(start, cur, fw / fh);
+                    if ok {
+                        let painter = ui.painter();
+                        painter.rect_stroke(sel_rect, 0.0, egui::Stroke::new(2.0, Color32::WHITE), egui::StrokeKind::Middle);
+                        painter.rect_stroke(
+                            sel_rect.shrink(1.5),
+                            0.0,
+                            egui::Stroke::new(1.0, Color32::from_rgb(255, 200, 0)),
+                            egui::StrokeKind::Middle,
+                        );
+                    }
+                }
+
+                // Auto-upgrade preview to full when settled
+                if self.texture.is_some() {
+                    let result_is_preview = self.displayed_gen == self.render_gen && self.render_complete;
+                    if result_is_preview {
+                        // already full — nothing to do
+                    }
+                }
+            });
+    }
+
+    fn do_translate(&mut self, dx_sign: f64, dy_sign: f64) {
+        self.do_translate_scaled(dx_sign, dy_sign, 1.0);
+    }
+
+    fn do_translate_scaled(&mut self, dx_sign: f64, dy_sign: f64, scale: f64) {
+        let (xmin, xmax, ymin, ymax) = self.view.bounds();
+        let radius = (xmax - xmin) / 2.0;
+        let step   = radius / 3.0 * scale;
+        self.push_view();
+        self.view.cx += dx_sign * step;
+        self.view.cy += dy_sign * step;
+        self.sync_xy = true;
+        self.request_render(true);
+    }
+
+    fn do_zoom(&mut self, zoom_in: bool, scale: f64) {
+        // base factor: zoom by (3/2)^scale per press
+        let factor = (1.5_f64).powf(scale);
+        self.push_view();
+        if zoom_in {
+            self.view.zoom = (self.view.zoom * factor).clamp(0.05, 1.0e13);
+        } else {
+            self.view.zoom = (self.view.zoom / factor).clamp(0.05, 1.0e13);
+        }
+        self.sync_xy = true;
+        self.request_render(true);
+    }
+
+    fn commit_selection(&mut self, start: egui::Pos2, end: egui::Pos2, fw: f32, fh: f32) {
+        let (sel_rect, ok) = selection_rect(start, end, fw / fh);
+        if !ok { return; }
+
+        let (fx1, fy1) = self.view.pixel_to_fractal(
+            (sel_rect.min.x - self.frac_rect.min.x) as f64,
+            (sel_rect.min.y - self.frac_rect.min.y) as f64,
+            fw as f64, fh as f64,
+        );
+        let (fx2, fy2) = self.view.pixel_to_fractal(
+            (sel_rect.max.x - self.frac_rect.min.x) as f64,
+            (sel_rect.max.y - self.frac_rect.min.y) as f64,
+            fw as f64, fh as f64,
+        );
+        let new_cx = (fx1 + fx2) * 0.5;
+        let new_cy = (fy1 + fy2) * 0.5;
+        // zoom: sel_w / fw = fraction of view covered
+        let sel_frac = sel_rect.width() / fw;
+        let new_zoom = (self.view.zoom / sel_frac as f64).clamp(0.05, 1.0e13);
+
+        self.push_view();
+        self.view.cx   = new_cx;
+        self.view.cy   = new_cy;
+        self.view.zoom = new_zoom;
+        self.sync_xy = true;
+        self.request_render(true);
+    }
+
+    fn handle_keyboard(&mut self, ctx: &egui::Context) {
+        // Don't steal keys while a text field has focus
+        let any_focused = ctx.memory(|m| m.focused().is_some());
+        if any_focused { return; }
+
+        ctx.input(|i| {
+            let mods  = i.modifiers;
+            let scale = modifier_scale(&mods);
+
+            // Q / Esc → quit
+            if i.key_pressed(Key::Q) || i.key_pressed(Key::Escape) {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             }
 
-            WindowEvent::MouseInput {
-                button: MouseButton::Right,
-                state: ElementState::Released, ..
-            } => {
-                self.zoom_out();
-                if let Some(w) = &self.window { w.request_redraw(); }
+            // WASD translation
+            if i.key_pressed(Key::W) { self.do_translate_scaled( 0.0, -1.0, scale); }
+            if i.key_pressed(Key::S) { self.do_translate_scaled( 0.0,  1.0, scale); }
+            if i.key_pressed(Key::A) { self.do_translate_scaled(-1.0,  0.0, scale); }
+            if i.key_pressed(Key::D) { self.do_translate_scaled( 1.0,  0.0, scale); }
+
+            // Arrow up/down: zoom
+            if i.key_pressed(Key::ArrowUp)   { self.do_zoom(true,  scale); }
+            if i.key_pressed(Key::ArrowDown)  { self.do_zoom(false, scale); }
+
+            // Arrow left/right: palette
+            if i.key_pressed(Key::ArrowLeft) {
+                let n = COLORMAPS.len();
+                self.set_colormap((self.colormap_idx + n - 1) % n);
+            }
+            if i.key_pressed(Key::ArrowRight) {
+                self.set_colormap((self.colormap_idx + 1) % COLORMAPS.len());
             }
 
-            WindowEvent::Resized(_) => {
+            // R: reset
+            if i.key_pressed(Key::R) {
+                self.view = self.default_view.clone();
+                self.view.aspect = self.current_aspect();
+                self.view_stack.clear();
+                self.sync_xy = true;
                 self.request_render(false);
-                if let Some(w) = &self.window { w.request_redraw(); }
             }
 
-            WindowEvent::RedrawRequested => {
-                self.poll_render();
-                self.blit();
-                // Keep requesting redraws while a render (or progressive pass) is in flight.
-                if self.displayed_gen < self.render_gen || !self.render_complete {
-                    if let Some(w) = &self.window { w.request_redraw(); }
+            // H / ?: help
+            if i.key_pressed(Key::H) {
+                self.show_help = !self.show_help;
+            }
+
+            // Backspace / Ctrl+Z: undo
+            if i.key_pressed(Key::Backspace)
+                || (mods.ctrl && i.key_pressed(Key::Z))
+            {
+                self.undo_zoom();
+            }
+
+            // Ctrl+S: save
+            if mods.ctrl && i.key_pressed(Key::S) {
+                self.show_save = true;
+            }
+        });
+    }
+
+    fn show_help_window(&mut self, ctx: &egui::Context) {
+        if !self.show_help { return; }
+        egui::Window::new("Controls")
+            .collapsible(false)
+            .resizable(false)
+            .show(ctx, |ui| {
+                egui::Grid::new("help_grid").num_columns(2).spacing([20.0, 4.0]).show(ui, |ui| {
+                    let rows: &[(&str, &str)] = &[
+                        ("W/A/S/D",          "Translate (Shift=2×, Alt=½, Ctrl+Shift=10r, Ctrl+Alt=r/10)"),
+                        ("↑ / ↓",            "Zoom in / out (same modifiers)"),
+                        ("← / →",            "Previous / next palette"),
+                        ("Drag (left btn)",  "Zoom into selection"),
+                        ("Right-click",      "Zoom out ×2"),
+                        ("Backspace/Ctrl+Z", "Undo zoom"),
+                        ("R",                "Reset view"),
+                        ("H / ?",            "Toggle this help"),
+                        ("Ctrl+S",           "Save PNG"),
+                        ("Q / Esc",          "Quit"),
+                    ];
+                    for (key, desc) in rows {
+                        ui.monospace(*key);
+                        ui.label(*desc);
+                        ui.end_row();
+                    }
+                });
+                if ui.button("Close").clicked() {
+                    self.show_help = false;
                 }
+            });
+    }
+
+    fn show_save_window(&mut self, ctx: &egui::Context) {
+        if !self.show_save { return; }
+        let genome  = self.genome.clone();
+        let config  = self.config.clone();
+        let view    = self.view.clone();
+        let nn_path = self.nn_path.clone();
+
+        let mut do_save = false;
+        let mut do_close = false;
+        egui::Window::new("Save Fractal Image")
+            .collapsible(false)
+            .resizable(false)
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label("Width:");
+                    ui.add(egui::TextEdit::singleline(&mut self.save_w_str).desired_width(80.0));
+                    ui.label("Height:");
+                    ui.add(egui::TextEdit::singleline(&mut self.save_h_str).desired_width(80.0));
+                });
+                let sw: u32 = self.save_w_str.trim().parse().unwrap_or(1920);
+                let sh: u32 = self.save_h_str.trim().parse().unwrap_or(1080);
+                if sw > 0 && sh > 0 {
+                    let r = sw as f64 / sh as f64;
+                    ui.label(
+                        egui::RichText::new(format!("→ ratio {sw}:{sh} = {r:.3}"))
+                            .color(Color32::GRAY),
+                    );
+                }
+                ui.horizontal(|ui| {
+                    if ui.button("Save").clicked() { do_save = true; }
+                    if ui.button("Cancel").clicked() { do_close = true; }
+                });
+            });
+
+        if do_save {
+            let sw: u32 = self.save_w_str.trim().parse().unwrap_or(1920);
+            let sh: u32 = self.save_h_str.trim().parse().unwrap_or(1080);
+            if sw >= 64 && sh >= 64 {
+                self.prefs.last_save_width  = sw;
+                self.prefs.last_save_height = sh;
+                self.prefs.save(&self.prefs_path);
+                thread::spawn(move || {
+                    eprintln!("Rendering {sw}×{sh} PNG…");
+                    let rgb  = render_save(&genome, &config, &view, sw, sh);
+                    let stem = nn_path.file_stem()
+                        .and_then(|s| s.to_str()).unwrap_or("fractal");
+                    let out = nn_path.parent().unwrap_or(Path::new("."))
+                        .join(format!(
+                            "{stem}_cx{:.4}_cy{:.4}_z{:.2}_{sw}x{sh}.png",
+                            view.cx, view.cy, view.zoom,
+                        ));
+                    match save_png(&rgb, sw, sh, &out) {
+                        Ok(_)  => eprintln!("Saved → {}", out.display()),
+                        Err(e) => eprintln!("Save error: {e}"),
+                    }
+                });
             }
-
-            _ => {}
+            self.show_save = false;
         }
-    }
-
-    fn user_event(&mut self, _: &ActiveEventLoop, _: ()) {
-        // Render thread finished a pass — poll for the result and redraw.
-        if self.poll_render() {
-            if let Some(w) = &self.window { w.request_redraw(); }
-        }
-    }
-
-    fn about_to_wait(&mut self, _: &ActiveEventLoop) {
-        if self.poll_render() {
-            if let Some(w) = &self.window { w.request_redraw(); }
-        }
-        // Auto-upgrade: only when a completed low-res preview has fully settled —
-        // not while progressive full-quality passes are still arriving.
-        if self.current_preview && self.render_complete && self.displayed_gen == self.render_gen {
-            self.request_render(false);
+        if do_close {
+            self.show_save = false;
         }
     }
 }
 
-// ── Fallback config ───────────────────────────────────────────────────────────
+impl eframe::App for App {
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        let ctx = ui.ctx().clone();
+        self.poll_render(&ctx);
+        self.handle_keyboard(&ctx);
+        self.show_toolbar(ui);
+        self.show_fractal_panel(ui);
+        self.show_help_window(&ctx);
+        self.show_save_window(&ctx);
+
+        // Auto-upgrade preview to full quality when idle
+        if self.render_complete && self.displayed_gen == self.render_gen {
+            if let Some(tex) = &self.texture {
+                let [tw, th] = tex.size();
+                let fw = self.frac_rect.width().round() as usize;
+                let fh = self.frac_rect.height().round() as usize;
+                if tw < fw / 2 || th < fh / 2 {
+                    self.request_render(false);
+                }
+            }
+        }
+
+        if !self.render_complete || self.displayed_gen < self.render_gen {
+            ctx.request_repaint();
+        }
+    }
+}
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
+
+/// Compute a selection rectangle constrained to `aspect` (w/h), returning (rect, valid).
+fn selection_rect(start: egui::Pos2, cur: egui::Pos2, aspect: f32) -> (egui::Rect, bool) {
+    let dx = cur.x - start.x;
+    let dy = cur.y - start.y;
+    // Constrain so sel_w / sel_h == aspect
+    let (sw, sh) = if dx.abs() / aspect.max(0.001) < dy.abs() {
+        (dy.abs() * aspect, dy.abs())
+    } else {
+        (dx.abs(), dx.abs() / aspect.max(0.001))
+    };
+    if sw < MIN_SEL_PX || sh < MIN_SEL_PX {
+        return (egui::Rect::NOTHING, false);
+    }
+    let x1 = if dx >= 0.0 { start.x } else { start.x - sw };
+    let y1 = if dy >= 0.0 { start.y } else { start.y - sh };
+    (egui::Rect::from_min_size(egui::Pos2::new(x1, y1), egui::Vec2::new(sw, sh)), true)
+}
+
+/// Returns the WASD / arrow-key step multiplier for the given modifiers.
+fn modifier_scale(mods: &egui::Modifiers) -> f64 {
+    if mods.ctrl && mods.shift { 30.0 }
+    else if mods.ctrl && mods.alt { 0.3 }
+    else if mods.shift { 2.0 }
+    else if mods.alt   { 0.5 }
+    else               { 1.0 }
+}
+
+// ── Default config ────────────────────────────────────────────────────────────
 
 fn default_config() -> Config {
     use nnfractals::config::{DedupConfig, OptimizationConfig, OutputConfig, RenderingConfig};
@@ -915,8 +1064,7 @@ fn default_config() -> Config {
             formula_diversity_weight: 0.30,
             clip_pred_weight: 0.50,
             formula_system: "legacy".to_string(),
-            max_nodes: 14,
-            max_depth: 5,
+            max_nodes: 14, max_depth: 5,
             ood_weight: 0.0,
         },
         output: OutputConfig {
@@ -929,20 +1077,40 @@ fn default_config() -> Config {
     }
 }
 
-// ── Entry ─────────────────────────────────────────────────────────────────────
+// ── Entry point ───────────────────────────────────────────────────────────────
 
 fn main() -> anyhow::Result<()> {
     let nn_path = std::env::args().nth(1).map(PathBuf::from).ok_or_else(|| {
         anyhow::anyhow!("Usage: nnfractals-viewer <genome.nn>")
     })?;
+
     #[cfg(feature = "wgpu-backend")]
     {
         render_gpu::init_gpu();
-        eprintln!("[viewer] Renderer: {}", if render_gpu::gpu_available() { "GPU (wgpu)" } else { "CPU (rayon fallback)" });
+        eprintln!(
+            "[viewer] Renderer: {}",
+            if render_gpu::gpu_available() { "GPU (wgpu)" } else { "CPU (rayon fallback)" }
+        );
     }
-    let el    = EventLoop::<()>::with_user_event().build()?;
-    let proxy = el.create_proxy();
-    let mut app = App::new(nn_path, proxy)?;
-    el.run_app(&mut app)?;
+
+    let prefs_path = Path::new(&nn_path).parent().unwrap_or(Path::new("."))
+        .join("viewer_prefs.toml");
+    let prefs = ViewerPrefs::load(&prefs_path);
+
+    let options = eframe::NativeOptions {
+        viewport: egui::ViewportBuilder::default()
+            .with_title("NNFractals Viewer")
+            .with_inner_size([prefs.window_width as f32, prefs.window_height as f32]),
+        ..Default::default()
+    };
+
+    eframe::run_native(
+        "NNFractals Viewer",
+        options,
+        Box::new(move |cc| {
+            Ok(Box::new(App::new(cc, nn_path).expect("Failed to load genome")))
+        }),
+    ).map_err(|e| anyhow::anyhow!("{e}"))?;
+
     Ok(())
 }

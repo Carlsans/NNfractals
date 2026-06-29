@@ -16,14 +16,12 @@ required-features = ["viewer", "wgpu-backend"]
 default = ["wgpu-backend"]
 wgpu-backend = ["dep:wgpu", "dep:pollster"]
 ndarray-backend = []
-viewer = ["dep:winit", "dep:softbuffer", "dep:font8x8"]
+viewer = ["dep:eframe"]
 
 [dependencies]
 wgpu       = { version = "29", optional = true }
 pollster   = { version = "0.3", optional = true }
-winit      = { version = "0.30", optional = true }
-softbuffer = { version = "0.4", optional = true }
-font8x8    = { version = "0.3", optional = true }
+eframe     = { version = "0.35", optional = true }
 image      = "0.25"
 colorous   = "1"
 clap       = { version = "4", features = ["derive"] }
