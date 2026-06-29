@@ -34,23 +34,26 @@ use nnfractals::render_gpu;
 // ── View ──────────────────────────────────────────────────────────────────────
 
 #[derive(Clone)]
+// Center + zoom are f64 so the view RETAINS precision under deep zoom. Storing
+// these as f32 caps effective zoom at the f32 limit (~10^6) regardless of how
+// precise the iteration is — you can't widen back digits that were never stored.
 struct View {
-    cx: f32,
-    cy: f32,
-    zoom: f32,
+    cx: f64,
+    cy: f64,
+    zoom: f64,
 }
 
 impl View {
-    fn bounds(&self) -> (f32, f32, f32, f32) {
+    fn bounds(&self) -> (f64, f64, f64, f64) {
         let half = 2.0 / self.zoom;
         (self.cx - half, self.cx + half, self.cy - half, self.cy + half)
     }
 
-    fn pixel_to_fractal(&self, px: f64, py: f64, w: u32, h: u32) -> (f32, f32) {
+    fn pixel_to_fractal(&self, px: f64, py: f64, w: u32, h: u32) -> (f64, f64) {
         let (xmin, xmax, ymin, ymax) = self.bounds();
         (
-            xmin + (px as f32 / w as f32) * (xmax - xmin),
-            ymin + (py as f32 / h as f32) * (ymax - ymin),
+            xmin + (px / w as f64) * (xmax - xmin),
+            ymin + (py / h as f64) * (ymax - ymin),
         )
     }
 }
@@ -70,10 +73,10 @@ enum Mode {
 /// pixelation and we must fall back to the f64 CPU path.
 fn needs_f64(view: &View, w: u32) -> bool {
     let span      = 4.0 / view.zoom;                       // xmax - xmin
-    let pixel_step = span / w.max(1) as f32;
+    let pixel_step = span / w.max(1) as f64;
     // Absolute f32 resolution near the view centre (magnitude × machine epsilon).
     let coord_mag = view.cx.abs().max(view.cy.abs()).max(1.0);
-    let f32_ulp   = coord_mag * f32::EPSILON;              // ≈ coord_mag · 1.19e-7
+    let f32_ulp   = coord_mag * f32::EPSILON as f64;       // ≈ coord_mag · 1.19e-7
     // Switch a bit before artifacts become visible (≈ 64 ulps per pixel).
     pixel_step < f32_ulp * 64.0
 }
@@ -97,7 +100,7 @@ fn render_cpu(
     // ── Deep-zoom path: f64 CPU iteration ────────────────────────────────────
     if use_f64 {
         use rayon::prelude::*;
-        let view64 = (view.cx as f64, view.cy as f64, view.zoom as f64);
+        let view64 = (view.cx, view.cy, view.zoom);
         let half   = 2.0 / view64.2;
         let (xmin, xmax) = (view64.0 - half, view64.0 + half);
         let (ymin, ymax) = (view64.1 - half, view64.1 + half);
@@ -139,7 +142,10 @@ fn render_cpu(
         return apply_colormap(&escape_times, color_iter, &config.rendering.colormap);
     }
 
-    let (xmin, xmax, ymin, ymax) = view.bounds();
+    // Shallow-zoom path (GPU f32 or CPU f32 fallback): f32 bounds are sufficient
+    // here because needs_f64() already routed deep views to the f64 branch above.
+    let (bxmin, bxmax, bymin, bymax) = view.bounds();
+    let (xmin, xmax, ymin, ymax) = (bxmin as f32, bxmax as f32, bymin as f32, bymax as f32);
     let bailout_sq = config.rendering.bailout * config.rendering.bailout;
 
     // GPU path — much faster for interactive use.
@@ -344,9 +350,9 @@ impl App {
         let genome = load_genome(&nn_path)?;
 
         let default_view = View {
-            cx:   genome.view_cx,
-            cy:   genome.view_cy,
-            zoom: genome.view_zoom.max(0.1),
+            cx:   genome.view_cx as f64,
+            cy:   genome.view_cy as f64,
+            zoom: genome.view_zoom.max(0.1) as f64,
         };
 
         // Capacity 2 allows a preview + a full-quality request to queue simultaneously.
@@ -506,13 +512,15 @@ impl App {
         let (fx2, fy2) = self.view.pixel_to_fractal(x2, y2, w, h);
         let new_cx   = (fx1 + fx2) * 0.5;
         let new_cy   = (fy1 + fy2) * 0.5;
-        let new_zoom = ((self.view.zoom as f64) * (w as f64 / size)) as f32;
+        let new_zoom = self.view.zoom * (w as f64 / size);
 
         self.push_view();
         self.view = View {
             cx:   new_cx,
             cy:   new_cy,
-            zoom: new_zoom.clamp(0.05, 2_000_000.0),
+            // f64 keeps coordinates precise to ~10^13 zoom (mantissa-limited);
+            // beyond that needs extended precision (twofloat/perturbation).
+            zoom: new_zoom.clamp(0.05, 1.0e13),
         };
         self.request_render(true); // fast 1/4-res preview; about_to_wait upgrades to full
     }
