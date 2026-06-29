@@ -223,6 +223,7 @@ struct RenderRequest {
     h:          u32,
     preview:    bool,
     generation: u64,
+    colormap:   String,
 }
 
 struct RenderResult {
@@ -348,15 +349,19 @@ impl App {
         let (res_tx, res_rx) = mpsc::sync_channel::<RenderResult>(4);
 
         {
-            let genome  = genome.clone();
-            let config  = config.clone();
+            let genome     = genome.clone();
+            let base_config = config.clone();
             thread::spawn(move || {
-                let full_iter  = config.rendering.max_iter;
+                let full_iter  = base_config.rendering.max_iter;
                 let full_steps: &[u32] = &[8, 24, 64, full_iter];
+                let mut config = base_config; // mutable so colormap can be updated per-request
                 let mut pending = req_rx.recv().ok();
                 while let Some(req) = pending.take() {
                     let mut latest = req;
                     while let Ok(newer) = req_rx.try_recv() { latest = newer; }
+
+                    // Apply the palette from this request (may have changed since startup)
+                    config.rendering.colormap = latest.colormap.clone();
 
                     let use_f64 = !latest.preview && needs_f64(&latest.view, latest.w);
 
@@ -443,6 +448,7 @@ impl App {
         let _ = self.req_tx.try_send(RenderRequest {
             view: self.view.clone(), w, h, preview,
             generation: self.render_gen,
+            colormap: self.config.rendering.colormap.clone(),
         });
     }
 
