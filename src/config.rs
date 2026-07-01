@@ -84,7 +84,7 @@ fn default_fractal_recursion_weight()   -> f32 { 0.35 }
 fn default_recursion_pred_weight()      -> f32 { 0.60 }
 fn default_formula_diversity_weight()   -> f32 { 0.30 }
 fn default_clip_pred_weight()           -> f32 { 0.50 }
-fn default_formula_system()             -> String { "legacy".to_string() }
+fn default_formula_system()             -> String { "dag".to_string() }
 fn default_max_nodes()                  -> usize { 14 }
 fn default_max_depth()                  -> usize { 5 }
 fn default_ood_weight()                 -> f32 { 0.0 }

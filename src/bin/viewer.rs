@@ -22,6 +22,7 @@ use serde::{Deserialize, Serialize};
 
 use nnfractals::colormap::apply_colormap;
 use nnfractals::config::Config;
+use nnfractals::dd::Dd;
 use nnfractals::formula::apply_formula;
 use nnfractals::genome::Genome;
 use nnfractals::io::{load_genome, save_png};
@@ -48,20 +49,23 @@ const COLORMAPS: &[&str] = &[
 // ── View ──────────────────────────────────────────────────────────────────────
 
 #[derive(Clone)]
-// Center + zoom stored as f64 for precision at deep zoom. `aspect` = xrange/yrange
-// so non-square ratios are first-class; 1.0 = square (legacy default).
+// Center stored in double-double (hi + lo) so WASD translation and drag-zoom
+// accumulate correctly beyond f64's ~10¹¹ limit.  `aspect` = xrange/yrange.
 struct View {
-    cx:     f64,
+    cx:     f64,  // hi part of double-double center x
+    cx_lo:  f64,  // lo part (0.0 until zoom exceeds ~10¹¹)
     cy:     f64,
+    cy_lo:  f64,
     zoom:   f64,   // vertical: half_y = 2.0 / zoom
     aspect: f64,   // xrange / yrange
 }
 
 impl View {
     fn new_square(cx: f64, cy: f64, zoom: f64) -> Self {
-        View { cx, cy, zoom, aspect: 1.0 }
+        View { cx, cx_lo: 0.0, cy, cy_lo: 0.0, zoom, aspect: 1.0 }
     }
 
+    // f64-only bounds — used by f32/f64 render paths and toolbar display.
     fn bounds(&self) -> (f64, f64, f64, f64) {
         let half_y = 2.0 / self.zoom;
         let half_x = half_y * self.aspect;
@@ -75,6 +79,12 @@ impl View {
             ymin + (py / h) * (ymax - ymin),
         )
     }
+
+    // Double-double center accessors.
+    fn cx_dd(&self) -> Dd { Dd { hi: self.cx, lo: self.cx_lo } }
+    fn cy_dd(&self) -> Dd { Dd { hi: self.cy, lo: self.cy_lo } }
+    fn set_cx_dd(&mut self, v: Dd) { self.cx = v.hi; self.cx_lo = v.lo; }
+    fn set_cy_dd(&mut self, v: Dd) { self.cy = v.hi; self.cy_lo = v.lo; }
 }
 
 fn needs_f64(view: &View, w: u32) -> bool {
@@ -88,6 +98,16 @@ fn needs_f64(view: &View, w: u32) -> bool {
 
 // ── Render helpers ────────────────────────────────────────────────────────────
 
+/// Returns true when pixel coordinates need more precision than f64 can give.
+/// Threshold: pixel step < 4 × f64 ULP at this coordinate magnitude.
+/// (f64 loses ~4 trailing bits before this; DD adds 31 more digits.)
+fn needs_dd(view: &View, w: u32) -> bool {
+    let (xmin, xmax, _, _) = view.bounds();
+    let pixel_step = (xmax - xmin) / w.max(1) as f64;
+    let coord_mag  = view.cx.abs().max(view.cy.abs()).max(1.0);
+    pixel_step < coord_mag * f64::EPSILON * 4.0
+}
+
 fn render_cpu(
     genome: &Genome, config: &Config, view: &View,
     w: u32, h: u32, compute_iter: u32, use_f64: bool,
@@ -96,6 +116,50 @@ fn render_cpu(
     let dag = genome.uses_program();
 
     if use_f64 {
+        // ── Double-double path — triggered when f64 pixel coordinates lose significance ──
+        // Resolution capping is handled by the render thread; (w, h) here are already capped.
+        if needs_dd(view, w) {
+            use rayon::prelude::*;
+
+            let cx_dd   = view.cx_dd();
+            let cy_dd   = view.cy_dd();
+            let half_y  = Dd::from_f64(2.0 / view.zoom);
+            let half_x  = half_y * view.aspect;
+            let xmin_dd = cx_dd - half_x;
+            let ymin_dd = cy_dd - half_y;
+            // Step per pixel — multiply by pixel index (small integer) preserves DD precision
+            let xs = (half_x + half_x) * (1.0 / (w.max(2) - 1) as f64);
+            let ys = (half_y + half_y) * (1.0 / (h.max(2) - 1) as f64);
+
+            let bsq     = (config.rendering.bailout * config.rendering.bailout) as f64;
+            let dag_bsq = genome.bailout_radius as f64 * genome.bailout_radius as f64;
+            let jc      = (genome.julia_cre as f64, genome.julia_cim as f64);
+            let phoenix = (genome.phoenix_re as f64, genome.phoenix_im as f64);
+            let fw_dd: Vec<(f64, f64)> = if dag { vec![] } else {
+                genome.formula_weights().iter().map(|&(r, i)| (r as f64, i as f64)).collect()
+            };
+
+            let escape_times: Vec<f32> = (0..(w * h) as usize)
+                .into_par_iter()
+                .map(|idx| {
+                    let px_dd = xmin_dd + xs * (idx % w as usize) as f64;
+                    let py_dd = ymin_dd + ys * (idx / w as usize) as f64;
+                    if dag {
+                        nnfractals::fractal::dag_escape_pixel_dd(
+                            &genome.program, &genome.warp, genome.julia_mode,
+                            jc, phoenix, dag_bsq, px_dd, py_dd, compute_iter,
+                        )
+                    } else {
+                        nnfractals::fractal::legacy_escape_pixel_dd(
+                            &fw_dd, bsq, px_dd, py_dd, compute_iter,
+                        )
+                    }
+                })
+                .collect();
+            return apply_colormap(&escape_times, color_iter, &config.rendering.colormap);
+        }
+
+        // ── Regular f64 path ────────────────────────────────────────────────
         use rayon::prelude::*;
         let (xmin, xmax, ymin, ymax) = view.bounds();
         let wf = (w.saturating_sub(1)).max(1) as f64;
@@ -327,6 +391,12 @@ struct App {
     // Auto-palette: background thread sends winner palette index when done
     auto_pal_rx:   Option<mpsc::Receiver<usize>>,
     auto_pal_busy: bool,
+
+    // True when the currently displayed texture came from a preview render
+    displayed_is_preview: bool,
+
+    // Continuous zoom animation — toggled with the Z key
+    zoom_anim: bool,
 }
 
 impl App {
@@ -377,23 +447,55 @@ impl App {
                     // Apply the palette from this request (may have changed since startup)
                     config.rendering.colormap = latest.colormap.clone();
 
-                    let use_f64 = !latest.preview && needs_f64(&latest.view, latest.w);
+                    // Check precision need regardless of whether this is a preview request.
+                    // f32/GPU previews are wrong once pixel size drops below f32 precision
+                    // (~zoom 1000), so we force f64 for previews at deep zoom too.
+                    let use_dd       = needs_dd(&latest.view, latest.w);
+                    let use_f64      = use_dd || needs_f64(&latest.view, latest.w);
+                    // "effective_preview": true only when f32/GPU is accurate enough
+                    let gpu_ok       = !use_f64;
+                    let eff_preview  = latest.preview && gpu_ok;
 
-                    let (rw, rh) = if latest.preview {
+                    // Resolution cap: the render thread controls this so that render_cpu
+                    // always returns exactly (rw × rh) pixels with no internal re-sizing.
+                    let (rw, rh) = if eff_preview {
+                        // GPU/f32 preview at 1/4 resolution — fast and correct at normal zoom
                         ((latest.w / 4).max(1), (latest.h / 4).max(1))
-                    } else if use_f64 {
-                        // cap resolution for f64 CPU path; egui scales texture up
+                    } else if use_dd {
+                        // DD is ~4–8× slower than f64.  Previews cap at 400px so continuous
+                        // zoom stays responsive; the settled full render goes to display
+                        // resolution (capped at 1600px) so deep-zoom shots are crisp, not
+                        // a stretched 400px blur.  DD coords stay sub-pixel-distinct to ~1e30,
+                        // so resolution — not precision — is what governs sharpness here.
+                        let cap = if latest.preview { 400u32 } else { 1600u32 };
                         let long = latest.w.max(latest.h).max(1);
-                        if long > 720 {
-                            ((latest.w * 720 / long).max(1), (latest.h * 720 / long).max(1))
-                        } else {
-                            (latest.w, latest.h)
-                        }
+                        if long > cap {
+                            ((latest.w * cap / long).max(1), (latest.h * cap / long).max(1))
+                        } else { (latest.w, latest.h) }
+                    } else if use_f64 {
+                        // At deep zoom, a "preview" request becomes a quick f64 render
+                        // at reduced resolution (180px) — still faster than full 720px
+                        let cap = if latest.preview { 180u32 } else { 720 };
+                        let long = latest.w.max(latest.h).max(1);
+                        if long > cap {
+                            ((latest.w * cap / long).max(1), (latest.h * cap / long).max(1))
+                        } else { (latest.w, latest.h) }
                     } else {
                         (latest.w, latest.h)
                     };
 
-                    let steps: &[u32] = if latest.preview { &[full_iter] } else { full_steps };
+                    // Step sequence:
+                    //   eff_preview        → GPU/f32 single-pass (very fast)
+                    //   preview + deep zoom → f64 quick 2-step (correct but still fast)
+                    //   full render        → progressive 4-step
+                    let quick_steps: &[u32] = &[8, 64];
+                    let steps: &[u32] = if eff_preview {
+                        &[full_iter]
+                    } else if latest.preview {
+                        quick_steps
+                    } else {
+                        full_steps
+                    };
 
                     for (i, &iter) in steps.iter().enumerate() {
                         let is_last = i == steps.len() - 1;
@@ -450,6 +552,8 @@ impl App {
             ipc_rx,
             auto_pal_rx: None,
             auto_pal_busy: false,
+            zoom_anim: false,
+            displayed_is_preview: false,
         };
         // Set initial aspect ratio from prefs
         app.apply_ratio(ratio_idx, false);
@@ -486,7 +590,7 @@ impl App {
 
     fn zoom_out(&mut self) {
         self.push_view();
-        self.view.zoom = (self.view.zoom * 0.5).max(0.05);
+        self.view.zoom = (self.view.zoom * 0.5).clamp(0.05, 1.0e30);
         self.sync_xy = true;
         self.request_render(true);
     }
@@ -519,11 +623,14 @@ impl App {
 
     fn update_view_from_bounds(&mut self, xmin: f64, xmax: f64, ymin: f64, ymax: f64) {
         if xmax <= xmin || ymax <= ymin { return; }
+        // User typed explicit f64 coordinates — reset the lo parts
         self.view.cx     = (xmin + xmax) / 2.0;
+        self.view.cx_lo  = 0.0;
         self.view.cy     = (ymin + ymax) / 2.0;
+        self.view.cy_lo  = 0.0;
         let yrange       = ymax - ymin;
         let xrange       = xmax - xmin;
-        self.view.zoom   = (4.0 / yrange).clamp(0.05, 1.0e13);
+        self.view.zoom   = (4.0 / yrange).clamp(0.05, 1.0e30);
         self.view.aspect = xrange / yrange;
         self.sync_xy = true;
     }
@@ -534,8 +641,9 @@ impl App {
             if res.generation >= self.displayed_gen {
                 let image = ColorImage::from_rgb([res.w as usize, res.h as usize], &res.pixels);
                 self.texture = Some(ctx.load_texture("fractal", image, TextureOptions::LINEAR));
-                self.render_complete = res.complete;
-                self.displayed_gen   = res.generation;
+                self.render_complete      = res.complete;
+                self.displayed_gen        = res.generation;
+                self.displayed_is_preview = res.is_preview;
                 got = true;
             }
         }
@@ -662,17 +770,52 @@ impl App {
 
                         ui.separator();
 
+                        // ── Depth + precision mode (kept on the left so it stays
+                        //    visible at any zoom; the right side scrolls off in DD) ──
+                        let z = self.view.zoom;
+                        let depth_str = if z < 10.0 {
+                            format!("{:.2}×", z)
+                        } else if z < 1.0e6 {
+                            format!("{:.0}×", z)
+                        } else {
+                            format!("1e{:.1}", z.log10())
+                        };
+                        ui.label(depth_str).on_hover_text("Current zoom depth");
+                        let w_mode = self.frac_rect.width() as u32;
+                        if needs_dd(&self.view, w_mode) {
+                            ui.colored_label(Color32::from_rgb(255, 160, 50), "DD")
+                                .on_hover_text("Double-double precision (deep zoom)");
+                        } else if needs_f64(&self.view, w_mode) {
+                            ui.colored_label(Color32::from_rgb(100, 200, 255), "f64")
+                                .on_hover_text("f64 precision");
+                        }
+                        if self.zoom_anim {
+                            ui.colored_label(Color32::from_rgb(100, 255, 100), "Z")
+                                .on_hover_text("Auto-zoom animation active");
+                        }
+
+                        ui.separator();
+
                         // ── XY coordinate fields ────────────────────────────
                         let (xmin, xmax, ymin, ymax) = self.view.bounds();
                         if self.sync_xy {
-                            self.xmin_str = format!("{:.6}", xmin);
-                            self.xmax_str = format!("{:.6}", xmax);
-                            self.ymin_str = format!("{:.6}", ymin);
-                            self.ymax_str = format!("{:.6}", ymax);
+                            // At deep zoom f64 bounds can round xmin==xmax at 6 decimal places.
+                            // Use enough digits so the two bounds are visually distinct.
+                            let w = self.frac_rect.width() as u32;
+                            let prec = if needs_dd(&self.view, w) { 15usize }
+                                       else if needs_f64(&self.view, w) { 10 }
+                                       else { 6 };
+                            self.xmin_str = format!("{:.prec$}", xmin);
+                            self.xmax_str = format!("{:.prec$}", xmax);
+                            self.ymin_str = format!("{:.prec$}", ymin);
+                            self.ymax_str = format!("{:.prec$}", ymax);
                             self.sync_xy = false;
                         }
 
-                        let field_w = font_size * 5.5;
+                        let w_check = self.frac_rect.width() as u32;
+                        let field_w = font_size * if needs_dd(&self.view, w_check) { 9.5 }
+                                                   else if needs_f64(&self.view, w_check) { 7.5 }
+                                                   else { 5.5 };
                         ui.label("x:");
                         let rx = ui.add(egui::TextEdit::singleline(&mut self.xmin_str)
                             .desired_width(field_w).font(egui::TextStyle::Monospace));
@@ -763,15 +906,11 @@ impl App {
                             self.show_save = true;
                         }
 
-                        // Status indicator (right-aligned)
+                        // Render-in-progress indicator (right-aligned; may scroll off
+                        // in DD mode, which is fine — depth lives on the left now).
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             if !self.render_complete || self.displayed_gen < self.render_gen {
                                 ui.colored_label(Color32::YELLOW, "rendering...");
-                            } else {
-                                let w = self.frac_rect.width() as u32;
-                                if needs_f64(&self.view, w) {
-                                    ui.colored_label(Color32::from_rgb(100, 200, 255), "f64");
-                                }
                             }
                         });
                     });
@@ -851,13 +990,6 @@ impl App {
                     }
                 }
 
-                // Auto-upgrade preview to full when settled
-                if self.texture.is_some() {
-                    let result_is_preview = self.displayed_gen == self.render_gen && self.render_complete;
-                    if result_is_preview {
-                        // already full — nothing to do
-                    }
-                }
             });
     }
 
@@ -866,24 +998,35 @@ impl App {
     }
 
     fn do_translate_scaled(&mut self, dx_sign: f64, dy_sign: f64, scale: f64) {
-        let (xmin, xmax, ymin, ymax) = self.view.bounds();
-        let radius = (xmax - xmin) / 2.0;
-        let step   = radius / 3.0 * scale;
+        let half_x = 2.0 / self.view.zoom * self.view.aspect;
+        let half_y = 2.0 / self.view.zoom;
+        let step_x = half_x / 3.0 * scale;
+        let step_y = half_y / 3.0 * scale;
         self.push_view();
-        self.view.cx += dx_sign * step;
-        self.view.cy += dy_sign * step;
+        // DD-accurate center update: f64 step added to dd center preserves precision at deep zoom
+        self.view.set_cx_dd(self.view.cx_dd() + Dd::from_f64(dx_sign * step_x));
+        self.view.set_cy_dd(self.view.cy_dd() + Dd::from_f64(dy_sign * step_y));
         self.sync_xy = true;
         self.request_render(true);
     }
 
     fn do_zoom(&mut self, zoom_in: bool, scale: f64) {
-        // base factor: zoom by (3/2)^scale per press
         let factor = (1.5_f64).powf(scale);
         self.push_view();
+        self.apply_zoom(zoom_in, factor);
+    }
+
+    /// Zoom without pushing to undo stack — for continuous key_down zoom.
+    fn do_zoom_nopush(&mut self, zoom_in: bool, scale: f64) {
+        let factor = (1.5_f64).powf(scale);
+        self.apply_zoom(zoom_in, factor);
+    }
+
+    fn apply_zoom(&mut self, zoom_in: bool, factor: f64) {
         if zoom_in {
-            self.view.zoom = (self.view.zoom * factor).clamp(0.05, 1.0e13);
+            self.view.zoom = (self.view.zoom * factor).clamp(0.05, 1.0e30);
         } else {
-            self.view.zoom = (self.view.zoom / factor).clamp(0.05, 1.0e13);
+            self.view.zoom = (self.view.zoom / factor).clamp(0.05, 1.0e30);
         }
         self.sync_xy = true;
         self.request_render(true);
@@ -893,43 +1036,55 @@ impl App {
         let (sel_rect, ok) = selection_rect(start, end, fw / fh);
         if !ok { return; }
 
-        let (fx1, fy1) = self.view.pixel_to_fractal(
-            (sel_rect.min.x - self.frac_rect.min.x) as f64,
-            (sel_rect.min.y - self.frac_rect.min.y) as f64,
-            fw as f64, fh as f64,
-        );
-        let (fx2, fy2) = self.view.pixel_to_fractal(
-            (sel_rect.max.x - self.frac_rect.min.x) as f64,
-            (sel_rect.max.y - self.frac_rect.min.y) as f64,
-            fw as f64, fh as f64,
-        );
-        let new_cx = (fx1 + fx2) * 0.5;
-        let new_cy = (fy1 + fy2) * 0.5;
-        // zoom: sel_w / fw = fraction of view covered
+        // Compute the selection center as an offset from the current dd center.
+        // Doing it this way (not via pixel_to_fractal which uses hi-only bounds)
+        // keeps the lo parts intact at extreme zoom.
+        let half_x = 2.0 / self.view.zoom * self.view.aspect;
+        let half_y = 2.0 / self.view.zoom;
+        let sel_cx_px = ((sel_rect.min.x + sel_rect.max.x) * 0.5 - self.frac_rect.min.x) as f64;
+        let sel_cy_px = ((sel_rect.min.y + sel_rect.max.y) * 0.5 - self.frac_rect.min.y) as f64;
+        let dx = (sel_cx_px / fw as f64 - 0.5) * 2.0 * half_x;
+        let dy = (sel_cy_px / fh as f64 - 0.5) * 2.0 * half_y;
+
         let sel_frac = sel_rect.width() / fw;
-        let new_zoom = (self.view.zoom / sel_frac as f64).clamp(0.05, 1.0e13);
+        let new_zoom = (self.view.zoom / sel_frac as f64).clamp(0.05, 1.0e30);
 
         self.push_view();
-        self.view.cx   = new_cx;
-        self.view.cy   = new_cy;
+        self.view.set_cx_dd(self.view.cx_dd() + Dd::from_f64(dx));
+        self.view.set_cy_dd(self.view.cy_dd() + Dd::from_f64(dy));
         self.view.zoom = new_zoom;
         self.sync_xy = true;
         self.request_render(true);
     }
 
     fn handle_keyboard(&mut self, ctx: &egui::Context) {
-        // Don't steal keys while a text field has focus
+        // Track whether a text field is capturing input (blocks WASD / palette / undo)
         let any_focused = ctx.memory(|m| m.focused().is_some());
-        if any_focused { return; }
 
         ctx.input(|i| {
             let mods  = i.modifiers;
             let scale = modifier_scale(&mods);
 
-            // Q / Esc → quit
+            // Q / Esc → quit (always active)
             if i.key_pressed(Key::Q) || i.key_pressed(Key::Escape) {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             }
+
+            // Arrow Up/Down: zoom — always active even when a text field has focus.
+            // UP/DOWN don't navigate single-line TextEdit fields, so this is safe.
+            // Blocked keys (WASD, palette arrows) that DO conflict are handled below.
+            let zoom_pressed_in  = i.key_pressed(Key::ArrowUp);
+            let zoom_pressed_out = i.key_pressed(Key::ArrowDown);
+            if zoom_pressed_in  { self.push_view(); }
+            if zoom_pressed_out { self.push_view(); }
+            if i.key_down(Key::ArrowUp)   { self.do_zoom_nopush(true,  0.03 * scale); }
+            if i.key_down(Key::ArrowDown)  { self.do_zoom_nopush(false, 0.03 * scale); }
+
+            // Z: toggle zoom animation — always active
+            if i.key_pressed(Key::Z) { self.zoom_anim = !self.zoom_anim; }
+
+            // Keys below conflict with text editing — skip when a field has focus
+            if any_focused { return; }
 
             // WASD translation
             if i.key_pressed(Key::W) { self.do_translate_scaled( 0.0, -1.0, scale); }
@@ -937,11 +1092,7 @@ impl App {
             if i.key_pressed(Key::A) { self.do_translate_scaled(-1.0,  0.0, scale); }
             if i.key_pressed(Key::D) { self.do_translate_scaled( 1.0,  0.0, scale); }
 
-            // Arrow up/down: zoom
-            if i.key_pressed(Key::ArrowUp)   { self.do_zoom(true,  scale); }
-            if i.key_pressed(Key::ArrowDown)  { self.do_zoom(false, scale); }
-
-            // Arrow left/right: palette
+            // Arrow left/right: palette (blocked when field focused — conflicts with cursor movement)
             if i.key_pressed(Key::ArrowLeft) {
                 let n = COLORMAPS.len();
                 self.set_colormap((self.colormap_idx + n - 1) % n);
@@ -986,16 +1137,19 @@ impl App {
             .show(ctx, |ui| {
                 egui::Grid::new("help_grid").num_columns(2).spacing([20.0, 4.0]).show(ui, |ui| {
                     let rows: &[(&str, &str)] = &[
-                        ("W/A/S/D",          "Translate (Shift=2×, Alt=½, Ctrl+Shift=10r, Ctrl+Alt=r/10)"),
-                        ("↑ / ↓",            "Zoom in / out (same modifiers)"),
+                        ("W/A/S/D",          "Translate (Shift=2x, Alt=1/2, Ctrl+Shift=10r, Ctrl+Alt=r/10)"),
+                        ("↑ / ↓ (hold)",     "Zoom in / out continuously (same modifiers)"),
+                        ("Z",                "Toggle auto-zoom animation toward center"),
                         ("← / →",            "Previous / next palette"),
                         ("Drag (left btn)",  "Zoom into selection"),
-                        ("Right-click",      "Zoom out ×2"),
+                        ("Right-click",      "Zoom out x2"),
                         ("Backspace/Ctrl+Z", "Undo zoom"),
                         ("R",                "Reset view"),
                         ("H / ?",            "Toggle this help"),
                         ("Ctrl+S",           "Save PNG"),
                         ("Q / Esc",          "Quit"),
+                        ("Status: f64",      "Using f64 precision (deep zoom)"),
+                        ("Status: DD",       "Double-double precision (~10^30 depth limit)"),
                     ];
                     for (key, desc) in rows {
                         ui.monospace(*key);
@@ -1093,6 +1247,12 @@ impl eframe::App for App {
             }
         }
 
+        // Zoom animation: advance one step per frame, request preview render
+        if self.zoom_anim {
+            self.apply_zoom(true, 1.02);
+            ctx.request_repaint();
+        }
+
         self.poll_render(&ctx);
         self.handle_keyboard(&ctx);
         self.show_toolbar(ui);
@@ -1100,16 +1260,11 @@ impl eframe::App for App {
         self.show_help_window(&ctx);
         self.show_save_window(&ctx);
 
-        // Auto-upgrade preview to full quality when idle
-        if self.render_complete && self.displayed_gen == self.render_gen {
-            if let Some(tex) = &self.texture {
-                let [tw, th] = tex.size();
-                let fw = self.frac_rect.width().round() as usize;
-                let fh = self.frac_rect.height().round() as usize;
-                if tw < fw / 2 || th < fh / 2 {
-                    self.request_render(false);
-                }
-            }
+        // Auto-upgrade: if the settled render was a preview (user paused after panning/zooming),
+        // kick off a full-quality render.  Using the is_preview flag instead of a size heuristic
+        // avoids an infinite loop when the DD or f64 path caps resolution below display size.
+        if self.render_complete && self.displayed_gen == self.render_gen && self.displayed_is_preview {
+            self.request_render(false);
         }
 
         if !self.render_complete || self.displayed_gen < self.render_gen {
@@ -1190,7 +1345,7 @@ fn default_config() -> Config {
             recursion_pred_weight: 0.60,
             formula_diversity_weight: 0.30,
             clip_pred_weight: 0.50,
-            formula_system: "legacy".to_string(),
+            formula_system: "dag".to_string(),
             max_nodes: 14, max_depth: 5,
             ood_weight: 0.0,
         },

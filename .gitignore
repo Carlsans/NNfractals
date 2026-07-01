@@ -18,3 +18,4 @@ populations2/
 evolution2.pid
 diversity_loop_state.json
 colormap_loop_state.json
+.run_pids

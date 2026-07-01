@@ -127,6 +127,64 @@ pub fn dag_escape_pixel_f64(
     max_iter as f32
 }
 
+/// Double-double DAG escape — used for zoom > ~10¹¹ where f64 runs out.
+/// Pixel coordinates arrive as `Dd`; iteration is dd-precise for polynomial
+/// ops, f64 fallback for transcendentals (whose weights are only f32 anyway).
+pub fn dag_escape_pixel_dd(
+    prog: &[crate::formula::OpNode], warp: &[crate::formula::OpNode],
+    julia: bool, jc: (f64, f64), phoenix: (f64, f64), bailout_sq: f64,
+    px: crate::dd::Dd, py: crate::dd::Dd, max_iter: u32,
+) -> f32 {
+    use crate::dd::{Dd, eval_program_dd};
+    // Warp in f64 (the warp grid doesn't need sub-pixel DD precision)
+    let (ix, iy) = if !warp.is_empty() {
+        let (wx, wy) = crate::formula::f64_impl::eval_program(warp, px.hi, py.hi, px.hi, py.hi);
+        (Dd::from_f64(wx), Dd::from_f64(wy))
+    } else {
+        (px, py)
+    };
+    let (mut zx, mut zy, cx, cy) = if julia {
+        (ix, iy, Dd::from_f64(jc.0), Dd::from_f64(jc.1))
+    } else {
+        (Dd::zero(), Dd::zero(), ix, iy)
+    };
+    let (mut pzx, mut pzy) = (Dd::zero(), Dd::zero());
+    let pr = Dd::from_f64(phoenix.0);
+    let pi = Dd::from_f64(phoenix.1);
+    for it in 0..max_iter {
+        let (fx, fy) = eval_program_dd(prog, zx, zy, cx, cy);
+        let (nx, ny) = (fx + pr*pzx - pi*pzy, fy + pr*pzy + pi*pzx);
+        (pzx, pzy) = (zx, zy);
+        (zx, zy) = (nx, ny);
+        let ms = (zx*zx + zy*zy).hi;
+        if ms > bailout_sq {
+            return ((it as f64 + 1.0) - (ms.log2() * 0.5).log2()).max(0.0) as f32;
+        }
+        if !zx.is_finite() || !zy.is_finite() { return it as f32; }
+    }
+    max_iter as f32
+}
+
+/// Double-double legacy-formula escape.
+pub fn legacy_escape_pixel_dd(
+    weights: &[(f64, f64)], bailout_sq: f64,
+    px: crate::dd::Dd, py: crate::dd::Dd, max_iter: u32,
+) -> f32 {
+    use crate::dd::{Dd, apply_formula_dd};
+    let (cx, cy) = (px, py);
+    let (mut zx, mut zy) = (Dd::zero(), Dd::zero());
+    for it in 0..max_iter {
+        let (nx, ny) = apply_formula_dd(weights, zx, zy, cx, cy);
+        (zx, zy) = (nx, ny);
+        let ms = (zx*zx + zy*zy).hi;
+        if ms > bailout_sq {
+            return ((it as f64 + 1.0) - (ms.log2() * 0.5).log2()).max(0.0) as f32;
+        }
+        if !zx.is_finite() || !zy.is_finite() { return it as f32; }
+    }
+    max_iter as f32
+}
+
 pub fn render_cpu_iter(
     genome: &Genome, config: &Config, width: u32, height: u32, max_iter: u32,
 ) -> Vec<f32> {

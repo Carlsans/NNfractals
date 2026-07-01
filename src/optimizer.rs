@@ -271,7 +271,8 @@ impl Optimizer {
             scorer.poll(self.generation);
         }
         if self.generation % 3 == 0 {
-            let probe_path = PathBuf::from("/tmp/nnfractals_probe.png");
+            // PID-scoped so concurrent instances don't race on the same probe file.
+            let probe_path = PathBuf::from(format!("/tmp/nnfractals_probe_{}.png", std::process::id()));
             let et  = render_cpu(&self.population[0], &self.config, 256, 256);
             let (_, bd) = beauty_score_full(&et, 256, self.config.rendering.max_iter);
             self.last_sub_scores = Some([bd.boundary, bd.edge, bd.entropy, bd.self_sim, bd.cool_zone]);
@@ -510,7 +511,8 @@ impl Optimizer {
         // below, after the candidate passes.
         let aesthetic_scores = match self.aesthetic.as_mut() {
             Some(aes) => {
-                let score_tmp = std::path::PathBuf::from("/tmp/nnfractals_score.png");
+                // PID-scoped so concurrent instances don't overwrite each other's candidate.
+                let score_tmp = std::path::PathBuf::from(format!("/tmp/nnfractals_score_{}.png", std::process::id()));
                 save_png(&rgb, w, h, &score_tmp).unwrap_or(());
                 aes.score_blocking(score_tmp)
             }

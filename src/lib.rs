@@ -1,4 +1,5 @@
 pub mod config;
+pub mod dd;
 pub mod formula;
 pub mod genome;
 pub mod fractal;

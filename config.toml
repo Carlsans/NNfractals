@@ -13,6 +13,7 @@ view_y_max     =  2.0
 # (Transformer + backprop removed — they fought the GA and drove elites to noise.)
 [optimization]
 population_size          = 40
+formula_system           = "dag" 
 elitism_count            = 6
 mutation_rate            = 0.20   # per-coefficient perturbation probability
 mutation_scale           = 0.08   # coefficient perturbation magnitude
