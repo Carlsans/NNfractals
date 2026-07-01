@@ -313,6 +313,10 @@ struct ViewerPrefs {
     colormap:         String,
     window_width:     u32,
     window_height:    u32,
+    /// Output folder for hi-res saves. Empty = next to the loaded .nn file.
+    /// Remembered across sessions once the user picks one.
+    #[serde(default)]
+    save_dir:         String,
 }
 
 impl Default for ViewerPrefs {
@@ -324,6 +328,7 @@ impl Default for ViewerPrefs {
             colormap:         "turbo".into(),
             window_width:     1024,
             window_height:    768,
+            save_dir:         String::new(),
         }
     }
 }
@@ -371,6 +376,7 @@ struct App {
     show_save: bool,
     save_w_str: String,
     save_h_str: String,
+    save_dir_str: String,
 
     ratio_idx:    usize,
     colormap_idx: usize,
@@ -414,6 +420,11 @@ impl App {
         let prefs_path = nn_path.parent().unwrap_or(Path::new("."))
             .join("viewer_prefs.toml");
         let prefs = ViewerPrefs::load(&prefs_path);
+        let save_dir_str = if prefs.save_dir.is_empty() {
+            nn_path.parent().unwrap_or(Path::new(".")).to_string_lossy().into_owned()
+        } else {
+            prefs.save_dir.clone()
+        };
 
         // Find colormap index from prefs
         let colormap_idx = COLORMAPS.iter().position(|&c| c == prefs.colormap)
@@ -542,6 +553,7 @@ impl App {
             show_save: false,
             save_w_str: prefs.last_save_width.to_string(),
             save_h_str: prefs.last_save_height.to_string(),
+            save_dir_str,
             ratio_idx, colormap_idx,
             xmin_str: format!("{:.6}", xmin),
             xmax_str: format!("{:.6}", xmax),
@@ -1192,6 +1204,16 @@ impl App {
                     );
                 }
                 ui.horizontal(|ui| {
+                    ui.label("Folder:");
+                    ui.add(egui::TextEdit::singleline(&mut self.save_dir_str)
+                        .desired_width(280.0)
+                        .hint_text("output folder for saved PNGs"));
+                });
+                ui.label(
+                    egui::RichText::new("Remembered as the default for next time.")
+                        .color(Color32::GRAY),
+                );
+                ui.horizontal(|ui| {
                     if ui.button("Save").clicked() { do_save = true; }
                     if ui.button("Cancel").clicked() { do_close = true; }
                 });
@@ -1201,19 +1223,32 @@ impl App {
             let sw: u32 = self.save_w_str.trim().parse().unwrap_or(1920);
             let sh: u32 = self.save_h_str.trim().parse().unwrap_or(1080);
             if sw >= 64 && sh >= 64 {
+                // Resolve output folder: use the chosen one, or fall back to the .nn's dir.
+                let out_dir = {
+                    let s = self.save_dir_str.trim();
+                    if s.is_empty() {
+                        nn_path.parent().unwrap_or(Path::new(".")).to_path_buf()
+                    } else {
+                        PathBuf::from(s)
+                    }
+                };
                 self.prefs.last_save_width  = sw;
                 self.prefs.last_save_height = sh;
+                self.prefs.save_dir = out_dir.to_string_lossy().into_owned();
                 self.prefs.save(&self.prefs_path);
                 thread::spawn(move || {
                     eprintln!("Rendering {sw}×{sh} PNG…");
                     let rgb  = render_save(&genome, &config, &view, sw, sh);
                     let stem = nn_path.file_stem()
                         .and_then(|s| s.to_str()).unwrap_or("fractal");
-                    let out = nn_path.parent().unwrap_or(Path::new("."))
-                        .join(format!(
-                            "{stem}_cx{:.4}_cy{:.4}_z{:.2}_{sw}x{sh}.png",
-                            view.cx, view.cy, view.zoom,
-                        ));
+                    if let Err(e) = std::fs::create_dir_all(&out_dir) {
+                        eprintln!("Save error: cannot create {}: {e}", out_dir.display());
+                        return;
+                    }
+                    let out = out_dir.join(format!(
+                        "{stem}_cx{:.4}_cy{:.4}_z{:.2}_{sw}x{sh}.png",
+                        view.cx, view.cy, view.zoom,
+                    ));
                     match save_png(&rgb, sw, sh, &out) {
                         Ok(_)  => eprintln!("Saved → {}", out.display()),
                         Err(e) => eprintln!("Save error: {e}"),
