@@ -25,6 +25,9 @@ use serde::{Deserialize, Serialize};
 use nnfractals::config::Config;
 
 const PREFS_FILE: &str = "browser_prefs.toml";
+const MIN_THUMB: u32 = 40;
+const MAX_THUMB: u32 = 320;
+const ZOOM_STEP: i32 = 16;
 
 // ── CLI ───────────────────────────────────────────────────────────────────────
 
@@ -461,6 +464,42 @@ impl App {
 
     // ── UI ───────────────────────────────────────────────────────────────────────
 
+    /// Adjust the thumbnail size by `delta` px (clamped); re-decode thumbnails at the
+    /// new size and persist. Used by Ctrl+/Ctrl- and Ctrl+mousewheel, and the toolbar.
+    fn zoom_thumbs(&mut self, delta: i32) {
+        let sz = (self.prefs.thumb_size as i32 + delta).clamp(MIN_THUMB as i32, MAX_THUMB as i32) as u32;
+        if sz != self.prefs.thumb_size {
+            self.prefs.thumb_size = sz;
+            self.thumb_cache.clear(); // re-decode at the new resolution so it stays crisp
+            self.save_prefs();
+        }
+    }
+
+    /// Ctrl + '+' / '-' and Ctrl + mousewheel zoom the thumbnails in/out.
+    /// (Ctrl+scroll is surfaced by egui as `zoom_delta()`; it does not also scroll
+    /// the table. We disable egui's own keyboard zoom in `ui()` so Ctrl+/- is ours.)
+    fn handle_zoom(&mut self, ctx: &egui::Context) {
+        let (ctrl, plus, minus, zoom_delta) = ctx.input(|i| {
+            (
+                i.modifiers.ctrl || i.modifiers.command,
+                i.key_pressed(egui::Key::Plus) || i.key_pressed(egui::Key::Equals),
+                i.key_pressed(egui::Key::Minus),
+                i.zoom_delta(),
+            )
+        });
+        if ctrl && plus {
+            self.zoom_thumbs(ZOOM_STEP);
+        }
+        if ctrl && minus {
+            self.zoom_thumbs(-ZOOM_STEP);
+        }
+        if zoom_delta > 1.001 {
+            self.zoom_thumbs(ZOOM_STEP);
+        } else if zoom_delta < 0.999 {
+            self.zoom_thumbs(-ZOOM_STEP);
+        }
+    }
+
     fn toolbar(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             ui.label("📁");
@@ -525,6 +564,16 @@ impl App {
                 } else {
                     ui.label(format!("{} fractals · {} selected", self.rows.len(), n));
                 }
+                ui.separator();
+                // Thumbnail zoom (also Ctrl +/- and Ctrl+mousewheel).
+                if ui.small_button("＋").on_hover_text("Zoom in (Ctrl+ / Ctrl+wheel)").clicked() {
+                    self.zoom_thumbs(ZOOM_STEP);
+                }
+                ui.label(format!("{}px", self.prefs.thumb_size));
+                if ui.small_button("－").on_hover_text("Zoom out (Ctrl- / Ctrl+wheel)").clicked() {
+                    self.zoom_thumbs(-ZOOM_STEP);
+                }
+                ui.label("🔍");
             });
         });
         if !self.status.is_empty() {
@@ -824,7 +873,11 @@ impl eframe::App for App {
         self.prefs.window_width = vr.width() as u32;
         self.prefs.window_height = vr.height() as u32;
 
+        // We own Ctrl+/- for thumbnail zoom, so stop egui rescaling the whole UI.
+        ctx.options_mut(|o| o.zoom_with_keyboard = false);
+
         self.drain_loader();
+        self.handle_zoom(&ctx);
         if self.sort_dirty {
             self.sort_rows();
             self.sort_dirty = false;
