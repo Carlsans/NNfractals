@@ -969,21 +969,31 @@ impl App {
                     egui::Sense::click_and_drag(),
                 );
 
-                // Right-click → zoom out
+                // Right-click → zoom out (also cancels any in-progress selection)
                 if resp.secondary_clicked() {
+                    self.drag_start = None;
                     self.zoom_out();
                 }
 
                 // Drag → selection rectangle
                 if resp.drag_started() {
-                    if let Some(p) = resp.interact_pointer_pos() {
-                        self.drag_start = Some(p);
-                    }
+                    self.drag_start = resp.interact_pointer_pos();
                 }
                 if resp.drag_stopped() {
                     if let (Some(start), Some(end)) = (self.drag_start.take(), resp.interact_pointer_pos()) {
                         self.commit_selection(start, end, fw, fh);
                     }
+                    self.drag_start = None;
+                }
+                // A plain click (press+release without a drag) cancels a pending selection —
+                // "click away" to abort instead of leaving the viewer stuck in selection mode.
+                if resp.clicked() {
+                    self.drag_start = None;
+                }
+                // Safety net: if we think a selection is in progress but no mouse button is
+                // actually held (e.g. the release happened off-widget and drag_stopped never
+                // fired), clear it so the viewer can't get stuck drawing a selection forever.
+                if self.drag_start.is_some() && !ui.ctx().input(|i| i.pointer.any_down()) {
                     self.drag_start = None;
                 }
 
@@ -1045,6 +1055,11 @@ impl App {
     }
 
     fn commit_selection(&mut self, start: egui::Pos2, end: egui::Pos2, fw: f32, fh: f32) {
+        // Guard against a zero/negative-size panel or non-finite pointer coords, which
+        // would otherwise produce a NaN/∞ zoom and wedge the render thread.
+        if !(fw > 0.0 && fh > 0.0) || start.any_nan() || end.any_nan() {
+            return;
+        }
         let (sel_rect, ok) = selection_rect(start, end, fw / fh);
         if !ok { return; }
 
@@ -1058,8 +1073,11 @@ impl App {
         let dx = (sel_cx_px / fw as f64 - 0.5) * 2.0 * half_x;
         let dy = (sel_cy_px / fh as f64 - 0.5) * 2.0 * half_y;
 
-        let sel_frac = sel_rect.width() / fw;
+        // Clamp the selection fraction so a sliver can't jump zoom by a huge factor
+        // (which at deep zoom makes the DD render take ~forever and looks like a hang).
+        let sel_frac = (sel_rect.width() / fw).clamp(0.02, 1.0);
         let new_zoom = (self.view.zoom / sel_frac as f64).clamp(0.05, 1.0e30);
+        if !new_zoom.is_finite() { return; }
 
         self.push_view();
         self.view.set_cx_dd(self.view.cx_dd() + Dd::from_f64(dx));
@@ -1097,6 +1115,9 @@ impl App {
 
             // Keys below conflict with text editing — skip when a field has focus
             if any_focused { return; }
+
+            // Space: quick-save at the default resolution into the default folder
+            if i.key_pressed(Key::Space) { self.quick_save(); }
 
             // WASD translation
             if i.key_pressed(Key::W) { self.do_translate_scaled( 0.0, -1.0, scale); }
@@ -1158,7 +1179,8 @@ impl App {
                         ("Backspace/Ctrl+Z", "Undo zoom"),
                         ("R",                "Reset view"),
                         ("H / ?",            "Toggle this help"),
-                        ("Ctrl+S",           "Save PNG"),
+                        ("Ctrl+S",           "Save PNG (dialog)"),
+                        ("Space",            "Quick-save at default resolution/folder"),
                         ("Q / Esc",          "Quit"),
                         ("Status: f64",      "Using f64 precision (deep zoom)"),
                         ("Status: DD",       "Double-double precision (~10^30 depth limit)"),
@@ -1175,12 +1197,55 @@ impl App {
             });
     }
 
-    fn show_save_window(&mut self, ctx: &egui::Context) {
-        if !self.show_save { return; }
+    /// Render an sw×sh PNG on a background thread and write it into `out_dir`.
+    /// Shared by the Save dialog and the spacebar quick-save.
+    fn spawn_save(&self, sw: u32, sh: u32, out_dir: PathBuf) {
         let genome  = self.genome.clone();
         let config  = self.config.clone();
         let view    = self.view.clone();
         let nn_path = self.nn_path.clone();
+        thread::spawn(move || {
+            eprintln!("Rendering {sw}×{sh} PNG…");
+            let rgb  = render_save(&genome, &config, &view, sw, sh);
+            let stem = nn_path.file_stem().and_then(|s| s.to_str()).unwrap_or("fractal");
+            if let Err(e) = std::fs::create_dir_all(&out_dir) {
+                eprintln!("Save error: cannot create {}: {e}", out_dir.display());
+                return;
+            }
+            let out = out_dir.join(format!(
+                "{stem}_cx{:.4}_cy{:.4}_z{:.2}_{sw}x{sh}.png",
+                view.cx, view.cy, view.zoom,
+            ));
+            match save_png(&rgb, sw, sh, &out) {
+                Ok(_)  => eprintln!("Saved → {}", out.display()),
+                Err(e) => eprintln!("Save error: {e}"),
+            }
+        });
+    }
+
+    /// Output folder for saves: the remembered folder, else the loaded .nn's dir.
+    fn save_out_dir(&self) -> PathBuf {
+        let s = self.save_dir_str.trim();
+        if s.is_empty() {
+            self.nn_path.parent().unwrap_or(Path::new(".")).to_path_buf()
+        } else {
+            PathBuf::from(s)
+        }
+    }
+
+    /// Spacebar quick-save: default resolution (last used) into the default folder,
+    /// no dialog. Persists nothing new — just uses the remembered defaults.
+    fn quick_save(&mut self) {
+        let sw = self.prefs.last_save_width.max(64);
+        let sh = self.prefs.last_save_height.max(64);
+        let out_dir = self.save_out_dir();
+        self.prefs.save_dir = out_dir.to_string_lossy().into_owned();
+        self.prefs.save(&self.prefs_path);
+        self.spawn_save(sw, sh, out_dir);
+    }
+
+    fn show_save_window(&mut self, ctx: &egui::Context) {
+        if !self.show_save { return; }
 
         let mut do_save = false;
         let mut do_close = false;
@@ -1223,37 +1288,12 @@ impl App {
             let sw: u32 = self.save_w_str.trim().parse().unwrap_or(1920);
             let sh: u32 = self.save_h_str.trim().parse().unwrap_or(1080);
             if sw >= 64 && sh >= 64 {
-                // Resolve output folder: use the chosen one, or fall back to the .nn's dir.
-                let out_dir = {
-                    let s = self.save_dir_str.trim();
-                    if s.is_empty() {
-                        nn_path.parent().unwrap_or(Path::new(".")).to_path_buf()
-                    } else {
-                        PathBuf::from(s)
-                    }
-                };
+                let out_dir = self.save_out_dir();
                 self.prefs.last_save_width  = sw;
                 self.prefs.last_save_height = sh;
                 self.prefs.save_dir = out_dir.to_string_lossy().into_owned();
                 self.prefs.save(&self.prefs_path);
-                thread::spawn(move || {
-                    eprintln!("Rendering {sw}×{sh} PNG…");
-                    let rgb  = render_save(&genome, &config, &view, sw, sh);
-                    let stem = nn_path.file_stem()
-                        .and_then(|s| s.to_str()).unwrap_or("fractal");
-                    if let Err(e) = std::fs::create_dir_all(&out_dir) {
-                        eprintln!("Save error: cannot create {}: {e}", out_dir.display());
-                        return;
-                    }
-                    let out = out_dir.join(format!(
-                        "{stem}_cx{:.4}_cy{:.4}_z{:.2}_{sw}x{sh}.png",
-                        view.cx, view.cy, view.zoom,
-                    ));
-                    match save_png(&rgb, sw, sh, &out) {
-                        Ok(_)  => eprintln!("Saved → {}", out.display()),
-                        Err(e) => eprintln!("Save error: {e}"),
-                    }
-                });
+                self.spawn_save(sw, sh, out_dir);
             }
             self.show_save = false;
         }
