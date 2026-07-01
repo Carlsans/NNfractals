@@ -300,6 +300,8 @@ struct App {
     selection: HashSet<PathBuf>,
     anchor: Option<usize>,
     sort_dirty: bool,
+    scroll_offset: f32,       // last known table scroll offset (for PageUp/Down/Home/End)
+    scroll_to: Option<f32>,   // target offset to apply next frame
 
     show_columns: bool,
     confirm_delete: bool,
@@ -323,6 +325,8 @@ impl App {
             selection: HashSet::new(),
             anchor: None,
             sort_dirty: false,
+            scroll_offset: 0.0,
+            scroll_to: None,
             show_columns: false,
             confirm_delete: false,
             dest: None,
@@ -592,7 +596,30 @@ impl App {
         let mut clicked_row: Option<usize> = None;
         let mut open_row: Option<usize> = None;
 
+        // ── Page Up/Down/Home/End scrolling ──
+        let row_height = thumb + 6.0 + ui.spacing().item_spacing.y;
+        let page = (ui.available_height() - row_height).max(row_height);
+        let content_h = self.rows.len() as f32 * row_height;
+        let (pgdn, pgup, home, end) = ui.input(|i| {
+            (
+                i.key_pressed(egui::Key::PageDown),
+                i.key_pressed(egui::Key::PageUp),
+                i.key_pressed(egui::Key::Home),
+                i.key_pressed(egui::Key::End),
+            )
+        });
+        if pgdn {
+            self.scroll_to = Some(self.scroll_offset + page);
+        } else if pgup {
+            self.scroll_to = Some((self.scroll_offset - page).max(0.0));
+        } else if home {
+            self.scroll_to = Some(0.0);
+        } else if end {
+            self.scroll_to = Some(content_h);
+        }
+
         // Disjoint borrows so the row closure can read rows/selection and fill the cache.
+        let scroll_to = self.scroll_to.take();
         let rows = &self.rows;
         let selection = &self.selection;
         let thumb_cache = &mut self.thumb_cache;
@@ -603,11 +630,14 @@ impl App {
             .sense(egui::Sense::click())
             .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
             .column(Column::exact(thumb + 4.0));
+        if let Some(off) = scroll_to {
+            builder = builder.vertical_scroll_offset(off);
+        }
         for _ in &columns {
             builder = builder.column(Column::initial(100.0).at_least(40.0).clip(true));
         }
 
-        builder
+        let table_out = builder
             .header(24.0, |mut header| {
                 header.col(|ui| {
                     ui.strong("img");
@@ -666,6 +696,8 @@ impl App {
                     }
                 });
             });
+        // Remember where the table ended up so the next Page key steps from here.
+        self.scroll_offset = table_out.state.offset.y;
 
         // ── Apply interactions (borrows above have ended) ──
         if let Some(c) = clicked_col {
