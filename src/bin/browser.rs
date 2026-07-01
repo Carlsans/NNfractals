@@ -20,6 +20,7 @@ use std::thread;
 use clap::Parser;
 use eframe::egui::{self, Color32, ColorImage, TextureHandle, TextureOptions};
 use egui_extras::{Column, TableBuilder};
+use rand::Rng;
 use serde::{Deserialize, Serialize};
 
 use nnfractals::config::Config;
@@ -307,6 +308,12 @@ struct App {
     confirm_delete: bool,
     dest: Option<DestDialog>,
     status: String,
+
+    // Pairwise rating mode (collect human "which is nicer?" judgments).
+    rating_mode: bool,
+    pair: Option<(usize, usize)>,
+    rating_cache: HashMap<PathBuf, Option<TextureHandle>>,
+    ratings_logged: usize,
 }
 
 impl App {
@@ -331,6 +338,10 @@ impl App {
             confirm_delete: false,
             dest: None,
             status: String::new(),
+            rating_mode: false,
+            pair: None,
+            rating_cache: HashMap::new(),
+            ratings_logged: 0,
         }
     }
 
@@ -515,6 +526,16 @@ impl App {
             if ui.button("Columns ▾").clicked() {
                 self.show_columns = !self.show_columns;
             }
+            if ui.selectable_label(self.rating_mode, "⚖ Rate")
+                .on_hover_text("Pairwise rating: pick the nicer of two fractals to build a\n\
+                                 human-preference dataset (ratings.jsonl) for training.")
+                .clicked()
+            {
+                self.rating_mode = !self.rating_mode;
+                if self.rating_mode {
+                    self.pick_pair();
+                }
+            }
             ui.separator();
 
             let n = self.selection.len();
@@ -582,6 +603,118 @@ impl App {
         });
         if !self.status.is_empty() {
             ui.label(egui::RichText::new(&self.status).color(Color32::LIGHT_GREEN));
+        }
+    }
+
+    // ── Pairwise rating mode ─────────────────────────────────────────────────────
+
+    fn pick_pair(&mut self) {
+        if self.rows.len() < 2 {
+            self.pair = None;
+            return;
+        }
+        let mut r = rand::rng();
+        let a = r.random_range(0..self.rows.len());
+        let mut b = r.random_range(0..self.rows.len());
+        while b == a {
+            b = r.random_range(0..self.rows.len());
+        }
+        self.pair = Some((a, b));
+    }
+
+    fn log_rating(&mut self, winner: usize, loser: usize) {
+        let wp = self.rows[winner].nn_path.to_string_lossy().into_owned();
+        let lp = self.rows[loser].nn_path.to_string_lossy().into_owned();
+        let line = format!("{{\"winner\": {:?}, \"loser\": {:?}}}\n", wp, lp);
+        let path = self.folder.join("ratings.jsonl");
+        use std::io::Write;
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+            let _ = f.write_all(line.as_bytes());
+            self.ratings_logged += 1;
+            self.status = format!("{} ratings → {}", self.ratings_logged, path.display());
+        } else {
+            self.status = format!("could not write {}", path.display());
+        }
+    }
+
+    /// Draw one fractal image as a big clickable button; returns true if picked.
+    fn rating_cell(&mut self, ui: &mut egui::Ui, idx: usize, side: f32) -> bool {
+        let path = self.rows[idx].png_path.clone();
+        let tex = self
+            .rating_cache
+            .entry(path.clone())
+            .or_insert_with(|| load_thumb(ui.ctx(), &path, 768));
+        let mut clicked = false;
+        ui.vertical_centered(|ui| {
+            if let Some(t) = tex {
+                let ts = t.size_vec2();
+                let scale = (side / ts.x).min(side / ts.y);
+                let img = egui::Image::new(egui::load::SizedTexture::new(t.id(), ts * scale))
+                    .sense(egui::Sense::click());
+                if ui.add(img).clicked() {
+                    clicked = true;
+                }
+            } else {
+                ui.label("(no image)");
+            }
+        });
+        clicked
+    }
+
+    fn show_rating_panel(&mut self, ui: &mut egui::Ui) {
+        if self.rows.len() < 2 {
+            ui.centered_and_justified(|ui| ui.label("Need at least 2 fractals to rate."));
+            return;
+        }
+        if self.pair.map_or(true, |(a, b)| a >= self.rows.len() || b >= self.rows.len()) {
+            self.pick_pair();
+        }
+        let (li, ri) = self.pair.unwrap();
+
+        let (pick_l, pick_r, skip) = ui.input(|i| {
+            (
+                i.key_pressed(egui::Key::Num1) || i.key_pressed(egui::Key::ArrowLeft),
+                i.key_pressed(egui::Key::Num2) || i.key_pressed(egui::Key::ArrowRight),
+                i.key_pressed(egui::Key::Space),
+            )
+        });
+
+        ui.horizontal(|ui| {
+            ui.heading("Which fractal is nicer?");
+            ui.label(
+                egui::RichText::new("click an image  ·  1/←  ·  2/→  ·  Space = skip")
+                    .weak(),
+            );
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.label(format!("{} rated", self.ratings_logged));
+            });
+        });
+
+        let avail = ui.available_size();
+        let side = ((avail.x / 2.0) - 24.0).min(avail.y - 12.0).max(64.0);
+
+        let mut chosen: Option<bool> = None; // Some(true) = left wins
+        ui.columns(2, |cols| {
+            if self.rating_cell(&mut cols[0], li, side) {
+                chosen = Some(true);
+            }
+            if self.rating_cell(&mut cols[1], ri, side) {
+                chosen = Some(false);
+            }
+        });
+
+        if pick_l {
+            chosen = Some(true);
+        } else if pick_r {
+            chosen = Some(false);
+        }
+
+        if let Some(left_wins) = chosen {
+            let (w, l) = if left_wins { (li, ri) } else { (ri, li) };
+            self.log_rating(w, l);
+            self.pick_pair();
+        } else if skip {
+            self.pick_pair();
         }
     }
 
@@ -916,7 +1049,13 @@ impl eframe::App for App {
         }
 
         egui::Panel::top("toolbar").show(ui, |ui| self.toolbar(ui));
-        egui::CentralPanel::default().show(ui, |ui| self.show_table(ui));
+        egui::CentralPanel::default().show(ui, |ui| {
+            if self.rating_mode {
+                self.show_rating_panel(ui);
+            } else {
+                self.show_table(ui);
+            }
+        });
 
         self.show_columns_window(&ctx);
         self.show_delete_window(&ctx);
