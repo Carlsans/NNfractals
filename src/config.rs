@@ -112,6 +112,16 @@ pub struct OutputConfig {
     /// Minimum L2 distance between saved-image behavioral descriptors.
     #[serde(default = "default_min_save_distance")]
     pub min_save_distance: f32,
+    /// Minimum ensemble aesthetic score = mean(nima, topiq_iaa, ap25) [~1,10] for a
+    /// fractal to pass the Stage-2 gate. These fractal-tuned models discriminate far
+    /// better than CLIP/LAION. Applied only when the multi-model sidecar provides them;
+    /// otherwise the old clip/laion gate is used. 0 disables (falls back to clip/laion).
+    #[serde(default = "default_min_ensemble")]
+    pub min_ensemble: f32,
+    /// Minimum MUSIQ technical-quality score [0,100]; rejects blurry/degenerate saves.
+    /// Applied only when musiq is available. 0 disables.
+    #[serde(default = "default_min_musiq")]
+    pub min_musiq: f32,
 }
 
 /// Periodic near-duplicate cleanup run by the evolution loop.
@@ -142,6 +152,8 @@ fn default_min_entropy_prefilter()  -> f32 { 0.20 }
 fn default_max_entropy_prefilter()  -> f32 { 0.65 }
 fn default_min_clip_score()         -> f32 { 0.49 }
 fn default_min_laion_score()        -> f32 { 5.15 }
+fn default_min_ensemble()           -> f32 { 4.6 }
+fn default_min_musiq()              -> f32 { 30.0 }
 
 impl Config {
     pub fn load(path: &Path) -> anyhow::Result<Self> {

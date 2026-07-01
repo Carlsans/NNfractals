@@ -149,14 +149,18 @@ impl Optimizer {
                 let path = e.path();
                 if path.extension().and_then(|x| x.to_str()) != Some("nn") { continue; }
                 if let Ok(g) = load_genome(&path) {
-                    // Seed primarily by aesthetic quality (CLIP+LAION), with smaller
-                    // bonuses for recursion/self-replication. Doubling CLIP weight
-                    // ensures epoch restarts inherit the most aesthetically successful
-                    // genomes, not just the most recursive ones.
-                    let clip = if g.clip_score > 0.0 { g.clip_score } else { g.beauty };
-                    let laion_norm = g.laion_score / 10.0;
-                    let score = 2.0 * clip
-                        + 0.15 * laion_norm
+                    // Seed primarily by aesthetic quality. Prefer the fractal-tuned
+                    // ensemble (mean nima/topiq/ap25) when present — it separates
+                    // fractals far better than CLIP/LAION — else fall back to CLIP.
+                    let aesthetic = if g.aesthetic_ensemble > 0.0 {
+                        g.aesthetic_ensemble / 10.0
+                    } else if g.clip_score > 0.0 {
+                        g.clip_score
+                    } else {
+                        g.beauty
+                    };
+                    let score = 2.0 * aesthetic
+                        + 0.15 * (g.laion_score / 10.0)
                         + 0.20 * g.self_replication
                         + 0.20 * g.fractal_recursion;
                     candidates.push((score, g));
@@ -370,8 +374,12 @@ impl Optimizer {
         if self.aesthetic.is_some() && aesthetic_scores.is_none() {
             display::print_status("⚠ aesthetic scorer returned no score — genome saved unscored (run backfill_scores later)");
         }
-        let final_beauty = aesthetic_scores.as_ref()
-            .map(|s| s.laion / 10.0).unwrap_or(beauty);
+        let ensemble = aesthetic_scores.as_ref().map(|s| s.ensemble()).unwrap_or(0.0);
+        let final_beauty = if ensemble > 0.0 {
+            ensemble / 10.0
+        } else {
+            aesthetic_scores.as_ref().map(|s| s.laion / 10.0).unwrap_or(beauty)
+        };
 
         let mut g = genome.clone();
         g.beauty            = final_beauty;
@@ -382,6 +390,11 @@ impl Optimizer {
         g.beauty_cool_zone  = bd.cool_zone;
         g.clip_score        = aesthetic_scores.as_ref().map(|s| s.clip).unwrap_or(0.0);
         g.laion_score       = aesthetic_scores.as_ref().map(|s| s.laion).unwrap_or(0.0);
+        g.nima              = aesthetic_scores.as_ref().map(|s| s.nima).unwrap_or(0.0);
+        g.topiq_iaa         = aesthetic_scores.as_ref().map(|s| s.topiq_iaa).unwrap_or(0.0);
+        g.ap25_score        = aesthetic_scores.as_ref().map(|s| s.ap25).unwrap_or(0.0);
+        g.musiq             = aesthetic_scores.as_ref().map(|s| s.musiq).unwrap_or(0.0);
+        g.aesthetic_ensemble = ensemble;
         g.self_replication  = crate::fractal::self_replication_score(&g, &self.config);
         g.fractal_recursion = crate::fractal::fractal_recursion_score(&g, &self.config);
         if g.clip_score  > self.max_clip_score  { self.max_clip_score  = g.clip_score; }
@@ -528,12 +541,22 @@ impl Optimizer {
             display::print_status("⚠ aesthetic scorer returned no score — falling back to beauty gate (run backfill_scores later)");
         }
 
-        // Save gate: pass if EITHER clip OR laion exceeds its threshold (OR logic).
-        // Privileges fractals that are excellent on at least one aesthetic dimension.
+        // Save gate. Prefer the fractal-tuned ensemble (mean of nima/topiq_iaa/ap25)
+        // when the multi-model sidecar provides it: it discriminates fractals ~10x
+        // better than CLIP/LAION. Fall back to the old clip-OR-laion gate otherwise.
         let passes = match &aesthetic_scores {
-            Some(s) => s.clip  >= self.config.output.min_clip_score
-                    || s.laion >= self.config.output.min_laion_score,
-            None    => beauty  >= self.config.output.min_beauty,
+            Some(s) => {
+                let ens = s.ensemble();
+                let min_ens = self.config.output.min_ensemble;
+                if ens > 0.0 && min_ens > 0.0 {
+                    let quality_ok = s.musiq <= 0.0 || s.musiq >= self.config.output.min_musiq;
+                    ens >= min_ens && quality_ok
+                } else {
+                    s.clip  >= self.config.output.min_clip_score
+                        || s.laion >= self.config.output.min_laion_score
+                }
+            }
+            None => beauty >= self.config.output.min_beauty,
         };
         if !passes {
             return "low_clip_laion";  // nothing written to the output dir
@@ -544,10 +567,14 @@ impl Optimizer {
         let png_path = self.config.output.save_dir.join(format!("{name}.png"));
         save_png(&rgb, w, h, &png_path).unwrap_or(());
 
-        // Use LAION (wider range) as the stored beauty when available
-        let final_score = aesthetic_scores.as_ref()
-            .map(|s| s.laion / 10.0)
-            .unwrap_or(beauty);
+        // Stored "beauty" = ensemble aesthetic when available (fractal-tuned), else
+        // LAION (wider range than CLIP), else geometric beauty.
+        let ensemble = aesthetic_scores.as_ref().map(|s| s.ensemble()).unwrap_or(0.0);
+        let final_score = if ensemble > 0.0 {
+            ensemble / 10.0
+        } else {
+            aesthetic_scores.as_ref().map(|s| s.laion / 10.0).unwrap_or(beauty)
+        };
 
         let mut g = self.population[idx].clone();
         g.beauty           = final_score;
@@ -558,6 +585,11 @@ impl Optimizer {
         g.beauty_cool_zone = bd.cool_zone;
         g.clip_score       = aesthetic_scores.as_ref().map(|s| s.clip).unwrap_or(0.0);
         g.laion_score      = aesthetic_scores.as_ref().map(|s| s.laion).unwrap_or(0.0);
+        g.nima             = aesthetic_scores.as_ref().map(|s| s.nima).unwrap_or(0.0);
+        g.topiq_iaa        = aesthetic_scores.as_ref().map(|s| s.topiq_iaa).unwrap_or(0.0);
+        g.ap25_score       = aesthetic_scores.as_ref().map(|s| s.ap25).unwrap_or(0.0);
+        g.musiq            = aesthetic_scores.as_ref().map(|s| s.musiq).unwrap_or(0.0);
+        g.aesthetic_ensemble = ensemble;
         // Measure zoom self-replication and fractal recursion only for genomes that
         // actually pass the gate (a handful per generation) — they travel with the .nn.
         g.self_replication  = crate::fractal::self_replication_score(&g, &self.config);

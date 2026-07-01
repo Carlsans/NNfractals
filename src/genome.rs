@@ -62,6 +62,18 @@ pub struct Genome {
     #[serde(default)] pub clip_score:  f32,
     /// LAION MLP aesthetic score [0,10] at save time; 0.0 if unavailable.
     #[serde(default)] pub laion_score: f32,
+    /// NIMA (AVA) aesthetic score [~1,10]; discriminates fractals far better than
+    /// LAION/CLIP. 0.0 if unavailable.
+    #[serde(default)] pub nima: f32,
+    /// TOPIQ-IAA aesthetic score [~1,10]; high spread on fractals. 0.0 if unavailable.
+    #[serde(default)] pub topiq_iaa: f32,
+    /// Aesthetic Predictor v2.5 (SigLIP) score [~1,10]. 0.0 if unavailable.
+    #[serde(default)] pub ap25_score: f32,
+    /// MUSIQ technical-quality score [0,100] (sharpness/structure). 0.0 if unavailable.
+    #[serde(default)] pub musiq: f32,
+    /// Ensemble aesthetic = mean(nima, topiq_iaa, ap25_score) at save time. This is
+    /// the fractal-tuned "beauty by human standard" signal the GA now selects on.
+    #[serde(default)] pub aesthetic_ensemble: f32,
     /// Zoom self-replication score [0,1]: how much the fractal reproduces its
     /// whole-set structure under deep zoom (Mandelbrot-like). 0.0 if not measured.
     #[serde(default)] pub self_replication: f32,
@@ -255,6 +267,7 @@ impl Genome {
             beauty: 0.0,
             beauty_boundary: 0.0, beauty_edge: 0.0, beauty_entropy: 0.0,
             beauty_self_sim: 0.0, beauty_cool_zone: 0.0, clip_score: 0.0, laion_score: 0.0,
+            nima: 0.0, topiq_iaa: 0.0, ap25_score: 0.0, musiq: 0.0, aesthetic_ensemble: 0.0,
             self_replication: 0.0,
             fractal_recursion: 0.0,
             pred_recursion: 0.0,

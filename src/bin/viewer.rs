@@ -1430,6 +1430,7 @@ fn default_config() -> Config {
             min_entropy_prefilter: 0.42, max_entropy_prefilter: 0.65,
             min_clip_score: 0.512, min_laion_score: 5.30,
             min_beauty: 0.35, min_save_distance: 0.04,
+            min_ensemble: 4.6, min_musiq: 30.0,
         },
     }
 }

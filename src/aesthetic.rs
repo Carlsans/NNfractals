@@ -15,8 +15,27 @@ pub struct AestheticDisplay {
 
 #[derive(Clone, Debug, Default)]
 pub struct AestheticScores {
-    pub clip:  f32,
-    pub laion: f32,
+    pub clip:      f32,
+    pub laion:     f32,
+    pub nima:      f32,
+    pub topiq_iaa: f32,
+    pub ap25:      f32,
+    pub musiq:     f32,
+}
+
+impl AestheticScores {
+    /// Fractal-tuned "beauty" = mean of the three aesthetic predictors that
+    /// discriminate fractals well (NIMA, TOPIQ-IAA, AP v2.5). Falls back to any
+    /// subset that is present (non-zero); 0.0 if none available.
+    pub fn ensemble(&self) -> f32 {
+        let parts = [self.nima, self.topiq_iaa, self.ap25];
+        let present: Vec<f32> = parts.iter().copied().filter(|&v| v > 0.0).collect();
+        if present.is_empty() {
+            0.0
+        } else {
+            present.iter().sum::<f32>() / present.len() as f32
+        }
+    }
 }
 
 /// Non-blocking aesthetic scorer backed by a Python sidecar process.
@@ -85,16 +104,21 @@ impl AestheticScorer {
                 if reader.read_line(&mut line).is_err() { break; }
                 let s = line.trim();
                 if !s.starts_with("ERROR") {
-                    let parts: Vec<&str> = s.split_whitespace().collect();
-                    if parts.len() >= 2 {
-                        if let (Ok(clip), Ok(laion)) = (parts[0].parse::<f32>(), parts[1].parse::<f32>()) {
-                            score_tx.send(AestheticScores { clip, laion }).ok();
-                        }
-                    } else if parts.len() == 1 {
-                        // Backward compat: single score treated as clip only
-                        if let Ok(clip) = parts[0].parse::<f32>() {
-                            score_tx.send(AestheticScores { clip, laion: 0.0 }).ok();
-                        }
+                    // Protocol: "clip laion [nima topiq_iaa ap25 musiq]" — extra fields
+                    // are optional so older sidecars still parse.
+                    let f: Vec<f32> = s.split_whitespace()
+                        .filter_map(|t| t.parse::<f32>().ok())
+                        .collect();
+                    if !f.is_empty() {
+                        let get = |i: usize| f.get(i).copied().unwrap_or(0.0);
+                        score_tx.send(AestheticScores {
+                            clip:      get(0),
+                            laion:     get(1),
+                            nima:      get(2),
+                            topiq_iaa: get(3),
+                            ap25:      get(4),
+                            musiq:     get(5),
+                        }).ok();
                     }
                 }
             }
