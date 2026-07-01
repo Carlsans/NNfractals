@@ -362,9 +362,14 @@ impl Optimizer {
         let (beauty, bd) = beauty_score_full(&escape_times, w as usize, self.config.rendering.max_iter);
         save_png(&rgb, w, h, &png_path).unwrap_or(());
 
-        // Score with CLIP+LAION if the aesthetic scorer is ready (non-blocking)
+        // Score with CLIP+LAION. Block (waiting up to ~60s for the model to finish
+        // loading) rather than skipping when not-yet-ready — otherwise restart-best
+        // saves early in a run would be persisted with 0 scores.
         let aesthetic_scores = self.aesthetic.as_mut()
-            .and_then(|a| if a.is_ready() { a.score_blocking(png_path.clone()) } else { None });
+            .and_then(|a| a.score_blocking(png_path.clone()));
+        if self.aesthetic.is_some() && aesthetic_scores.is_none() {
+            display::print_status("⚠ aesthetic scorer returned no score — genome saved unscored (run backfill_scores later)");
+        }
         let final_beauty = aesthetic_scores.as_ref()
             .map(|s| s.laion / 10.0).unwrap_or(beauty);
 
@@ -518,6 +523,10 @@ impl Optimizer {
             }
             None => None,
         };
+
+        if self.aesthetic.is_some() && aesthetic_scores.is_none() {
+            display::print_status("⚠ aesthetic scorer returned no score — falling back to beauty gate (run backfill_scores later)");
+        }
 
         // Save gate: pass if EITHER clip OR laion exceeds its threshold (OR logic).
         // Privileges fractals that are excellent on at least one aesthetic dimension.
