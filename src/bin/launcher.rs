@@ -33,8 +33,29 @@ fn bin_dir() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."))
 }
 
+/// Locate a project binary robustly: sibling of this exe, the other build profile
+/// (target/debug ↔ target/release), then ~/.local/bin, then the bare name (PATH).
 fn sibling(name: &str) -> PathBuf {
-    bin_dir().join(name)
+    let dir = bin_dir();
+    let c = dir.join(name);
+    if c.exists() {
+        return c;
+    }
+    if let Some(target) = dir.parent() {
+        for prof in ["release", "debug"] {
+            let c = target.join(prof).join(name);
+            if c.exists() {
+                return c;
+            }
+        }
+    }
+    if let Ok(home) = std::env::var("HOME") {
+        let c = PathBuf::from(home).join(".local/bin").join(name);
+        if c.exists() {
+            return c;
+        }
+    }
+    PathBuf::from(name)
 }
 
 /// The project root — the dir holding `config.toml` (needed as cwd for evolution,

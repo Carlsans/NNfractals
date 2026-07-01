@@ -225,17 +225,38 @@ fn resolve_folder(cli: Option<PathBuf>, prefs: &BrowserPrefs) -> PathBuf {
     PathBuf::from("fractals_dag")
 }
 
-/// Path to the sibling viewer binary (falls back to bare name on PATH).
-fn viewer_path() -> PathBuf {
+/// Locate a project binary robustly: sibling of this exe, the other build profile
+/// (target/debug ↔ target/release — the viewer is often only built in release),
+/// then ~/.local/bin, and finally the bare name (OS PATH lookup).
+fn locate_bin(name: &str) -> PathBuf {
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
-            let cand = dir.join("nnfractals-viewer");
-            if cand.exists() {
-                return cand;
+            let c = dir.join(name);
+            if c.exists() {
+                return c;
+            }
+            // …/target/{debug,release}/<exe> → also try the sibling profile dir.
+            if let Some(target) = dir.parent() {
+                for prof in ["release", "debug"] {
+                    let c = target.join(prof).join(name);
+                    if c.exists() {
+                        return c;
+                    }
+                }
             }
         }
     }
-    PathBuf::from("nnfractals-viewer")
+    if let Ok(home) = std::env::var("HOME") {
+        let c = PathBuf::from(home).join(".local/bin").join(name);
+        if c.exists() {
+            return c;
+        }
+    }
+    PathBuf::from(name)
+}
+
+fn viewer_path() -> PathBuf {
+    locate_bin("nnfractals-viewer")
 }
 
 fn load_thumb(ctx: &egui::Context, path: &Path, sz: u32) -> Option<TextureHandle> {
