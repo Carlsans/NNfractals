@@ -12,16 +12,29 @@ name = "nnfractals-viewer"
 path = "src/bin/viewer.rs"
 required-features = ["viewer", "wgpu-backend"]
 
+[[bin]]
+name = "nnfractals-browser"
+path = "src/bin/browser.rs"
+required-features = ["browser"]
+
+[[bin]]
+name = "nnfractals-launcher"
+path = "src/bin/launcher.rs"
+required-features = ["launcher"]
+
 [features]
 default = ["wgpu-backend"]
 wgpu-backend = ["dep:wgpu", "dep:pollster"]
 ndarray-backend = []
 viewer = ["dep:eframe"]
+browser = ["dep:eframe", "dep:egui_extras"]
+launcher = ["dep:eframe"]
 
 [dependencies]
 wgpu       = { version = "29", optional = true }
 pollster   = { version = "0.3", optional = true }
-eframe     = { version = "0.35", optional = true }
+eframe      = { version = "0.35", optional = true }
+egui_extras = { version = "0.35", optional = true }
 image      = "0.25"
 colorous   = "1"
 clap       = { version = "4", features = ["derive"] }
