@@ -32,10 +32,12 @@ clip_pred_weight         = 0.50   # per-gen bonus for formula-predicted CLIP aes
 pref_weight              = 0.4    # blend trained human-preference (pref_score) into saved fitness + seed ranking
 seed_pref_weight         = 3.0    # STRONG pref weight when picking the individuals that START the group (warm-start/restart seeds)
 musiq_weight             = 0.25   # positive reward for high MUSIQ technical quality (norm (musiq-30)/50), below pref so pref stays dominant
+archive_random_ratio     = 0.30   # NEW ARCHITECTURE: 30% of each (re)seeded pool is pure-random; rest bred from archive seeds (never plain-cloned)
+duplicate_penalty_weight = 0.50   # NEW ARCHITECTURE: quadratic penalty on formula families that dominate the saved archive (FormulaUsageTracker)
 
 [output]
-save_dir                 = "./fractals"
-population_dir           = "./populations"
+save_dir                 = "./fractals_1"     # NEW ARCHITECTURE: fresh empty pool, replaces ./fractals
+population_dir           = "./populations_1"
 min_entropy_prefilter    = 0.38  # widened: dedup cleans near-dups every 2h
 max_entropy_prefilter    = 0.70  # widened: dedup cleans near-dups every 2h
 min_clip_score           = 0.522 # OR gate: pass if CLIP ≥ this (above mean) — privileges CLIP winners

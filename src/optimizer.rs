@@ -14,6 +14,7 @@ use crate::fitness::{novelty_score, is_degenerate, behavior_descriptor, beauty_s
 use crate::io::{save_genome, save_png};
 use crate::display;
 use crate::aesthetic::AestheticScorer;
+use crate::formula_usage::FormulaUsageTracker;
 
 pub struct Optimizer {
     config: Config,
@@ -39,9 +40,16 @@ pub struct Optimizer {
     // search — the cheap geometric fitness is ⊥ taste (measured corr≈0.05), so this is
     // the only path by which measured taste can influence the population per-gen.
     pref_elites: VecDeque<Genome>,
+    // Persistent archive-wide formula-family usage counts (quadratic duplicate
+    // penalty) — see FormulaUsageTracker.
+    formula_usage: FormulaUsageTracker,
 }
 
 const PREF_ELITE_CAP: usize = 24;
+// How often (in generations) the duplicate-usage tracker does a full rescan of
+// the save_dir to correct drift from external changes (dedup.py, browser
+// deletes, another instance's saves).
+const DUPLICATE_RESCAN_GENS: u32 = 50;
 
 impl Optimizer {
     pub fn new(config: Config) -> Self {
@@ -51,33 +59,18 @@ impl Optimizer {
         std::fs::create_dir_all(&config.output.population_dir).unwrap_or(());
         display::init();
 
-        // Warm-start: seed up to N_SEEDS best genomes from the archive
+        // Warm-start: seed up to N_SEEDS best genomes from the archive. Seeds are
+        // never entered into the population directly — seed_population() always
+        // routes them through crossover/mutation (see its doc comment).
         const N_SEEDS: usize = 12;
-        const N_RANDOM_INJECT: usize = 8;
         let seeds = Self::load_archive_seeds(&config, N_SEEDS);
 
         let pop_size = config.optimization.population_size;
-        let mut population: Vec<Genome> = seeds.clone();
-
-        // Always inject N_RANDOM_INJECT fully random genomes for exploration diversity.
-        // These are added before mutations so they're always guaranteed regardless of seed count.
-        let n_random = N_RANDOM_INJECT.min(pop_size.saturating_sub(population.len()));
-        population.extend((0..n_random).map(|_| Genome::random(&config, &mut rng)));
+        let population = Self::seed_population(&config, &mut rng, &seeds, pop_size, Vec::new());
         display::print_status(&format!(
-            "Warm-start: {} archive seeds + {} fresh random individuals",
-            seeds.len(), n_random
+            "Warm-start: {} archive seeds, {:.0}% random ratio → {} genomes (bred, not cloned)",
+            seeds.len(), config.optimization.archive_random_ratio * 100.0, population.len()
         ));
-
-        // Fill remainder with mutations of seeds
-        let n_fill = pop_size.saturating_sub(population.len());
-        if seeds.is_empty() {
-            population.extend((0..n_fill).map(|_| Genome::random(&config, &mut rng)));
-        } else {
-            for i in 0..n_fill {
-                let src = &seeds[i % seeds.len()];
-                population.push(src.mutate(&config, &mut rng));
-            }
-        }
 
         // Prime the formula archive with basis-weight vectors of the starting population,
         // mirroring the behavior_archive priming logic below.
@@ -126,6 +119,7 @@ impl Optimizer {
                 "CLIP predictor:      no model file — CLIP criterion inert this run"),
         }
 
+        let formula_usage = FormulaUsageTracker::new(&config.output.save_dir);
         Self {
             config,
             population,
@@ -146,7 +140,59 @@ impl Optimizer {
             recursion_model,
             clip_model,
             pref_elites: VecDeque::new(),
+            formula_usage,
         }
+    }
+
+    /// Compose a (re)seeded population: `archive_random_ratio` of `pop_size` is
+    /// fresh random genomes (biased toward exotic ops for part of that slice);
+    /// the rest is derived from `seeds` — but a seed is ALWAYS bred first, never
+    /// entered as a literal clone. Each archive-derived slot is either the
+    /// crossover of two distinct seeds followed by a mutation, or a straight
+    /// mutation of one seed, mirroring how `evolve()` breeds each generation.
+    /// If `seeds` is empty (e.g. a brand-new save_dir) the whole pool falls back
+    /// to random genomes. `carry` (e.g. the current best-ever) is kept verbatim
+    /// ahead of both — that's ordinary elitism, not archive re-seeding.
+    fn seed_population(
+        config: &Config,
+        rng: &mut StdRng,
+        seeds: &[Genome],
+        pop_size: usize,
+        carry: Vec<Genome>,
+    ) -> Vec<Genome> {
+        let mut population = carry;
+
+        let random_ratio = config.optimization.archive_random_ratio.clamp(0.0, 1.0);
+        let n_random = ((pop_size as f32 * random_ratio).round() as usize)
+            .min(pop_size.saturating_sub(population.len()));
+        const EXOTIC_FRAC: f32 = 0.4;
+        let n_exotic = ((n_random as f32 * EXOTIC_FRAC).round() as usize).min(n_random);
+        for i in 0..n_random {
+            population.push(if i < n_exotic {
+                Genome::random_exotic(config, rng)
+            } else {
+                Genome::random(config, rng)
+            });
+        }
+
+        let n_fill = pop_size.saturating_sub(population.len());
+        if seeds.is_empty() {
+            population.extend((0..n_fill).map(|_| Genome::random(config, rng)));
+        } else {
+            for _ in 0..n_fill {
+                let a_idx = rng.random_range(0..seeds.len());
+                let child = if seeds.len() >= 2 && rng.random_bool(0.5) {
+                    let mut b_idx = rng.random_range(0..seeds.len());
+                    while b_idx == a_idx { b_idx = rng.random_range(0..seeds.len()); }
+                    Genome::crossover(&seeds[a_idx], &seeds[b_idx], config, rng)
+                        .mutate(config, rng)
+                } else {
+                    seeds[a_idx].mutate(config, rng)
+                };
+                population.push(child);
+            }
+        }
+        population
     }
 
     /// Append one JSON line of per-generation telemetry to gen_metrics_<pool>.jsonl.
@@ -252,6 +298,8 @@ impl Optimizer {
         let fdw = self.config.optimization.formula_diversity_weight;
         let cpw = self.config.optimization.clip_pred_weight;
         let oodw = self.config.optimization.ood_weight;
+        let dpw = self.config.optimization.duplicate_penalty_weight;
+        self.formula_usage.maybe_periodic_rescan(&self.config.output.save_dir, DUPLICATE_RESCAN_GENS);
         let formula_snap: Vec<Vec<f32>> = self.formula_archive.iter().cloned().collect();
         // Snapshot of already-saved behavioral descriptors for OOD novelty.
         let saved_snap: Vec<Vec<f32>> = if oodw != 0.0 { self.save_descriptors.clone() } else { Vec::new() };
@@ -284,13 +332,19 @@ impl Optimizer {
                     .map(|d| descriptor.iter().zip(d).map(|(a, b)| (a - b) * (a - b)).sum::<f32>().sqrt())
                     .fold(f32::INFINITY, f32::min)
             };
+            // Persistent archive-wide duplicate penalty: quadratic in the fraction
+            // of the SAVED archive already using this formula family, so a family
+            // that comes to dominate the gallery is actively pushed away from —
+            // distinct from formula_diversity above, which only sees the recent
+            // per-generation window.
+            let dup_pen = self.formula_usage.penalty(&self.population[i], dpw);
             self.population[i].beauty_entropy    = raw_png;       // save gate uses raw
             self.population[i].pred_recursion    = pred_rec;
             self.population[i].pred_clip         = pred_clip_val;
             self.population[i].formula_diversity = formula_div;
             self.population[i].fitness =
                 structured_ent + nw * novelty + rpw * pred_rec + fdw * formula_div
-                + cpw * pred_clip_val + oodw * ood - cxpen;
+                + cpw * pred_clip_val + oodw * ood - cxpen - dup_pen;
             if self.behavior_archive.len() >= archive_max { self.behavior_archive.pop_front(); }
             self.behavior_archive.push_back(descriptor);
             if self.formula_archive.len() >= archive_max { self.formula_archive.pop_front(); }
@@ -457,6 +511,7 @@ impl Optimizer {
         if g.laion_score > self.max_laion_score { self.max_laion_score = g.laion_score; }
         g.formula_readable = g.formula_expr();   // human-readable comment in the .nn
         save_genome(&g, &nn_path).unwrap_or(());
+        self.formula_usage.record(&g);
         display::print_save(&g, &png_path.display().to_string(), final_beauty);
         self.saved_count += 1;
         let eval_et = render_cpu_iter(genome, &self.config,
@@ -477,51 +532,25 @@ impl Optimizer {
         display::print_restart(self.generation,
                                self.best_ever.as_ref().map(|g| g.fitness).unwrap_or(0.0));
 
-        // Reload a FEW archive seeds on restart, but bias heavily toward fresh random
-        // Seeds now ranked by CLIP score; 6 seeds keeps the top-CLIP genomes in play
-        // each epoch without over-constraining exploration (random + exotic fill the rest).
+        // Reload a FEW archive seeds on restart. Seeds ranked by CLIP/pref score;
+        // 6 seeds keeps the top genomes in play each epoch without over-constraining
+        // exploration. As in new(), seeds are never cloned straight into the pool —
+        // seed_population() breeds every archive-derived slot via crossover/mutation.
         const N_SEEDS: usize = 6;
-        const N_RANDOM_INJECT: usize = 18;
         let seeds = Self::load_archive_seeds(&self.config, N_SEEDS);
-        let mut new_pop: Vec<Genome> = seeds.clone();
-        // Always include current best_ever if not already in seeds
+
+        // Current best-ever carries forward verbatim — ordinary elitism, distinct
+        // from archive re-seeding.
+        let mut carry: Vec<Genome> = Vec::new();
         if let Some(best) = &self.best_ever {
-            if !new_pop.iter().any(|g| g.id == best.id) {
-                new_pop.push(best.clone());
-            }
+            carry.push(best.clone());
         }
         let pop_size = self.config.optimization.population_size;
-
-        // Always inject N_RANDOM_INJECT fresh random genomes on every stagnation restart.
-        // 8 of these are "exotic": forced terms from the 6 bases proven to score best on CLIP
-        // (z², sin, tan, z/(z²+1), (z²-1)/(z²+1), 1/(z²+c)) — see FormulaTerm::random_exotic.
-        const N_EXOTIC: usize = 8;
-        let n_random = N_RANDOM_INJECT.min(pop_size.saturating_sub(new_pop.len()));
-        for i in 0..n_random {
-            let g = if i < N_EXOTIC {
-                Genome::random_exotic(&self.config, &mut self.rng)
-            } else {
-                Genome::random(&self.config, &mut self.rng)
-            };
-            new_pop.push(g);
-        }
+        let new_pop = Self::seed_population(&self.config, &mut self.rng, &seeds, pop_size, carry);
         display::print_status(&format!(
-            "Restart: {} seeds + {} random ({} exotic) injected",
-            seeds.len(), n_random, N_EXOTIC.min(n_random)
+            "Restart: {} archive seeds, {:.0}% random ratio → {} genomes (best-ever carried, rest bred)",
+            seeds.len(), self.config.optimization.archive_random_ratio * 100.0, new_pop.len()
         ));
-
-        // Fill remainder with mutations of seeds
-        if !seeds.is_empty() {
-            let n_fill = pop_size.saturating_sub(new_pop.len());
-            for i in 0..n_fill {
-                let src = &seeds[i % seeds.len()];
-                new_pop.push(src.mutate(&self.config, &mut self.rng));
-            }
-        } else {
-            while new_pop.len() < pop_size {
-                new_pop.push(Genome::random(&self.config, &mut self.rng));
-            }
-        }
         self.population    = new_pop;
         self.stagnant_gens = 0;
         // Retain the 300 most-recent save descriptors across restarts so the diversity gate
@@ -668,6 +697,7 @@ impl Optimizer {
             + self.config.optimization.musiq_weight * musiq_norm;
         g.formula_readable = g.formula_expr();   // human-readable comment in the .nn
         save_genome(&g, &nn_path).unwrap_or(());
+        self.formula_usage.record(&g);
         self.save_descriptors.push(desc);
         // ITER3: remember genomes with genuinely high measured pref so evolve() can
         // breed from them — the only per-gen channel for measured taste to steer search.

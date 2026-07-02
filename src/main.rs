@@ -71,6 +71,12 @@ fn spawn_dedup_cleaner(config: &Config) {
     let threshold  = config.dedup.similarity_threshold;
     let save_dir   = config.output.save_dir.clone();
     let exe        = std::env::current_exe().ok();
+    // Per-instance log so concurrent instances (separate save_dirs) don't
+    // interleave their dedup output into one file.
+    let log_name = format!(
+        "dedup_{}.log",
+        save_dir.file_name().and_then(|s| s.to_str()).unwrap_or("pool")
+    );
 
     thread::spawn(move || {
         loop {
@@ -78,7 +84,7 @@ fn spawn_dedup_cleaner(config: &Config) {
 
             let log = OpenOptions::new()
                 .create(true).append(true)
-                .open("dedup.log")
+                .open(&log_name)
                 .ok();
             let (out, err) = match &log {
                 Some(f) => (

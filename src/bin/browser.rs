@@ -289,6 +289,35 @@ fn resolve_folder(cli: Option<PathBuf>, prefs: &BrowserPrefs) -> PathBuf {
     PathBuf::from("fractals_dag")
 }
 
+/// Candidate fractal output folders for the toolbar's directory selector: any
+/// top-level directory whose name starts with "fractals" (fractals/,
+/// fractals_dag/, fractals_1/, fractals_2/, ...), plus whichever folder is
+/// currently active even if it doesn't match (e.g. a custom --dir). Re-scanned
+/// on reload() so newly-created instance folders show up without a restart.
+fn discover_fractal_dirs(current: &Path) -> Vec<PathBuf> {
+    let mut dirs: Vec<PathBuf> = std::fs::read_dir(".")
+        .map(|entries| {
+            entries
+                .flatten()
+                .map(|e| e.path())
+                .filter(|p| {
+                    p.is_dir()
+                        && p.file_name()
+                            .and_then(|n| n.to_str())
+                            .map(|n| n.starts_with("fractals"))
+                            .unwrap_or(false)
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    if !dirs.iter().any(|d| d == current) {
+        dirs.push(current.to_path_buf());
+    }
+    dirs.sort();
+    dirs.dedup();
+    dirs
+}
+
 /// Locate a project binary robustly: sibling of this exe, the other build profile
 /// (target/debug ↔ target/release — the viewer is often only built in release),
 /// then ~/.local/bin, and finally the bare name (OS PATH lookup).
@@ -350,6 +379,7 @@ struct App {
     prefs: BrowserPrefs,
     prefs_path: PathBuf,
     folder: PathBuf,
+    known_folders: Vec<PathBuf>,
 
     rows: Vec<Row>,
     catalog: BTreeSet<String>,
@@ -383,11 +413,13 @@ struct App {
 impl App {
     fn new(prefs: BrowserPrefs, prefs_path: PathBuf, folder: PathBuf) -> Self {
         let loader = Some(spawn_loader(folder.clone()));
+        let known_folders = discover_fractal_dirs(&folder);
         let prefs_autoreload = prefs.autoreload;
         App {
             prefs,
             prefs_path,
             folder,
+            known_folders,
             rows: Vec::new(),
             catalog: BTreeSet::new(),
             loader,
@@ -426,6 +458,15 @@ impl App {
         self.load_count = 0;
         self.loading = true;
         self.loader = Some(spawn_loader(self.folder.clone()));
+        self.known_folders = discover_fractal_dirs(&self.folder);
+    }
+
+    /// Switch the browsed folder (toolbar dropdown) and reload its contents.
+    fn switch_folder(&mut self, new_folder: PathBuf) {
+        if new_folder == self.folder { return; }
+        self.folder = new_folder;
+        self.reload();
+        self.save_prefs();
     }
 
     /// Autoreload tick: add newly-saved .nn and drop deleted ones, preserving the
@@ -619,7 +660,20 @@ impl App {
     fn toolbar(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             ui.label("📁");
-            ui.monospace(self.folder.to_string_lossy());
+            let mut chosen: Option<PathBuf> = None;
+            egui::ComboBox::from_id_salt("folder_select")
+                .selected_text(self.folder.to_string_lossy())
+                .show_ui(ui, |ui| {
+                    for dir in &self.known_folders {
+                        let label = dir.to_string_lossy().into_owned();
+                        if ui.selectable_label(dir == &self.folder, label).clicked() {
+                            chosen = Some(dir.clone());
+                        }
+                    }
+                });
+            if let Some(dir) = chosen {
+                self.switch_folder(dir);
+            }
             if ui.button("Reload").clicked() {
                 self.reload();
             }

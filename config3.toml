@@ -38,8 +38,8 @@ archive_random_ratio     = 0.30   # NEW ARCHITECTURE: 30% of each (re)seeded poo
 duplicate_penalty_weight = 0.50   # NEW ARCHITECTURE: quadratic penalty on formula families that dominate the saved archive (FormulaUsageTracker)
 
 [output]
-save_dir                 = "./fractals_2"     # NEW ARCHITECTURE: fresh empty pool, replaces ./fractals_dag
-population_dir           = "./populations_2"
+save_dir                 = "./fractals_3"     # NEW ARCHITECTURE: fresh empty pool (instance 3 of 4)
+population_dir           = "./populations_3"
 min_entropy_prefilter    = 0.38  # widened: dedup cleans near-dups every 2h
 max_entropy_prefilter    = 0.70  # widened: dedup cleans near-dups every 2h
 min_clip_score           = 0.522 # OR gate: pass if CLIP ≥ this (above mean) — privileges CLIP winners

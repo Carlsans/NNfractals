@@ -9,13 +9,20 @@ __pycache__/
 *.bak
 .claude/
 dedup.log
+dedup_*.log
 evolution.log
 evolution.pid
 loop_state.json
 recursion_loop_state.json
 fractals_dag/
 populations2/
+fractals_[1-4]/
+populations_[1-4]/
 evolution2.pid
+evolution3.pid
+evolution4.pid
+evo3.log
+evo4.log
 diversity_loop_state.json
 colormap_loop_state.json
 .run_pids
@@ -31,3 +38,4 @@ gen_metrics_*.jsonl
 metric_loop_journal.md
 hour_timer.out
 verify.out
+.loop_cycle_start

@@ -10,5 +10,6 @@ pub mod io;
 pub mod display;
 pub mod optimizer;
 pub mod aesthetic;
+pub mod formula_usage;
 #[cfg(feature = "wgpu-backend")]
 pub mod render_gpu;

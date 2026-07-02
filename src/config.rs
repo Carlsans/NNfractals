@@ -101,6 +101,19 @@ pub struct OptimizationConfig {
     /// geometric fitness is ⊥ taste). 0 disables (pure fitness-elite breeding).
     #[serde(default = "default_pref_elite_count")]
     pub pref_elite_count: u32,
+    /// Fraction of a freshly (re)seeded population that's pure-random genomes; the
+    /// rest is derived from archive seeds via crossover/mutation (never a plain
+    /// clone of a saved genome — see Optimizer::seed_population). Applies at
+    /// startup and every stagnation restart. 0 = archive-only fill, 1 = pure random.
+    #[serde(default = "default_archive_random_ratio")]
+    pub archive_random_ratio: f32,
+    /// Weight on the formula-duplication penalty: fitness -= duplicate_penalty_weight
+    /// · (uses_in_archive / archive_total)². `uses_in_archive` counts saved genomes
+    /// sharing the candidate's structural formula signature (formula_ops_label), so
+    /// formula families that already dominate the gallery pay a quadratic price for
+    /// more of the same. 0 disables. See FormulaUsageTracker.
+    #[serde(default = "default_duplicate_penalty_weight")]
+    pub duplicate_penalty_weight: f32,
 }
 
 fn default_self_replication_weight()    -> f32 { 0.35 }
@@ -116,6 +129,8 @@ fn default_pref_weight()                -> f32 { 0.4 }
 fn default_seed_pref_weight()           -> f32 { 3.0 }
 fn default_musiq_weight()               -> f32 { 0.25 }
 fn default_pref_elite_count()           -> u32 { 4 }
+fn default_archive_random_ratio()       -> f32 { 0.30 }
+fn default_duplicate_penalty_weight()   -> f32 { 0.50 }
 
 #[derive(Deserialize, Clone, Debug)]
 pub struct OutputConfig {

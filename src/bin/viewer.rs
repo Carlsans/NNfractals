@@ -1548,6 +1548,8 @@ fn default_config() -> Config {
             seed_pref_weight: 3.0,
             musiq_weight: 0.25,
             pref_elite_count: 4,
+            archive_random_ratio: 0.30,
+            duplicate_penalty_weight: 0.50,
         },
         output: OutputConfig {
             save_dir: "./fractals".into(),
