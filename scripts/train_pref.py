@@ -106,6 +106,10 @@ def main():
     ap.add_argument("--epochs", type=int, default=400)
     ap.add_argument("--reg", type=float, default=1e-3)
     ap.add_argument("--field", default="pref_score")
+    ap.add_argument("--holdout", type=float, default=0.0,
+                    help="fraction of comparisons held out to report generalization accuracy")
+    ap.add_argument("--eval", action="store_true",
+                    help="only train + report accuracy; do not score/write the galleries")
     args = ap.parse_args()
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -136,21 +140,42 @@ def main():
             diffs.append(emb[w] - emb[l])
     if len(diffs) < 5:
         raise SystemExit("too few usable comparisons (missing pngs?).")
-    X = torch.tensor(np.stack(diffs), dtype=torch.float32, device=device)
-    log(f"training on {X.shape[0]} pairs, dim={X.shape[1]}")
+    Xall = torch.tensor(np.stack(diffs), dtype=torch.float32, device=device)
 
-    # ── Fit Bradley-Terry (logistic on embedding differences) ──
-    w = torch.zeros(X.shape[1], requires_grad=True, device=device)
-    opt = torch.optim.Adam([w], lr=0.05)
-    for ep in range(args.epochs):
-        opt.zero_grad()
-        logits = X @ w                       # want > 0 (winner beats loser)
-        loss = torch.nn.functional.softplus(-logits).mean() + args.reg * (w * w).sum()
-        loss.backward()
-        opt.step()
-    with torch.no_grad():
-        acc = (X @ w > 0).float().mean().item()
-    log(f"train pairwise accuracy: {acc*100:.1f}%  (final loss {loss.item():.4f})")
+    def fit(X):
+        w = torch.zeros(X.shape[1], requires_grad=True, device=device)
+        opt = torch.optim.Adam([w], lr=0.05)
+        loss = None
+        for _ in range(args.epochs):
+            opt.zero_grad()
+            loss = torch.nn.functional.softplus(-(X @ w)).mean() + args.reg * (w * w).sum()
+            loss.backward()
+            opt.step()
+        return w.detach(), float(loss.item())
+
+    def acc(w, X):
+        with torch.no_grad():
+            return (X @ w > 0).float().mean().item()
+
+    # ── Optional held-out generalization check ──
+    if args.holdout > 0.0:
+        n = Xall.shape[0]
+        perm = torch.randperm(n)
+        n_val = max(1, int(n * args.holdout))
+        val_idx, tr_idx = perm[:n_val], perm[n_val:]
+        w_tr, _ = fit(Xall[tr_idx])
+        log(f"holdout {args.holdout:.0%}: train acc {acc(w_tr, Xall[tr_idx])*100:.1f}%  "
+            f"VAL acc {acc(w_tr, Xall[val_idx])*100:.1f}%  "
+            f"({tr_idx.numel()} train / {val_idx.numel()} val pairs)")
+
+    # ── Fit on ALL comparisons for the final model ──
+    w, final_loss = fit(Xall)
+    log(f"trained on {Xall.shape[0]} pairs (dim {Xall.shape[1]}); "
+        f"train pairwise accuracy {acc(w, Xall)*100:.1f}%  (loss {final_loss:.4f})")
+
+    if args.eval:
+        log("eval mode — not scoring galleries.")
+        return
 
     # ── Apply to every .nn in --dirs ──
     all_nn = []
