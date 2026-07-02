@@ -108,6 +108,8 @@ def main():
     ap.add_argument("--field", default="pref_score")
     ap.add_argument("--holdout", type=float, default=0.0,
                     help="fraction of comparisons held out to report generalization accuracy")
+    ap.add_argument("--holdout-repeats", type=int, default=1,
+                    help="number of random holdout splits to average (embed once, refit each)")
     ap.add_argument("--eval", action="store_true",
                     help="only train + report accuracy; do not score/write the galleries")
     args = ap.parse_args()
@@ -157,16 +159,20 @@ def main():
         with torch.no_grad():
             return (X @ w > 0).float().mean().item()
 
-    # ── Optional held-out generalization check ──
+    # ── Optional held-out generalization check (averaged over random splits) ──
     if args.holdout > 0.0:
         n = Xall.shape[0]
-        perm = torch.randperm(n)
         n_val = max(1, int(n * args.holdout))
-        val_idx, tr_idx = perm[:n_val], perm[n_val:]
-        w_tr, _ = fit(Xall[tr_idx])
-        log(f"holdout {args.holdout:.0%}: train acc {acc(w_tr, Xall[tr_idx])*100:.1f}%  "
-            f"VAL acc {acc(w_tr, Xall[val_idx])*100:.1f}%  "
-            f"({tr_idx.numel()} train / {val_idx.numel()} val pairs)")
+        vals = []
+        for _ in range(max(1, args.holdout_repeats)):
+            perm = torch.randperm(n)
+            val_idx, tr_idx = perm[:n_val], perm[n_val:]
+            w_tr, _ = fit(Xall[tr_idx])
+            vals.append(acc(w_tr, Xall[val_idx]))
+        vals = np.array(vals)
+        log(f"holdout {args.holdout:.0%} × {len(vals)} splits: "
+            f"VAL acc {vals.mean()*100:.1f}% ± {vals.std()*100:.1f}%  "
+            f"(chance 50%, {n - n_val} train / {n_val} val pairs each)")
 
     # ── Fit on ALL comparisons for the final model ──
     w, final_loss = fit(Xall)
