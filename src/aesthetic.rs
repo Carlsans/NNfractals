@@ -68,11 +68,17 @@ impl AestheticScorer {
             })
             .copied()?;
 
+        // Route the sidecar's stderr (model-load logs / tracebacks) to a file so
+        // failures are diagnosable — a silent /dev/null makes "no score" impossible
+        // to debug.
+        let err_log = std::fs::File::create("aesthetic_sidecar.log")
+            .map(Stdio::from)
+            .unwrap_or_else(|_| Stdio::null());
         let mut child = Command::new(python)
             .arg("aesthetic_scorer.py")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+            .stderr(err_log)
             .spawn()
             .ok()?;
 
@@ -90,10 +96,19 @@ impl AestheticScorer {
             let mut reader = BufReader::new(child_stdout);
             let mut line   = String::new();
 
-            // Phase 1: wait for READY (CLIP model loading takes 30–60s on first run)
-            match reader.read_line(&mut line) {
-                Ok(_) if line.trim() == "READY" => { ready_tx.send(true).ok(); }
-                _                               => { ready_tx.send(false).ok(); return; }
+            // Phase 1: wait for READY. Skip any stray stdout lines a library may emit
+            // during model loading (e.g. pyiqa's "Loading pretrained model ..."), so a
+            // noisy line can't be mistaken for a failed handshake.
+            loop {
+                line.clear();
+                match reader.read_line(&mut line) {
+                    Ok(0) => { ready_tx.send(false).ok(); return; } // EOF before READY
+                    Ok(_) => {
+                        if line.trim() == "READY" { ready_tx.send(true).ok(); break; }
+                        // else: ignore noise and keep reading
+                    }
+                    Err(_) => { ready_tx.send(false).ok(); return; }
+                }
             }
             drop(ready_tx);
 
@@ -162,7 +177,9 @@ impl AestheticScorer {
     /// Waits up to 60s for the scorer to become ready (handles slow CLIP model load at startup).
     pub fn score_blocking(&mut self, path: PathBuf) -> Option<AestheticScores> {
         if !self.is_ready {
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+            // The multi-model sidecar (CLIP+LAION+nima+topiq+ap25+musiq+SigLIP) takes
+            // ~90-120s to load; allow generous time before giving up.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(240);
             while !self.is_ready && std::time::Instant::now() < deadline {
                 // Use map to avoid holding a borrow across the self-mutation below
                 let result = self.ready_rx.as_ref()

@@ -109,7 +109,67 @@ enum LoadMsg {
     Done,
 }
 
-/// Read `dir` for `*.nn`, parse each as generic JSON, stream `Row`s back.
+/// Format a UNIX timestamp (seconds, UTC) as a fixed-width, sortable "YYYY-MM-DD HH:MM".
+fn fmt_unix(secs: u64) -> String {
+    let days = (secs / 86400) as i64;
+    let tod = secs % 86400;
+    let (h, mi) = (tod / 3600, (tod % 3600) / 60);
+    // civil_from_days (Howard Hinnant), exact, no deps.
+    let z = days + 719468;
+    let era = (if z >= 0 { z } else { z - 146096 }) / 146097;
+    let doe = z - era * 146097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    format!("{y:04}-{m:02}-{d:02} {h:02}:{mi:02}")
+}
+
+/// Parse one `.nn` (generic JSON) into a Row, adding file/bytes/modified cells.
+fn parse_nn(path: &Path) -> Option<Row> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let val = serde_json::from_str::<serde_json::Value>(&text).ok()?;
+    let serde_json::Value::Object(map) = val else { return None };
+
+    let mut cells: BTreeMap<String, Cell> = BTreeMap::new();
+    for (k, v) in &map {
+        match v {
+            serde_json::Value::Number(n) => {
+                if let Some(f) = n.as_f64() {
+                    cells.insert(k.clone(), Cell::Num(f));
+                }
+            }
+            serde_json::Value::Bool(b) => {
+                cells.insert(k.clone(), Cell::Bool(*b));
+            }
+            serde_json::Value::String(s) => {
+                cells.insert(k.clone(), Cell::Text(s.clone()));
+            }
+            serde_json::Value::Array(a) => {
+                cells.insert(format!("{k}.len"), Cell::Num(a.len() as f64));
+            }
+            _ => {}
+        }
+    }
+    let meta = std::fs::metadata(path).ok();
+    let fname = path.file_name().and_then(|s| s.to_str()).unwrap_or("").to_string();
+    let fsize = meta.as_ref().map(|m| m.len()).unwrap_or(0);
+    let mtime = meta
+        .and_then(|m| m.modified().ok())
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    cells.insert("file".into(), Cell::Text(fname));
+    cells.insert("bytes".into(), Cell::Num(fsize as f64));
+    cells.insert("modified".into(), Cell::Text(fmt_unix(mtime)));
+
+    Some(Row { nn_path: path.to_path_buf(), png_path: path.with_extension("png"), cells })
+}
+
+/// Read `dir` for `*.nn`, parse each, stream `Row`s back.
 fn spawn_loader(dir: PathBuf) -> mpsc::Receiver<LoadMsg> {
     let (tx, rx) = mpsc::channel();
     thread::spawn(move || {
@@ -119,44 +179,10 @@ fn spawn_loader(dir: PathBuf) -> mpsc::Receiver<LoadMsg> {
                 if path.extension().and_then(|x| x.to_str()) != Some("nn") {
                     continue;
                 }
-                let Ok(text) = std::fs::read_to_string(&path) else { continue };
-                let Ok(val) = serde_json::from_str::<serde_json::Value>(&text) else { continue };
-                let serde_json::Value::Object(map) = val else { continue };
-
-                let mut cells: BTreeMap<String, Cell> = BTreeMap::new();
-                for (k, v) in &map {
-                    match v {
-                        serde_json::Value::Number(n) => {
-                            if let Some(f) = n.as_f64() {
-                                cells.insert(k.clone(), Cell::Num(f));
-                            }
-                        }
-                        serde_json::Value::Bool(b) => {
-                            cells.insert(k.clone(), Cell::Bool(*b));
-                        }
-                        serde_json::Value::String(s) => {
-                            cells.insert(k.clone(), Cell::Text(s.clone()));
-                        }
-                        serde_json::Value::Array(a) => {
-                            cells.insert(format!("{k}.len"), Cell::Num(a.len() as f64));
-                        }
-                        _ => {}
+                if let Some(row) = parse_nn(&path) {
+                    if tx.send(LoadMsg::Row(row)).is_err() {
+                        return;
                     }
-                }
-                // Always-available file columns.
-                let fname = path
-                    .file_name()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or("")
-                    .to_string();
-                let fsize = e.metadata().map(|m| m.len()).unwrap_or(0);
-                cells.insert("file".into(), Cell::Text(fname));
-                cells.insert("bytes".into(), Cell::Num(fsize as f64));
-
-                let png_path = path.with_extension("png");
-                let row = Row { nn_path: path, png_path, cells };
-                if tx.send(LoadMsg::Row(row)).is_err() {
-                    return;
                 }
             }
         }
@@ -179,17 +205,19 @@ struct BrowserPrefs {
     copy_dir: String,
     window_width: u32,
     window_height: u32,
+    #[serde(default)]
+    autoreload: bool,
 }
 
 impl Default for BrowserPrefs {
     fn default() -> Self {
         Self {
             folder: String::new(),
-            columns: ["file", "beauty", "clip_score", "laion_score", "fitness"]
+            columns: ["file", "modified", "pref_score", "aesthetic_ensemble", "musiq", "nima"]
                 .iter()
                 .map(|s| s.to_string())
                 .collect(),
-            sort_column: "beauty".into(),
+            sort_column: "pref_score".into(),
             sort_desc: true,
             thumb_size: 96,
             breed_dir: "breeding".into(),
@@ -197,6 +225,7 @@ impl Default for BrowserPrefs {
             copy_dir: String::new(),
             window_width: 1400,
             window_height: 900,
+            autoreload: false,
         }
     }
 }
@@ -314,11 +343,16 @@ struct App {
     pair: Option<(usize, usize)>,
     rating_cache: HashMap<PathBuf, Option<TextureHandle>>,
     ratings_logged: usize,
+
+    // Autoreload: periodically pick up newly-saved fractals without a full reload.
+    autoreload: bool,
+    last_refresh: std::time::Instant,
 }
 
 impl App {
     fn new(prefs: BrowserPrefs, prefs_path: PathBuf, folder: PathBuf) -> Self {
         let loader = Some(spawn_loader(folder.clone()));
+        let prefs_autoreload = prefs.autoreload;
         App {
             prefs,
             prefs_path,
@@ -342,6 +376,8 @@ impl App {
             pair: None,
             rating_cache: HashMap::new(),
             ratings_logged: 0,
+            autoreload: prefs_autoreload,
+            last_refresh: std::time::Instant::now(),
         }
     }
 
@@ -359,6 +395,40 @@ impl App {
         self.load_count = 0;
         self.loading = true;
         self.loader = Some(spawn_loader(self.folder.clone()));
+    }
+
+    /// Autoreload tick: add newly-saved .nn and drop deleted ones, preserving the
+    /// current rows/scroll/selection (unlike a full reload). Cheap: only new files
+    /// are parsed. Re-sorts if anything was added.
+    fn refresh_incremental(&mut self) {
+        let known: HashSet<PathBuf> = self.rows.iter().map(|r| r.nn_path.clone()).collect();
+        let mut on_disk: HashSet<PathBuf> = HashSet::new();
+        let mut added = 0;
+        if let Ok(entries) = std::fs::read_dir(&self.folder) {
+            for e in entries.flatten() {
+                let p = e.path();
+                if p.extension().and_then(|x| x.to_str()) != Some("nn") {
+                    continue;
+                }
+                on_disk.insert(p.clone());
+                if !known.contains(&p) {
+                    if let Some(row) = parse_nn(&p) {
+                        for k in row.cells.keys() {
+                            self.catalog.insert(k.clone());
+                        }
+                        self.rows.push(row);
+                        added += 1;
+                    }
+                }
+            }
+        }
+        let before = self.rows.len();
+        self.rows.retain(|r| on_disk.contains(&r.nn_path));
+        let removed = before - self.rows.len();
+        if added > 0 || removed > 0 {
+            self.sort_dirty = true;
+            self.status = format!("autoreload: +{added} new, -{removed} gone ({} total)", self.rows.len());
+        }
     }
 
     fn drain_loader(&mut self) {
@@ -521,6 +591,14 @@ impl App {
             ui.monospace(self.folder.to_string_lossy());
             if ui.button("Reload").clicked() {
                 self.reload();
+            }
+            if ui.checkbox(&mut self.autoreload, "auto")
+                .on_hover_text("Auto-pick-up newly-saved fractals every few seconds\n(keeps scroll & selection; great while evolution runs)")
+                .changed()
+            {
+                self.prefs.autoreload = self.autoreload;
+                self.last_refresh = std::time::Instant::now();
+                self.save_prefs();
             }
             ui.separator();
             if ui.button("Columns ▾").clicked() {
@@ -1095,6 +1173,13 @@ impl eframe::App for App {
         ctx.options_mut(|o| o.zoom_with_keyboard = false);
 
         self.drain_loader();
+        // Autoreload: pick up new saves every few seconds (only when the initial load
+        // is done, so we don't fight the loader thread).
+        if self.autoreload && !self.loading && self.last_refresh.elapsed().as_secs_f32() >= 6.0 {
+            self.refresh_incremental();
+            self.last_refresh = std::time::Instant::now();
+            ctx.request_repaint_after(std::time::Duration::from_secs(6));
+        }
         self.handle_zoom(&ctx);
         if self.sort_dirty {
             self.sort_rows();

@@ -22,6 +22,7 @@ Scores:
   musiq      [0,100]  MUSIQ technical quality                  — pyiqa
 """
 
+import contextlib
 import sys
 import torch
 import torch.nn as nn
@@ -67,30 +68,10 @@ def log(*a):
 
 def load_models(device):
     m = {"device": device}
-
-    # ── CLIP ViT-L/14 + LAION MLP (required baseline) ──
-    log("Loading CLIP ViT-L/14...")
-    clip, _, preprocess = open_clip.create_model_and_transforms(
-        "ViT-L-14", pretrained="openai", device=device)
-    clip.eval()
-    tokenizer = open_clip.get_tokenizer("ViT-L-14")
-    with torch.no_grad():
-        tok = tokenizer(GOOD_PROMPTS + BAD_PROMPTS).to(device)
-        tf = clip.encode_text(tok).float()
-        tf /= tf.norm(dim=-1, keepdim=True)
-        good = tf[:len(GOOD_PROMPTS)].mean(0, keepdim=True)
-        bad = tf[len(GOOD_PROMPTS):].mean(0, keepdim=True)
-        good /= good.norm(dim=-1, keepdim=True)
-        bad /= bad.norm(dim=-1, keepdim=True)
-    m.update(clip=clip, preprocess=preprocess, good=good, bad=bad)
-
-    log("Loading LAION aesthetic MLP...")
-    wpath = hf_hub_download("camenduru/improved-aesthetic-predictor",
-                            "sac+logos+ava1-l14-linearMSE.pth")
-    mlp = AestheticMLP().to(device)
-    mlp.load_state_dict(torch.load(wpath, map_location=device, weights_only=True))
-    mlp.eval()
-    m["mlp"] = mlp
+    # CLIP + LAION were dropped — they barely vary across fractals (~1% dynamic
+    # range) and only wasted ~1.7GB VRAM. The gate/selection use the ensemble
+    # (nima/topiq/ap25) + musiq + pref. clip/laion slots are emitted as 0.0 to keep
+    # the stdout protocol stable.
 
     # ── pyiqa metrics (optional) ──
     m["pyiqa"] = {}
@@ -145,13 +126,7 @@ def score_image(m, path):
     device = m["device"]
     img = Image.open(path).convert("RGB")
 
-    # CLIP + LAION share one image embedding.
-    with torch.no_grad():
-        x = m["preprocess"](img).unsqueeze(0).to(device)
-        feat = m["clip"].encode_image(x).float()
-        fn = feat / feat.norm(dim=-1, keepdim=True)
-        clip = ((fn @ m["good"].T).item() - (fn @ m["bad"].T).item() + 1.0) / 2.0
-        laion = m["mlp"](fn).item()
+    clip, laion = 0.0, 0.0  # CLIP/LAION removed — kept as 0.0 for protocol stability
 
     def pyiqa_score(name):
         met = m["pyiqa"].get(name)
@@ -199,7 +174,11 @@ def score_image(m, path):
 def main():
     device = "cuda" if torch.cuda.is_available() else "cpu"
     try:
-        m = load_models(device)
+        # Some libraries (e.g. pyiqa) print "Loading pretrained model ..." to STDOUT.
+        # Our stdin/stdout protocol reserves stdout for "READY" + score lines only, so
+        # redirect all load-time chatter to stderr to keep the channel clean.
+        with contextlib.redirect_stdout(sys.stderr):
+            m = load_models(device)
     except Exception as e:
         print(f"ERROR: failed to load models: {e}", flush=True)
         sys.exit(1)
