@@ -33,6 +33,11 @@ use nnfractals::render_gpu;
 
 const MAX_UNDO: usize = 20;
 const MIN_SEL_PX: f32 = 12.0;
+// Minimum zoom (zoom = 2/half_y). No practical zoom-out limit — the floor is just
+// the smallest positive f64, kept only so half_y = 2/zoom stays finite (avoids
+// div-by-zero / NaN). The old 0.05 floor is what capped zoom-out at the ±40 wall.
+const MIN_ZOOM: f64 = f64::MIN_POSITIVE;
+const MAX_ZOOM: f64 = 1.0e30;
 
 const RATIOS: &[(&str, f64, f64)] = &[
     ("1:1",  1.0, 1.0),
@@ -251,6 +256,24 @@ fn render_cpu(
 }
 
 /// Render at W×H with letterboxing to preserve the view's coordinate aspect ratio.
+/// Dedicated rayon pool for hi-res PNG saves. `render_save` → `render_cpu` uses
+/// `into_par_iter`, which otherwise runs on the GLOBAL pool and — at deep zoom,
+/// where a save render is huge — monopolizes every core, starving the interactive
+/// render (which shares that global pool). Confining saves to their own half-sized
+/// pool guarantees the viewer keeps cores and never freezes mid-zoom during a save.
+fn save_pool() -> &'static rayon::ThreadPool {
+    use std::sync::OnceLock;
+    static POOL: OnceLock<rayon::ThreadPool> = OnceLock::new();
+    POOL.get_or_init(|| {
+        let n = std::thread::available_parallelism().map(|x| x.get()).unwrap_or(4);
+        let threads = (n / 2).max(1); // leave at least half the cores for interactive rendering
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .build()
+            .expect("build save thread pool")
+    })
+}
+
 fn render_save(genome: &Genome, config: &Config, view: &View, w: u32, h: u32) -> Vec<u8> {
     let (xmin, xmax, ymin, ymax) = view.bounds();
     let view_ratio = (xmax - xmin) / (ymax - ymin);
@@ -359,7 +382,7 @@ struct App {
     default_view: View,
     view_stack:   Vec<View>,
 
-    req_tx:          mpsc::SyncSender<RenderRequest>,
+    req_tx:          mpsc::Sender<RenderRequest>,
     res_rx:          mpsc::Receiver<RenderResult>,
     render_gen:      u64,
     displayed_gen:   u64,
@@ -437,7 +460,12 @@ impl App {
         config.rendering.colormap = COLORMAPS[colormap_idx].to_string();
 
         let ctx = cc.egui_ctx.clone();
-        let (req_tx, req_rx) = mpsc::sync_channel::<RenderRequest>(2);
+        // Requests are UNBOUNDED: a bounded channel silently drops requests once
+        // full (try_send), which at deep zoom — where render_cpu is slow and the
+        // worker stays busy — left render_gen ahead of any queued request, so the
+        // worker parked on recv() and the view froze until the next user event.
+        // The worker coalesces to the newest request each loop, so no backlog builds.
+        let (req_tx, req_rx) = mpsc::channel::<RenderRequest>();
         let (res_tx, res_rx) = mpsc::sync_channel::<RenderResult>(4);
 
         {
@@ -578,7 +606,7 @@ impl App {
         let h = self.frac_rect.height().round() as u32;
         if w == 0 || h == 0 { return; }
         self.render_gen += 1;
-        let _ = self.req_tx.try_send(RenderRequest {
+        let _ = self.req_tx.send(RenderRequest {
             view: self.view.clone(), w, h, preview,
             generation: self.render_gen,
             colormap: self.config.rendering.colormap.clone(),
@@ -602,7 +630,7 @@ impl App {
 
     fn zoom_out(&mut self) {
         self.push_view();
-        self.view.zoom = (self.view.zoom * 0.5).clamp(0.05, 1.0e30);
+        self.view.zoom = (self.view.zoom * 0.5).clamp(MIN_ZOOM, MAX_ZOOM);
         self.sync_xy = true;
         self.request_render(true);
     }
@@ -642,7 +670,7 @@ impl App {
         self.view.cy_lo  = 0.0;
         let yrange       = ymax - ymin;
         let xrange       = xmax - xmin;
-        self.view.zoom   = (4.0 / yrange).clamp(0.05, 1.0e30);
+        self.view.zoom   = (4.0 / yrange).clamp(MIN_ZOOM, MAX_ZOOM);
         self.view.aspect = xrange / yrange;
         self.sync_xy = true;
     }
@@ -690,7 +718,7 @@ impl App {
         let h = self.frac_rect.height().round() as u32;
         if w == 0 || h == 0 { return; }
         self.render_gen += 1;
-        let _ = self.req_tx.try_send(RenderRequest {
+        let _ = self.req_tx.send(RenderRequest {
             view: self.view.clone(), w, h, preview,
             generation: self.render_gen,
             colormap: self.config.rendering.colormap.clone(),
@@ -1046,9 +1074,9 @@ impl App {
 
     fn apply_zoom(&mut self, zoom_in: bool, factor: f64) {
         if zoom_in {
-            self.view.zoom = (self.view.zoom * factor).clamp(0.05, 1.0e30);
+            self.view.zoom = (self.view.zoom * factor).clamp(MIN_ZOOM, MAX_ZOOM);
         } else {
-            self.view.zoom = (self.view.zoom / factor).clamp(0.05, 1.0e30);
+            self.view.zoom = (self.view.zoom / factor).clamp(MIN_ZOOM, MAX_ZOOM);
         }
         self.sync_xy = true;
         self.request_render(true);
@@ -1076,7 +1104,7 @@ impl App {
         // Clamp the selection fraction so a sliver can't jump zoom by a huge factor
         // (which at deep zoom makes the DD render take ~forever and looks like a hang).
         let sel_frac = (sel_rect.width() / fw).clamp(0.02, 1.0);
-        let new_zoom = (self.view.zoom / sel_frac as f64).clamp(0.05, 1.0e30);
+        let new_zoom = (self.view.zoom / sel_frac as f64).clamp(MIN_ZOOM, MAX_ZOOM);
         if !new_zoom.is_finite() { return; }
 
         self.push_view();
@@ -1206,7 +1234,9 @@ impl App {
         let nn_path = self.nn_path.clone();
         thread::spawn(move || {
             eprintln!("Rendering {sw}×{sh} PNG…");
-            let rgb  = render_save(&genome, &config, &view, sw, sh);
+            // Confine to the dedicated save pool so a deep-zoom save can't starve the
+            // interactive render's cores (which would freeze zooming until save finished).
+            let rgb  = save_pool().install(|| render_save(&genome, &config, &view, sw, sh));
             let stem = nn_path.file_stem().and_then(|s| s.to_str()).unwrap_or("fractal");
             if let Err(e) = std::fs::create_dir_all(&out_dir) {
                 eprintln!("Save error: cannot create {}: {e}", out_dir.display());
@@ -1425,6 +1455,7 @@ fn default_config() -> Config {
             ood_weight: 0.0,
             pref_weight: 0.4,
             seed_pref_weight: 3.0,
+            musiq_weight: 0.25,
         },
         output: OutputConfig {
             save_dir: "./fractals".into(),

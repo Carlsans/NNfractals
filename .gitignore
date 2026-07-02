@@ -23,3 +23,7 @@ browser_prefs.toml
 breeding/
 pref_model.npz
 ratings.jsonl
+evo1.log
+evo2.log
+aesthetic_sidecar.log
+viewer_output/

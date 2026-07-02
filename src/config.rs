@@ -89,6 +89,13 @@ pub struct OptimizationConfig {
     /// the generic aesthetic ranking for seeding.
     #[serde(default = "default_seed_pref_weight")]
     pub seed_pref_weight: f32,
+    /// Weight on MUSIQ technical quality (∈ ~[30,80], normalized to [0,1] as
+    /// (musiq-30)/50). Blended positively into saved fitness and seed ranking:
+    /// score += musiq_weight · musiq_norm. Kept below pref_weight so pref stays
+    /// dominant while high-musiq fractals are actively rewarded (Carl's taste).
+    /// 0 disables.
+    #[serde(default = "default_musiq_weight")]
+    pub musiq_weight: f32,
 }
 
 fn default_self_replication_weight()    -> f32 { 0.35 }
@@ -102,6 +109,7 @@ fn default_max_depth()                  -> usize { 5 }
 fn default_ood_weight()                 -> f32 { 0.0 }
 fn default_pref_weight()                -> f32 { 0.4 }
 fn default_seed_pref_weight()           -> f32 { 3.0 }
+fn default_musiq_weight()               -> f32 { 0.25 }
 
 #[derive(Deserialize, Clone, Debug)]
 pub struct OutputConfig {

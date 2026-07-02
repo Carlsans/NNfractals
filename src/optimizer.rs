@@ -162,8 +162,10 @@ impl Optimizer {
                     // Seeding leans hard on pref_score (seed_pref_weight) so the group
                     // that STARTS evolution is the best-by-your-taste genomes; aesthetic /
                     // recursion / self-replication act as secondary tiebreakers + diversity.
+                    let musiq_norm = ((g.musiq - 30.0) / 50.0).clamp(0.0, 1.0);
                     let score = config.optimization.seed_pref_weight * g.pref_score
                         + 1.0 * aesthetic
+                        + config.optimization.musiq_weight * musiq_norm
                         + 0.15 * (g.laion_score / 10.0)
                         + 0.20 * g.self_replication
                         + 0.20 * g.fractal_recursion;
@@ -603,8 +605,12 @@ impl Optimizer {
         if g.clip_score  > self.max_clip_score  { self.max_clip_score  = g.clip_score; }
         if g.laion_score > self.max_laion_score { self.max_laion_score = g.laion_score; }
         // Blend the human-preference score into the saved fitness so archive seeding
-        // and elitism favour your taste (config-weighted; 0 = inert).
-        g.fitness = final_score + self.config.optimization.pref_weight * g.pref_score;
+        // and elitism favour your taste (config-weighted; 0 = inert). Also reward high
+        // MUSIQ technical quality (normalized), kept below pref so pref stays dominant.
+        let musiq_norm = ((g.musiq - 30.0) / 50.0).clamp(0.0, 1.0);
+        g.fitness = final_score
+            + self.config.optimization.pref_weight * g.pref_score
+            + self.config.optimization.musiq_weight * musiq_norm;
         g.formula_readable = g.formula_expr();   // human-readable comment in the .nn
         save_genome(&g, &nn_path).unwrap_or(());
         self.save_descriptors.push(desc);

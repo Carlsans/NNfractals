@@ -31,6 +31,7 @@ formula_diversity_weight = 0.30   # per-gen bonus for structurally distinct form
 clip_pred_weight         = 0.50   # per-gen bonus for formula-predicted CLIP aesthetic (linear model on archive)
 pref_weight              = 0.4    # blend trained human-preference (pref_score) into saved fitness + seed ranking
 seed_pref_weight         = 3.0    # STRONG pref weight when picking the individuals that START the group (warm-start/restart seeds)
+musiq_weight             = 0.25   # positive reward for high MUSIQ technical quality (norm (musiq-30)/50), below pref so pref stays dominant
 
 [output]
 save_dir                 = "./fractals"

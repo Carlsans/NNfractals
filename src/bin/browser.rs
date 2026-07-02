@@ -47,6 +47,9 @@ enum Cell {
     Num(f64),
     Bool(bool),
     Text(String),
+    /// A UNIX timestamp (seconds). Sorts numerically by the raw value but
+    /// displays as a human "YYYY-MM-DD HH:MM" date+hour.
+    Time(u64),
 }
 
 impl Cell {
@@ -61,6 +64,7 @@ impl Cell {
             }
             Cell::Bool(b) => b.to_string(),
             Cell::Text(s) => s.clone(),
+            Cell::Time(secs) => fmt_unix(*secs),
         }
     }
     fn type_rank(&self) -> u8 {
@@ -68,6 +72,7 @@ impl Cell {
             Cell::Num(_) => 0,
             Cell::Bool(_) => 1,
             Cell::Text(_) => 2,
+            Cell::Time(_) => 3,
         }
     }
 }
@@ -79,6 +84,7 @@ fn cmp_present(x: &Cell, y: &Cell) -> Ordering {
         (Cell::Num(a), Cell::Num(b)) => a.partial_cmp(b).unwrap_or(Ordering::Equal),
         (Cell::Bool(a), Cell::Bool(b)) => a.cmp(b),
         (Cell::Text(a), Cell::Text(b)) => a.cmp(b),
+        (Cell::Time(a), Cell::Time(b)) => a.cmp(b),
         _ => x.type_rank().cmp(&y.type_rank()),
     }
 }
@@ -109,10 +115,35 @@ enum LoadMsg {
     Done,
 }
 
-/// Format a UNIX timestamp (seconds, UTC) as a fixed-width, sortable "YYYY-MM-DD HH:MM".
+/// Local UTC offset in seconds, resolved once from the system (`date +%z`), so
+/// displayed times match the wall clock and follow DST. Falls back to 0 (UTC).
+fn local_offset_secs() -> i64 {
+    use std::sync::OnceLock;
+    static OFFSET: OnceLock<i64> = OnceLock::new();
+    *OFFSET.get_or_init(|| {
+        std::process::Command::new("date")
+            .arg("+%z")
+            .output()
+            .ok()
+            .and_then(|o| String::from_utf8(o.stdout).ok())
+            .and_then(|s| {
+                let s = s.trim(); // e.g. "-0400"
+                if s.len() < 5 { return None; }
+                let sign = if s.starts_with('-') { -1 } else { 1 };
+                let h: i64 = s[1..3].parse().ok()?;
+                let m: i64 = s[3..5].parse().ok()?;
+                Some(sign * (h * 3600 + m * 60))
+            })
+            .unwrap_or(0)
+    })
+}
+
+/// Format a UNIX timestamp (seconds) in local time as a fixed-width "YYYY-MM-DD HH:MM".
+/// Sorting still uses the raw UTC seconds, so display offset never affects order.
 fn fmt_unix(secs: u64) -> String {
-    let days = (secs / 86400) as i64;
-    let tod = secs % 86400;
+    let adj = secs as i64 + local_offset_secs();
+    let days = adj.div_euclid(86400);
+    let tod = adj.rem_euclid(86400);
     let (h, mi) = (tod / 3600, (tod % 3600) / 60);
     // civil_from_days (Howard Hinnant), exact, no deps.
     let z = days + 719468;
@@ -164,7 +195,7 @@ fn parse_nn(path: &Path) -> Option<Row> {
         .unwrap_or(0);
     cells.insert("file".into(), Cell::Text(fname));
     cells.insert("bytes".into(), Cell::Num(fsize as f64));
-    cells.insert("modified".into(), Cell::Text(fmt_unix(mtime)));
+    cells.insert("modified".into(), Cell::Time(mtime));
 
     Some(Row { nn_path: path.to_path_buf(), png_path: path.with_extension("png"), cells })
 }
