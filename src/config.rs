@@ -83,6 +83,12 @@ pub struct OptimizationConfig {
     /// 0 disables (inert until a pref model exists and the sidecar emits it).
     #[serde(default = "default_pref_weight")]
     pub pref_weight: f32,
+    /// Weight on pref_score specifically when ranking archive genomes to SEED the
+    /// initial/restart population. Larger than pref_weight so the individuals that
+    /// *start* the group are the highest-pref (best-by-your-taste) genomes. 0 = use
+    /// the generic aesthetic ranking for seeding.
+    #[serde(default = "default_seed_pref_weight")]
+    pub seed_pref_weight: f32,
 }
 
 fn default_self_replication_weight()    -> f32 { 0.35 }
@@ -95,6 +101,7 @@ fn default_max_nodes()                  -> usize { 14 }
 fn default_max_depth()                  -> usize { 5 }
 fn default_ood_weight()                 -> f32 { 0.0 }
 fn default_pref_weight()                -> f32 { 0.4 }
+fn default_seed_pref_weight()           -> f32 { 3.0 }
 
 #[derive(Deserialize, Clone, Debug)]
 pub struct OutputConfig {

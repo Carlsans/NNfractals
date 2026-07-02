@@ -159,11 +159,14 @@ impl Optimizer {
                     } else {
                         g.beauty
                     };
-                    let score = 2.0 * aesthetic
+                    // Seeding leans hard on pref_score (seed_pref_weight) so the group
+                    // that STARTS evolution is the best-by-your-taste genomes; aesthetic /
+                    // recursion / self-replication act as secondary tiebreakers + diversity.
+                    let score = config.optimization.seed_pref_weight * g.pref_score
+                        + 1.0 * aesthetic
                         + 0.15 * (g.laion_score / 10.0)
                         + 0.20 * g.self_replication
-                        + 0.20 * g.fractal_recursion
-                        + config.optimization.pref_weight * g.pref_score;
+                        + 0.20 * g.fractal_recursion;
                     candidates.push((score, g));
                 }
             }

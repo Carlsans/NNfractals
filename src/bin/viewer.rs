@@ -1424,6 +1424,7 @@ fn default_config() -> Config {
             max_nodes: 14, max_depth: 5,
             ood_weight: 0.0,
             pref_weight: 0.4,
+            seed_pref_weight: 3.0,
         },
         output: OutputConfig {
             save_dir: "./fractals".into(),

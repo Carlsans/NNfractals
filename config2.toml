@@ -12,7 +12,7 @@ view_y_max     =  2.0
 # Formula = sparse set of weighted basis terms, evolved directly by the GA.
 # (Transformer + backprop removed — they fought the GA and drove elites to noise.)
 [optimization]
-population_size          = 40
+population_size          = 100    # larger pool → more diversity + more offspring of good-pref seeds
 formula_system           = "dag"   # A/B experiment: instance 2 runs the expression-DAG system
 ood_weight               = 0.25   # reward fractals unlike anything already saved (drives unusual)
 elitism_count            = 6
@@ -30,6 +30,8 @@ fractal_recursion_weight = 0.35   # favor embedded miniature copies of the whole
 recursion_pred_weight    = 0.80   # MAJOR per-gen criterion: formula-only predicted recursion (recursion_model.json)
 formula_diversity_weight = 0.30   # per-gen bonus for structurally distinct formula families (k-NN in basis space)
 clip_pred_weight         = 0.50   # per-gen bonus for formula-predicted CLIP aesthetic (linear model on archive)
+pref_weight              = 0.4    # blend trained human-preference (pref_score) into saved fitness + seed ranking
+seed_pref_weight         = 3.0    # STRONG pref weight when picking the individuals that START the group (warm-start/restart seeds)
 
 [output]
 save_dir                 = "./fractals_dag"   # separate pool: keeps DAG experiment from contaminating the legacy archive/warm-start
