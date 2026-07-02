@@ -162,7 +162,8 @@ impl Optimizer {
                     let score = 2.0 * aesthetic
                         + 0.15 * (g.laion_score / 10.0)
                         + 0.20 * g.self_replication
-                        + 0.20 * g.fractal_recursion;
+                        + 0.20 * g.fractal_recursion
+                        + config.optimization.pref_weight * g.pref_score;
                     candidates.push((score, g));
                 }
             }
@@ -395,6 +396,7 @@ impl Optimizer {
         g.ap25_score        = aesthetic_scores.as_ref().map(|s| s.ap25).unwrap_or(0.0);
         g.musiq             = aesthetic_scores.as_ref().map(|s| s.musiq).unwrap_or(0.0);
         g.aesthetic_ensemble = ensemble;
+        g.pref_score        = aesthetic_scores.as_ref().map(|s| s.pref).unwrap_or(0.0);
         g.self_replication  = crate::fractal::self_replication_score(&g, &self.config);
         g.fractal_recursion = crate::fractal::fractal_recursion_score(&g, &self.config);
         if g.clip_score  > self.max_clip_score  { self.max_clip_score  = g.clip_score; }
@@ -590,13 +592,16 @@ impl Optimizer {
         g.ap25_score       = aesthetic_scores.as_ref().map(|s| s.ap25).unwrap_or(0.0);
         g.musiq            = aesthetic_scores.as_ref().map(|s| s.musiq).unwrap_or(0.0);
         g.aesthetic_ensemble = ensemble;
+        g.pref_score       = aesthetic_scores.as_ref().map(|s| s.pref).unwrap_or(0.0);
         // Measure zoom self-replication and fractal recursion only for genomes that
         // actually pass the gate (a handful per generation) — they travel with the .nn.
         g.self_replication  = crate::fractal::self_replication_score(&g, &self.config);
         g.fractal_recursion = crate::fractal::fractal_recursion_score(&g, &self.config);
         if g.clip_score  > self.max_clip_score  { self.max_clip_score  = g.clip_score; }
         if g.laion_score > self.max_laion_score { self.max_laion_score = g.laion_score; }
-        g.fitness = final_score;
+        // Blend the human-preference score into the saved fitness so archive seeding
+        // and elitism favour your taste (config-weighted; 0 = inert).
+        g.fitness = final_score + self.config.optimization.pref_weight * g.pref_score;
         g.formula_readable = g.formula_expr();   // human-readable comment in the .nn
         save_genome(&g, &nn_path).unwrap_or(());
         self.save_descriptors.push(desc);

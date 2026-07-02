@@ -192,9 +192,10 @@ def main():
     w_np = w.detach().cpu().numpy()
 
     raw = {p: float(np.dot(emb_all[p], w_np)) for p in emb_all}
+    lo, hi = 0.0, 1.0
     if raw:
         vals = np.array(list(raw.values()))
-        lo, hi = np.percentile(vals, 1), np.percentile(vals, 99)
+        lo, hi = float(np.percentile(vals, 1)), float(np.percentile(vals, 99))
         rng = (hi - lo) or 1.0
         written = 0
         for p, r in raw.items():
@@ -208,10 +209,10 @@ def main():
                 pass
         log(f"wrote {args.field} to {written} .nn files")
 
-    # ── Save weights for reuse ──
+    # ── Save weights + normalisation for the sidecar to reuse ──
     out = Path("pref_model.npz")
-    np.savez(out, w=w_np, backbone=args.backbone)
-    log(f"saved model → {out}")
+    np.savez(out, w=w_np, lo=lo, hi=hi, backbone=args.backbone)
+    log(f"saved model → {out}  (lo={lo:.4f} hi={hi:.4f})")
 
 
 if __name__ == "__main__":

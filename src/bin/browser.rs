@@ -550,6 +550,14 @@ impl App {
                 }
             });
             if ui
+                .add_enabled(has_sel, egui::Button::new("★ Good"))
+                .on_hover_text("Mark selected as favorite/good (F). Writes favorite=true\n\
+                                 into the .nn — a sortable column and a training signal.")
+                .clicked()
+            {
+                self.toggle_favorite();
+            }
+            if ui
                 .add_enabled(has_sel, egui::Button::new("Delete"))
                 .on_hover_text("Permanently delete selected .nn + .png")
                 .clicked()
@@ -604,6 +612,43 @@ impl App {
         if !self.status.is_empty() {
             ui.label(egui::RichText::new(&self.status).color(Color32::LIGHT_GREEN));
         }
+    }
+
+    /// Indices (in current display order) of the selected rows.
+    fn selected_indices(&self) -> Vec<usize> {
+        (0..self.rows.len())
+            .filter(|&i| self.selection.contains(&self.rows[i].nn_path))
+            .collect()
+    }
+
+    /// Toggle a persistent `favorite` flag on the selected fractals: writes
+    /// "favorite": true/false into each .nn (a sortable browser column, and a
+    /// positive-example signal we can later feed into the preference model).
+    fn toggle_favorite(&mut self) {
+        let idxs = self.selected_indices();
+        if idxs.is_empty() {
+            self.status = "select fractal(s) first, then ★ / F to mark as good".into();
+            return;
+        }
+        // New state = opposite of the first selected row's current flag.
+        let currently = matches!(self.rows[idxs[0]].cells.get("favorite"), Some(Cell::Bool(true)));
+        let value = !currently;
+        let mut n = 0;
+        for i in idxs {
+            let p = self.rows[i].nn_path.clone();
+            let Ok(txt) = std::fs::read_to_string(&p) else { continue };
+            let Ok(mut v) = serde_json::from_str::<serde_json::Value>(&txt) else { continue };
+            if let Some(obj) = v.as_object_mut() {
+                obj.insert("favorite".into(), serde_json::Value::Bool(value));
+                let out = serde_json::to_string_pretty(&v).unwrap_or(txt);
+                if std::fs::write(&p, out).is_ok() {
+                    self.rows[i].cells.insert("favorite".into(), Cell::Bool(value));
+                    self.catalog.insert("favorite".into());
+                    n += 1;
+                }
+            }
+        }
+        self.status = format!("marked {n} fractal(s) favorite = {value}");
     }
 
     // ── Pairwise rating mode ─────────────────────────────────────────────────────
@@ -724,6 +769,7 @@ impl App {
         let sort_col = self.prefs.sort_column.clone();
         let sort_desc = self.prefs.sort_desc;
         let mods = ui.input(|i| i.modifiers);
+        let fav_key = ui.input(|i| i.key_pressed(egui::Key::F));
 
         let mut clicked_col: Option<String> = None;
         let mut clicked_row: Option<usize> = None;
@@ -798,6 +844,9 @@ impl App {
                     row.set_selected(selection.contains(&r.nn_path));
 
                     row.col(|ui| {
+                        if matches!(r.cells.get("favorite"), Some(Cell::Bool(true))) {
+                            ui.colored_label(Color32::from_rgb(255, 205, 60), "★");
+                        }
                         let tex = thumb_cache
                             .entry(r.png_path.clone())
                             .or_insert_with(|| load_thumb(ui.ctx(), &r.png_path, thumb as u32));
@@ -853,6 +902,10 @@ impl App {
             self.selection.insert(path.clone());
             self.anchor = Some(idx);
             self.open_path(&path);
+        }
+        // F toggles the "favorite / good" flag on the selection.
+        if fav_key {
+            self.toggle_favorite();
         }
     }
 

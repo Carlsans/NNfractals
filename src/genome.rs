@@ -74,6 +74,10 @@ pub struct Genome {
     /// Ensemble aesthetic = mean(nima, topiq_iaa, ap25_score) at save time. This is
     /// the fractal-tuned "beauty by human standard" signal the GA now selects on.
     #[serde(default)] pub aesthetic_ensemble: f32,
+    /// Human-preference score [0,1] from the trained taste model (pref_model.npz,
+    /// SigLIP + Bradley-Terry). 0.0 if no model / not scored. Blended into selection
+    /// via optimization.pref_weight.
+    #[serde(default)] pub pref_score: f32,
     /// Zoom self-replication score [0,1]: how much the fractal reproduces its
     /// whole-set structure under deep zoom (Mandelbrot-like). 0.0 if not measured.
     #[serde(default)] pub self_replication: f32,
@@ -268,6 +272,7 @@ impl Genome {
             beauty_boundary: 0.0, beauty_edge: 0.0, beauty_entropy: 0.0,
             beauty_self_sim: 0.0, beauty_cool_zone: 0.0, clip_score: 0.0, laion_score: 0.0,
             nima: 0.0, topiq_iaa: 0.0, ap25_score: 0.0, musiq: 0.0, aesthetic_ensemble: 0.0,
+            pref_score: 0.0,
             self_replication: 0.0,
             fractal_recursion: 0.0,
             pred_recursion: 0.0,

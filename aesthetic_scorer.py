@@ -118,6 +118,26 @@ def load_models(device):
     except Exception as e:
         log(f"AP v2.5 unavailable: {e}")
 
+    # ── Human-preference model: SigLIP base + trained linear head (pref_model.npz) ──
+    m["pref"] = None
+    import os
+    if os.path.exists("pref_model.npz"):
+        try:
+            import numpy as np
+            from transformers import AutoModel, AutoProcessor
+            data = np.load("pref_model.npz")
+            w = torch.tensor(np.asarray(data["w"]), dtype=torch.float32, device=device)
+            lo = float(data["lo"]) if "lo" in data else 0.0
+            hi = float(data["hi"]) if "hi" in data else 1.0
+            rng = (hi - lo) or 1.0
+            repo = "google/siglip-base-patch16-224"
+            proc = AutoProcessor.from_pretrained(repo)
+            sig = AutoModel.from_pretrained(repo).to(device).eval()
+            log("Loading preference model (pref_model.npz) + SigLIP base...")
+            m["pref"] = (proc, sig, w, lo, rng)
+        except Exception as e:
+            log(f"preference model unavailable: {e}")
+
     return m
 
 
@@ -157,7 +177,23 @@ def score_image(m, path):
         except Exception:
             ap25 = 0.0
 
-    return clip, laion, nima, topiq, ap25, musiq
+    pref = 0.0
+    if m["pref"] is not None:
+        try:
+            proc, sig, w, lo, rng = m["pref"]
+            inp = proc(images=img, return_tensors="pt").to(device)
+            with torch.no_grad():
+                vision = getattr(sig, "vision_model", sig)
+                out = vision(pixel_values=inp["pixel_values"])
+                e = out.pooler_output if getattr(out, "pooler_output", None) is not None \
+                    else out.last_hidden_state.mean(1)
+                e = torch.nn.functional.normalize(e.float(), dim=-1)
+                raw = float((e @ w).item())
+            pref = min(1.0, max(0.0, (raw - lo) / rng))
+        except Exception:
+            pref = 0.0
+
+    return clip, laion, nima, topiq, ap25, musiq, pref
 
 
 def main():
@@ -175,8 +211,8 @@ def main():
         if not path:
             continue
         try:
-            clip, laion, nima, topiq, ap25, musiq = score_image(m, path)
-            print(f"{clip:.4f} {laion:.4f} {nima:.4f} {topiq:.4f} {ap25:.4f} {musiq:.4f}",
+            clip, laion, nima, topiq, ap25, musiq, pref = score_image(m, path)
+            print(f"{clip:.4f} {laion:.4f} {nima:.4f} {topiq:.4f} {ap25:.4f} {musiq:.4f} {pref:.4f}",
                   flush=True)
         except Exception as e:
             print(f"ERROR: {e}", flush=True)

@@ -21,6 +21,7 @@ pub struct AestheticScores {
     pub topiq_iaa: f32,
     pub ap25:      f32,
     pub musiq:     f32,
+    pub pref:      f32,
 }
 
 impl AestheticScores {
@@ -118,6 +119,7 @@ impl AestheticScorer {
                             topiq_iaa: get(3),
                             ap25:      get(4),
                             musiq:     get(5),
+                            pref:      get(6),
                         }).ok();
                     }
                 }

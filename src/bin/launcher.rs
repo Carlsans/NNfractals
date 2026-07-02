@@ -174,6 +174,48 @@ impl App {
             Err(err) => self.status = format!("run.sh failed: {err}"),
         }
     }
+
+    /// Train the human-preference model from the browser's ratings, then score the
+    /// galleries. Long-running, so it's spawned detached with output to train_pref.log.
+    fn train_pref(&mut self) {
+        // Find ratings.jsonl (browser writes it into the browsed gallery folder).
+        let ratings = ["fractals_dag/ratings.jsonl", "fractals/ratings.jsonl", "ratings.jsonl"]
+            .iter()
+            .map(|r| self.root.join(r))
+            .find(|p| p.exists());
+        let Some(ratings) = ratings else {
+            self.status = "no ratings.jsonl found — rate fractals in the browser (⚖ Rate) first".into();
+            return;
+        };
+        // Galleries that exist.
+        let dirs: Vec<&str> = ["fractals_dag", "fractals"]
+            .iter().copied().filter(|d| self.root.join(d).is_dir()).collect();
+        if dirs.is_empty() {
+            self.status = "no gallery folders (fractals_dag / fractals) found".into();
+            return;
+        }
+        let log_path = self.root.join("train_pref.log");
+        let log = match std::fs::File::create(&log_path) {
+            Ok(f) => f,
+            Err(e) => { self.status = format!("cannot write train_pref.log: {e}"); return; }
+        };
+        let errlog = log.try_clone().ok();
+        let mut cmd = Command::new("python3");
+        cmd.arg("scripts/train_pref.py")
+            .arg("--ratings").arg(&ratings)
+            .arg("--dirs").args(&dirs)
+            .current_dir(&self.root)
+            .stdout(std::process::Stdio::from(log));
+        if let Some(e) = errlog {
+            cmd.stderr(std::process::Stdio::from(e));
+        }
+        match cmd.spawn() {
+            Ok(_) => self.status = format!(
+                "training taste model in background (embeds all fractals; a few min)\n\
+                 watch: {}", log_path.display()),
+            Err(e) => self.status = format!("could not start training: {e}"),
+        }
+    }
 }
 
 impl eframe::App for App {
@@ -243,6 +285,18 @@ impl eframe::App for App {
                 egui::RichText::new("Instances share one gallery and log to evolution.log.")
                     .weak(),
             );
+
+            ui.horizontal(|ui| {
+                if ui
+                    .button("🎓  Train taste model")
+                    .on_hover_text("Train the preference model from your browser ratings\n\
+                                     (ratings.jsonl) and score every fractal → pref_score.\n\
+                                     Evolution then selects on your taste (optimization.pref_weight).")
+                    .clicked()
+                {
+                    self.train_pref();
+                }
+            });
 
             ui.add_space(8.0);
             ui.separator();

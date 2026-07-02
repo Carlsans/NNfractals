@@ -77,6 +77,12 @@ pub struct OptimizationConfig {
     /// evolution toward fractals unlike anything in the collection. 0 disables.
     #[serde(default = "default_ood_weight")]
     pub ood_weight: f32,
+    /// Weight on the human-preference model (pref_score ∈ [0,1], trained via the
+    /// browser's ⚖ Rate mode + scripts/train_pref.py). Blended into the saved
+    /// fitness and archive-seed ranking: score += pref_weight · pref_score.
+    /// 0 disables (inert until a pref model exists and the sidecar emits it).
+    #[serde(default = "default_pref_weight")]
+    pub pref_weight: f32,
 }
 
 fn default_self_replication_weight()    -> f32 { 0.35 }
@@ -88,6 +94,7 @@ fn default_formula_system()             -> String { "dag".to_string() }
 fn default_max_nodes()                  -> usize { 14 }
 fn default_max_depth()                  -> usize { 5 }
 fn default_ood_weight()                 -> f32 { 0.0 }
+fn default_pref_weight()                -> f32 { 0.4 }
 
 #[derive(Deserialize, Clone, Debug)]
 pub struct OutputConfig {

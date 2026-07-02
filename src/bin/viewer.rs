@@ -1423,6 +1423,7 @@ fn default_config() -> Config {
             formula_system: "dag".to_string(),
             max_nodes: 14, max_depth: 5,
             ood_weight: 0.0,
+            pref_weight: 0.4,
         },
         output: OutputConfig {
             save_dir: "./fractals".into(),
