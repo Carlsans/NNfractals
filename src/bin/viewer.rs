@@ -326,6 +326,13 @@ struct RenderResult {
     generation: u64,
 }
 
+/// Progress messages from a background hi-res save thread → the UI status line.
+enum SaveMsg {
+    Started { w: u32, h: u32 },
+    Done(PathBuf),
+    Failed(String),
+}
+
 // ── Preferences ───────────────────────────────────────────────────────────────
 
 #[derive(Serialize, Deserialize)]
@@ -426,6 +433,17 @@ struct App {
 
     // Continuous zoom animation — toggled with the Z key
     zoom_anim: bool,
+
+    // egui context clone so background threads (saves) can request a repaint.
+    egui_ctx: egui::Context,
+    // Hi-res save progress. Worker threads report Started/Done/Failed here; their
+    // JoinHandles are kept so a slow save is never lost when the window closes
+    // (joined in on_exit). saves_active drives the toolbar "saving…" indicator.
+    save_tx:      mpsc::Sender<SaveMsg>,
+    save_rx:      mpsc::Receiver<SaveMsg>,
+    save_jobs:    Vec<thread::JoinHandle<()>>,
+    saves_active: usize,
+    save_status:  String,
 }
 
 impl App {
@@ -566,6 +584,7 @@ impl App {
         );
 
         let (xmin, xmax, ymin, ymax) = default_view.bounds();
+        let (save_tx, save_rx) = mpsc::channel::<SaveMsg>();
         let mut app = Self {
             genome, config, nn_path,
             view: default_view.clone(),
@@ -594,6 +613,11 @@ impl App {
             auto_pal_busy: false,
             zoom_anim: false,
             displayed_is_preview: false,
+            egui_ctx: cc.egui_ctx.clone(),
+            save_tx, save_rx,
+            save_jobs: Vec::new(),
+            saves_active: 0,
+            save_status: String::new(),
         };
         // Set initial aspect ratio from prefs
         app.apply_ratio(ratio_idx, false);
@@ -946,11 +970,29 @@ impl App {
                             self.show_save = true;
                         }
 
-                        // Render-in-progress indicator (right-aligned; may scroll off
-                        // in DD mode, which is fine — depth lives on the left now).
+                        // Render / save status (right-aligned; may scroll off in DD
+                        // mode, which is fine — depth lives on the left now).
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             if !self.render_complete || self.displayed_gen < self.render_gen {
                                 ui.colored_label(Color32::YELLOW, "rendering...");
+                            }
+                            // Save feedback: active count in blue while rendering to disk,
+                            // else the last outcome (green Saved / red FAILED).
+                            if self.saves_active > 0 {
+                                ui.colored_label(
+                                    Color32::LIGHT_BLUE,
+                                    format!("💾 saving {}…", self.saves_active),
+                                );
+                            }
+                            if !self.save_status.is_empty() {
+                                let col = if self.save_status.starts_with("Save FAILED") {
+                                    Color32::LIGHT_RED
+                                } else if self.save_status.starts_with("Saved") {
+                                    Color32::LIGHT_GREEN
+                                } else {
+                                    Color32::LIGHT_BLUE // "Rendering …"
+                                };
+                                ui.colored_label(col, &self.save_status);
                             }
                         });
                     });
@@ -1227,30 +1269,44 @@ impl App {
 
     /// Render an sw×sh PNG on a background thread and write it into `out_dir`.
     /// Shared by the Save dialog and the spacebar quick-save.
-    fn spawn_save(&self, sw: u32, sh: u32, out_dir: PathBuf) {
+    fn spawn_save(&mut self, sw: u32, sh: u32, out_dir: PathBuf) {
         let genome  = self.genome.clone();
         let config  = self.config.clone();
         let view    = self.view.clone();
         let nn_path = self.nn_path.clone();
-        thread::spawn(move || {
-            eprintln!("Rendering {sw}×{sh} PNG…");
+        let tx      = self.save_tx.clone();
+        let ctx     = self.egui_ctx.clone();
+        self.saves_active += 1;
+        self.save_status = format!("Rendering {sw}×{sh} PNG…");
+        let handle = thread::spawn(move || {
+            let _ = tx.send(SaveMsg::Started { w: sw, h: sh });
+            ctx.request_repaint();
             // Confine to the dedicated save pool so a deep-zoom save can't starve the
             // interactive render's cores (which would freeze zooming until save finished).
             let rgb  = save_pool().install(|| render_save(&genome, &config, &view, sw, sh));
             let stem = nn_path.file_stem().and_then(|s| s.to_str()).unwrap_or("fractal");
             if let Err(e) = std::fs::create_dir_all(&out_dir) {
-                eprintln!("Save error: cannot create {}: {e}", out_dir.display());
+                let _ = tx.send(SaveMsg::Failed(format!("cannot create {}: {e}", out_dir.display())));
+                ctx.request_repaint();
                 return;
             }
-            let out = out_dir.join(format!(
-                "{stem}_cx{:.4}_cy{:.4}_z{:.2}_{sw}x{sh}.png",
-                view.cx, view.cy, view.zoom,
-            ));
-            match save_png(&rgb, sw, sh, &out) {
-                Ok(_)  => eprintln!("Saved → {}", out.display()),
-                Err(e) => eprintln!("Save error: {e}"),
+            // Collision-safe name: the cx/cy/zoom in the filename are rounded, so two
+            // nearby views would otherwise map to the same path and silently overwrite.
+            // Append _2, _3, … when the target already exists.
+            let base = format!("{stem}_cx{:.4}_cy{:.4}_z{:.2}_{sw}x{sh}", view.cx, view.cy, view.zoom);
+            let mut out = out_dir.join(format!("{base}.png"));
+            let mut n = 2;
+            while out.exists() {
+                out = out_dir.join(format!("{base}_{n}.png"));
+                n += 1;
             }
+            match save_png(&rgb, sw, sh, &out) {
+                Ok(_)  => { let _ = tx.send(SaveMsg::Done(out)); }
+                Err(e) => { let _ = tx.send(SaveMsg::Failed(e.to_string())); }
+            }
+            ctx.request_repaint();
         });
+        self.save_jobs.push(handle);
     }
 
     /// Output folder for saves: the remembered folder, else the loaded .nn's dir.
@@ -1343,6 +1399,29 @@ impl eframe::App for App {
             ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
         }
 
+        // Hi-res save progress: update the status line as background saves report in.
+        while let Ok(msg) = self.save_rx.try_recv() {
+            match msg {
+                SaveMsg::Started { w, h } => {
+                    self.save_status = format!("Rendering {w}×{h} PNG…");
+                }
+                SaveMsg::Done(path) => {
+                    self.saves_active = self.saves_active.saturating_sub(1);
+                    let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
+                    self.save_status = format!("Saved → {name}");
+                    eprintln!("Saved → {}", path.display());
+                }
+                SaveMsg::Failed(e) => {
+                    self.saves_active = self.saves_active.saturating_sub(1);
+                    self.save_status = format!("Save FAILED: {e}");
+                    eprintln!("Save error: {e}");
+                }
+            }
+        }
+        // Drop handles for saves that have already completed (keeps the vec small;
+        // any still-running ones remain to be joined on exit).
+        self.save_jobs.retain(|h| !h.is_finished());
+
         // Auto-palette: apply result when background scoring finishes
         if let Some(ref rx) = self.auto_pal_rx {
             if let Ok(best) = rx.try_recv() {
@@ -1372,8 +1451,20 @@ impl eframe::App for App {
             self.request_render(false);
         }
 
-        if !self.render_complete || self.displayed_gen < self.render_gen {
+        if !self.render_complete || self.displayed_gen < self.render_gen || self.saves_active > 0 {
             ctx.request_repaint();
+        }
+    }
+
+    /// Don't lose in-flight hi-res saves when the window closes: block until every
+    /// background save thread has finished writing its PNG. A deep-zoom save can take
+    /// a while, so exit may pause briefly — but the file is guaranteed to land.
+    fn on_exit(&mut self) {
+        if !self.save_jobs.is_empty() {
+            eprintln!("Waiting for {} pending save(s) to finish…", self.save_jobs.len());
+        }
+        for h in self.save_jobs.drain(..) {
+            let _ = h.join();
         }
     }
 }

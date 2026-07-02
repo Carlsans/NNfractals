@@ -41,6 +41,16 @@ case "${1:-}" in
     else
       echo "no $PIDFILE — nothing to stop"
     fi
+    # Also stop the aesthetic scorer sidecar(s). They are child processes of the
+    # evolution instances, but can outlive an abrupt kill (e.g. blocked in a GPU
+    # score) and keep holding VRAM. SIGTERM first, then SIGKILL any stragglers.
+    # (pkill never matches its own PID, and "bash run.sh stop" doesn't contain the
+    # pattern, so this can't self-terminate the script.)
+    if pkill -f "aesthetic_scorer.py" 2>/dev/null; then
+      echo "stopped aesthetic scorer sidecar(s)"
+      sleep 1
+      pkill -9 -f "aesthetic_scorer.py" 2>/dev/null
+    fi
     exit 0 ;;
   status)
     if [ -f "$PIDFILE" ]; then
