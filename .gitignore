@@ -27,3 +27,7 @@ evo1.log
 evo2.log
 aesthetic_sidecar.log
 viewer_output/
+gen_metrics_*.jsonl
+metric_loop_journal.md
+hour_timer.out
+verify.out

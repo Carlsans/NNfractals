@@ -96,6 +96,11 @@ pub struct OptimizationConfig {
     /// 0 disables.
     #[serde(default = "default_musiq_weight")]
     pub musiq_weight: f32,
+    /// ITER3: number of high measured-pref recently-saved genomes re-injected into the
+    /// breeding pool each generation, so real human-preference steers the search (cheap
+    /// geometric fitness is ⊥ taste). 0 disables (pure fitness-elite breeding).
+    #[serde(default = "default_pref_elite_count")]
+    pub pref_elite_count: u32,
 }
 
 fn default_self_replication_weight()    -> f32 { 0.35 }
@@ -110,6 +115,7 @@ fn default_ood_weight()                 -> f32 { 0.0 }
 fn default_pref_weight()                -> f32 { 0.4 }
 fn default_seed_pref_weight()           -> f32 { 3.0 }
 fn default_musiq_weight()               -> f32 { 0.25 }
+fn default_pref_elite_count()           -> u32 { 4 }
 
 #[derive(Deserialize, Clone, Debug)]
 pub struct OutputConfig {
@@ -144,6 +150,12 @@ pub struct OutputConfig {
     /// Applied only when musiq is available. 0 disables.
     #[serde(default = "default_min_musiq")]
     pub min_musiq: f32,
+    /// Minimum human-preference score [0,1] (pref_score) for a fractal to pass the
+    /// gate. Cheap geometric fitness is orthogonal to taste (measured corr≈0.05), so
+    /// pref only enters at the gate + seeding — this floor keeps low-taste fractals
+    /// out of the gallery. Applied only when pref is scored (>0). 0 disables.
+    #[serde(default = "default_min_pref")]
+    pub min_pref: f32,
 }
 
 /// Periodic near-duplicate cleanup run by the evolution loop.
@@ -176,6 +188,7 @@ fn default_min_clip_score()         -> f32 { 0.49 }
 fn default_min_laion_score()        -> f32 { 5.15 }
 fn default_min_ensemble()           -> f32 { 4.6 }
 fn default_min_musiq()              -> f32 { 30.0 }
+fn default_min_pref()               -> f32 { 0.45 }
 
 impl Config {
     pub fn load(path: &Path) -> anyhow::Result<Self> {

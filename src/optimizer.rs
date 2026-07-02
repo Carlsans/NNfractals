@@ -34,7 +34,14 @@ pub struct Optimizer {
     max_laion_score: f32,
     recursion_model: Option<crate::recursion_model::RecursionModel>,
     clip_model:      Option<crate::recursion_model::RecursionModel>,
+    // ITER3: ring of recently-saved genomes with high MEASURED pref (from the sidecar).
+    // Re-injected into breeding each generation so real human-preference steers the
+    // search — the cheap geometric fitness is ⊥ taste (measured corr≈0.05), so this is
+    // the only path by which measured taste can influence the population per-gen.
+    pref_elites: VecDeque<Genome>,
 }
+
+const PREF_ELITE_CAP: usize = 24;
 
 impl Optimizer {
     pub fn new(config: Config) -> Self {
@@ -138,6 +145,40 @@ impl Optimizer {
             max_laion_score: 0.0,
             recursion_model,
             clip_model,
+            pref_elites: VecDeque::new(),
+        }
+    }
+
+    /// Append one JSON line of per-generation telemetry to gen_metrics_<pool>.jsonl.
+    /// Pool name is derived from save_dir so concurrent pools don't share a file.
+    fn log_gen_metrics(&self, tally: &std::collections::HashMap<&'static str, u32>) {
+        use std::io::Write;
+        let base = std::path::Path::new(&self.config.output.save_dir)
+            .file_name().and_then(|s| s.to_str()).unwrap_or("pool");
+        let path = format!("gen_metrics_{base}.jsonl");
+
+        let n = self.population.len().max(1) as f64;
+        let best = self.population.first().map(|g| g.fitness as f64).unwrap_or(0.0);
+        let mean = self.population.iter().map(|g| g.fitness as f64).sum::<f64>() / n;
+        let var  = self.population.iter().map(|g| (g.fitness as f64 - mean).powi(2)).sum::<f64>() / n;
+        let std  = var.sqrt();
+        let mean_fdiv = self.population.iter().map(|g| g.formula_diversity as f64).sum::<f64>() / n;
+        let t = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs()).unwrap_or(0);
+        let saved_gen = tally.get("saved").copied().unwrap_or(0);
+        let mut reasons: Vec<String> = tally.iter().map(|(k, v)| format!("\"{k}\":{v}")).collect();
+        reasons.sort();
+
+        let line = format!(
+            "{{\"t\":{t},\"gen\":{},\"elapsed\":{},\"best_fit\":{best:.5},\"mean_fit\":{mean:.5},\
+\"std_fit\":{std:.5},\"mean_fdiv\":{mean_fdiv:.5},\"best_ever\":{:.5},\"stagnant\":{},\
+\"saved_total\":{},\"saved_gen\":{saved_gen},\"reasons\":{{{}}}}}\n",
+            self.generation, self.start.elapsed().as_secs(),
+            self.best_ever.as_ref().map(|g| g.fitness).unwrap_or(0.0), self.stagnant_gens,
+            self.saved_count, reasons.join(","),
+        );
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+            let _ = f.write_all(line.as_bytes());
         }
     }
 
@@ -351,6 +392,14 @@ impl Optimizer {
             .join(" ");
         display::print_status(&format!("Gen {}  Save scan: {}", self.generation, summary));
 
+        // Structured per-generation telemetry (every 10 gens) → gen_metrics_<pool>.jsonl.
+        // The TUI evolution.log is a redraw and unparseable; this JSONL gives the
+        // time-series (fitness trend, diversity, save/acceptance rate, stagnation)
+        // needed to analyse evolution dynamics offline.
+        if self.generation % 10 == 0 {
+            self.log_gen_metrics(&tally);
+        }
+
         // ── Stagnation restart ────────────────────────────────────────────
         if self.stagnant_gens >= self.config.optimization.restart_after_gens {
             self.restart_population();
@@ -557,7 +606,13 @@ impl Optimizer {
                 let min_ens = self.config.output.min_ensemble;
                 if ens > 0.0 && min_ens > 0.0 {
                     let quality_ok = s.musiq <= 0.0 || s.musiq >= self.config.output.min_musiq;
-                    ens >= min_ens && quality_ok
+                    // Taste floor: reject low human-preference fractals so the gallery
+                    // isn't flooded with mediocre-pref saves (analysis: without this,
+                    // median saved pref was only ~0.55). Applied only when pref is
+                    // actually scored (>0), mirroring the musiq floor, so a down sidecar
+                    // can't block everything.
+                    let pref_ok = s.pref <= 0.0 || s.pref >= self.config.output.min_pref;
+                    ens >= min_ens && quality_ok && pref_ok
                 } else {
                     s.clip  >= self.config.output.min_clip_score
                         || s.laion >= self.config.output.min_laion_score
@@ -566,7 +621,7 @@ impl Optimizer {
             None => beauty >= self.config.output.min_beauty,
         };
         if !passes {
-            return "low_clip_laion";  // nothing written to the output dir
+            return "low_aesthetic";  // failed ensemble/musiq/pref gate; nothing written
         }
 
         // Passed — now write the permanent PNG to the output dir.
@@ -614,6 +669,13 @@ impl Optimizer {
         g.formula_readable = g.formula_expr();   // human-readable comment in the .nn
         save_genome(&g, &nn_path).unwrap_or(());
         self.save_descriptors.push(desc);
+        // ITER3: remember genomes with genuinely high measured pref so evolve() can
+        // breed from them — the only per-gen channel for measured taste to steer search.
+        // Recency ring (FIFO) so it tracks the current search region, not stale winners.
+        if g.pref_score > 0.0 {
+            self.pref_elites.push_back(g.clone());
+            while self.pref_elites.len() > PREF_ELITE_CAP { self.pref_elites.pop_front(); }
+        }
         display::print_save(&g, &png_path.display().to_string(), final_score);
         self.saved_count += 1;
         "saved"
@@ -636,6 +698,25 @@ impl Optimizer {
             if !diverse.iter().any(|e| e.id == g.id) { diverse.push(g.clone()); }
         }
 
+        // ITER3: breeding parent pool = fitness-diverse elites + top measured-pref elites.
+        // The pref-elites pull offspring toward regions that actually scored high with the
+        // sidecar (measured taste), which per-gen geometric fitness cannot express.
+        let mut parents: Vec<Genome> = diverse.clone();
+        let n_pref = (self.config.optimization.pref_elite_count as usize).min(self.pref_elites.len());
+        if n_pref > 0 {
+            // Highest measured pref from the recency ring.
+            let mut ranked: Vec<&Genome> = self.pref_elites.iter().collect();
+            ranked.sort_by(|a, b| b.pref_score.partial_cmp(&a.pref_score).unwrap_or(std::cmp::Ordering::Equal));
+            for g in ranked.into_iter().take(n_pref) {
+                if !parents.iter().any(|e| e.id == g.id) { parents.push(g.clone()); }
+            }
+        }
+
+        // ITER4: survivors carried forward = fitness-diverse elites ONLY. pref-elites
+        // influence via mutated offspring (they're in `parents` for breeding) but are NOT
+        // kept as immortal clones — iter3 pinned them as survivors → 35% "exists"
+        // re-attempts + formula families 71%→54%. Breeding-only keeps the taste-steering
+        // while restoring diversity.
         let mut new_pop = diverse;
 
         // Continuous exploration: inject a few fresh random genomes every generation, not
@@ -647,19 +728,20 @@ impl Optimizer {
             new_pop.push(Genome::random(&self.config, &mut self.rng));
         }
 
+        let pn = parents.len().max(1);
         while new_pop.len() < n {
-            let a_idx = self.rng.random_range(0..elite_count);
-            let a = &self.population[a_idx];
+            let a_idx = self.rng.random_range(0..pn);
+            let a = &parents[a_idx];
             let child = if self.rng.random_bool(0.5) {
-                let diff: Vec<usize> = (0..elite_count)
-                    .filter(|&i| self.population[i].formula_ops_label() != a.formula_ops_label())
+                let diff: Vec<usize> = (0..pn)
+                    .filter(|&i| parents[i].formula_ops_label() != a.formula_ops_label())
                     .collect();
                 let b_idx = if !diff.is_empty() {
                     diff[self.rng.random_range(0..diff.len())]
                 } else {
-                    self.rng.random_range(0..elite_count)
+                    self.rng.random_range(0..pn)
                 };
-                Genome::crossover(a, &self.population[b_idx], &self.config, &mut self.rng)
+                Genome::crossover(a, &parents[b_idx], &self.config, &mut self.rng)
                     .mutate(&self.config, &mut self.rng)
             } else {
                 a.mutate(&self.config, &mut self.rng)
