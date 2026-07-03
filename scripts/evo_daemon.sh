@@ -34,6 +34,8 @@ PATS=(
   "${BIN_REL} --config config3.toml"
   "${BIN_REL} --config config4.toml"
 )
+# fractals_N pool each instance owns — used to also reap its dedup.py child on stop.
+POOLS=("./fractals_1" "./fractals_2" "./fractals_3" "./fractals_4")
 
 running_pid() { pgrep -f "${PATS[$1]}" | head -1; }
 
@@ -59,12 +61,28 @@ start_instance() {
 stop_instance() {
   local idx=$1
   local pid; pid="$(running_pid $idx)"
-  if [ -z "$pid" ]; then echo "[$((idx+1))] not running"; rm -f "${PIDFILES[$idx]}"; return 0; fi
-  pkill -f "${PATS[$idx]}"
-  for _ in 1 2 3 4 5; do [ -z "$(running_pid $idx)" ] && break; sleep 1; done
-  pkill -9 -f "${PATS[$idx]}" 2>/dev/null
+  if [ -z "$pid" ]; then
+    echo "[$((idx+1))] not running"
+  else
+    pkill -f "${PATS[$idx]}"
+    for _ in 1 2 3 4 5; do [ -z "$(running_pid $idx)" ] && break; sleep 1; done
+    pkill -9 -f "${PATS[$idx]}" 2>/dev/null
+    echo "[$((idx+1))] stopped (was pid $pid)"
+  fi
   rm -f "${PIDFILES[$idx]}"
-  echo "[$((idx+1))] stopped (was pid $pid)"
+  # The instance's dedup.py cleaner thread blocks on cmd.status() waiting for the
+  # child; killing the rust process externally (as we just did) orphans that
+  # child instead of stopping it, and it keeps running to completion completely
+  # independently — observed accumulating 11 stacked dedup.py processes eating
+  # ~10 CPU cores after 6+ restarts over ~14h. Reap this instance's dedup.py too.
+  # No trailing anchor: --binary <path> follows --dir <pool> on the real command
+  # line, and there's no fractals_1x pool to collide with fractals_1.
+  local dedup_pat="scripts/dedup.py.*--dir ${POOLS[$idx]} "
+  local dpid; dpid="$(pgrep -f "$dedup_pat" | tr '\n' ' ')"
+  if [ -n "$dpid" ]; then
+    pkill -f "$dedup_pat"
+    echo "[$((idx+1))] also stopped orphan-prone dedup.py (was pid(s): $dpid)"
+  fi
 }
 
 start_all() {
