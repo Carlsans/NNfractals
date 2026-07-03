@@ -355,8 +355,23 @@ impl Optimizer {
         self.population.sort_by(|a, b|
             b.fitness.partial_cmp(&a.fitness).unwrap_or(std::cmp::Ordering::Equal));
 
-        // ── Track best-ever (raw beauty, no novelty inflation) ───────────
-        let (current_beauty, _, _) = evaluate_fitness_full(&self.population[0], &self.config);
+        // ── Track best-ever (structured beauty, no novelty inflation) ─────
+        // CYCLE12 FIX: was reading the raw_png compression-entropy (tuple index 0)
+        // instead of the multiscale structured entropy (index 1). raw_png is
+        // uncorrelated with the fitness ranking (population[0] is sorted by
+        // .fitness, which uses `structured`, not raw_png) and is NOT penalised for
+        // noise the way multiscale_entropy is — so whichever genome happened to top
+        // the ranking had an essentially random raw_png, and once a noisy/busy
+        // render pushed it near its ceiling (~1.01, observed identically across
+        // every restart of every instance for the entire project's life), no
+        // genuinely well-formed fractal could ever beat it (those sit ~0.35-0.70).
+        // best_ever was therefore permanently pinned, stagnant_gens never reset,
+        // and restart_population() fired like clockwork every restart_after_gens
+        // (20) generations forever — the population never got a longer
+        // uninterrupted run to actually improve. Using `structured` (already the
+        // real per-gen selection criterion, and specifically designed to punish
+        // noise) fixes this.
+        let (_, current_beauty, _) = evaluate_fitness_full(&self.population[0], &self.config);
         let best_ever_beauty    = self.best_ever.as_ref().map(|g| g.fitness).unwrap_or(0.0);
         if current_beauty > best_ever_beauty + 0.005 {
             let mut clone = self.population[0].clone();
