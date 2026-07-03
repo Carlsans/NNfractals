@@ -12,7 +12,7 @@ view_y_max     =  2.0
 # Formula = sparse set of weighted basis terms, evolved directly by the GA.
 # (Transformer + backprop removed — they fought the GA and drove elites to noise.)
 [optimization]
-population_size          = 130    # CYCLE8: 100→130 — dedup-orphan fix freed real CPU headroom (load 28→~8 of 16 cores); more per-gen exploration breadth
+population_size          = 100    # CYCLE9: reverted 130→100 — gens/sec rose but SAVED-file rate dropped (-7%/-41%); larger pool saturates the fixed-size novelty archive (novelty_k/archive_size unscaled), inflating low_diversity rejects
 formula_system           = "dag"
 ood_weight               = 0.25   # reward fractals unlike anything already saved (drives unusual)
 elitism_count            = 6
