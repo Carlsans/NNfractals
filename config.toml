@@ -14,24 +14,26 @@ view_y_max     =  2.0
 [optimization]
 population_size          = 100    # larger pool → more diversity + more offspring of good-pref seeds
 formula_system           = "dag"
+ood_weight               = 0.25   # reward fractals unlike anything already saved (drives unusual)
 elitism_count            = 6
 mutation_rate            = 0.20   # per-coefficient perturbation probability
 mutation_scale           = 0.08   # coefficient perturbation magnitude
 eval_width               = 64     # 64×64: fast PNG compression eval (4096 pixels per genome)
 eval_height              = 64
 eval_max_iter            = 128    # deeper iteration → richer fitness signal
-restart_after_gens       = 30     # faster epoch cycle, reload archive seeds more often
-novelty_weight           = 0.45   # push hard toward unexplored visual regions
+restart_after_gens       = 20     # CYCLE1: matched to config2.toml's proven tuning; faster reseed from high-pref archive
+novelty_weight           = 0.60   # CYCLE1: ↑ from 0.45 — absorb freed dead-predictor weight into real exploration
 novelty_k                = 5
 archive_size             = 150
 self_replication_weight  = 0.35   # favor Mandelbrot-like zoom self-replication in seed ranking
 fractal_recursion_weight = 0.35   # favor embedded miniature copies of the whole set (baby-Mandelbrots)
-recursion_pred_weight    = 0.80   # MAJOR per-gen criterion: formula-only predicted recursion (recursion_model.json)
-formula_diversity_weight = 0.30   # per-gen bonus for structurally distinct formula families (k-NN in basis space)
-clip_pred_weight         = 0.50   # per-gen bonus for formula-predicted CLIP aesthetic (linear model on archive)
+recursion_pred_weight    = 0.0    # CYCLE1: DISABLED — pred_recursion is a dead constant for DAG genomes (model trained on old basis repr); was inert offset
+formula_diversity_weight = 0.45   # CYCLE1: ↑ from 0.30 — real per-gen exploration signal (formula-space k-NN varies for DAG)
+clip_pred_weight         = 0.0    # CYCLE1: DISABLED — pred_clip is a dead constant for DAG genomes; CLIP collapsed on fractals anyway
 pref_weight              = 0.4    # blend trained human-preference (pref_score) into saved fitness + seed ranking
 seed_pref_weight         = 3.0    # STRONG pref weight when picking the individuals that START the group (warm-start/restart seeds)
 musiq_weight             = 0.25   # positive reward for high MUSIQ technical quality (norm (musiq-30)/50), below pref so pref stays dominant
+pref_elite_count         = 4      # CYCLE1: re-inject top-4 measured-pref recent saves into breeding each gen — real taste steers search
 archive_random_ratio     = 0.30   # NEW ARCHITECTURE: 30% of each (re)seeded pool is pure-random; rest bred from archive seeds (never plain-cloned)
 duplicate_penalty_weight = 0.50   # NEW ARCHITECTURE: quadratic penalty on formula families that dominate the saved archive (FormulaUsageTracker)
 
@@ -43,6 +45,8 @@ max_entropy_prefilter    = 0.70  # widened: dedup cleans near-dups every 2h
 min_clip_score           = 0.522 # OR gate: pass if CLIP ≥ this (above mean) — privileges CLIP winners
 min_laion_score          = 5.30  # OR gate: pass if LAION ≥ this — privileges LAION winners
 min_beauty               = 0.35  # fallback beauty when aesthetic scorer unavailable
+min_pref                 = 0.55  # CYCLE1: matched to config2.toml's proven taste floor
+min_musiq                = 50.0  # CYCLE1: matched to config2.toml's proven quality floor
 min_save_distance        = 0.05  # relaxed from 0.08 — dedup handles remaining near-dups
 
 [dedup]
