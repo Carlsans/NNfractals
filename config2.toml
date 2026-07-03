@@ -46,7 +46,7 @@ min_clip_score           = 0.522 # OR gate: pass if CLIP ≥ this (above mean) �
 min_laion_score          = 5.30  # OR gate: pass if LAION ≥ this — privileges LAION winners
 min_beauty               = 0.35  # fallback beauty when aesthetic scorer unavailable
 min_pref                 = 0.55  # ITER4: raised 0.50→0.55 (iter3 pref median 0.70, p10 0.53 — headroom to push taste; pairs with breeding-only pref-elites)
-min_musiq                = 57.0  # CYCLE5: raised 55→57 — p10 musiq was 58.2, diversity fix (cycle4) confirmed working, still headroom on musiq
+min_musiq                = 58.0  # CYCLE6: raised 57→58 — p10 musiq was 59.4, medians stable after last raise (64.7 held)
 min_save_distance        = 0.05  # relaxed from 0.08 — dedup handles remaining near-dups
 
 [dedup]
