@@ -46,7 +46,7 @@ min_clip_score           = 0.522 # OR gate: pass if CLIP ≥ this (above mean) �
 min_laion_score          = 5.30  # OR gate: pass if LAION ≥ this — privileges LAION winners
 min_beauty               = 0.35  # fallback beauty when aesthetic scorer unavailable
 min_pref                 = 0.55  # CYCLE1: matched to config2.toml's proven taste floor
-min_musiq                = 55.0  # CYCLE3: raised 50→55 — p10 musiq was 55.8, comfortable headroom above the old floor
+min_musiq                = 57.0  # CYCLE5: raised 55→57 — p10 musiq was 57.9, diversity fix (cycle4) confirmed working, still headroom on musiq
 min_save_distance        = 0.05  # relaxed from 0.08 — dedup handles remaining near-dups
 
 [dedup]
