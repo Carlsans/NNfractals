@@ -1278,6 +1278,13 @@ impl App {
         let ctx     = self.egui_ctx.clone();
         self.saves_active += 1;
         self.save_status = format!("Rendering {sw}×{sh} PNG…");
+        // Captured NOW (click time), not when the render finishes: renders vary
+        // wildly in duration (deep-zoom DD renders are much slower than shallow
+        // ones), so a fast save queued after a slow one can finish first and get
+        // an earlier on-disk mtime — inverting file-manager "sort by modified"
+        // order relative to the order you actually saved them in. Stamping the
+        // finished file with the click time keeps that order intact.
+        let click_time = std::time::SystemTime::now();
         let handle = thread::spawn(move || {
             let _ = tx.send(SaveMsg::Started { w: sw, h: sh });
             ctx.request_repaint();
@@ -1301,7 +1308,15 @@ impl App {
                 n += 1;
             }
             match save_png(&rgb, sw, sh, &out) {
-                Ok(_)  => { let _ = tx.send(SaveMsg::Done(out)); }
+                Ok(_) => {
+                    // Best-effort: if this fails (unusual filesystem, permissions),
+                    // the file still exists with its real write-time mtime — just
+                    // not in click order. Not worth failing the save over.
+                    if let Ok(f) = std::fs::File::open(&out) {
+                        let _ = f.set_modified(click_time);
+                    }
+                    let _ = tx.send(SaveMsg::Done(out));
+                }
                 Err(e) => { let _ = tx.send(SaveMsg::Failed(e.to_string())); }
             }
             ctx.request_repaint();
