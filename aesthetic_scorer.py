@@ -185,6 +185,14 @@ def main():
 
     print("READY", flush=True)
 
+    # Requests vary in image size (256x256 gen-probes vs. larger save candidates),
+    # so torch's caching allocator accumulates differently-sized cached blocks that
+    # are never returned to the driver on their own — observed as GPU free memory
+    # steadily shrinking over hours of a long-running evolution instance even
+    # though every call here is already no_grad/inference_mode (no real leak).
+    # Periodic empty_cache() releases the unused cached blocks back to the driver.
+    EMPTY_CACHE_EVERY = 100
+    n_requests = 0
     for line in sys.stdin:
         path = line.strip()
         if not path:
@@ -195,6 +203,9 @@ def main():
                   flush=True)
         except Exception as e:
             print(f"ERROR: {e}", flush=True)
+        n_requests += 1
+        if device == "cuda" and n_requests % EMPTY_CACHE_EVERY == 0:
+            torch.cuda.empty_cache()
 
 
 if __name__ == "__main__":
