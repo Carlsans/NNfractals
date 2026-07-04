@@ -380,10 +380,23 @@ impl Optimizer {
         let (_, current_beauty, _) = evaluate_fitness_full(&self.population[0], &self.config);
         self.last_top_structured = current_beauty;
         let best_ever_beauty    = self.best_ever.as_ref().map(|g| g.fitness).unwrap_or(0.0);
+        // CYCLE14 FIX: `top_structured` telemetry (added cycle13) showed ~47-49% of ALL
+        // generations land EXACTLY at best_ever (many different genomes genuinely reach
+        // the same near-ceiling structured-entropy value at this eval resolution — not
+        // a single frozen genome), yet a strict `> +0.005` absolute margin can never be
+        // cleared once already this close to the metric's practical ceiling — there's
+        // no headroom left near the top of a bounded scale. That made "stagnant" fire on
+        // every generation that merely matched the all-time high instead of beating it,
+        // even though repeatedly matching a near-record value is excellent performance,
+        // not decline. Now: only a genuine, meaningful drop (more than 0.005 BELOW the
+        // record) counts as stagnation; matching or nearly matching it keeps the clock
+        // reset. Recording a new best_ever still requires strictly exceeding it.
         if current_beauty > best_ever_beauty + 0.005 {
             let mut clone = self.population[0].clone();
             clone.fitness = current_beauty;
             self.best_ever = Some(clone);
+            self.stagnant_gens = 0;
+        } else if current_beauty >= best_ever_beauty - 0.005 {
             self.stagnant_gens = 0;
         } else {
             self.stagnant_gens += 1;
