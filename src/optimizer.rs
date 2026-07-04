@@ -31,6 +31,11 @@ pub struct Optimizer {
     aesthetic: Option<AestheticScorer>,
     last_sub_scores: Option<[f32; 5]>,  // [boundary, edge, entropy, self_sim, cool_zone]
     max_png_entropy: f32,               // max PNG compression ratio seen across all evaluations
+    // CYCLE13 diagnostic: population[0]'s structured (multiscale) entropy this gen —
+    // the exact quantity compared against best_ever each gen. Logged so a future
+    // analysis can see HOW CLOSE it gets to best_ever (near-miss vs. wildly off),
+    // rather than only the binary "did best_ever change" signal.
+    last_top_structured: f32,
     max_clip_score: f32,
     max_laion_score: f32,
     recursion_model: Option<crate::recursion_model::RecursionModel>,
@@ -135,6 +140,7 @@ impl Optimizer {
             aesthetic,
             last_sub_scores: None,
             max_png_entropy: 0.0,
+            last_top_structured: 0.0,
             max_clip_score: 0.0,
             max_laion_score: 0.0,
             recursion_model,
@@ -217,11 +223,11 @@ impl Optimizer {
 
         let line = format!(
             "{{\"t\":{t},\"gen\":{},\"elapsed\":{},\"best_fit\":{best:.5},\"mean_fit\":{mean:.5},\
-\"std_fit\":{std:.5},\"mean_fdiv\":{mean_fdiv:.5},\"best_ever\":{:.5},\"stagnant\":{},\
-\"saved_total\":{},\"saved_gen\":{saved_gen},\"reasons\":{{{}}}}}\n",
+\"std_fit\":{std:.5},\"mean_fdiv\":{mean_fdiv:.5},\"best_ever\":{:.5},\"top_structured\":{:.5},\
+\"stagnant\":{},\"saved_total\":{},\"saved_gen\":{saved_gen},\"reasons\":{{{}}}}}\n",
             self.generation, self.start.elapsed().as_secs(),
-            self.best_ever.as_ref().map(|g| g.fitness).unwrap_or(0.0), self.stagnant_gens,
-            self.saved_count, reasons.join(","),
+            self.best_ever.as_ref().map(|g| g.fitness).unwrap_or(0.0), self.last_top_structured,
+            self.stagnant_gens, self.saved_count, reasons.join(","),
         );
         if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
             let _ = f.write_all(line.as_bytes());
@@ -372,6 +378,7 @@ impl Optimizer {
         // real per-gen selection criterion, and specifically designed to punish
         // noise) fixes this.
         let (_, current_beauty, _) = evaluate_fitness_full(&self.population[0], &self.config);
+        self.last_top_structured = current_beauty;
         let best_ever_beauty    = self.best_ever.as_ref().map(|g| g.fitness).unwrap_or(0.0);
         if current_beauty > best_ever_beauty + 0.005 {
             let mut clone = self.population[0].clone();
