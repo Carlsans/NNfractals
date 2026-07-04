@@ -79,6 +79,26 @@ def find_pairs(fractals_dir):
     return pairs
 
 
+# Comparison is O(n^2) (full pairwise cosine-similarity matrix). As an archive
+# grows past several thousand files this becomes minutes-to-hours (observed:
+# 17k-file archive pinned a CPU core for 2h12m+, longer than the periodic 2h
+# interval that triggers this script, so runs started overlapping back-to-back).
+# Cap the COMPARISON scope to the most-recently-modified files each round —
+# recent saves are also the ones most likely to be near-duplicates of each
+# other (the population explores similar regions in bursts), and this bounds
+# runtime to a fixed size regardless of how large the total archive grows.
+MAX_COMPARE_FILES = 4000
+
+
+def find_recent_pairs(fractals_dir, limit=MAX_COMPARE_FILES):
+    """Like find_pairs, but capped to the `limit` most-recently-modified pairs."""
+    pairs = find_pairs(fractals_dir)
+    if len(pairs) <= limit:
+        return pairs
+    pairs.sort(key=lambda p: p[2].stat().st_mtime, reverse=True)
+    return pairs[:limit]
+
+
 # ── Beauty score ──────────────────────────────────────────────────────────────
 
 def beauty_score(nn_path):
@@ -228,10 +248,17 @@ def run_dedup_loop(fractals_dir, threshold, binary):
         if not pairs:
             print("No paired images left.")
             break
-        # Re-render any non-512×512 images before comparing
+        # Re-render any non-512×512 images before comparing (cheap size check,
+        # scoped to the whole archive — correctness matters here, not speed).
         rerender_all(pairs, binary)
-        pairs = find_pairs(fractals_dir)
-        n = dedup_round(pairs, threshold)
+        # The O(n^2) comparison itself is capped to the most-recently-modified
+        # files (see find_recent_pairs) so runtime stays bounded as the total
+        # archive keeps growing across the project's life.
+        recent = find_recent_pairs(fractals_dir)
+        if len(recent) < len(pairs):
+            print(f"Comparing the {len(recent)} most recent of {len(pairs)} total "
+                  f"paired images (capped to bound O(n²) runtime).")
+        n = dedup_round(recent, threshold)
         if n == 0:
             print(f"Pool is clean (threshold {threshold:.3f}). Done.")
             break
