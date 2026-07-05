@@ -87,7 +87,21 @@ def find_pairs(fractals_dir):
 # recent saves are also the ones most likely to be near-duplicates of each
 # other (the population explores similar regions in bursts), and this bounds
 # runtime to a fixed size regardless of how large the total archive grows.
-MAX_COMPARE_FILES = 4000
+#
+# 4000 turned out to still be insufficient under a high-duplicate-density burst
+# (a population that converges on one fecund-but-repetitive formula family can
+# flood the recent window with near-duplicate pairs, needing MANY dedup_round()
+# passes to fully clean — observed a single invocation running ~2h45m+, right
+# back to the severity this cap was meant to fix). Lowered to 2000 (~4x cheaper
+# per round) and — more importantly — the round count itself is now hard-capped
+# below, since no fixed per-round file limit can bound the TOTAL runtime if an
+# unbounded number of rounds are needed.
+MAX_COMPARE_FILES = 2000
+# Hard cap on rounds per invocation: dedup is an ongoing, resumable hygiene
+# task, not a one-shot operation that must reach "fully clean" every time it
+# runs — better to do a bounded amount of cleanup now and pick up the rest at
+# the next scheduled interval than to let one invocation run indefinitely.
+MAX_ROUNDS = 15
 
 
 def find_recent_pairs(fractals_dir, limit=MAX_COMPARE_FILES):
@@ -243,7 +257,12 @@ def run_dedup_loop(fractals_dir, threshold, binary):
     round_num = 0
     while True:
         round_num += 1
-        print(f"\n── Round {round_num} ──")
+        if round_num > MAX_ROUNDS:
+            print(f"\nHit MAX_ROUNDS={MAX_ROUNDS} for this invocation — stopping here; "
+                  f"remaining near-duplicates (if any) will be cleaned at the next "
+                  f"scheduled interval instead of extending this run indefinitely.")
+            break
+        print(f"\n── Round {round_num}/{MAX_ROUNDS} ──")
         pairs = find_pairs(fractals_dir)
         if not pairs:
             print("No paired images left.")
