@@ -48,7 +48,7 @@ const RATIOS: &[(&str, f64, f64)] = &[
 ];
 
 const COLORMAPS: &[&str] = &[
-    "turbo", "inferno", "viridis", "plasma", "magma", "earth", "neon",
+    "turbo", "inferno", "viridis", "plasma", "magma", "earth", "neon", "grayscale",
 ];
 
 // ── View ──────────────────────────────────────────────────────────────────────
@@ -444,6 +444,9 @@ struct App {
     save_jobs:    Vec<thread::JoinHandle<()>>,
     saves_active: usize,
     save_status:  String,
+
+    // 'b' toggles a grayscale view; remembers the palette to restore on toggle-off.
+    binary_prev_idx: Option<usize>,
 }
 
 impl App {
@@ -618,6 +621,7 @@ impl App {
             save_jobs: Vec::new(),
             saves_active: 0,
             save_status: String::new(),
+            binary_prev_idx: None,
         };
         // Set initial aspect ratio from prefs
         app.apply_ratio(ratio_idx, false);
@@ -779,8 +783,9 @@ impl App {
         let toolbar_h = (win_h * 0.055).clamp(28.0, 58.0);
         let font_size = (toolbar_h * 0.55).clamp(12.0, 28.0);
 
+        // Content-sized (no exact_size) so the wrapped toolbar can grow to
+        // multiple rows when the window is narrower than the menu.
         egui::Panel::top("toolbar")
-            .exact_size(toolbar_h)
             .show(ui, |ui| {
                 // Scale all button text to match toolbar height
                 {
@@ -799,8 +804,8 @@ impl App {
                     );
                 }
 
-                egui::ScrollArea::horizontal().show(ui, |ui| {
-                    ui.horizontal_centered(|ui| {
+                // Wraps onto extra rows when the window width < menu width.
+                ui.horizontal_wrapped(|ui| {
                         // ── Translation arrows ──────────────────────────────
                         if ui.button("←").on_hover_text("A — left (Shift=2×, Alt=½)").clicked() {
                             self.do_translate(-1.0, 0.0);
@@ -970,34 +975,42 @@ impl App {
                             self.show_save = true;
                         }
 
-                        // Render / save status (right-aligned; may scroll off in DD
-                        // mode, which is fine — depth lives on the left now).
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if !self.render_complete || self.displayed_gen < self.render_gen {
-                                ui.colored_label(Color32::YELLOW, "rendering...");
-                            }
-                            // Save feedback: active count in blue while rendering to disk,
-                            // else the last outcome (green Saved / red FAILED).
-                            if self.saves_active > 0 {
-                                ui.colored_label(
-                                    Color32::LIGHT_BLUE,
-                                    format!("💾 saving {}…", self.saves_active),
-                                );
-                            }
-                            if !self.save_status.is_empty() {
-                                let col = if self.save_status.starts_with("Save FAILED") {
-                                    Color32::LIGHT_RED
-                                } else if self.save_status.starts_with("Saved") {
-                                    Color32::LIGHT_GREEN
-                                } else {
-                                    Color32::LIGHT_BLUE // "Rendering …"
-                                };
-                                ui.colored_label(col, &self.save_status);
-                            }
-                        });
-                    });
                 });
             });
+    }
+
+    /// Thin status line drawn directly *below* the toolbar (its own panel), so
+    /// the render/save indicators no longer crowd or scroll off the menu.
+    fn show_status_bar(&mut self, ui: &mut egui::Ui) {
+        let rendering = !self.render_complete || self.displayed_gen < self.render_gen;
+        if !rendering && self.saves_active == 0 && self.save_status.is_empty() {
+            return; // nothing to show — don't reserve a strip
+        }
+        egui::Panel::top("save_status").show(ui, |ui| {
+            ui.horizontal(|ui| {
+                if rendering {
+                    ui.colored_label(Color32::YELLOW, "rendering...");
+                }
+                // Save feedback: active count in blue while rendering to disk,
+                // else the last outcome (green Saved / red FAILED).
+                if self.saves_active > 0 {
+                    ui.colored_label(
+                        Color32::LIGHT_BLUE,
+                        format!("💾 saving {}…", self.saves_active),
+                    );
+                }
+                if !self.save_status.is_empty() {
+                    let col = if self.save_status.starts_with("Save FAILED") {
+                        Color32::LIGHT_RED
+                    } else if self.save_status.starts_with("Saved") {
+                        Color32::LIGHT_GREEN
+                    } else {
+                        Color32::LIGHT_BLUE // "Rendering …"
+                    };
+                    ui.colored_label(col, &self.save_status);
+                }
+            });
+        });
     }
 
     fn show_fractal_panel(&mut self, ui: &mut egui::Ui) {
@@ -1092,8 +1105,10 @@ impl App {
     fn do_translate_scaled(&mut self, dx_sign: f64, dy_sign: f64, scale: f64) {
         let half_x = 2.0 / self.view.zoom * self.view.aspect;
         let half_y = 2.0 / self.view.zoom;
-        let step_x = half_x / 3.0 * scale;
-        let step_y = half_y / 3.0 * scale;
+        // /6.0 (was /3.0) halves the WASD pan step; modifier_scale (Alt=½, etc.)
+        // still multiplies on top, so WASD and WASD+Alt both halve proportionally.
+        let step_x = half_x / 6.0 * scale;
+        let step_y = half_y / 6.0 * scale;
         self.push_view();
         // DD-accurate center update: f64 step added to dd center preserves precision at deep zoom
         self.view.set_cx_dd(self.view.cx_dd() + Dd::from_f64(dx_sign * step_x));
@@ -1194,6 +1209,18 @@ impl App {
             if i.key_pressed(Key::S) { self.do_translate_scaled( 0.0,  1.0, scale); }
             if i.key_pressed(Key::A) { self.do_translate_scaled(-1.0,  0.0, scale); }
             if i.key_pressed(Key::D) { self.do_translate_scaled( 1.0,  0.0, scale); }
+
+            // B: toggle grayscale view (press again to restore the previous palette)
+            if i.key_pressed(Key::B) {
+                let gray = COLORMAPS.iter().position(|&c| c == "grayscale").unwrap_or(0);
+                if self.colormap_idx == gray {
+                    let restore = self.binary_prev_idx.take().unwrap_or(0);
+                    self.set_colormap(restore);
+                } else {
+                    self.binary_prev_idx = Some(self.colormap_idx);
+                    self.set_colormap(gray);
+                }
+            }
 
             // Arrow left/right: palette (blocked when field focused — conflicts with cursor movement)
             if i.key_pressed(Key::ArrowLeft) {
@@ -1455,6 +1482,7 @@ impl eframe::App for App {
         self.poll_render(&ctx);
         self.handle_keyboard(&ctx);
         self.show_toolbar(ui);
+        self.show_status_bar(ui);
         self.show_fractal_panel(ui);
         self.show_help_window(&ctx);
         self.show_save_window(&ctx);
@@ -1664,6 +1692,7 @@ fn main() -> anyhow::Result<()> {
         "NNFractals Viewer",
         options,
         Box::new(move |cc| {
+            nnfractals::gui_font::install(&cc.egui_ctx);
             Ok(Box::new(App::new(cc, nn_path, ipc_rx).expect("Failed to load genome")))
         }),
     ).map_err(|e| anyhow::anyhow!("{e}"))?;

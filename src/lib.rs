@@ -11,5 +11,7 @@ pub mod display;
 pub mod optimizer;
 pub mod aesthetic;
 pub mod formula_usage;
+#[cfg(any(feature = "viewer", feature = "browser", feature = "launcher"))]
+pub mod gui_font;
 #[cfg(feature = "wgpu-backend")]
 pub mod render_gpu;

@@ -24,6 +24,7 @@ fn color_at(name: &str, t: f64) -> (u8, u8, u8) {
         "sunset"  => sunset_color(t),
         "arctic"  => arctic_color(t),
         "ember"   => ember_color(t),
+        "grayscale" => grayscale_color(t),
         _ => { let c = pick_gradient(name).eval_continuous(t); (c.r, c.g, c.b) }
     }
 }
@@ -163,6 +164,12 @@ fn ember_color(t: f64) -> (u8, u8, u8) {
         (1.000, [255, 245, 180]),
     ];
     lerp_stops(STOPS, t)
+}
+
+// Smooth grayscale gradient: black (t=0) → white (t=1).
+fn grayscale_color(t: f64) -> (u8, u8, u8) {
+    let v = (t.clamp(0.0, 1.0) * 255.0).round() as u8;
+    (v, v, v)
 }
 
 fn lerp_stops(stops: &[(f64, [u8; 3])], t: f64) -> (u8, u8, u8) {

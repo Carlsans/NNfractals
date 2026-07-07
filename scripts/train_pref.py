@@ -81,10 +81,18 @@ def embed_paths(embed, paths, device, batch=32):
             out[pth] = vec
         buf_paths.clear(); buf_imgs.clear()
 
+    corpus = Path("train_corpus")
     for i, p in enumerate(uniq):
         png = png_for(p)
         if not png.exists():
-            continue
+            # Fall back to the persistent training corpus: the browser copies
+            # every rated image there (same hash-name) so comparisons stay
+            # usable after evolution/dedup deletes the originals.
+            alt = corpus / (Path(p).stem + ".png")
+            if alt.exists():
+                png = alt
+            else:
+                continue
         try:
             buf_imgs.append(Image.open(png).convert("RGB"))
             buf_paths.append(p)

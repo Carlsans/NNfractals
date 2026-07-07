@@ -238,6 +238,12 @@ struct BrowserPrefs {
     window_height: u32,
     #[serde(default)]
     autoreload: bool,
+    #[serde(default = "default_starred_dir")]
+    starred_dir: String,
+}
+
+fn default_starred_dir() -> String {
+    "Starred".into()
 }
 
 impl Default for BrowserPrefs {
@@ -257,6 +263,7 @@ impl Default for BrowserPrefs {
             window_width: 1400,
             window_height: 900,
             autoreload: false,
+            starred_dir: default_starred_dir(),
         }
     }
 }
@@ -310,6 +317,9 @@ fn discover_fractal_dirs(current: &Path) -> Vec<PathBuf> {
                 .collect()
         })
         .unwrap_or_default();
+    // Always offer the curated "Starred" folder ("see only starred"), even
+    // though it doesn't match the "fractals*" prefix.
+    dirs.push(PathBuf::from("Starred"));
     if !dirs.iter().any(|d| d == current) {
         dirs.push(current.to_path_buf());
     }
@@ -714,8 +724,9 @@ impl App {
             });
             if ui
                 .add_enabled(has_sel, egui::Button::new("★ Good"))
-                .on_hover_text("Mark selected as favorite/good (F). Writes favorite=true\n\
-                                 into the .nn — a sortable column and a training signal.")
+                .on_hover_text("Star selected (F): copies .nn + .png into the Starred\n\
+                                 folder (dedup can't delete them) and sets favorite=true.\n\
+                                 Browse the \"Starred\" folder to see only these.")
                 .clicked()
             {
                 self.toggle_favorite();
@@ -784,34 +795,80 @@ impl App {
             .collect()
     }
 
-    /// Toggle a persistent `favorite` flag on the selected fractals: writes
-    /// "favorite": true/false into each .nn (a sortable browser column, and a
-    /// positive-example signal we can later feed into the preference model).
+    /// Write the persistent `favorite` flag into one row's .nn (sortable column
+    /// + a positive-example training signal), reflecting it in the live cell.
+    fn write_favorite(&mut self, i: usize, value: bool) -> bool {
+        let p = self.rows[i].nn_path.clone();
+        let Ok(txt) = std::fs::read_to_string(&p) else { return false };
+        let Ok(mut v) = serde_json::from_str::<serde_json::Value>(&txt) else { return false };
+        if let Some(obj) = v.as_object_mut() {
+            obj.insert("favorite".into(), serde_json::Value::Bool(value));
+            let out = serde_json::to_string_pretty(&v).unwrap_or(txt);
+            if std::fs::write(&p, out).is_ok() {
+                self.rows[i].cells.insert("favorite".into(), Cell::Bool(value));
+                self.catalog.insert("favorite".into());
+                return true;
+            }
+        }
+        false
+    }
+
+    /// True if a copy of this fractal already lives in the Starred folder.
+    fn is_starred(&self, nn_path: &Path) -> bool {
+        nn_path
+            .file_name()
+            .map(|n| Path::new(&self.prefs.starred_dir).join(n).exists())
+            .unwrap_or(false)
+    }
+
+    /// Star (or un-star) rows: copies the .nn + sibling .png into the Starred
+    /// folder — a dedup-immune keeper the GA/dedup can't delete — and sets the
+    /// `favorite` flag. Un-starring removes the Starred copies and clears the flag.
+    fn set_starred(&mut self, idxs: &[usize], value: bool) {
+        let dir = PathBuf::from(&self.prefs.starred_dir);
+        if value {
+            let _ = std::fs::create_dir_all(&dir);
+        }
+        let mut n = 0;
+        for &i in idxs {
+            let nn = self.rows[i].nn_path.clone();
+            let png = nn.with_extension("png");
+            let Some(nn_name) = nn.file_name().map(|s| s.to_owned()) else { continue };
+            if value {
+                if std::fs::copy(&nn, dir.join(&nn_name)).is_err() {
+                    continue;
+                }
+                if png.exists() {
+                    if let Some(pn) = png.file_name() {
+                        let _ = std::fs::copy(&png, dir.join(pn));
+                    }
+                }
+            } else {
+                let _ = std::fs::remove_file(dir.join(&nn_name));
+                if let Some(pn) = png.file_name() {
+                    let _ = std::fs::remove_file(dir.join(pn));
+                }
+            }
+            self.write_favorite(i, value);
+            n += 1;
+        }
+        self.status = if value {
+            format!("starred {n} → {}", self.prefs.starred_dir)
+        } else {
+            format!("unstarred {n}")
+        };
+    }
+
+    /// Toolbar "★ Good" / F key: toggle the whole selection's starred state
+    /// (based on the first selected row).
     fn toggle_favorite(&mut self) {
         let idxs = self.selected_indices();
         if idxs.is_empty() {
-            self.status = "select fractal(s) first, then ★ / F to mark as good".into();
+            self.status = "select fractal(s) first, then ★ / F to star".into();
             return;
         }
-        // New state = opposite of the first selected row's current flag.
-        let currently = matches!(self.rows[idxs[0]].cells.get("favorite"), Some(Cell::Bool(true)));
-        let value = !currently;
-        let mut n = 0;
-        for i in idxs {
-            let p = self.rows[i].nn_path.clone();
-            let Ok(txt) = std::fs::read_to_string(&p) else { continue };
-            let Ok(mut v) = serde_json::from_str::<serde_json::Value>(&txt) else { continue };
-            if let Some(obj) = v.as_object_mut() {
-                obj.insert("favorite".into(), serde_json::Value::Bool(value));
-                let out = serde_json::to_string_pretty(&v).unwrap_or(txt);
-                if std::fs::write(&p, out).is_ok() {
-                    self.rows[i].cells.insert("favorite".into(), Cell::Bool(value));
-                    self.catalog.insert("favorite".into());
-                    n += 1;
-                }
-            }
-        }
-        self.status = format!("marked {n} fractal(s) favorite = {value}");
+        let value = !self.is_starred(&self.rows[idxs[0]].nn_path);
+        self.set_starred(&idxs, value);
     }
 
     // ── Pairwise rating mode ─────────────────────────────────────────────────────
@@ -830,11 +887,35 @@ impl App {
         self.pair = Some((a, b));
     }
 
+    /// Copy a fractal's .nn + .png into `train_corpus/` (same hash-name; skip if
+    /// already there) so the training set survives evolution/dedup deleting the
+    /// originals. Returns the corpus .nn path (what the central ratings reference).
+    fn persist_to_corpus(&self, src_nn: &Path, corpus: &Path) -> String {
+        let name = src_nn.file_name().unwrap_or_default().to_owned();
+        let dst_nn = corpus.join(&name);
+        if !dst_nn.exists() {
+            let _ = std::fs::copy(src_nn, &dst_nn);
+        }
+        let src_png = src_nn.with_extension("png");
+        let dst_png = dst_nn.with_extension("png");
+        if src_png.exists() && !dst_png.exists() {
+            let _ = std::fs::copy(&src_png, &dst_png);
+        }
+        dst_nn.to_string_lossy().into_owned()
+    }
+
     fn log_rating(&mut self, winner: usize, loser: usize) {
-        let wp = self.rows[winner].nn_path.to_string_lossy().into_owned();
-        let lp = self.rows[loser].nn_path.to_string_lossy().into_owned();
+        // Persist both compared images into a dedup-immune corpus and log the
+        // comparison — referencing the corpus copies — to one central store, so
+        // old ratings stay usable after the originals are deleted from the pool.
+        let corpus = PathBuf::from("train_corpus");
+        let _ = std::fs::create_dir_all(&corpus);
+        let wsrc = self.rows[winner].nn_path.clone();
+        let lsrc = self.rows[loser].nn_path.clone();
+        let wp = self.persist_to_corpus(&wsrc, &corpus);
+        let lp = self.persist_to_corpus(&lsrc, &corpus);
         let line = format!("{{\"winner\": {:?}, \"loser\": {:?}}}\n", wp, lp);
-        let path = self.folder.join("ratings.jsonl");
+        let path = corpus.join("ratings.jsonl");
         use std::io::Write;
         if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
             let _ = f.write_all(line.as_bytes());
@@ -911,6 +992,32 @@ impl App {
             }
         });
 
+        // Star either/both of the compared fractals to keep them (→ Starred folder).
+        let (l_starred, r_starred) =
+            (self.is_starred(&self.rows[li].nn_path), self.is_starred(&self.rows[ri].nn_path));
+        let mut star_left = false;
+        let mut star_right = false;
+        ui.columns(2, |cols| {
+            cols[0].vertical_centered(|ui| {
+                let lbl = if l_starred { "★ Starred" } else { "☆ Star this" };
+                if ui.button(lbl).clicked() {
+                    star_left = true;
+                }
+            });
+            cols[1].vertical_centered(|ui| {
+                let lbl = if r_starred { "★ Starred" } else { "☆ Star this" };
+                if ui.button(lbl).clicked() {
+                    star_right = true;
+                }
+            });
+        });
+        if star_left {
+            self.set_starred(&[li], !l_starred);
+        }
+        if star_right {
+            self.set_starred(&[ri], !r_starred);
+        }
+
         if pick_l {
             chosen = Some(true);
         } else if pick_r {
@@ -937,6 +1044,8 @@ impl App {
         let mut clicked_col: Option<String> = None;
         let mut clicked_row: Option<usize> = None;
         let mut open_row: Option<usize> = None;
+        let mut star_toggle: Option<usize> = None;
+        let starred_dir = PathBuf::from(&self.prefs.starred_dir);
 
         // ── Page Up/Down/Home/End scrolling ──
         let row_height = thumb + 6.0 + ui.spacing().item_spacing.y;
@@ -1007,8 +1116,23 @@ impl App {
                     row.set_selected(selection.contains(&r.nn_path));
 
                     row.col(|ui| {
-                        if matches!(r.cells.get("favorite"), Some(Cell::Bool(true))) {
-                            ui.colored_label(Color32::from_rgb(255, 205, 60), "★");
+                        // Clickable star: filled if a copy is in the Starred folder.
+                        let starred = r
+                            .nn_path
+                            .file_name()
+                            .map(|n| starred_dir.join(n).exists())
+                            .unwrap_or(false);
+                        let (glyph, col) = if starred {
+                            ("★", Color32::from_rgb(255, 205, 60))
+                        } else {
+                            ("☆", Color32::from_gray(140))
+                        };
+                        if ui
+                            .add(egui::Button::new(egui::RichText::new(glyph).color(col)).frame(false))
+                            .on_hover_text("Star / un-star (copy to the Starred folder)")
+                            .clicked()
+                        {
+                            star_toggle = Some(idx);
                         }
                         let tex = thumb_cache
                             .entry(r.png_path.clone())
@@ -1066,7 +1190,12 @@ impl App {
             self.anchor = Some(idx);
             self.open_path(&path);
         }
-        // F toggles the "favorite / good" flag on the selection.
+        // Per-row star click: toggle just that row's Starred copy.
+        if let Some(idx) = star_toggle {
+            let v = !self.is_starred(&self.rows[idx].nn_path);
+            self.set_starred(&[idx], v);
+        }
+        // F toggles the star on the selection.
         if fav_key {
             self.toggle_favorite();
         }
@@ -1310,7 +1439,10 @@ fn main() -> anyhow::Result<()> {
     eframe::run_native(
         "NNFractals Browser",
         options,
-        Box::new(move |_cc| Ok(Box::new(App::new(prefs, prefs_path, folder)))),
+        Box::new(move |cc| {
+            nnfractals::gui_font::install(&cc.egui_ctx);
+            Ok(Box::new(App::new(prefs, prefs_path, folder)))
+        }),
     )
     .map_err(|e| anyhow::anyhow!("{e}"))?;
     Ok(())

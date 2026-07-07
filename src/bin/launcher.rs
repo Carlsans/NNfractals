@@ -9,11 +9,14 @@
 //!
 //! Run:  cargo run --features launcher --bin nnfractals-launcher
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::{Duration, Instant};
 
 use clap::Parser;
 use eframe::egui::{self, Color32};
+use sysinfo::{ProcessesToUpdate, System};
 
 #[derive(Parser)]
 #[command(name = "nnfractals-launcher", about = "Front door to NNFractals")]
@@ -125,6 +128,51 @@ fn install_desktop_entry() -> Result<PathBuf, String> {
     Ok(path)
 }
 
+// ── Process / resource monitoring ────────────────────────────────────────────
+
+/// One running evolution or scorer process with its resource usage.
+struct ProcRow {
+    pid: u32,
+    kind: &'static str, // "evolution" | "scorer"
+    cpu: f32,           // percent (can exceed 100 across cores)
+    ram_mb: u64,        // resident set size
+    vram_mb: u64,       // GPU memory (from nvidia-smi), 0 if none/unknown
+}
+
+/// Per-PID GPU memory (MiB) from `nvidia-smi`. Empty if nvidia-smi is absent.
+fn gpu_mem_by_pid() -> HashMap<u32, u64> {
+    let mut m = HashMap::new();
+    if let Ok(out) = Command::new("nvidia-smi")
+        .args(["--query-compute-apps=pid,used_memory", "--format=csv,noheader,nounits"])
+        .output()
+    {
+        for line in String::from_utf8_lossy(&out.stdout).lines() {
+            let mut it = line.split(',');
+            if let (Some(p), Some(mem)) = (it.next(), it.next()) {
+                if let (Ok(pid), Ok(mb)) = (p.trim().parse::<u32>(), mem.trim().parse::<u64>()) {
+                    *m.entry(pid).or_insert(0) += mb;
+                }
+            }
+        }
+    }
+    m
+}
+
+/// One-line overall GPU utilisation + VRAM summary from `nvidia-smi`.
+fn gpu_overall() -> Option<String> {
+    let out = Command::new("nvidia-smi")
+        .args(["--query-gpu=utilization.gpu,memory.used,memory.total", "--format=csv,noheader,nounits"])
+        .output()
+        .ok()?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    let parts: Vec<String> = text.lines().next()?.split(',').map(|s| s.trim().to_string()).collect();
+    if parts.len() >= 3 {
+        Some(format!("GPU {}% · VRAM {}/{} MiB", parts[0], parts[1], parts[2]))
+    } else {
+        None
+    }
+}
+
 // ── Application ────────────────────────────────────────────────────────────────
 
 struct App {
@@ -132,6 +180,12 @@ struct App {
     instances: u32,
     viewer_path: String,
     status: String,
+
+    // Live process/resource monitor (refreshed ~every 60s and on demand).
+    sys: System,
+    procs: Vec<ProcRow>,
+    gpu_line: String,
+    last_refresh: Option<Instant>,
 }
 
 impl App {
@@ -141,7 +195,81 @@ impl App {
             instances: 2,
             viewer_path: String::new(),
             status: String::new(),
+            sys: System::new(),
+            procs: Vec::new(),
+            gpu_line: String::new(),
+            last_refresh: None,
         }
+    }
+
+    /// Scan the process table for evolution (`nnfractals`) + aesthetic scorer
+    /// (`aesthetic_scorer.py`) processes — regardless of who started them — and
+    /// read their CPU/RAM (sysinfo) + VRAM (nvidia-smi).
+    fn refresh_procs(&mut self) {
+        self.sys.refresh_processes(ProcessesToUpdate::All, true);
+        let vram = gpu_mem_by_pid();
+        let mut rows: Vec<ProcRow> = Vec::new();
+        for (pid, p) in self.sys.processes() {
+            let name = p.name().to_string_lossy();
+            let is_evo = name == "nnfractals";
+            let is_scorer = !is_evo
+                && p.cmd().iter().any(|a| a.to_string_lossy().contains("aesthetic_scorer.py"));
+            if !(is_evo || is_scorer) {
+                continue;
+            }
+            let id = pid.as_u32();
+            rows.push(ProcRow {
+                pid: id,
+                kind: if is_evo { "evolution" } else { "scorer" },
+                cpu: p.cpu_usage(),
+                ram_mb: p.memory() / 1024 / 1024,
+                vram_mb: vram.get(&id).copied().unwrap_or(0),
+            });
+        }
+        rows.sort_by(|a, b| (a.kind, a.pid).cmp(&(b.kind, b.pid)));
+        self.procs = rows;
+        self.gpu_line = gpu_overall().unwrap_or_else(|| "GPU: nvidia-smi unavailable".into());
+        self.last_refresh = Some(Instant::now());
+    }
+
+    /// Report how many evolution/scorer processes are running (works even for
+    /// instances started from the CLI, not just via run.sh).
+    fn status_evolution(&mut self) {
+        self.refresh_procs();
+        if self.procs.is_empty() {
+            self.status = "no evolution / scorer processes running".into();
+        } else {
+            let evo = self.procs.iter().filter(|r| r.kind == "evolution").count();
+            let sc = self.procs.iter().filter(|r| r.kind == "scorer").count();
+            self.status = format!("running: {evo} evolution + {sc} scorer process(es)");
+        }
+    }
+
+    /// Stop ALL evolution + scorer processes by PID (SIGTERM, then SIGKILL any
+    /// stragglers), independent of run.sh's .run_pids. Also runs `run.sh stop`
+    /// for its bookkeeping.
+    fn stop_evolution(&mut self) {
+        self.refresh_procs();
+        let pids: Vec<u32> = self.procs.iter().map(|r| r.pid).collect();
+        if pids.is_empty() {
+            self.status = "no evolution / scorer processes to stop".into();
+            return;
+        }
+        for pid in &pids {
+            let _ = Command::new("kill").arg(pid.to_string()).status();
+        }
+        std::thread::sleep(Duration::from_millis(1200));
+        self.refresh_procs();
+        for r in &self.procs {
+            let _ = Command::new("kill").arg("-9").arg(r.pid.to_string()).status();
+        }
+        // Best-effort run.sh cleanup (clears .run_pids, pkills scorer stragglers).
+        let script = self.root.join("run.sh");
+        if script.exists() {
+            let _ = Command::new("bash").arg(&script).arg("stop").current_dir(&self.root).output();
+        }
+        self.refresh_procs();
+        self.status = format!("stopped {} process(es)", pids.len());
     }
 
     /// Spawn a sibling binary with the project root as cwd.
@@ -178,20 +306,30 @@ impl App {
     /// Train the human-preference model from the browser's ratings, then score the
     /// galleries. Long-running, so it's spawned detached with output to train_pref.log.
     fn train_pref(&mut self) {
-        // Find ratings.jsonl (browser writes it into the browsed gallery folder).
-        let ratings = ["fractals_dag/ratings.jsonl", "fractals/ratings.jsonl", "ratings.jsonl"]
-            .iter()
-            .map(|r| self.root.join(r))
-            .find(|p| p.exists());
+        // Prefer the central accumulating corpus store (browser writes rated
+        // images + comparisons there so they survive dedup); fall back to legacy.
+        let ratings = [
+            "train_corpus/ratings.jsonl",
+            "fractals_dag/ratings.jsonl",
+            "fractals/ratings.jsonl",
+            "ratings.jsonl",
+        ]
+        .iter()
+        .map(|r| self.root.join(r))
+        .find(|p| p.exists());
         let Some(ratings) = ratings else {
             self.status = "no ratings.jsonl found — rate fractals in the browser (⚖ Rate) first".into();
             return;
         };
-        // Galleries that exist.
-        let dirs: Vec<&str> = ["fractals_dag", "fractals"]
-            .iter().copied().filter(|d| self.root.join(d).is_dir()).collect();
+        // Score the live pools + curated Starred (plus the corpus itself, which
+        // holds the rated images even after evolution deleted the originals).
+        let dirs: Vec<&str> = ["fractals_1", "fractals_2", "Starred", "train_corpus", "fractals_dag", "fractals"]
+            .iter()
+            .copied()
+            .filter(|d| self.root.join(d).is_dir())
+            .collect();
         if dirs.is_empty() {
-            self.status = "no gallery folders (fractals_dag / fractals) found".into();
+            self.status = "no gallery folders found to score".into();
             return;
         }
         let log_path = self.root.join("train_pref.log");
@@ -220,6 +358,14 @@ impl App {
 
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        // Refresh the resource monitor at most every 60s; schedule a wake-up so
+        // it keeps updating even when the window is idle.
+        let stale = self.last_refresh.map_or(true, |t| t.elapsed() >= Duration::from_secs(60));
+        if stale {
+            self.refresh_procs();
+        }
+        ui.ctx().request_repaint_after(Duration::from_secs(60));
+
         egui::CentralPanel::default().show(ui, |ui| {
             ui.add_space(6.0);
             ui.heading("NNFractals");
@@ -268,17 +414,31 @@ impl eframe::App for App {
                 ui.add(egui::DragValue::new(&mut self.instances).range(1..=32));
                 if ui
                     .button("▶  Start")
-                    .on_hover_text("Launch N background evolution instances (run.sh)")
+                    .on_hover_text("Launch N background evolution instances (run.sh).\n\
+                                     Each instance auto-starts its aesthetic scorer.")
                     .clicked()
                 {
                     let n = self.instances.to_string();
                     self.run_sh(&[n.as_str()]);
+                    // Give the instances a moment to fork their scorer children,
+                    // then reflect them in the monitor.
+                    std::thread::sleep(Duration::from_millis(600));
+                    self.refresh_procs();
                 }
-                if ui.button("■  Stop").clicked() {
-                    self.run_sh(&["stop"]);
+                if ui
+                    .button("■  Stop")
+                    .on_hover_text("Stop every evolution + scorer process (by PID scan),\n\
+                                     even ones started outside the launcher.")
+                    .clicked()
+                {
+                    self.stop_evolution();
                 }
-                if ui.button("↻  Status").clicked() {
-                    self.run_sh(&["status"]);
+                if ui
+                    .button("↻  Status")
+                    .on_hover_text("List running evolution + scorer processes.")
+                    .clicked()
+                {
+                    self.status_evolution();
                 }
             });
             ui.label(
@@ -297,6 +457,51 @@ impl eframe::App for App {
                     self.train_pref();
                 }
             });
+
+            ui.add_space(8.0);
+            ui.separator();
+
+            // ── Processes (live resource monitor) ──
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("Processes").strong());
+                if ui.button("↻  Refresh").on_hover_text("Auto-refreshes every 60s").clicked() {
+                    self.refresh_procs();
+                }
+                if let Some(t) = self.last_refresh {
+                    ui.label(
+                        egui::RichText::new(format!("updated {}s ago", t.elapsed().as_secs()))
+                            .weak(),
+                    );
+                }
+            });
+            ui.label(egui::RichText::new(&self.gpu_line).monospace());
+            if self.procs.is_empty() {
+                ui.label(egui::RichText::new("no evolution / scorer processes running").weak());
+            } else {
+                egui::Grid::new("proc_grid")
+                    .striped(true)
+                    .num_columns(5)
+                    .show(ui, |ui| {
+                        ui.strong("pid");
+                        ui.strong("kind");
+                        ui.strong("cpu%");
+                        ui.strong("ram");
+                        ui.strong("vram");
+                        ui.end_row();
+                        for r in &self.procs {
+                            ui.monospace(r.pid.to_string());
+                            ui.label(r.kind);
+                            ui.monospace(format!("{:.0}", r.cpu));
+                            ui.monospace(format!("{} MB", r.ram_mb));
+                            ui.monospace(if r.vram_mb > 0 {
+                                format!("{} MiB", r.vram_mb)
+                            } else {
+                                "—".into()
+                            });
+                            ui.end_row();
+                        }
+                    });
+            }
 
             ui.add_space(8.0);
             ui.separator();
@@ -345,7 +550,10 @@ fn main() -> anyhow::Result<()> {
     eframe::run_native(
         "NNFractals Launcher",
         options,
-        Box::new(|_cc| Ok(Box::new(App::new()))),
+        Box::new(|cc| {
+            nnfractals::gui_font::install(&cc.egui_ctx);
+            Ok(Box::new(App::new()))
+        }),
     )
     .map_err(|e| anyhow::anyhow!("{e}"))?;
     Ok(())

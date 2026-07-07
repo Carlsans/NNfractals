@@ -39,3 +39,6 @@ metric_loop_journal.md
 hour_timer.out
 verify.out
 .loop_cycle_start
+train_corpus/
+Starred/
+train_pref.log

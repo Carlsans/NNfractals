@@ -28,13 +28,14 @@ wgpu-backend = ["dep:wgpu", "dep:pollster"]
 ndarray-backend = []
 viewer = ["dep:eframe"]
 browser = ["dep:eframe", "dep:egui_extras"]
-launcher = ["dep:eframe"]
+launcher = ["dep:eframe", "dep:sysinfo"]
 
 [dependencies]
 wgpu       = { version = "29", optional = true }
 pollster   = { version = "0.3", optional = true }
 eframe      = { version = "0.35", optional = true }
 egui_extras = { version = "0.35", optional = true }
+sysinfo    = { version = "0.32", optional = true }
 image      = "0.25"
 colorous   = "1"
 clap       = { version = "4", features = ["derive"] }
