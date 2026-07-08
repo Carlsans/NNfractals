@@ -1,0 +1,19 @@
+# Python dependencies for NNfractals' scripts (aesthetic_scorer.py sidecar,
+# scripts/dedup.py, scripts/train_pref.py, scripts/score_extra.py,
+# scripts/colormap_chart.py).
+#
+# torch is deliberately NOT listed here: scripts/install-deps.sh installs it
+# separately first, picking the CPU-only or CUDA wheel based on whether a GPU
+# was detected (plain `pip install torch` always pulls the multi-GB
+# CUDA-bundled wheel, wasted bandwidth/disk on a GPU-less machine). Every
+# score path already falls back to CPU via torch.cuda.is_available(), so
+# either wheel works fine here.
+numpy
+scipy
+matplotlib
+open_clip_torch
+Pillow
+huggingface_hub
+transformers
+pyiqa
+aesthetic-predictor-v2-5

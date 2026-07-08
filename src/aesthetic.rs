@@ -57,16 +57,7 @@ impl AestheticScorer {
             return None;
         }
 
-        let python = ["python3", "python"]
-            .iter()
-            .find(|&&cmd| {
-                Command::new(cmd)
-                    .arg("--version")
-                    .output()
-                    .map(|o| o.status.success())
-                    .unwrap_or(false)
-            })
-            .copied()?;
+        let python = crate::python_bin(std::path::Path::new("."));
 
         // Route the sidecar's stderr (model-load logs / tracebacks) to a file so
         // failures are diagnosable — a silent /dev/null makes "no score" impossible

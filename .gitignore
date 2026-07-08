@@ -43,3 +43,4 @@ verify.out
 train_corpus/
 Starred/
 train_pref.log
+.venv/

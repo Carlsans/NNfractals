@@ -94,7 +94,7 @@ fn spawn_dedup_cleaner(config: &Config) {
                 None => (Stdio::null(), Stdio::null()),
             };
 
-            let mut cmd = Command::new("python3");
+            let mut cmd = Command::new(nnfractals::python_bin(std::path::Path::new(".")));
             cmd.arg("scripts/dedup.py")
                 .arg("--run")
                 .arg("--threshold").arg(format!("{threshold}"))

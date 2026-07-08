@@ -349,7 +349,7 @@ impl App {
             self.status = "a background job is already running".into();
             return;
         }
-        let mut cmd = Command::new("python3");
+        let mut cmd = Command::new(nnfractals::python_bin(&self.root));
         cmd.arg(script)
             .args(&args)
             .current_dir(&self.root)
