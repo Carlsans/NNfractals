@@ -19,6 +19,7 @@ use std::time::{Duration, Instant};
 
 use clap::Parser;
 use eframe::egui::{self, Color32};
+use serde::{Deserialize, Serialize};
 use sysinfo::{ProcessesToUpdate, System};
 
 #[derive(Parser)]
@@ -243,6 +244,40 @@ fn discover_pools(root: &Path) -> Vec<String> {
     dirs
 }
 
+// ── Preferences (small TOML round-trip, mirrors BrowserPrefs) ──────────────────
+
+const PREFS_FILE: &str = "launcher_prefs.toml";
+
+#[derive(Serialize, Deserialize)]
+struct LauncherPrefs {
+    #[serde(default = "default_dedup_threshold")]
+    dedup_threshold: f32,
+}
+
+fn default_dedup_threshold() -> f32 {
+    0.94
+}
+
+impl Default for LauncherPrefs {
+    fn default() -> Self {
+        Self { dedup_threshold: default_dedup_threshold() }
+    }
+}
+
+impl LauncherPrefs {
+    fn load(path: &Path) -> Self {
+        std::fs::read_to_string(path)
+            .ok()
+            .and_then(|s| toml::from_str(&s).ok())
+            .unwrap_or_default()
+    }
+    fn save(&self, path: &Path) {
+        if let Ok(s) = toml::to_string_pretty(self) {
+            let _ = std::fs::write(path, s);
+        }
+    }
+}
+
 // ── Application ────────────────────────────────────────────────────────────────
 
 struct App {
@@ -267,11 +302,14 @@ struct App {
     dedup_folder: String,
     dedup_threshold: f32,
     dedup_confirm: bool,
+    prefs_path: PathBuf,
 }
 
 impl App {
     fn new() -> Self {
         let root = project_root();
+        let prefs_path = root.join(PREFS_FILE);
+        let prefs = LauncherPrefs::load(&prefs_path);
         let known_folders = discover_pools(&root);
         let rescore_folder = known_folders
             .iter()
@@ -298,8 +336,9 @@ impl App {
                 .or_else(|| known_folders.first())
                 .cloned()
                 .unwrap_or_else(|| "fractals_1".into()),
-            dedup_threshold: 0.94,
+            dedup_threshold: prefs.dedup_threshold,
             dedup_confirm: false,
+            prefs_path,
         }
     }
 
@@ -585,6 +624,9 @@ impl App {
             let binary = sibling("nnfractals");
             args.push("--binary".to_string());
             args.push(binary.to_string_lossy().into_owned());
+            // Confirmed deletions are a deliberate choice of threshold —
+            // remember it as the default for next time.
+            LauncherPrefs { dedup_threshold: self.dedup_threshold }.save(&self.prefs_path);
         }
         let name = if dry_run {
             format!("Preview dedup {folder}")

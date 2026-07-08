@@ -27,6 +27,7 @@ diversity_loop_state.json
 colormap_loop_state.json
 .run_pids
 browser_prefs.toml
+launcher_prefs.toml
 breeding/
 pref_model.npz
 ratings.jsonl
