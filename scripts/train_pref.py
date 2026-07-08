@@ -163,7 +163,7 @@ def score_only(args, device):
         if k % 200 == 0 or k + 1 == n:
             progress("write", k + 1, n)
     log(f"wrote {args.field} to {written} .nn files")
-    print(f"DONE {written}", flush=True)
+    print(f"DONE wrote {args.field} to {written} file(s)", flush=True)
 
 
 def main():

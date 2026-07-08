@@ -209,7 +209,7 @@ fn parse_job_line(tx: &mpsc::Sender<JobMsg>, line: &str) {
         }
     }
     if let Some(rest) = line.strip_prefix("DONE ") {
-        let _ = tx.send(JobMsg::Done(format!("wrote pref_score to {rest} files")));
+        let _ = tx.send(JobMsg::Done(rest.to_string()));
         return;
     }
     let _ = tx.send(JobMsg::Log(line.to_string()));
@@ -253,6 +253,11 @@ struct App {
     job_rx: Option<mpsc::Receiver<JobMsg>>,
     known_folders: Vec<String>,
     rescore_folder: String,
+
+    // Dedup preview/run controls.
+    dedup_folder: String,
+    dedup_threshold: f32,
+    dedup_confirm: bool,
 }
 
 impl App {
@@ -276,20 +281,28 @@ impl App {
             last_refresh: None,
             job: JobState::default(),
             job_rx: None,
-            known_folders,
+            known_folders: known_folders.clone(),
             rescore_folder,
+            dedup_folder: known_folders
+                .iter()
+                .find(|d| d.as_str() == "fractals_1")
+                .or_else(|| known_folders.first())
+                .cloned()
+                .unwrap_or_else(|| "fractals_1".into()),
+            dedup_threshold: 0.94,
+            dedup_confirm: false,
         }
     }
 
-    /// Spawn `train_pref.py <args>` with piped output, streaming its progress
+    /// Spawn `python3 <script> <args>` with piped output, streaming its progress
     /// into `self.job` via background reader threads (non-blocking, live-tracked).
-    fn spawn_tracked(&mut self, name: String, args: Vec<String>) {
+    fn spawn_tracked(&mut self, name: String, script: &str, args: Vec<String>) {
         if self.job.running {
-            self.status = "a training/rescore job is already running".into();
+            self.status = "a background job is already running".into();
             return;
         }
         let mut cmd = Command::new("python3");
-        cmd.arg("scripts/train_pref.py")
+        cmd.arg(script)
             .args(&args)
             .current_dir(&self.root)
             .stdout(Stdio::piped())
@@ -377,6 +390,7 @@ impl App {
         }
         self.spawn_tracked(
             format!("Rescore {folder}"),
+            "scripts/train_pref.py",
             vec!["--score-only".into(), "--dirs".into(), folder],
         );
     }
@@ -518,7 +532,38 @@ impl App {
             "--dirs".to_string(),
         ];
         args.extend(dirs);
-        self.spawn_tracked("Train taste model".into(), args);
+        self.spawn_tracked("Train taste model".into(), "scripts/train_pref.py", args);
+    }
+
+    /// Preview (dry-run) or actually run the near-duplicate cleaner on the
+    /// chosen folder at the chosen threshold. Progress/result stream through
+    /// the same job-tracking machinery as train/rescore.
+    fn dedup(&mut self, dry_run: bool) {
+        let folder = self.dedup_folder.clone();
+        if !self.root.join(&folder).is_dir() {
+            self.status = format!("folder '{folder}' not found");
+            return;
+        }
+        let mut args = vec![
+            "--run".to_string(),
+            "--dir".to_string(),
+            folder.clone(),
+            "--threshold".to_string(),
+            format!("{:.3}", self.dedup_threshold),
+        ];
+        if dry_run {
+            args.push("--dry-run".to_string());
+        } else {
+            let binary = sibling("nnfractals");
+            args.push("--binary".to_string());
+            args.push(binary.to_string_lossy().into_owned());
+        }
+        let name = if dry_run {
+            format!("Preview dedup {folder}")
+        } else {
+            format!("Dedup {folder}")
+        };
+        self.spawn_tracked(name, "scripts/dedup.py", args);
     }
 }
 
@@ -654,13 +699,64 @@ impl eframe::App for App {
                 }
             });
 
-            // ── Live job progress (train / rescore) ──
+            ui.add_space(8.0);
+            ui.separator();
+
+            // ── Dedup: find/remove near-duplicate fractals in a folder ──
+            ui.label(egui::RichText::new("Dedup").strong());
+            ui.horizontal(|ui| {
+                ui.label("Folder:");
+                egui::ComboBox::from_id_salt("dedup_folder")
+                    .selected_text(&self.dedup_folder)
+                    .show_ui(ui, |ui| {
+                        for d in &self.known_folders {
+                            ui.selectable_value(&mut self.dedup_folder, d.clone(), d);
+                        }
+                    });
+                ui.label("Threshold:");
+                ui.add(
+                    egui::DragValue::new(&mut self.dedup_threshold)
+                        .range(0.80..=0.999)
+                        .speed(0.001)
+                        .fixed_decimals(3),
+                )
+                .on_hover_text("Cosine-similarity cutoff for \"same fractal\" (0–1).\n\
+                                 Higher = stricter (fewer matches). Default 0.94.");
+            });
+            ui.horizontal(|ui| {
+                if ui
+                    .add_enabled(!self.job.running, egui::Button::new("🔍  Preview (dry run)"))
+                    .on_hover_text("Scan the folder and report how many fractals would be\n\
+                                     deleted at this threshold. Deletes and re-renders nothing.")
+                    .clicked()
+                {
+                    self.dedup_confirm = false;
+                    self.dedup(true);
+                }
+                ui.checkbox(&mut self.dedup_confirm, "confirm");
+                if ui
+                    .add_enabled(
+                        !self.job.running && self.dedup_confirm,
+                        egui::Button::new("🗑  Delete duplicates"),
+                    )
+                    .on_hover_text("Actually delete the lower-scored fractal of each\n\
+                                     near-duplicate pair. Preview first — tick \"confirm\" to enable.")
+                    .clicked()
+                {
+                    self.dedup_confirm = false;
+                    self.dedup(false);
+                }
+            });
+
+            // ── Live job progress (train / rescore / dedup) ──
             if self.job.running || !self.job.message.is_empty() {
                 ui.add_space(4.0);
                 let phase_label = match self.job.phase.as_str() {
                     "load" => "loading model",
                     "embed" => "embedding images",
                     "write" => "writing pref_score",
+                    "round" => "scanning",
+                    "vectorize" => "comparing images",
                     "" => "starting…",
                     other => other,
                 };

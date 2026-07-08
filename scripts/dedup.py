@@ -9,14 +9,16 @@ comparison is consistent regardless of original save resolution.
 Standard image size for all .nn-paired images: 512×512.
 
 Usage:
-  python3 scripts/dedup.py --test        Show similar pairs (no deletion)
-  python3 scripts/dedup.py --rerender    Re-render all non-512×512 paired images
-  python3 scripts/dedup.py --run         Full dedup loop (deletes losers)
+  python3 scripts/dedup.py --test              Show similar pairs (no deletion)
+  python3 scripts/dedup.py --rerender          Re-render all non-512×512 paired images
+  python3 scripts/dedup.py --run               Full dedup loop (deletes losers)
+  python3 scripts/dedup.py --run --dry-run     Report how many would be deleted; no writes
 
 Options:
-  --threshold F   Similarity cutoff, 0–1 (default 0.94)
-  --dir PATH      Fractals directory (default ./fractals)
-  --binary PATH   Path to nnfractals binary (default ./target/release/nnfractals)
+  --threshold F     Similarity cutoff, 0–1 (default 0.94)
+  --dir PATH        Fractals directory (default ./fractals)
+  --binary PATH     Path to nnfractals binary (default ./target/release/nnfractals)
+  --max-compare N   Override the comparison window size (default 2000)
 """
 
 import argparse
@@ -29,6 +31,11 @@ from pathlib import Path
 import numpy as np
 from PIL import Image
 from scipy.fft import dct as sdct
+
+def progress(phase, done, total):
+    """Machine-readable progress line the launcher parses to drive its progress bar."""
+    print(f"PROGRESS {phase} {done} {total}", flush=True)
+
 
 TARGET_SIZE = (512, 512)
 
@@ -165,7 +172,7 @@ def rerender_all(pairs, binary):
 
 # ── Similarity index ──────────────────────────────────────────────────────────
 
-def build_vector_matrix(pairs):
+def build_vector_matrix(pairs, on_progress=None):
     """
     Load all paired images, compute feature_vec for each.
     Returns (stems list, matrix N×_FEAT_LEN) with L2-normalised rows.
@@ -174,7 +181,10 @@ def build_vector_matrix(pairs):
     n = len(pairs)
     for i, (stem, nn_path, png_path) in enumerate(pairs):
         if i % 200 == 0:
-            print(f"  Loading {i}/{n}…", end="\r", flush=True)
+            if on_progress:
+                on_progress(i, n)
+            else:
+                print(f"  Loading {i}/{n}…", end="\r", flush=True)
         try:
             img = Image.open(png_path)
             # Re-render on the fly if not the right size (cheap check)
@@ -184,7 +194,10 @@ def build_vector_matrix(pairs):
             stems.append(stem)
         except Exception as e:
             print(f"  [WARN] {png_path.name}: {e}")
-    print(f"  Loaded {len(stems)}/{n} images.          ")
+    if on_progress:
+        on_progress(n, n)
+    else:
+        print(f"  Loaded {len(stems)}/{n} images.          ")
     return stems, np.stack(vecs)   # (N, _FEAT_LEN)
 
 
@@ -209,13 +222,15 @@ def find_duplicate_pairs(stems, mat, threshold):
 
 # ── Dedup round ───────────────────────────────────────────────────────────────
 
-def dedup_round(pairs, threshold):
+def dedup_round(pairs, threshold, dry_run=False, on_progress=None):
     """
-    One pass: find near-duplicate pairs, delete the lower-beauty one.
-    Returns number of deletions (0 = done).
+    One pass: find near-duplicate pairs, delete (or, if dry_run, just report)
+    the lower-beauty one of each pair. Returns (deletions, examples) where
+    examples is up to 25 (sim, keep_stem, drop_stem, keep_score, drop_score)
+    tuples for reporting.
     """
     print(f"Building feature vectors for {len(pairs)} images…")
-    stems, mat = build_vector_matrix(pairs)
+    stems, mat = build_vector_matrix(pairs, on_progress=on_progress)
     stem_to_paths = {s: (nn, png) for s, nn, png in pairs}
 
     print(f"Comparing all pairs (threshold ≥ {threshold:.3f})…")
@@ -223,10 +238,12 @@ def dedup_round(pairs, threshold):
     print(f"Found {len(hits)} near-duplicate pair(s).")
 
     if not hits:
-        return 0
+        return 0, []
 
     deleted = set()
     deletions = 0
+    examples = []
+    tag = "WOULD DROP" if dry_run else "DROP"
     for sim, ia, ib in hits:
         sa, sb = stems[ia], stems[ib]
         if sa in deleted or sb in deleted:
@@ -243,18 +260,37 @@ def dedup_round(pairs, threshold):
             loser = sa
         print(
             f"  sim={sim:.4f}  KEEP {winner[:16]} ({winner_s:.4f})"
-            f"  DROP {loser[:16]} ({loser_s:.4f})"
+            f"  {tag} {loser[:16]} ({loser_s:.4f})"
         )
-        loser_nn.unlink(missing_ok=True)
-        loser_png.unlink(missing_ok=True)
+        if not dry_run:
+            loser_nn.unlink(missing_ok=True)
+            loser_png.unlink(missing_ok=True)
         deleted.add(loser)
         deletions += 1
+        if len(examples) < 25:
+            examples.append((sim, winner, loser, winner_s, loser_s))
 
-    return deletions
+    return deletions, examples
 
 
-def run_dedup_loop(fractals_dir, threshold, binary):
+def run_dedup_loop(fractals_dir, threshold, binary, dry_run=False, max_compare=None):
+    """
+    Run the dedup loop. In normal (destructive) mode this repeats rounds,
+    each re-scanning the recency-capped comparison window from disk, until
+    the pool is clean or MAX_ROUNDS is hit.
+
+    In dry-run mode nothing is written to disk (no re-render, no deletion),
+    so the comparison window never changes between rounds — a single pass
+    already resolves every pair above threshold within that window, so we
+    stop after round 1. Returns (total_deleted, considered, total_in_dir,
+    examples).
+    """
+    limit = max_compare or MAX_COMPARE_FILES
     round_num = 0
+    total_deleted = 0
+    total_considered = 0
+    total_in_dir = 0
+    all_examples = []
     while True:
         round_num += 1
         if round_num > MAX_ROUNDS:
@@ -263,25 +299,40 @@ def run_dedup_loop(fractals_dir, threshold, binary):
                   f"scheduled interval instead of extending this run indefinitely.")
             break
         print(f"\n── Round {round_num}/{MAX_ROUNDS} ──")
+        progress("round", round_num, MAX_ROUNDS)
         pairs = find_pairs(fractals_dir)
+        total_in_dir = len(pairs)
         if not pairs:
             print("No paired images left.")
             break
-        # Re-render any non-512×512 images before comparing (cheap size check,
-        # scoped to the whole archive — correctness matters here, not speed).
-        rerender_all(pairs, binary)
+        if not dry_run:
+            # Re-render any non-512×512 images before comparing (cheap size
+            # check, scoped to the whole archive — correctness matters here,
+            # not speed). Skipped in dry-run: previewing must not touch disk.
+            rerender_all(pairs, binary)
         # The O(n^2) comparison itself is capped to the most-recently-modified
         # files (see find_recent_pairs) so runtime stays bounded as the total
         # archive keeps growing across the project's life.
-        recent = find_recent_pairs(fractals_dir)
+        recent = find_recent_pairs(fractals_dir, limit)
+        total_considered = len(recent)
         if len(recent) < len(pairs):
             print(f"Comparing the {len(recent)} most recent of {len(pairs)} total "
                   f"paired images (capped to bound O(n²) runtime).")
-        n = dedup_round(recent, threshold)
+        n, examples = dedup_round(
+            recent, threshold, dry_run=dry_run,
+            on_progress=lambda done, tot: progress("vectorize", done, tot),
+        )
+        total_deleted += n
+        all_examples.extend(examples)
         if n == 0:
             print(f"Pool is clean (threshold {threshold:.3f}). Done.")
             break
-        print(f"Deleted {n} lookalike(s) this round.")
+        print(f"{'Would delete' if dry_run else 'Deleted'} {n} lookalike(s) this round.")
+        if dry_run:
+            # Disk is untouched, so the recency window is identical next
+            # round — a second pass would just re-derive the same result.
+            break
+    return total_deleted, total_considered, total_in_dir, all_examples
 
 
 # ── Test mode ─────────────────────────────────────────────────────────────────
@@ -350,13 +401,18 @@ def main():
     ap.add_argument("--rerender",   action="store_true",
                     help="Re-render non-512×512 paired images to 512×512")
     ap.add_argument("--run",        action="store_true",
-                    help="Run full dedup loop (destructive)")
+                    help="Run full dedup loop (destructive, unless --dry-run)")
+    ap.add_argument("--dry-run",    action="store_true",
+                    help="With --run: don't delete or re-render anything, just "
+                         "report how many fractals would be deleted")
     ap.add_argument("--threshold",  type=float, default=0.94,
                     help="Similarity cutoff 0–1 (default 0.94)")
     ap.add_argument("--dir",        default="./fractals",
                     help="Fractals directory (default ./fractals)")
     ap.add_argument("--binary",     default="./target/release/nnfractals",
                     help="Path to nnfractals binary")
+    ap.add_argument("--max-compare", type=int, default=None,
+                    help=f"Override the comparison window size (default {MAX_COMPARE_FILES})")
     args = ap.parse_args()
 
     if not any([args.test, args.rerender, args.run]):
@@ -384,11 +440,27 @@ def main():
         run_test(pairs)
 
     if args.run:
-        if not binary.exists():
+        if not args.dry_run and not binary.exists():
             print(f"Binary not found: {binary}  (run: cargo build --release)")
             sys.exit(1)
-        print(f"Starting dedup loop (threshold ≥ {args.threshold:.3f})…")
-        run_dedup_loop(fractals_dir, args.threshold, binary)
+        mode = "Previewing (dry-run)" if args.dry_run else "Starting"
+        print(f"{mode} dedup loop (threshold ≥ {args.threshold:.3f})…")
+        deleted, considered, total_in_dir, examples = run_dedup_loop(
+            fractals_dir, args.threshold, binary,
+            dry_run=args.dry_run, max_compare=args.max_compare,
+        )
+        if args.dry_run:
+            scope = (
+                f"{considered} compared" if considered == total_in_dir
+                else f"{considered} of {total_in_dir} compared (most-recent window)"
+            )
+            print(f"\n{deleted} of {considered} fractal(s) would be deleted "
+                  f"({scope}, threshold {args.threshold:.3f}).")
+            print(f"DONE would delete {deleted} of {considered} fractal(s) "
+                  f"— {scope}, threshold {args.threshold:.3f}")
+        else:
+            print(f"DONE deleted {deleted} fractal(s) ({considered} compared, "
+                  f"threshold {args.threshold:.3f})")
 
 
 if __name__ == "__main__":
