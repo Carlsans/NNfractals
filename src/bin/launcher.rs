@@ -182,19 +182,28 @@ fn gpu_overall() -> Option<String> {
 enum JobMsg {
     Progress { phase: String, done: usize, total: usize },
     Log(String),
-    Done(String),
-    Failed(String),
+    /// The script's own authoritative "DONE ..." summary line — wins over
+    /// any later terminal message once received.
+    Summary(String),
+    /// Process termination, reported by the waiter thread. On success this
+    /// is only a fallback message (used if the script never printed its own
+    /// summary); on failure it always overrides, since a crash matters more
+    /// than whatever was last logged.
+    Exited { success: bool, detail: String },
 }
 
-/// Live state of the currently-running (or last) train/rescore job.
+/// Live state of the currently-running (or last) train/rescore/dedup job.
 #[derive(Default)]
 struct JobState {
     running: bool,
     name: String,   // e.g. "Train taste model" / "Rescore fractals_1"
-    phase: String,  // "load" | "embed" | "write"
+    phase: String,  // "load" | "embed" | "write" | "round" | "vectorize"
     done: usize,
     total: usize,
     message: String,
+    /// Set once the script's own "DONE ..." summary has been received, so
+    /// the process-exit fallback message doesn't clobber it (see JobMsg::Exited).
+    got_summary: bool,
 }
 
 /// Parse one stdout/stderr line from the python job and forward it to the UI.
@@ -209,7 +218,7 @@ fn parse_job_line(tx: &mpsc::Sender<JobMsg>, line: &str) {
         }
     }
     if let Some(rest) = line.strip_prefix("DONE ") {
-        let _ = tx.send(JobMsg::Done(rest.to_string()));
+        let _ = tx.send(JobMsg::Summary(rest.to_string()));
         return;
     }
     let _ = tx.send(JobMsg::Log(line.to_string()));
@@ -332,12 +341,14 @@ impl App {
                 }
             });
         }
-        // Waiter thread: emit a terminal Done/Failed when the process exits.
+        // Waiter thread: emit a terminal Exited when the process ends. On
+        // success this is only a fallback (see JobMsg::Exited) so it doesn't
+        // race with — and clobber — the script's own DONE summary line.
         thread::spawn(move || {
             let msg = match child.wait() {
-                Ok(s) if s.success() => JobMsg::Done("completed".into()),
-                Ok(s) => JobMsg::Failed(format!("python exited with {s}")),
-                Err(e) => JobMsg::Failed(format!("wait failed: {e}")),
+                Ok(s) if s.success() => JobMsg::Exited { success: true, detail: "completed".into() },
+                Ok(s) => JobMsg::Exited { success: false, detail: format!("python exited with {s}") },
+                Err(e) => JobMsg::Exited { success: false, detail: format!("wait failed: {e}") },
             };
             let _ = tx.send(msg);
         });
@@ -361,14 +372,31 @@ impl App {
                     self.job.done = done;
                     self.job.total = total;
                 }
-                JobMsg::Log(l) => self.job.message = l,
-                JobMsg::Done(m) => {
+                JobMsg::Log(l) => {
+                    // Routine progress chatter — don't let it clobber the
+                    // script's own final summary once one has arrived.
+                    if !self.job.got_summary {
+                        self.job.message = l;
+                    }
+                }
+                JobMsg::Summary(m) => {
                     self.job.running = false;
+                    self.job.got_summary = true;
                     self.job.message = m;
                 }
-                JobMsg::Failed(e) => {
+                JobMsg::Exited { success, detail } => {
                     self.job.running = false;
-                    self.job.message = format!("FAILED: {e}");
+                    if success {
+                        // Fallback only: keep the script's own summary if we
+                        // already have one (this message races it and is
+                        // usually a beat behind, so it must never win).
+                        if !self.job.got_summary {
+                            self.job.message = detail;
+                        }
+                    } else {
+                        self.job.message = format!("FAILED: {detail}");
+                        self.job.got_summary = true;
+                    }
                 }
             }
         }
