@@ -981,16 +981,29 @@ impl App {
 
     /// Thin status line drawn directly *below* the toolbar (its own panel), so
     /// the render/save indicators no longer crowd or scroll off the menu.
+    ///
+    /// Always shown at a fixed height (blank when idle) rather than
+    /// conditionally reserving/releasing its strip: this panel's own content
+    /// depends on render state (`rendering`), so letting its height vary was
+    /// a feedback loop — hiding it grew the fractal panel below, which was
+    /// detected as a resize and triggered a fresh render, which re-showed the
+    /// bar, shrinking the panel again, triggering another "resize"-render,
+    /// forever (very visible on the CPU renderer, where each cycle takes
+    /// seconds instead of milliseconds).
     fn show_status_bar(&mut self, ui: &mut egui::Ui) {
         let rendering = !self.render_complete || self.displayed_gen < self.render_gen;
-        if !rendering && self.saves_active == 0 && self.save_status.is_empty() {
-            return; // nothing to show — don't reserve a strip
-        }
         egui::Panel::top("save_status").show(ui, |ui| {
             ui.horizontal(|ui| {
-                if rendering {
-                    ui.colored_label(Color32::YELLOW, "rendering...");
-                }
+                // Always draw this label (transparent when idle) rather than
+                // omitting it: a min-height on the row isn't enough to pin
+                // its height exactly, since a *populated* text label is a
+                // couple pixels taller than a bare minimum — leaving a small
+                // per-frame height delta between "rendering"/"idle" that was
+                // enough to keep re-triggering the resize/render loop above.
+                // Same widget in every state, just invisible, guarantees an
+                // identical row height regardless of render state.
+                let color = if rendering { Color32::YELLOW } else { Color32::TRANSPARENT };
+                ui.colored_label(color, "rendering...");
                 // Save feedback: active count in blue while rendering to disk,
                 // else the last outcome (green Saved / red FAILED).
                 if self.saves_active > 0 {
