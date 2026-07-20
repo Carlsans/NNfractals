@@ -11,14 +11,18 @@ Standard image size for all .nn-paired images: 512×512.
 Usage:
   python3 scripts/dedup.py --test              Show similar pairs (no deletion)
   python3 scripts/dedup.py --rerender          Re-render all non-512×512 paired images
-  python3 scripts/dedup.py --run               Full dedup loop (deletes losers)
+  python3 scripts/dedup.py --run               Full dedup pass (deletes losers)
   python3 scripts/dedup.py --run --dry-run     Report how many would be deleted; no writes
 
 Options:
   --threshold F     Similarity cutoff, 0–1 (default 0.94)
   --dir PATH        Fractals directory (default ./fractals)
   --binary PATH     Path to nnfractals binary (default ./target/release/nnfractals)
-  --max-compare N   Override the comparison window size (default 2000)
+  --max-compare N   Cap comparison to the N most-recently-modified files
+                     (default: no cap, the full archive is compared — see
+                     the vector-cache note below). Only useful for bounding
+                     a manual/one-off run; the periodic 2h job never passes
+                     this.
 """
 
 import argparse
@@ -86,33 +90,12 @@ def find_pairs(fractals_dir):
     return pairs
 
 
-# Comparison is O(n^2) (full pairwise cosine-similarity matrix). As an archive
-# grows past several thousand files this becomes minutes-to-hours (observed:
-# 17k-file archive pinned a CPU core for 2h12m+, longer than the periodic 2h
-# interval that triggers this script, so runs started overlapping back-to-back).
-# Cap the COMPARISON scope to the most-recently-modified files each round —
-# recent saves are also the ones most likely to be near-duplicates of each
-# other (the population explores similar regions in bursts), and this bounds
-# runtime to a fixed size regardless of how large the total archive grows.
-#
-# 4000 turned out to still be insufficient under a high-duplicate-density burst
-# (a population that converges on one fecund-but-repetitive formula family can
-# flood the recent window with near-duplicate pairs, needing MANY dedup_round()
-# passes to fully clean — observed a single invocation running ~2h45m+, right
-# back to the severity this cap was meant to fix). Lowered to 2000 (~4x cheaper
-# per round) and — more importantly — the round count itself is now hard-capped
-# below, since no fixed per-round file limit can bound the TOTAL runtime if an
-# unbounded number of rounds are needed.
-MAX_COMPARE_FILES = 2000
-# Hard cap on rounds per invocation: dedup is an ongoing, resumable hygiene
-# task, not a one-shot operation that must reach "fully clean" every time it
-# runs — better to do a bounded amount of cleanup now and pick up the rest at
-# the next scheduled interval than to let one invocation run indefinitely.
-MAX_ROUNDS = 15
+def find_recent_pairs(fractals_dir, limit):
+    """Like find_pairs, but capped to the `limit` most-recently-modified pairs.
 
-
-def find_recent_pairs(fractals_dir, limit=MAX_COMPARE_FILES):
-    """Like find_pairs, but capped to the `limit` most-recently-modified pairs."""
+    Only used when the caller explicitly passes --max-compare (a manual/
+    one-off escape hatch) — the periodic dedup job compares the whole
+    archive via the vector cache instead (see build_vectors_cached)."""
     pairs = find_pairs(fractals_dir)
     if len(pairs) <= limit:
         return pairs
@@ -170,226 +153,392 @@ def rerender_all(pairs, binary):
     print(f"\nDone. {len(todo)} images updated.")
 
 
-# ── Similarity index ──────────────────────────────────────────────────────────
+# ── Vector cache ─────────────────────────────────────────────────────────────
+#
+# Comparison used to be capped to the MAX_COMPARE_FILES most-recently-modified
+# files each round, to bound the O(n^2) cost of an archive that had grown
+# past a few thousand files (observed: a 17k-file archive pinned a CPU core
+# for 2h12m+ in the old full-rescan design). That cap fixed the runtime
+# problem but broke correctness: once an archive is larger than the cap
+# (which all of this project's pools now are, at 20k-40k+ files each), any
+# file more than `limit` saves old permanently exits the comparison window
+# and is never compared to anything again — near-duplicates saved hours
+# apart, on either side of that boundary, are simply never checked against
+# each other. That's the "duplicates never get cleaned up" bug.
+#
+# Fix: cache each file's feature vector (keyed by stem + mtime, invalidated
+# automatically if the file changes, e.g. a re-render) in a sidecar file
+# next to the pool. A given run then only has to *compute* vectors for
+# files that are new or changed since the last run — usually a small
+# fraction of the archive — and compares those against the FULL cached
+# corpus (chunked to bound peak memory), not a fixed-size recent window.
+# Every pair that existed as of a given run is fully resolved by that run,
+# so nothing ever ages out; each subsequent run only has new work to do.
 
-def build_vector_matrix(pairs, on_progress=None):
+CACHE_NAME = ".dedup_cache.npz"
+# Column-chunk size for new-vs-corpus similarity search: bounds peak memory
+# to roughly (batch_size * CHUNK * 4) bytes regardless of total archive size.
+CHUNK = 4000
+
+
+def _cache_path(fractals_dir):
+    return Path(fractals_dir) / CACHE_NAME
+
+
+def _load_cache(fractals_dir):
+    """Return dict stem -> (mtime, vec, resolved), or {} if no/corrupt cache.
+
+    `resolved` is True once a stem has been through a *completed, non-dry-run*
+    comparison pass — see build_vectors_cached/dedup_round. It's distinct
+    from "vector is cached": --test and --run --dry-run both happily cache
+    vectors (expensive to recompute, harmless to reuse) without ever setting
+    resolved=True, since neither of them actually deletes anything — if they
+    did mark stems resolved, a real --run afterward would see "0 new files"
+    and skip comparing them entirely, silently leaving known duplicates on
+    disk forever.
     """
-    Load all paired images, compute feature_vec for each.
-    Returns (stems list, matrix N×_FEAT_LEN) with L2-normalised rows.
+    path = _cache_path(fractals_dir)
+    if not path.exists():
+        return {}
+    try:
+        with np.load(path) as z:
+            stems, mtimes, vecs, resolved = z["stems"], z["mtimes"], z["vecs"], z["resolved"]
+        return {s: (float(m), v, bool(r)) for s, m, v, r in zip(stems, mtimes, vecs, resolved)}
+    except Exception as e:
+        print(f"  [WARN] dedup vector cache unreadable ({e}); rebuilding.")
+        return {}
+
+
+def _save_cache(fractals_dir, cache):
+    if not cache:
+        return
+    stems = np.array(list(cache.keys()))
+    mtimes = np.array([m for m, _, _ in cache.values()], dtype=np.float64)
+    vecs = np.stack([v for _, v, _ in cache.values()]).astype(np.float32)
+    resolved = np.array([r for _, _, r in cache.values()], dtype=bool)
+    path = _cache_path(fractals_dir)
+    tmp = path.with_name(path.name + ".tmp")
+    # np.savez auto-appends ".npz" to a path-like target that doesn't already
+    # end in it (which would silently write to "<tmp>.npz" instead of <tmp>)
+    # — pass an open file object instead so it writes exactly where told.
+    with open(tmp, "wb") as f:
+        np.savez(f, stems=stems, mtimes=mtimes, vecs=vecs, resolved=resolved)
+    tmp.replace(path)  # atomic swap, avoids a half-written cache on crash
+
+
+def build_vectors_cached(pairs, fractals_dir, on_progress=None):
     """
-    stems, vecs = [], []
-    n = len(pairs)
-    for i, (stem, nn_path, png_path) in enumerate(pairs):
+    Load cached feature vectors, compute only for new/changed files (absent
+    from the cache, or whose png mtime moved — e.g. a fresh render), persist
+    the vector-cache update, and return everything needed for comparison.
+
+    Returns (stems, mat, unresolved_indices, cache): stems/mat cover the
+    *entire* current archive (aligned by row); unresolved_indices are the
+    positions never yet confirmed resolved (freshly computed this call, or
+    left unresolved by a previous dry-run/--test call) — the only ones that
+    can newly cross the similarity threshold against the rest of the corpus,
+    since every resolved pair was already mutually checked by a previous
+    *real* run. `cache` is returned so the caller can flip resolved=True
+    after a successful non-dry-run comparison pass and persist that.
+    """
+    cache = _load_cache(fractals_dir)
+    current_stems = {s for s, _, _ in pairs}
+    cache = {s: v for s, v in cache.items() if s in current_stems}  # drop deleted files
+
+    to_compute = []
+    for stem, nn_path, png_path in pairs:
+        mtime = png_path.stat().st_mtime
+        cached = cache.get(stem)
+        if cached is None or cached[0] != mtime:
+            to_compute.append((stem, png_path, mtime))
+
+    n_new = len(to_compute)
+    if n_new:
+        print(f"Computing feature vectors for {n_new} new/changed image(s) "
+              f"({len(pairs) - n_new} reused from cache)…")
+    for i, (stem, png_path, mtime) in enumerate(to_compute):
         if i % 200 == 0:
             if on_progress:
-                on_progress(i, n)
+                on_progress(i, n_new)
             else:
-                print(f"  Loading {i}/{n}…", end="\r", flush=True)
+                print(f"  Vectorizing {i}/{n_new}…", end="\r", flush=True)
         try:
             img = Image.open(png_path)
-            # Re-render on the fly if not the right size (cheap check)
             if img.size != TARGET_SIZE:
                 img = img.resize(TARGET_SIZE, Image.LANCZOS)
-            vecs.append(feature_vec(img))
-            stems.append(stem)
+            cache[stem] = (mtime, feature_vec(img), False)  # unresolved until a real run confirms it
         except Exception as e:
             print(f"  [WARN] {png_path.name}: {e}")
     if on_progress:
-        on_progress(n, n)
-    else:
-        print(f"  Loaded {len(stems)}/{n} images.          ")
-    return stems, np.stack(vecs)   # (N, _FEAT_LEN)
+        on_progress(n_new, n_new)
+    elif n_new:
+        print(f"  Vectorized {n_new}/{n_new}.          ")
+
+    _save_cache(fractals_dir, cache)
+
+    stems = [s for s, _, _ in pairs if s in cache]
+    mat = np.stack([cache[s][1] for s in stems]).astype(np.float32)
+    unresolved_indices = [i for i, s in enumerate(stems) if not cache[s][2]]
+    return stems, mat, unresolved_indices, cache
 
 
-def find_duplicate_pairs(stems, mat, threshold):
+def resolve_duplicates(mat, unresolved_indices, scores, threshold, chunk=CHUNK):
     """
-    O(n²) cosine similarity via matrix multiply.
-    Returns list of (sim, idx_a, idx_b) sorted by sim descending.
-    mat rows are already L2-normalised → dot product = cosine similarity.
+    Resolve every unresolved file against the *entire* corpus and decide
+    winner/loser on the fly, instead of collecting every matching edge into
+    a list/dict first. That collect-then-sort approach is what actually
+    caused a real OOM kill in production: one archive turned out to have a
+    single file with 13,000+ near-duplicates (a population that converged
+    hard on one repetitive formula family), which alone produces tens of
+    millions of edges — a plain Python dict of that size runs into tens of
+    GB of overhead. Here peak memory is bounded to O(chunk * corpus size)
+    no matter how dense the duplicate cluster is, because a decision is
+    made and the block discarded before moving to the next one.
+
+    Processes unresolved files in beauty-score descending order: by the
+    time a file is reached, every higher-scored *unresolved* file has
+    already had a chance to kill it (symmetric similarity), so a survivor
+    only needs its remaining live neighbors killed, never re-litigated.
+    Already-resolved (previously kept) files stay eligible to be killed
+    too — a new, higher-scoring duplicate arriving in a later run must
+    still beat out an old resolved one (this is the fix for the original
+    "duplicates saved hours apart never get compared" bug: nothing is ever
+    permanently exempt from being challenged by a better duplicate).
+
+    Returns {loser_idx: (winner_idx, sim)}.
     """
-    sim_mat = (mat @ mat.T).astype(np.float32)
-    upper = np.triu_indices(len(stems), k=1)
-    sims  = sim_mat[upper]
-    mask  = sims >= threshold
-    pairs = list(zip(
-        sims[mask].tolist(),
-        upper[0][mask].tolist(),
-        upper[1][mask].tolist(),
-    ))
-    pairs.sort(key=lambda x: -x[0])
-    return pairs
+    if not unresolved_indices:
+        return {}
+    n = len(mat)
+    alive = np.ones(n, dtype=bool)
+    order = sorted(unresolved_indices, key=lambda i: -scores[i])
+    verdict = {}
+
+    for start in range(0, len(order), chunk):
+        batch_idx = np.array(order[start:start + chunk])
+        live_mask = alive[batch_idx]
+        if not live_mask.any():
+            continue
+        active = batch_idx[live_mask]
+        sims = mat[active] @ mat.T  # (len(active), n) — bounded, discarded after this batch
+        for row, i in enumerate(active.tolist()):
+            if not alive[i]:
+                continue  # killed by an earlier row within this same batch
+            neighbor_mask = (sims[row] >= threshold) & alive
+            neighbor_mask[i] = False
+            for j in np.nonzero(neighbor_mask)[0].tolist():
+                if not alive[j]:
+                    continue
+                sim = float(sims[row, j])
+                if scores[i] >= scores[j]:
+                    alive[j] = False
+                    verdict[j] = (i, sim)
+                else:
+                    alive[i] = False
+                    verdict[i] = (j, sim)
+                    break
+    return verdict
 
 
-# ── Dedup round ───────────────────────────────────────────────────────────────
+_SCAN_CAP = 2000  # candidate pool cap per bucket — plenty for a top-5/mid-5 preview
 
-def dedup_round(pairs, threshold, dry_run=False, on_progress=None):
+
+def _scan_block(sims2d, row_offset, col_offset, top, mid):
+    """Collect (sim, gi, gj) from a 2D similarity block into `top`
+    (sim >= 0.95) and `mid` (0.70 <= sim < 0.90) — np.nonzero on the 2D
+    block gives coordinate arrays directly, so this only ever iterates
+    actual matches, never every cell. Stops touching a bucket once it's
+    past _SCAN_CAP: a densely-duplicated archive can have a single file
+    with 10k+ near-duplicates, so an uncapped accumulation here has the
+    same runaway-memory failure mode as the old edge-collecting dedup
+    path did (see resolve_duplicates's docstring) — this is only a
+    preview, a bounded candidate pool is all --test needs."""
+    if len(top) < _SCAN_CAP:
+        hi_r, hi_c = np.nonzero(sims2d >= 0.95)
+        for r, c in zip(hi_r.tolist(), hi_c.tolist()):
+            top.append((float(sims2d[r, c]), row_offset + r, col_offset + c))
+            if len(top) >= _SCAN_CAP:
+                break
+    if len(mid) < _SCAN_CAP:
+        mi_r, mi_c = np.nonzero((sims2d >= 0.70) & (sims2d < 0.90))
+        for r, c in zip(mi_r.tolist(), mi_c.tolist()):
+            mid.append((float(sims2d[r, c]), row_offset + r, col_offset + c))
+            if len(mid) >= _SCAN_CAP:
+                break
+
+
+def scan_similarity_spectrum(mat, chunk=CHUNK):
     """
-    One pass: find near-duplicate pairs, delete (or, if dry_run, just report)
-    the lower-beauty one of each pair. Returns (deletions, examples) where
-    examples is up to 25 (sim, keep_stem, drop_stem, keep_score, drop_score)
-    tuples for reporting.
+    Full self-comparison across the whole corpus (needed for --test's "show
+    me the most similar pairs" query — there's no way around O(n^2) work for
+    a true global ranking), chunked over the column axis so a dense N×N
+    matrix (multiple GB at 40k+ files) is never materialized, and every
+    block comparison stays a vectorized numpy op rather than a per-pair
+    Python loop (which at 40k files would be ~800M iterations — far too
+    slow). Returns (top_candidates, mid_candidates) as (sim, i, j) lists,
+    sorted by similarity descending.
     """
-    print(f"Building feature vectors for {len(pairs)} images…")
-    stems, mat = build_vector_matrix(pairs, on_progress=on_progress)
+    n = len(mat)
+    top, mid = [], []
+    for start in range(0, n, chunk):
+        end = min(start + chunk, n)
+        block = mat[start:end]
+        if start > 0:
+            # Rows before this chunk vs. this chunk's columns: every row
+            # index here is already < every column index, no mask needed.
+            _scan_block(mat[:start] @ block.T, 0, start, top, mid)
+        # Within-chunk pairs need the i<j restriction — mask self + the
+        # lower triangle out of range before scanning.
+        diag = block @ block.T
+        diag[np.tril_indices(end - start)] = -1.0
+        _scan_block(diag, start, start, top, mid)
+    top.sort(key=lambda x: -x[0])
+    mid.sort(key=lambda x: -x[0])
+    return top, mid
+
+
+# ── Dedup pass ────────────────────────────────────────────────────────────────
+
+def dedup_round(pairs, threshold, fractals_dir, dry_run=False, on_progress=None):
+    """
+    One full pass over the archive: reuse cached vectors for unchanged
+    files, compute vectors only for new/changed ones, and compare
+    still-unresolved files against the full corpus. Deletes (or, if
+    dry_run, reports) the lower-beauty file of each matched pair.
+
+    Only a completed non-dry-run pass marks the corpus "resolved" in the
+    cache — a dry-run must never do that, or a later real run would see
+    nothing new to compare and silently skip re-checking (and thus never
+    delete) the exact duplicates the dry-run just reported.
+    """
+    stems, mat, unresolved, cache = build_vectors_cached(pairs, fractals_dir, on_progress=on_progress)
     stem_to_paths = {s: (nn, png) for s, nn, png in pairs}
+    scores = np.array([beauty_score(stem_to_paths[s][0]) for s in stems], dtype=np.float64)
 
-    print(f"Comparing all pairs (threshold ≥ {threshold:.3f})…")
-    hits = find_duplicate_pairs(stems, mat, threshold)
-    print(f"Found {len(hits)} near-duplicate pair(s).")
-
-    if not hits:
-        return 0, []
+    print(f"Comparing {len(unresolved)} unresolved image(s) against the full "
+          f"{len(stems)}-file archive (threshold ≥ {threshold:.3f})…")
+    verdict = resolve_duplicates(mat, unresolved, scores, threshold)
+    print(f"Found {len(verdict)} near-duplicate pair(s).")
 
     deleted = set()
-    deletions = 0
     examples = []
-    tag = "WOULD DROP" if dry_run else "DROP"
-    for sim, ia, ib in hits:
-        sa, sb = stems[ia], stems[ib]
-        if sa in deleted or sb in deleted:
-            continue
-        nn_a, png_a = stem_to_paths[sa]
-        nn_b, png_b = stem_to_paths[sb]
-        score_a = beauty_score(nn_a)
-        score_b = beauty_score(nn_b)
-        if score_a >= score_b:
-            winner, loser_nn, loser_png, loser_s, winner_s = sa, nn_b, png_b, score_b, score_a
-            loser = sb
-        else:
-            winner, loser_nn, loser_png, loser_s, winner_s = sb, nn_a, png_a, score_a, score_b
-            loser = sa
-        print(
-            f"  sim={sim:.4f}  KEEP {winner[:16]} ({winner_s:.4f})"
-            f"  {tag} {loser[:16]} ({loser_s:.4f})"
-        )
-        if not dry_run:
-            loser_nn.unlink(missing_ok=True)
-            loser_png.unlink(missing_ok=True)
-        deleted.add(loser)
-        deletions += 1
-        if len(examples) < 25:
-            examples.append((sim, winner, loser, winner_s, loser_s))
+    if verdict:
+        tag = "WOULD DROP" if dry_run else "DROP"
+        # Report highest-similarity first; a densely-duplicated archive can
+        # produce thousands of deletions in one pass, so only print the
+        # first VERBOSE_LIMIT lines in full and summarize the rest — this
+        # is purely a log-readability cap, every deletion below still
+        # happens (or would, in dry-run).
+        VERBOSE_LIMIT = 50
+        ranked = sorted(verdict.items(), key=lambda kv: -kv[1][1])
+        for i, (loser_i, (winner_i, sim)) in enumerate(ranked):
+            loser, winner = stems[loser_i], stems[winner_i]
+            loser_nn, loser_png = stem_to_paths[loser]
+            winner_s, loser_s = float(scores[winner_i]), float(scores[loser_i])
+            if i < VERBOSE_LIMIT:
+                print(
+                    f"  sim={sim:.4f}  KEEP {winner[:16]} ({winner_s:.4f})"
+                    f"  {tag} {loser[:16]} ({loser_s:.4f})"
+                )
+            elif i == VERBOSE_LIMIT:
+                print(f"  … and {len(ranked) - VERBOSE_LIMIT} more (suppressed for log size)")
+            if not dry_run:
+                loser_nn.unlink(missing_ok=True)
+                loser_png.unlink(missing_ok=True)
+            deleted.add(loser)
+            if len(examples) < 25:
+                examples.append((sim, winner, loser, winner_s, loser_s))
 
-    return deletions, examples
+    if not dry_run:
+        # The full corpus considered this round is now mutually resolved:
+        # drop deleted stems from the cache and mark every survivor resolved
+        # so the next run only has new-since-now files left to check.
+        for s in deleted:
+            cache.pop(s, None)
+        for s in stems:
+            if s in cache and s not in deleted:
+                mtime, vec, _ = cache[s]
+                cache[s] = (mtime, vec, True)
+        _save_cache(fractals_dir, cache)
+
+    return len(deleted), examples
 
 
 def run_dedup_loop(fractals_dir, threshold, binary, dry_run=False, max_compare=None):
     """
-    Run the dedup loop. In normal (destructive) mode this repeats rounds,
-    each re-scanning the recency-capped comparison window from disk, until
-    the pool is clean or MAX_ROUNDS is hit.
-
-    In dry-run mode nothing is written to disk (no re-render, no deletion),
-    so the comparison window never changes between rounds — a single pass
-    already resolves every pair above threshold within that window, so we
-    stop after round 1. Returns (total_deleted, considered, total_in_dir,
-    examples).
+    Run one full dedup pass over the archive. Every file is eligible for
+    comparison via the on-disk vector cache — nothing ever ages out the way
+    it did under the old recency-windowed approach. `max_compare`, if given,
+    caps how many of the most-recently-modified files are considered at all;
+    only meant for bounding a manual/one-off run — the periodic 2h job never
+    passes it.
     """
-    limit = max_compare or MAX_COMPARE_FILES
-    round_num = 0
-    total_deleted = 0
-    total_considered = 0
-    total_in_dir = 0
-    all_examples = []
-    while True:
-        round_num += 1
-        if round_num > MAX_ROUNDS:
-            print(f"\nHit MAX_ROUNDS={MAX_ROUNDS} for this invocation — stopping here; "
-                  f"remaining near-duplicates (if any) will be cleaned at the next "
-                  f"scheduled interval instead of extending this run indefinitely.")
-            break
-        print(f"\n── Round {round_num}/{MAX_ROUNDS} ──")
-        progress("round", round_num, MAX_ROUNDS)
+    progress("round", 1, 1)
+    pairs = find_pairs(fractals_dir)
+    total_in_dir = len(pairs)
+    if not pairs:
+        print("No paired images left.")
+        return 0, 0, 0, []
+
+    if not dry_run:
+        # Re-render any non-512×512 images before comparing (skipped in
+        # dry-run: previewing must not touch disk). Re-scan afterward since
+        # this can change mtimes, which build_vectors_cached uses to decide
+        # what needs a fresh feature vector.
+        rerender_all(pairs, binary)
         pairs = find_pairs(fractals_dir)
         total_in_dir = len(pairs)
-        if not pairs:
-            print("No paired images left.")
-            break
-        if not dry_run:
-            # Re-render any non-512×512 images before comparing (cheap size
-            # check, scoped to the whole archive — correctness matters here,
-            # not speed). Skipped in dry-run: previewing must not touch disk.
-            rerender_all(pairs, binary)
-        # The O(n^2) comparison itself is capped to the most-recently-modified
-        # files (see find_recent_pairs) so runtime stays bounded as the total
-        # archive keeps growing across the project's life.
-        recent = find_recent_pairs(fractals_dir, limit)
-        total_considered = len(recent)
-        if len(recent) < len(pairs):
-            print(f"Comparing the {len(recent)} most recent of {len(pairs)} total "
-                  f"paired images (capped to bound O(n²) runtime).")
-        n, examples = dedup_round(
-            recent, threshold, dry_run=dry_run,
-            on_progress=lambda done, tot: progress("vectorize", done, tot),
-        )
-        total_deleted += n
-        all_examples.extend(examples)
-        if n == 0:
-            print(f"Pool is clean (threshold {threshold:.3f}). Done.")
-            break
-        print(f"{'Would delete' if dry_run else 'Deleted'} {n} lookalike(s) this round.")
-        if dry_run:
-            # Disk is untouched, so the recency window is identical next
-            # round — a second pass would just re-derive the same result.
-            break
-    return total_deleted, total_considered, total_in_dir, all_examples
+
+    if max_compare and len(pairs) > max_compare:
+        pairs = find_recent_pairs(fractals_dir, max_compare)
+        print(f"--max-compare set: limiting to the {len(pairs)} most recent of "
+              f"{total_in_dir} paired images.")
+
+    considered = len(pairs)
+    deleted, examples = dedup_round(
+        pairs, threshold, fractals_dir, dry_run=dry_run,
+        on_progress=lambda done, tot: progress("vectorize", done, tot),
+    )
+    if deleted:
+        print(f"{'Would delete' if dry_run else 'Deleted'} {deleted} lookalike(s).")
+    else:
+        print(f"Pool is clean (threshold {threshold:.3f}).")
+    return deleted, considered, total_in_dir, examples
 
 
 # ── Test mode ─────────────────────────────────────────────────────────────────
 
-def run_test(pairs, n_examples=10):
+def run_test(pairs, fractals_dir):
     """
-    Show pairs spanning the similarity spectrum. No deletion.
-    Shows top 5 (most similar) + 5 from the 0.70–0.90 range.
+    Show pairs spanning the similarity spectrum. No deletion, no disk writes
+    beyond the vector cache (safe/idempotent — same cache --run would use).
+    Shows top 5 (most similar) + 5 from the 0.70-0.90 range.
     """
-    print(f"\nBuilding feature vectors for {len(pairs)} images…")
-    stems, mat = build_vector_matrix(pairs)
+    print(f"\nBuilding feature vectors for {len(pairs)} images (cached)…")
+    stems, mat, _, _ = build_vectors_cached(pairs, fractals_dir)
     stem_to_paths = {s: (nn, png) for s, nn, png in pairs}
 
-    print("Computing all pairwise similarities…")
-    sim_mat = (mat @ mat.T).astype(np.float32)
-    upper   = np.triu_indices(len(stems), k=1)
-    sims    = sim_mat[upper]
-    order   = np.argsort(-sims)
+    print("Scanning pairwise similarities…")
+    top_hits, mid_hits = scan_similarity_spectrum(mat)
+    top_pairs = [(sim, stems[ia], stems[ib]) for sim, ia, ib in top_hits[:5]]
+    mid_pairs = [(sim, stems[ia], stems[ib]) for sim, ia, ib in mid_hits[:5]]
 
-    top_pairs = []
-    mid_pairs = []
-    seen = set()
-    for idx in order:
-        ia, ib = int(upper[0][idx]), int(upper[1][idx])
-        sa, sb  = stems[ia], stems[ib]
-        key = (min(sa, sb), max(sa, sb))
-        if key in seen:
-            continue
-        seen.add(key)
-        sim = float(sims[idx])
-        entry = (
-            sim, sa, sb,
-            stem_to_paths[sa][0], stem_to_paths[sa][1],
-            stem_to_paths[sb][0], stem_to_paths[sb][1],
-        )
-        if sim >= 0.95 and len(top_pairs) < 5:
-            top_pairs.append(entry)
-        elif 0.70 <= sim < 0.90 and len(mid_pairs) < 5:
-            mid_pairs.append(entry)
-        if len(top_pairs) >= 5 and len(mid_pairs) >= 5:
-            break
-
-    def print_entry(rank, sim, sa, sb, nn_a, png_a, nn_b, png_b):
-        score_a = beauty_score(nn_a)
-        score_b = beauty_score(nn_b)
+    def print_entry(rank, sim, sa, sb):
+        nn_a, png_a = stem_to_paths[sa]
+        nn_b, png_b = stem_to_paths[sb]
+        score_a, score_b = beauty_score(nn_a), beauty_score(nn_b)
         print(f"  [{rank}] similarity = {sim:.4f}")
         print(f"        A: {sa}  score={score_a:.4f}  {png_a}")
         print(f"        B: {sb}  score={score_b:.4f}  {png_b}")
         print()
 
     print(f"\n─── Very similar (likely duplicates, sim ≥ 0.95) ───")
-    for i, e in enumerate(top_pairs, 1):
-        print_entry(i, *e)
+    for i, (sim, sa, sb) in enumerate(top_pairs, 1):
+        print_entry(i, sim, sa, sb)
 
     print(f"─── Mid-range (borderline) ───")
-    for i, e in enumerate(mid_pairs, len(top_pairs) + 1):
-        print_entry(i, *e)
+    for i, (sim, sa, sb) in enumerate(mid_pairs, len(top_pairs) + 1):
+        print_entry(i, sim, sa, sb)
 
 
 # ── Entry ─────────────────────────────────────────────────────────────────────
@@ -401,7 +550,7 @@ def main():
     ap.add_argument("--rerender",   action="store_true",
                     help="Re-render non-512×512 paired images to 512×512")
     ap.add_argument("--run",        action="store_true",
-                    help="Run full dedup loop (destructive, unless --dry-run)")
+                    help="Run full dedup pass (destructive, unless --dry-run)")
     ap.add_argument("--dry-run",    action="store_true",
                     help="With --run: don't delete or re-render anything, just "
                          "report how many fractals would be deleted")
@@ -412,7 +561,9 @@ def main():
     ap.add_argument("--binary",     default="./target/release/nnfractals",
                     help="Path to nnfractals binary")
     ap.add_argument("--max-compare", type=int, default=None,
-                    help=f"Override the comparison window size (default {MAX_COMPARE_FILES})")
+                    help="Cap comparison to the N most-recently-modified files "
+                         "(default: no cap, compares the full archive via the "
+                         "vector cache)")
     args = ap.parse_args()
 
     if not any([args.test, args.rerender, args.run]):
@@ -437,14 +588,14 @@ def main():
     if args.test:
         pairs = find_pairs(fractals_dir)
         print(f"Found {len(pairs)} paired images.")
-        run_test(pairs)
+        run_test(pairs, fractals_dir)
 
     if args.run:
         if not args.dry_run and not binary.exists():
             print(f"Binary not found: {binary}  (run: cargo build --release)")
             sys.exit(1)
         mode = "Previewing (dry-run)" if args.dry_run else "Starting"
-        print(f"{mode} dedup loop (threshold ≥ {args.threshold:.3f})…")
+        print(f"{mode} dedup pass (threshold ≥ {args.threshold:.3f})…")
         deleted, considered, total_in_dir, examples = run_dedup_loop(
             fractals_dir, args.threshold, binary,
             dry_run=args.dry_run, max_compare=args.max_compare,
@@ -452,7 +603,7 @@ def main():
         if args.dry_run:
             scope = (
                 f"{considered} compared" if considered == total_in_dir
-                else f"{considered} of {total_in_dir} compared (most-recent window)"
+                else f"{considered} of {total_in_dir} compared (--max-compare)"
             )
             print(f"\n{deleted} of {considered} fractal(s) would be deleted "
                   f"({scope}, threshold {args.threshold:.3f}).")
