@@ -186,16 +186,28 @@ def _cache_path(fractals_dir):
 
 
 def _load_cache(fractals_dir):
-    """Return dict stem -> (mtime, vec, resolved), or {} if no/corrupt cache.
+    """Return dict stem -> (mtime, vec, resolved_threshold), or {} if no/corrupt cache.
 
-    `resolved` is True once a stem has been through a *completed, non-dry-run*
-    comparison pass — see build_vectors_cached/dedup_round. It's distinct
-    from "vector is cached": --test and --run --dry-run both happily cache
-    vectors (expensive to recompute, harmless to reuse) without ever setting
-    resolved=True, since neither of them actually deletes anything — if they
-    did mark stems resolved, a real --run afterward would see "0 new files"
-    and skip comparing them entirely, silently leaving known duplicates on
-    disk forever.
+    `resolved_threshold` is the loosest (lowest) similarity threshold a stem
+    has been through a *completed, non-dry-run* comparison pass at, or None
+    if never resolved. Resolving at a loose threshold implies resolution at
+    any stricter one too (every pair that would match at a higher threshold
+    would also have matched at a lower one, so it was already seen) — but
+    NOT the reverse: resolving at threshold 0.97 says nothing about pairs in
+    [0.80, 0.97), so a later request at 0.80 must still recheck. A file only
+    counts as already-checked for the CURRENT run's threshold T if
+    resolved_threshold <= T. (Earlier versions stored a bare bool, which
+    silently broke this: resolving once at 0.97 marked everything "done",
+    so a later dry-run preview at 0.80 found "0 unresolved" and reported 0
+    duplicates regardless of threshold — legacy bool caches are treated as
+    unresolved below so they self-heal into the new format on next use.)
+
+    Distinct from "vector is cached": --test and --run --dry-run both
+    happily cache vectors (expensive to recompute, harmless to reuse)
+    without ever advancing resolved_threshold, since neither of them
+    actually deletes anything — if they did, a real --run afterward could
+    see "already resolved" and skip comparing, silently leaving known
+    duplicates on disk forever.
     """
     path = _cache_path(fractals_dir)
     if not path.exists():
@@ -203,7 +215,15 @@ def _load_cache(fractals_dir):
     try:
         with np.load(path) as z:
             stems, mtimes, vecs, resolved = z["stems"], z["mtimes"], z["vecs"], z["resolved"]
-        return {s: (float(m), v, bool(r)) for s, m, v, r in zip(stems, mtimes, vecs, resolved)}
+        if resolved.dtype == bool:
+            # Legacy format: no record of *which* threshold. Keep the
+            # (expensive) vectors, treat as never-resolved so the next run
+            # rebuilds resolution state at whatever threshold it uses.
+            return {s: (float(m), v, None) for s, m, v in zip(stems, mtimes, vecs)}
+        return {
+            s: (float(m), v, (None if np.isinf(r) else float(r)))
+            for s, m, v, r in zip(stems, mtimes, vecs, resolved)
+        }
     except Exception as e:
         print(f"  [WARN] dedup vector cache unreadable ({e}); rebuilding.")
         return {}
@@ -215,7 +235,9 @@ def _save_cache(fractals_dir, cache):
     stems = np.array(list(cache.keys()))
     mtimes = np.array([m for m, _, _ in cache.values()], dtype=np.float64)
     vecs = np.stack([v for _, v, _ in cache.values()]).astype(np.float32)
-    resolved = np.array([r for _, _, r in cache.values()], dtype=bool)
+    resolved = np.array(
+        [(np.inf if t is None else t) for _, _, t in cache.values()], dtype=np.float64
+    )
     path = _cache_path(fractals_dir)
     tmp = path.with_name(path.name + ".tmp")
     # np.savez auto-appends ".npz" to a path-like target that doesn't already
@@ -226,7 +248,7 @@ def _save_cache(fractals_dir, cache):
     tmp.replace(path)  # atomic swap, avoids a half-written cache on crash
 
 
-def build_vectors_cached(pairs, fractals_dir, on_progress=None):
+def build_vectors_cached(pairs, fractals_dir, threshold, on_progress=None):
     """
     Load cached feature vectors, compute only for new/changed files (absent
     from the cache, or whose png mtime moved — e.g. a fresh render), persist
@@ -234,12 +256,12 @@ def build_vectors_cached(pairs, fractals_dir, on_progress=None):
 
     Returns (stems, mat, unresolved_indices, cache): stems/mat cover the
     *entire* current archive (aligned by row); unresolved_indices are the
-    positions never yet confirmed resolved (freshly computed this call, or
-    left unresolved by a previous dry-run/--test call) — the only ones that
-    can newly cross the similarity threshold against the rest of the corpus,
-    since every resolved pair was already mutually checked by a previous
-    *real* run. `cache` is returned so the caller can flip resolved=True
-    after a successful non-dry-run comparison pass and persist that.
+    positions not yet resolved *at this threshold or looser* (freshly
+    computed this call, never resolved, or only ever resolved at a
+    stricter threshold than the one being requested now) — the only ones
+    that can newly cross `threshold` against the rest of the corpus.
+    `cache` is returned so the caller can advance resolved_threshold after
+    a successful non-dry-run comparison pass and persist that.
     """
     cache = _load_cache(fractals_dir)
     current_stems = {s for s, _, _ in pairs}
@@ -266,7 +288,7 @@ def build_vectors_cached(pairs, fractals_dir, on_progress=None):
             img = Image.open(png_path)
             if img.size != TARGET_SIZE:
                 img = img.resize(TARGET_SIZE, Image.LANCZOS)
-            cache[stem] = (mtime, feature_vec(img), False)  # unresolved until a real run confirms it
+            cache[stem] = (mtime, feature_vec(img), None)  # unresolved until a real run confirms it
         except Exception as e:
             print(f"  [WARN] {png_path.name}: {e}")
     if on_progress:
@@ -278,7 +300,10 @@ def build_vectors_cached(pairs, fractals_dir, on_progress=None):
 
     stems = [s for s, _, _ in pairs if s in cache]
     mat = np.stack([cache[s][1] for s in stems]).astype(np.float32)
-    unresolved_indices = [i for i, s in enumerate(stems) if not cache[s][2]]
+    unresolved_indices = [
+        i for i, s in enumerate(stems)
+        if cache[s][2] is None or cache[s][2] > threshold
+    ]
     return stems, mat, unresolved_indices, cache
 
 
@@ -406,12 +431,15 @@ def dedup_round(pairs, threshold, fractals_dir, dry_run=False, on_progress=None)
     still-unresolved files against the full corpus. Deletes (or, if
     dry_run, reports) the lower-beauty file of each matched pair.
 
-    Only a completed non-dry-run pass marks the corpus "resolved" in the
-    cache — a dry-run must never do that, or a later real run would see
-    nothing new to compare and silently skip re-checking (and thus never
-    delete) the exact duplicates the dry-run just reported.
+    Only a completed non-dry-run pass advances resolved_threshold in the
+    cache — a dry-run must never do that, or a later real run at the same
+    (or looser) threshold would see nothing unresolved and silently skip
+    re-checking (and thus never delete) the exact duplicates the dry-run
+    just reported.
     """
-    stems, mat, unresolved, cache = build_vectors_cached(pairs, fractals_dir, on_progress=on_progress)
+    stems, mat, unresolved, cache = build_vectors_cached(
+        pairs, fractals_dir, threshold, on_progress=on_progress
+    )
     stem_to_paths = {s: (nn, png) for s, nn, png in pairs}
     scores = np.array([beauty_score(stem_to_paths[s][0]) for s in stems], dtype=np.float64)
 
@@ -450,15 +478,20 @@ def dedup_round(pairs, threshold, fractals_dir, dry_run=False, on_progress=None)
                 examples.append((sim, winner, loser, winner_s, loser_s))
 
     if not dry_run:
-        # The full corpus considered this round is now mutually resolved:
-        # drop deleted stems from the cache and mark every survivor resolved
-        # so the next run only has new-since-now files left to check.
+        # The full corpus considered this round is now mutually resolved at
+        # `threshold` (or looser, if it already had a lower resolved_threshold
+        # from an earlier run): drop deleted stems from the cache and advance
+        # every survivor's resolved_threshold so the next run at this
+        # threshold or higher has only new-since-now files left to check —
+        # but a future run requesting a LOOSER threshold still correctly
+        # sees everyone as unresolved again (see build_vectors_cached).
         for s in deleted:
             cache.pop(s, None)
         for s in stems:
             if s in cache and s not in deleted:
-                mtime, vec, _ = cache[s]
-                cache[s] = (mtime, vec, True)
+                mtime, vec, prev_rt = cache[s]
+                new_rt = threshold if prev_rt is None else min(prev_rt, threshold)
+                cache[s] = (mtime, vec, new_rt)
         _save_cache(fractals_dir, cache)
 
     return len(deleted), examples
@@ -515,7 +548,10 @@ def run_test(pairs, fractals_dir):
     Shows top 5 (most similar) + 5 from the 0.70-0.90 range.
     """
     print(f"\nBuilding feature vectors for {len(pairs)} images (cached)…")
-    stems, mat, _, _ = build_vectors_cached(pairs, fractals_dir)
+    # threshold=0.0 is a placeholder — run_test does its own full self-scan
+    # via scan_similarity_spectrum below regardless of resolved_threshold,
+    # so the unresolved-indices list (discarded here) is never consulted.
+    stems, mat, _, _ = build_vectors_cached(pairs, fractals_dir, 0.0)
     stem_to_paths = {s: (nn, png) for s, nn, png in pairs}
 
     print("Scanning pairwise similarities…")
