@@ -36,6 +36,8 @@ musiq_weight             = 0.25   # positive reward for high MUSIQ technical qua
 pref_elite_count         = 4      # CYCLE1: re-inject top-4 measured-pref recent saves into breeding each gen — real taste steers search
 archive_random_ratio     = 0.30   # NEW ARCHITECTURE: 30% of each (re)seeded pool is pure-random; rest bred from archive seeds (never plain-cloned)
 duplicate_penalty_weight = 0.50   # NEW ARCHITECTURE: quadratic penalty on formula families that dominate the saved archive (FormulaUsageTracker)
+archive_seeding_enabled  = false # 2026-07-28: reseed purely random on warm-start/restart (was reinforcing whatever formula family the archive had converged toward); set true to restore archive-seeded warm-start
+angle_structure_weight  = 0.0   # 2026-07-28: bonus for angular structure in the bailout exit-angle field (DAG only, fitness.rs::angle_structure_score). 0 = feature fully inert (default; see render_gpu "free when disabled")
 
 [output]
 save_dir                 = "./fractals_1"     # NEW ARCHITECTURE: fresh empty pool, replaces ./fractals
@@ -52,3 +54,8 @@ min_save_distance        = 0.05  # relaxed from 0.08 — dedup handles remaining
 [dedup]
 similarity_threshold     = 0.97  # multi-scale DCT geometric mean (16/32/64px grayscale); run scripts/dedup.py --run
 interval_hours           = 2.0   # evolution auto-cleans near-duplicates every N hours (0 = disable)
+
+[mass_extinction]
+events_per_day    = 3.0   # 2026-07-28: rare random near-total wipe, independent of individual fitness (see Optimizer::mass_extinction). 0 disables.
+min_survivor_frac = 0.0   # survivor fraction resampled uniformly in [min,max] on every event
+max_survivor_frac = 0.03

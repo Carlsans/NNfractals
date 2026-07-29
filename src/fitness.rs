@@ -53,6 +53,87 @@ pub fn edge_density_fast(escape_times: &[f32], width: usize, max_iter: u32) -> f
     (frac / 0.20).min(1.0)
 }
 
+/// Structural richness of the bailout exit-angle field (arg(z) at escape,
+/// DAG genomes only — see fractal::dag_escape_pixel). Mirrors
+/// edge_density_fast's shape, but uses CIRCULAR distance since angle wraps
+/// at ±π (a plain difference would falsely treat +π and -π, right next to
+/// each other on the circle, as maximally different). Returns [0,1]; 0 when
+/// the angle buffer wasn't captured (all-zero — angle_structure_weight=0
+/// skips computing it entirely, see evaluate_fitness_full/_batch).
+pub fn angle_structure_score(angles: &[f32], width: usize) -> f32 {
+    if angles.len() < 4 || width == 0 { return 0.0; }
+    let height = angles.len() / width;
+    const TWO_PI: f32 = std::f32::consts::TAU;
+    let circ_dist = |a: f32, b: f32| { let d = (a - b).rem_euclid(TWO_PI); d.min(TWO_PI - d) };
+    let threshold = std::f32::consts::FRAC_PI_4; // 45°
+
+    let mut edge_pairs = 0u32;
+    let mut total = 0u32;
+
+    for y in 0..height {
+        for x in 0..width.saturating_sub(1) {
+            let a = angles[y * width + x];
+            let b = angles[y * width + x + 1];
+            if circ_dist(a, b) > threshold { edge_pairs += 1; }
+            total += 1;
+        }
+    }
+    for y in 0..height.saturating_sub(1) {
+        for x in 0..width {
+            let a = angles[y * width + x];
+            let b = angles[(y + 1) * width + x];
+            if circ_dist(a, b) > threshold { edge_pairs += 1; }
+            total += 1;
+        }
+    }
+    // Same 20%→1.0 saturation convention as edge_density_fast.
+    let frac = edge_pairs as f32 / total.max(1) as f32;
+    (frac / 0.20).min(1.0)
+}
+
+#[cfg(test)]
+mod angle_structure_tests {
+    use super::angle_structure_score;
+
+    #[test]
+    fn empty_or_undersized_is_zero() {
+        assert_eq!(angle_structure_score(&[], 4), 0.0);
+        assert_eq!(angle_structure_score(&[0.0, 0.1, 0.2], 4), 0.0); // len < 4
+        assert_eq!(angle_structure_score(&[0.0, 0.1, 0.2, 0.3], 0), 0.0); // width 0
+    }
+
+    #[test]
+    fn wrap_around_near_pi_is_not_an_edge() {
+        // A checkerboard alternating +π-ε / -π+ε would score maximal edge
+        // density under a NAIVE linear |a-b| comparison (diff ≈ 2π), but
+        // these two angles are actually adjacent on the circle (diff ≈ 2ε) —
+        // the circular-distance implementation must treat this as smooth,
+        // not structured.
+        use std::f32::consts::PI;
+        let near_pos = PI - 0.01;
+        let near_neg = -PI + 0.01;
+        let w = 4;
+        let angles = vec![near_pos, near_neg, near_pos, near_neg,
+                           near_neg, near_pos, near_neg, near_pos,
+                           near_pos, near_neg, near_pos, near_neg,
+                           near_neg, near_pos, near_neg, near_pos];
+        let score = angle_structure_score(&angles, w);
+        assert!(score < 0.05, "wrap-around angles falsely scored as structured: {score}");
+    }
+
+    #[test]
+    fn genuinely_alternating_angles_score_high() {
+        // 0 vs π (a true 180° jump every step) should saturate the score.
+        let w = 4;
+        let angles = vec![0.0, std::f32::consts::PI, 0.0, std::f32::consts::PI,
+                           std::f32::consts::PI, 0.0, std::f32::consts::PI, 0.0,
+                           0.0, std::f32::consts::PI, 0.0, std::f32::consts::PI,
+                           std::f32::consts::PI, 0.0, std::f32::consts::PI, 0.0];
+        let score = angle_structure_score(&angles, w);
+        assert!(score > 0.95, "genuinely alternating angles scored too low: {score}");
+    }
+}
+
 /// PNG compression entropy: render fractal → apply colormap → encode PNG in memory.
 /// Returns bytes_per_pixel of the compressed PNG (higher = harder to compress = more visual detail).
 /// This is the primary fitness metric — it directly measures structural complexity as perceived

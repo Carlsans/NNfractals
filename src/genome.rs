@@ -95,6 +95,10 @@ pub struct Genome {
     /// genomes in normalised 58-dim basis-weight space. Higher = structurally
     /// distinct formula family. Drives selection when formula_diversity_weight > 0.
     #[serde(default)] pub formula_diversity: f32,
+    /// Structural richness [0,1] of the bailout exit-angle field (DAG genomes
+    /// only — see fitness::angle_structure_score). 0.0 if not measured
+    /// (angle_structure_weight = 0). Drives selection when > 0.
+    #[serde(default)] pub angle_structure: f32,
     /// Expression-DAG program (Phase-1 formula system). When non-empty, this
     /// replaces the flat `terms` basis-sum: z_{n+1} = eval_program(program,z,c).
     /// Empty ⇒ legacy genome that still evaluates via `terms`/`formula_weights`.
@@ -278,6 +282,7 @@ impl Genome {
             pred_recursion: 0.0,
             pred_clip: 0.0,
             formula_diversity: 0.0,
+            angle_structure: 0.0,
             program: Vec::new(),
             julia_mode: false,
             julia_cre: 0.0,

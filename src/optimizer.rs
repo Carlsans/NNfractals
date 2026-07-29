@@ -64,11 +64,17 @@ impl Optimizer {
         std::fs::create_dir_all(&config.output.population_dir).unwrap_or(());
         display::init();
 
-        // Warm-start: seed up to N_SEEDS best genomes from the archive. Seeds are
-        // never entered into the population directly — seed_population() always
-        // routes them through crossover/mutation (see its doc comment).
+        // Warm-start: seed up to N_SEEDS best genomes from the archive, but only
+        // when archive_seeding_enabled opts in (off by default — see its doc
+        // comment in config.rs for why). Seeds are never entered into the
+        // population directly — seed_population() always routes them through
+        // crossover/mutation (see its doc comment).
         const N_SEEDS: usize = 12;
-        let seeds = Self::load_archive_seeds(&config, N_SEEDS);
+        let seeds = if config.optimization.archive_seeding_enabled {
+            Self::load_archive_seeds(&config, N_SEEDS)
+        } else {
+            Vec::new()
+        };
 
         let pop_size = config.optimization.population_size;
         let population = Self::seed_population(&config, &mut rng, &seeds, pop_size, Vec::new());
@@ -286,7 +292,7 @@ impl Optimizer {
         let archive_snap: Vec<Vec<f32>> = self.behavior_archive.iter().cloned().collect();
 
         #[cfg(feature = "wgpu-backend")]
-        let fitnesses: Vec<(f32, f32, Vec<f32>)> = if crate::render_gpu::gpu_available() {
+        let fitnesses: Vec<(f32, f32, f32, Vec<f32>)> = if crate::render_gpu::gpu_available() {
             display::print_status(&format!("Gen {}  Evaluating {} genomes (GPU)...", self.generation, n_pop));
             evaluate_fitness_batch(&self.population, &self.config)
         } else {
@@ -295,7 +301,7 @@ impl Optimizer {
         };
 
         #[cfg(not(feature = "wgpu-backend"))]
-        let fitnesses: Vec<(f32, f32, Vec<f32>)> = {
+        let fitnesses: Vec<(f32, f32, f32, Vec<f32>)> = {
             display::print_status(&format!("Gen {}  Evaluating {} genomes...", self.generation, n_pop));
             self.population.par_iter().map(|genome| evaluate_fitness_full(genome, &self.config)).collect()
         };
@@ -305,12 +311,13 @@ impl Optimizer {
         let cpw = self.config.optimization.clip_pred_weight;
         let oodw = self.config.optimization.ood_weight;
         let dpw = self.config.optimization.duplicate_penalty_weight;
+        let asw = self.config.optimization.angle_structure_weight;
         self.formula_usage.maybe_periodic_rescan(&self.config.output.save_dir, DUPLICATE_RESCAN_GENS);
         let formula_snap: Vec<Vec<f32>> = self.formula_archive.iter().cloned().collect();
         // Snapshot of already-saved behavioral descriptors for OOD novelty.
         let saved_snap: Vec<Vec<f32>> = if oodw != 0.0 { self.save_descriptors.clone() } else { Vec::new() };
         for (i, fitness_result) in fitnesses.into_iter().enumerate() {
-            let (raw_png, structured_ent, descriptor) = fitness_result;
+            let (raw_png, structured_ent, angle_score, descriptor) = fitness_result;
             // raw_png → save-gate thresholding (beauty_entropy), thresholds unchanged.
             // structured_ent → geometric mean(fine, coarse) PNG entropy: selection fitness.
             //   Noise scores high at fine scale but near-zero at coarse (averages to uniform).
@@ -348,9 +355,10 @@ impl Optimizer {
             self.population[i].pred_recursion    = pred_rec;
             self.population[i].pred_clip         = pred_clip_val;
             self.population[i].formula_diversity = formula_div;
+            self.population[i].angle_structure   = angle_score;
             self.population[i].fitness =
                 structured_ent + nw * novelty + rpw * pred_rec + fdw * formula_div
-                + cpw * pred_clip_val + oodw * ood - cxpen - dup_pen;
+                + cpw * pred_clip_val + oodw * ood + asw * angle_score - cxpen - dup_pen;
             if self.behavior_archive.len() >= archive_max { self.behavior_archive.pop_front(); }
             self.behavior_archive.push_back(descriptor);
             if self.formula_archive.len() >= archive_max { self.formula_archive.pop_front(); }
@@ -377,7 +385,7 @@ impl Optimizer {
         // uninterrupted run to actually improve. Using `structured` (already the
         // real per-gen selection criterion, and specifically designed to punish
         // noise) fixes this.
-        let (_, current_beauty, _) = evaluate_fitness_full(&self.population[0], &self.config);
+        let (_, current_beauty, _, _) = evaluate_fitness_full(&self.population[0], &self.config);
         self.last_top_structured = current_beauty;
         let best_ever_beauty    = self.best_ever.as_ref().map(|g| g.fitness).unwrap_or(0.0);
         // CYCLE14 FIX: `top_structured` telemetry (added cycle13) showed ~47-49% of ALL
@@ -489,8 +497,24 @@ impl Optimizer {
             self.log_gen_metrics(&tally);
         }
 
-        // ── Stagnation restart ────────────────────────────────────────────
-        if self.stagnant_gens >= self.config.optimization.restart_after_gens {
+        // ── Mass extinction / stagnation restart / evolve ─────────────────
+        // Mass extinction is checked first: it's strictly more disruptive
+        // than a stagnation restart (already resets stagnant_gens too), so
+        // if it fires on the same generation a restart would have, running
+        // restart_population()/evolve() right after would be pointless.
+        let mec = &self.config.mass_extinction;
+        // generation>=5 guards against gen-1 warmup (GPU pipeline compile,
+        // aesthetic sidecar spawn) transiently inflating the mean-gen-time
+        // estimate the probability below is normalized against.
+        let mass_extinction_fires = self.generation >= 5 && mec.events_per_day > 0.0 && {
+            let mean_gen_secs = self.start.elapsed().as_secs_f64() / self.generation as f64;
+            let p_fire = mass_extinction_p_fire(mec.events_per_day, mean_gen_secs);
+            self.rng.random::<f64>() < p_fire
+        };
+
+        if mass_extinction_fires {
+            self.mass_extinction();
+        } else if self.stagnant_gens >= self.config.optimization.restart_after_gens {
             self.restart_population();
         } else {
             display::print_status(&format!("Gen {}  Evolving population...", self.generation));
@@ -557,22 +581,46 @@ impl Optimizer {
         self.save_descriptors.push(desc);
     }
 
-    fn restart_population(&mut self) {
+    /// Shared population-rebuild core for restart_population() (stagnation)
+    /// and mass_extinction() (rare random wipe). Force-saves best_ever if it
+    /// hasn't already been saved via the normal per-generation gate, keeps
+    /// `survivors` verbatim, refills the rest via seed_population() (`seeds`
+    /// — empty unless the caller opted into archive seeding), resets
+    /// stagnant_gens, and trims save_descriptors to the most-recent 300 so
+    /// the diversity gate keeps blocking already-saved visual regions across
+    /// the rebuild (clearing it caused the same view to be re-saved 10-18×
+    /// across successive restarts).
+    fn rebuild_population(&mut self, seeds: &[Genome], survivors: Vec<Genome>) {
         if let Some(best) = self.best_ever.clone() {
             let already_saved = self.config.output.save_dir
                 .join(format!("{:016x}.nn", best.id))
                 .exists();
             if !already_saved { self.force_save(&best); }
         }
+        let pop_size = self.config.optimization.population_size;
+        self.population = Self::seed_population(&self.config, &mut self.rng, seeds, pop_size, survivors);
+        self.stagnant_gens = 0;
+        let keep = 300usize;
+        if self.save_descriptors.len() > keep {
+            self.save_descriptors.drain(..self.save_descriptors.len() - keep);
+        }
+    }
+
+    fn restart_population(&mut self) {
         display::print_restart(self.generation,
                                self.best_ever.as_ref().map(|g| g.fitness).unwrap_or(0.0));
 
-        // Reload a FEW archive seeds on restart. Seeds ranked by CLIP/pref score;
-        // 6 seeds keeps the top genomes in play each epoch without over-constraining
+        // Reload a FEW archive seeds on restart, when archive_seeding_enabled
+        // opts in (off by default). Seeds ranked by CLIP/pref score; 6 seeds
+        // keeps the top genomes in play each epoch without over-constraining
         // exploration. As in new(), seeds are never cloned straight into the pool —
         // seed_population() breeds every archive-derived slot via crossover/mutation.
         const N_SEEDS: usize = 6;
-        let seeds = Self::load_archive_seeds(&self.config, N_SEEDS);
+        let seeds = if self.config.optimization.archive_seeding_enabled {
+            Self::load_archive_seeds(&self.config, N_SEEDS)
+        } else {
+            Vec::new()
+        };
 
         // Current best-ever carries forward verbatim — ordinary elitism, distinct
         // from archive re-seeding.
@@ -581,20 +629,37 @@ impl Optimizer {
             carry.push(best.clone());
         }
         let pop_size = self.config.optimization.population_size;
-        let new_pop = Self::seed_population(&self.config, &mut self.rng, &seeds, pop_size, carry);
         display::print_status(&format!(
             "Restart: {} archive seeds, {:.0}% random ratio → {} genomes (best-ever carried, rest bred)",
-            seeds.len(), self.config.optimization.archive_random_ratio * 100.0, new_pop.len()
+            seeds.len(), self.config.optimization.archive_random_ratio * 100.0, pop_size
         ));
-        self.population    = new_pop;
-        self.stagnant_gens = 0;
-        // Retain the 300 most-recent save descriptors across restarts so the diversity gate
-        // keeps blocking visual regions already saved in previous epochs. Clearing it caused
-        // the same view to be re-saved 10-18× across successive restarts.
-        let keep = 300usize;
-        if self.save_descriptors.len() > keep {
-            self.save_descriptors.drain(..self.save_descriptors.len() - keep);
-        }
+        self.rebuild_population(&seeds, carry);
+    }
+
+    /// Rare, randomly-timed near-total wipe (see MassExtinctionConfig).
+    /// Survivor selection is uniform at random over the WHOLE population —
+    /// deliberately fitness-blind, unlike restart_population()'s elitism.
+    /// Refill is always pure random/exotic (empty seeds), regardless of
+    /// archive_seeding_enabled — extinction specifically must not lean on
+    /// the disk archive.
+    fn mass_extinction(&mut self) {
+        use rand::seq::IndexedRandom;
+        let mec = self.config.mass_extinction.clone();
+        let frac = if mec.max_survivor_frac > mec.min_survivor_frac {
+            self.rng.random_range(mec.min_survivor_frac..=mec.max_survivor_frac)
+        } else {
+            mec.min_survivor_frac.max(0.0)
+        };
+        let n_survivors = ((self.population.len() as f32) * frac).round() as usize;
+        // Fitness-BLIND uniform sample — best_ever is force-saved to disk by
+        // rebuild_population() but NOT auto-injected here; it only survives
+        // in the live population if it happens to be randomly picked.
+        let survivors: Vec<Genome> = self.population
+            .choose_multiple(&mut self.rng, n_survivors)
+            .cloned()
+            .collect();
+        display::print_mass_extinction(self.generation, survivors.len(), self.population.len(), frac);
+        self.rebuild_population(&[], survivors);
     }
 
     /// Returns a static reason string for the per-generation save-scan tally:
@@ -814,5 +879,42 @@ impl Optimizer {
             new_pop.push(child);
         }
         self.population = new_pop;
+    }
+}
+
+/// Per-generation probability of a mass-extinction event, derived from a
+/// target rate (events/day) and this run's mean generation duration so far —
+/// an exact Poisson-process interval probability, independent of the pure
+/// function's caller so it's testable without spinning up an Optimizer.
+fn mass_extinction_p_fire(events_per_day: f32, mean_gen_secs: f64) -> f64 {
+    let lambda = events_per_day as f64 * mean_gen_secs / 86400.0;
+    1.0 - (-lambda).exp()
+}
+
+#[cfg(test)]
+mod mass_extinction_tests {
+    use super::mass_extinction_p_fire;
+
+    #[test]
+    fn day_normalized_rate_matches_target() {
+        // events_per_day=3.0 at 60s/gen ⇒ 1440 gens/day; summing the
+        // per-gen probability over a day should reproduce ~3.0 events/day.
+        let p = mass_extinction_p_fire(3.0, 60.0);
+        let gens_per_day = 86400.0 / 60.0;
+        let expected_events = p * gens_per_day;
+        assert!((expected_events - 3.0).abs() < 0.01,
+            "expected ~3.0 events/day, got {expected_events}");
+    }
+
+    #[test]
+    fn zero_events_per_day_never_fires() {
+        assert_eq!(mass_extinction_p_fire(0.0, 60.0), 0.0);
+    }
+
+    #[test]
+    fn probability_is_monotonic_in_rate() {
+        let low = mass_extinction_p_fire(1.0, 60.0);
+        let high = mass_extinction_p_fire(10.0, 60.0);
+        assert!(high > low);
     }
 }

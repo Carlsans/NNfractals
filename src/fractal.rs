@@ -5,14 +5,17 @@ use crate::formula::apply_formula;
 #[cfg(feature = "wgpu-backend")]
 use crate::render_gpu;
 
-/// CPU fitness: (raw_png_entropy, multiscale_structured_entropy, behavioral_descriptor).
+/// CPU fitness: (raw_png_entropy, multiscale_structured_entropy, angle_structure, behavioral_descriptor).
 ///
 /// raw_png_entropy  — used for save-gate thresholding (min/max_entropy_prefilter).
 /// multiscale_entropy — used for GA selection: geometric mean of fine (64px) and
 ///   coarse (16px average-pool) PNG entropy. Penalises granular noise because noise
 ///   averages to near-uniform at coarse scale; structured fractals stay complex at
 ///   all scales. Replace the old single-scale fitness for selection only.
-pub fn evaluate_fitness_full(genome: &Genome, config: &Config) -> (f32, f32, Vec<f32>) {
+/// angle_structure — structural richness of the bailout exit-angle field (DAG
+///   genomes only); 0.0 unless angle_structure_weight > 0 (see
+///   fitness::angle_structure_score and dag_render_with_angle).
+pub fn evaluate_fitness_full(genome: &Genome, config: &Config) -> (f32, f32, f32, Vec<f32>) {
     let ew = config.optimization.eval_width;
     let eh = config.optimization.eval_height;
     let emi = config.optimization.eval_max_iter;
@@ -23,8 +26,14 @@ pub fn evaluate_fitness_full(genome: &Genome, config: &Config) -> (f32, f32, Vec
     let structured = crate::fitness::multiscale_entropy(
         &escape_times, ew, eh, emi, &config.rendering.colormap,
     );
+    let angle_score = if config.optimization.angle_structure_weight != 0.0 && genome.uses_program() {
+        let (_, angles) = dag_render_with_angle(genome, config, ew, eh, emi);
+        crate::fitness::angle_structure_score(&angles, ew as usize)
+    } else {
+        0.0
+    };
     let descriptor = crate::fitness::behavior_descriptor(&escape_times, emi);
-    (raw_png, structured, descriptor)
+    (raw_png, structured, angle_score, descriptor)
 }
 
 /// CPU rendering — returns smooth escape times [H*W].
@@ -64,15 +73,24 @@ pub fn best_entropy_view(genome: &Genome, config: &Config) -> Genome {
     best
 }
 
-/// Escape-time for one pixel under the DAG iteration with Phase-3/4 dynamics:
-/// optional coordinate warp, Julia vs Mandelbrot initialization, and phoenix
-/// memory z_{n+1} = f(z,c) + p·z_{n-1}. Mirrors the WGSL main loop.
+/// Escape-time (and exit angle) for one pixel under the DAG iteration with
+/// Phase-3/4 dynamics: optional coordinate warp, Julia vs Mandelbrot
+/// initialization, and phoenix memory z_{n+1} = f(z,c) + p·z_{n-1}. Mirrors
+/// the WGSL main loop.
+///
+/// Returns `(escape_time, exit_angle)` — `exit_angle` is `arg(z)` at the
+/// moment of bailout (`atan2(zy, zx)`), computed in the same loop and at the
+/// same return points as `escape_time` so the two values can never
+/// numerically diverge. `0.0` for the non-finite-escape and max-iter
+/// (interior) cases, which have no meaningful exit angle. Most callers only
+/// want `.0` (escape time); see `dag_render_with_angle` for a caller that
+/// keeps both.
 #[allow(clippy::too_many_arguments)]
 pub fn dag_escape_pixel(
     prog: &[crate::formula::OpNode], warp: &[crate::formula::OpNode],
     julia: bool, jc: (f32, f32), phoenix: (f32, f32), bailout_sq: f32,
     px: f32, py: f32, max_iter: u32,
-) -> f32 {
+) -> (f32, f32) {
     use crate::formula::eval_program;
     // Coordinate warp bends the pixel-derived input plane.
     let (mut ix, mut iy) = (px, py);
@@ -91,10 +109,13 @@ pub fn dag_escape_pixel(
         pzx = zx; pzy = zy;
         zx = nx; zy = ny;
         let ms = zx * zx + zy * zy;
-        if ms > bailout_sq { return ((it as f32 + 1.0) - (ms.log2() * 0.5).log2()).max(0.0); }
-        if !zx.is_finite() || !zy.is_finite() { return it as f32; }
+        if ms > bailout_sq {
+            let et = ((it as f32 + 1.0) - (ms.log2() * 0.5).log2()).max(0.0);
+            return (et, zy.atan2(zx));
+        }
+        if !zx.is_finite() || !zy.is_finite() { return (it as f32, 0.0); }
     }
-    max_iter as f32
+    (max_iter as f32, 0.0)
 }
 
 /// f64 (deep-zoom) version of `dag_escape_pixel` — same dynamics, double
@@ -215,7 +236,7 @@ pub fn render_cpu_iter(
             let py = idx / width as usize;
             let cx = xmin + (px as f32 / wf) * (xmax - xmin);
             let cy = ymin + (py as f32 / hf) * (ymax - ymin);
-            dag_escape_pixel(prog, warp, julia, jc, phoenix, bsq, cx, cy, max_iter)
+            dag_escape_pixel(prog, warp, julia, jc, phoenix, bsq, cx, cy, max_iter).0
         }).collect();
     }
 
@@ -254,6 +275,44 @@ pub fn render_cpu_iter(
         }
         max_iter as f32
     }).collect()
+}
+
+/// DAG-genome-only sibling of `render_cpu_iter` that also captures the
+/// exit-angle channel (see `dag_escape_pixel`'s doc comment). GPU when
+/// available (via `render_batch_dag_angle`, capture_angle=true), else the
+/// Rayon CPU fallback keeping both tuple components. Caller must ensure
+/// `genome.uses_program()` — legacy genomes have no angle data, out of scope
+/// for this feature.
+pub fn dag_render_with_angle(
+    genome: &Genome, _config: &Config, width: u32, height: u32, max_iter: u32,
+) -> (Vec<f32>, Vec<f32>) {
+    let (xmin, xmax, ymin, ymax) = genome.view_bounds();
+
+    #[cfg(feature = "wgpu-backend")]
+    if render_gpu::gpu_available() {
+        let item = render_gpu::dag_item(genome);
+        let (mut ets, mut angs) = render_gpu::render_batch_dag_angle(
+            &[item], &[(xmin, xmax, ymin, ymax)], width, height, max_iter, true,
+        );
+        return (ets.pop().unwrap_or_default(), angs.pop().unwrap_or_default());
+    }
+
+    let prog = &genome.program;
+    let warp = &genome.warp;
+    let julia = genome.julia_mode;
+    let jc = (genome.julia_cre, genome.julia_cim);
+    let phoenix = (genome.phoenix_re, genome.phoenix_im);
+    let bsq = genome.bailout_radius * genome.bailout_radius;
+    let wf = (width.saturating_sub(1)).max(1) as f32;
+    let hf = (height.saturating_sub(1)).max(1) as f32;
+    let n  = (width * height) as usize;
+    (0..n).into_par_iter().map(|idx| {
+        let px = idx % width as usize;
+        let py = idx / width as usize;
+        let cx = xmin + (px as f32 / wf) * (xmax - xmin);
+        let cy = ymin + (py as f32 / hf) * (ymax - ymin);
+        dag_escape_pixel(prog, warp, julia, jc, phoenix, bsq, cx, cy, max_iter)
+    }).unzip()
 }
 
 /// Render explicit fractal-plane bounds (GPU when available, else CPU) → escape times.
@@ -716,15 +775,22 @@ fn best_copy_match(
 }
 
 /// Batch-evaluate all genomes in ONE GPU dispatch with per-genome view bounds.
+/// Returns (raw_png_entropy, multiscale_structured_entropy, angle_structure,
+/// behavioral_descriptor) per genome — see evaluate_fitness_full for the
+/// meaning of each. angle_structure is 0.0 for every genome unless
+/// angle_structure_weight > 0 (skips computing the angle buffer entirely —
+/// see render_gpu::render_batch_dag_angle's "free when disabled" design) and
+/// is always 0.0 for legacy (non-DAG) genomes.
 #[cfg(feature = "wgpu-backend")]
 pub fn evaluate_fitness_batch(
     genomes: &[crate::genome::Genome],
     config:  &Config,
-) -> Vec<(f32, f32, Vec<f32>)> {
+) -> Vec<(f32, f32, f32, Vec<f32>)> {
     let ew  = config.optimization.eval_width;
     let eh  = config.optimization.eval_height;
     let emi = config.optimization.eval_max_iter;
     let bsq = config.rendering.bailout * config.rendering.bailout;
+    let want_angle = config.optimization.angle_structure_weight != 0.0;
 
     let views: Vec<(f32,f32,f32,f32)> = genomes.iter()
         .map(|g| { let (a,b,c,d) = g.view_bounds(); (a,b,c,d) })
@@ -734,23 +800,39 @@ pub fn evaluate_fitness_batch(
     // population is one system); a mixed batch falls back to per-genome CPU.
     let all_dag = !genomes.is_empty() && genomes.iter().all(|g| g.uses_program());
     let any_dag = genomes.iter().any(|g| g.uses_program());
-    let escape_batch = if all_dag {
+    let (escape_batch, angle_batch): (Vec<Vec<f32>>, Vec<Vec<f32>>) = if all_dag {
         let items: Vec<render_gpu::DagItem> = genomes.iter().map(render_gpu::dag_item).collect();
-        render_gpu::render_batch_dag(&items, &views, ew, eh, emi)
+        if want_angle {
+            render_gpu::render_batch_dag_angle(&items, &views, ew, eh, emi, true)
+        } else {
+            (render_gpu::render_batch_dag(&items, &views, ew, eh, emi),
+             genomes.iter().map(|_| Vec::new()).collect())
+        }
     } else if any_dag {
-        genomes.iter().map(|g| render_cpu_iter(g, config, ew, eh, emi)).collect()
+        genomes.iter().map(|g| {
+            if want_angle && g.uses_program() {
+                dag_render_with_angle(g, config, ew, eh, emi)
+            } else {
+                (render_cpu_iter(g, config, ew, eh, emi), Vec::new())
+            }
+        }).unzip()
     } else {
         let fw_vecs: Vec<Vec<(f32,f32)>> = genomes.iter().map(|g| g.formula_weights()).collect();
         let fw_refs: Vec<&[(f32,f32)]> = fw_vecs.iter().map(|v| v.as_slice()).collect();
-        render_gpu::render_batch(&fw_refs, &views, ew, eh, emi, bsq)
+        (render_gpu::render_batch(&fw_refs, &views, ew, eh, emi, bsq),
+         genomes.iter().map(|_| Vec::new()).collect())
     };
 
     // Parallelize PNG encoding across all CPU cores while GPU is idle post-dispatch
-    escape_batch.into_par_iter().map(|et| {
+    escape_batch.into_par_iter().zip(angle_batch.into_par_iter()).map(|(et, ang)| {
         let raw_png   = crate::fitness::png_compression_entropy(&et, ew, eh, emi, &config.rendering.colormap);
         let structured = crate::fitness::multiscale_entropy(&et, ew, eh, emi, &config.rendering.colormap);
+        // Empty `ang` (feature off, or a legacy genome in a mixed batch) → 0.0,
+        // matching evaluate_fitness_full's convention (angle_structure_score
+        // returns 0.0 for len<4).
+        let angle_score = crate::fitness::angle_structure_score(&ang, ew as usize);
         let desc = crate::fitness::behavior_descriptor(&et, emi);
-        (raw_png, structured, desc)
+        (raw_png, structured, angle_score, desc)
     }).collect()
 }
 
@@ -775,7 +857,7 @@ mod dag_f64_tests {
         for gy in 0..n { for gx in 0..n {
             let px = -1.8 + 3.6 * gx as f64 / n as f64;
             let py = -1.8 + 3.6 * gy as f64 / n as f64;
-            let a = super::dag_escape_pixel(&prog, &[], julia, (jc.0 as f32, jc.1 as f32),
+            let (a, _) = super::dag_escape_pixel(&prog, &[], julia, (jc.0 as f32, jc.1 as f32),
                 (ph.0 as f32, ph.1 as f32), bsq as f32, px as f32, py as f32, 128);
             let b = super::dag_escape_pixel_f64(&prog, &[], julia, jc, ph, bsq, px, py, 128);
             if (a - b).abs() < 1.0 { agree += 1; }

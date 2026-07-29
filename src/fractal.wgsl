@@ -4,20 +4,22 @@
 // No control-flow divergence: all threads in a warp take the same switch branch per iteration.
 
 struct Params {
-    width:        u32,
-    height:       u32,
-    max_iter:     u32,
-    genome_count: u32,
-    bailout_sq:   f32,
-    use_dag:      u32,   // 0 = legacy 58-basis sum, 1 = expression-DAG VM
-    _pad2:        f32,
-    _pad3:        f32,
+    width:         u32,
+    height:        u32,
+    max_iter:      u32,
+    genome_count:  u32,
+    bailout_sq:    f32,
+    use_dag:       u32,   // 0 = legacy 58-basis sum, 1 = expression-DAG VM
+    capture_angle: u32,   // 0 = angle channel not computed/written at all (DAG path only)
+    _pad3:         f32,
 }
 
 // Batched layout (Z dispatch dimension = genome index):
 //   all_fw      : genome_count × 116 f32s  (58 complex weights each)
 //   view_bounds : genome_count × 4 f32s    (xmin, xmax, ymin, ymax per genome)
-//   output      : genome_count × width×height f32s (escape times)
+//   output      : genome_count × width×height f32s (escape times), followed by
+//                 a second genome_count × width×height f32 block (exit angles,
+//                 arg(z) at bailout, DAG path only) when params.capture_angle != 0
 @group(0) @binding(0) var<uniform>             params      : Params;
 @group(0) @binding(1) var<storage, read>       all_fw      : array<f32>;
 @group(0) @binding(2) var<storage, read>       view_bounds : array<f32>;
@@ -234,6 +236,7 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
     let out_offset = genome_idx * pixels;
     let dag        = params.use_dag != 0u;
     var etime = f32(params.max_iter);
+    var angle = 0.0f;  // arg(z) at bailout — DAG path only, see params.capture_angle
 
     if (dag) {
         // DAG layout: 248 f32/genome = main(120) + warp(120) + dynamics(8).
@@ -263,6 +266,7 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
             if ms > bsq {
                 let nu = log2(log2(sqrt(ms) + 1e-10));
                 etime = max(0.0, f32(iter) + 1.0 - nu);
+                if (params.capture_angle != 0u) { angle = atan2(z.y, z.x); }
                 break;
             }
             if z.x != z.x || z.y != z.y || abs(z.x) > 1e15 || abs(z.y) > 1e15 {
@@ -288,4 +292,7 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
         }
     }
     output[out_offset + pixel_idx] = etime;
+    if (params.capture_angle != 0u) {
+        output[params.genome_count * pixels + out_offset + pixel_idx] = angle;
+    }
 }

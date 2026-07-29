@@ -13,6 +13,47 @@ pub fn apply_colormap(escape_times: &[f32], max_iter: u32, colormap_name: &str) 
     pixels
 }
 
+/// Cosmetic alternative to `apply_colormap`: hue driven by the bailout
+/// exit-angle (arg z at escape — see fractal::dag_escape_pixel), value/
+/// lightness driven by the same normalized escape fraction the standard
+/// palettes use, fixed high saturation. Never called from the GA's save
+/// path (try_save/force_save always use apply_colormap/turbo) — this is
+/// purely for the viewer's interactive "∠" toggle. `angles` must be the
+/// same length as `escape_times` (interior/non-finite-escape pixels have
+/// angle 0.0, which just renders as red — no special-casing needed since
+/// those pixels are already at the value-gradient's dark/light extreme).
+pub fn apply_angle_colormap(escape_times: &[f32], angles: &[f32], max_iter: u32) -> Vec<u8> {
+    let max = max_iter as f64;
+    let mut pixels = Vec::with_capacity(escape_times.len() * 3);
+    for (i, &t) in escape_times.iter().enumerate() {
+        let norm = (t as f64 / max).clamp(0.0, 1.0);
+        let angle = angles.get(i).copied().unwrap_or(0.0);
+        let hue = ((angle as f64 + std::f64::consts::PI) / std::f64::consts::TAU * 360.0).rem_euclid(360.0);
+        let (r, g, b) = hsv_to_rgb(hue, 0.75, norm);
+        pixels.push(r);
+        pixels.push(g);
+        pixels.push(b);
+    }
+    pixels
+}
+
+fn hsv_to_rgb(h: f64, s: f64, v: f64) -> (u8, u8, u8) {
+    let c = v * s;
+    let hp = h / 60.0;
+    let x = c * (1.0 - (hp.rem_euclid(2.0) - 1.0).abs());
+    let (r1, g1, b1) = match hp as u32 {
+        0 => (c, x, 0.0),
+        1 => (x, c, 0.0),
+        2 => (0.0, c, x),
+        3 => (0.0, x, c),
+        4 => (x, 0.0, c),
+        _ => (c, 0.0, x),
+    };
+    let m = v - c;
+    let to_u8 = |v: f64| ((v + m).clamp(0.0, 1.0) * 255.0).round() as u8;
+    (to_u8(r1), to_u8(g1), to_u8(b1))
+}
+
 fn color_at(name: &str, t: f64) -> (u8, u8, u8) {
     match name {
         "earth"   => earth_color(t),

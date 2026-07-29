@@ -8,6 +8,8 @@ pub struct Config {
     pub output: OutputConfig,
     #[serde(default)]
     pub dedup: DedupConfig,
+    #[serde(default)]
+    pub mass_extinction: MassExtinctionConfig,
 }
 
 #[derive(Deserialize, Clone, Debug)]
@@ -114,6 +116,23 @@ pub struct OptimizationConfig {
     /// more of the same. 0 disables. See FormulaUsageTracker.
     #[serde(default = "default_duplicate_penalty_weight")]
     pub duplicate_penalty_weight: f32,
+    /// Whether startup warm-start and stagnation-restart reseed from the
+    /// on-disk archive (fractals_N/*.nn, via load_archive_seeds) or build
+    /// purely from random/exotic genomes. Off by default: repeated
+    /// archive-seeded restarts were found to reinforce whatever formula
+    /// family the archive had already converged toward, rather than
+    /// escaping it. Set true to restore the original archive-seeded
+    /// behavior (kept intact, not removed, for experimentation).
+    #[serde(default = "default_archive_seeding_enabled")]
+    pub archive_seeding_enabled: bool,
+    /// Per-generation bonus for genomes whose bailout exit-angle field
+    /// (arg z at escape, DAG genomes only — see fitness::angle_structure_score)
+    /// has rich angular structure. fitness += angle_structure_weight ·
+    /// angle_structure. 0 disables (default) — the angle buffer is then
+    /// skipped entirely on both GPU and CPU (see
+    /// render_gpu::render_batch_dag_angle's "free when disabled" design).
+    #[serde(default = "default_angle_structure_weight")]
+    pub angle_structure_weight: f32,
 }
 
 fn default_self_replication_weight()    -> f32 { 0.35 }
@@ -131,6 +150,8 @@ fn default_musiq_weight()               -> f32 { 0.25 }
 fn default_pref_elite_count()           -> u32 { 4 }
 fn default_archive_random_ratio()       -> f32 { 0.30 }
 fn default_duplicate_penalty_weight()   -> f32 { 0.50 }
+fn default_archive_seeding_enabled()    -> bool { false }
+fn default_angle_structure_weight()     -> f32 { 0.0 }
 
 #[derive(Deserialize, Clone, Debug)]
 pub struct OutputConfig {
@@ -193,8 +214,47 @@ impl Default for DedupConfig {
     }
 }
 
+/// Rare, randomly-triggered population wipe — independent of, and coexists
+/// with, the stagnation-restart mechanism. Modeled as a Poisson process: each
+/// generation fires with probability derived from `events_per_day`, so the
+/// real-world rate stays roughly constant regardless of how fast/slow
+/// generations run. When it fires: force-saves the current best-ever genome
+/// if not already saved (file-level safety net only), keeps a
+/// uniformly-random, fitness-BLIND survivor fraction of the population, and
+/// refills every other slot with pure random/exotic genomes (no breeding, no
+/// archive-seeding, regardless of archive_seeding_enabled). Resets
+/// stagnant_gens afterward.
+#[derive(Deserialize, Clone, Debug)]
+pub struct MassExtinctionConfig {
+    /// Expected number of mass-extinction events per real-world day, averaged
+    /// over the run's lifetime. 0 disables the feature entirely.
+    #[serde(default = "default_mass_extinction_events_per_day")]
+    pub events_per_day: f32,
+    /// Minimum fraction of the population kept (uniformly at random,
+    /// independent of fitness) when a mass extinction fires.
+    #[serde(default = "default_mass_extinction_min_survivor_frac")]
+    pub min_survivor_frac: f32,
+    /// Maximum fraction kept. Actual kept fraction is resampled uniformly in
+    /// [min_survivor_frac, max_survivor_frac] fresh on every event.
+    #[serde(default = "default_mass_extinction_max_survivor_frac")]
+    pub max_survivor_frac: f32,
+}
+
+impl Default for MassExtinctionConfig {
+    fn default() -> Self {
+        MassExtinctionConfig {
+            events_per_day:    default_mass_extinction_events_per_day(),
+            min_survivor_frac: default_mass_extinction_min_survivor_frac(),
+            max_survivor_frac: default_mass_extinction_max_survivor_frac(),
+        }
+    }
+}
+
 fn default_dedup_threshold()        -> f32 { 0.97 }
 fn default_dedup_interval_hours()   -> f32 { 2.0 }
+fn default_mass_extinction_events_per_day()    -> f32 { 3.0 }
+fn default_mass_extinction_min_survivor_frac() -> f32 { 0.0 }
+fn default_mass_extinction_max_survivor_frac() -> f32 { 0.03 }
 fn default_min_beauty()             -> f32 { 0.45 }
 fn default_min_save_distance()      -> f32 { 0.10 }
 fn default_min_entropy_prefilter()  -> f32 { 0.20 }

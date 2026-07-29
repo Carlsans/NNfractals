@@ -180,6 +180,32 @@ pub fn render_batch_dag(
     }).collect()
 }
 
+/// Same as `render_batch_dag`, but optionally also returns the exit-angle
+/// channel per item (second Vec in the tuple; empty per-item Vecs when
+/// `capture_angle` is false). Used by the angle_structure_weight fitness
+/// term and the viewer's cosmetic angle-coloring toggle — see
+/// dispatch_dag_angle's doc comment for the "free when disabled" design.
+pub fn render_batch_dag_angle(
+    items: &[DagItem],
+    views: &[(f32,f32,f32,f32)],
+    w: u32, h: u32, mi: u32,
+    capture_angle: bool,
+) -> (Vec<Vec<f32>>, Vec<Vec<f32>>) {
+    assert_eq!(items.len(), views.len());
+    if let Some(Some(m)) = GPU.get() {
+        if let Ok(mut r) = m.lock() {
+            return r.dispatch_dag_angle(items, views, w, h, mi, capture_angle);
+        }
+    }
+    items.iter().zip(views).map(|(it, &(xmin,xmax,ymin,ymax))| {
+        if capture_angle {
+            render_cpu_seq_dag_angle(it, w, h, mi, xmin, xmax, ymin, ymax)
+        } else {
+            (render_cpu_seq_dag(it, w, h, mi, xmin, xmax, ymin, ymax), Vec::new())
+        }
+    }).unzip()
+}
+
 pub fn render_cpu_seq_dag(
     item: &DagItem, w: u32, h: u32, mi: u32,
     xmin: f32, xmax: f32, ymin: f32, ymax: f32,
@@ -192,8 +218,27 @@ pub fn render_cpu_seq_dag(
         crate::fractal::dag_escape_pixel(
             item.prog, item.warp, item.julia, item.jc, item.phoenix, item.bailout_sq,
             cx, cy, mi,
-        )
+        ).0
     }).collect()
+}
+
+/// Same as `render_cpu_seq_dag`, but keeps both the escape-time and exit-angle
+/// channels — CPU fallback for `render_batch_dag_angle` when no GPU adapter
+/// is available.
+pub fn render_cpu_seq_dag_angle(
+    item: &DagItem, w: u32, h: u32, mi: u32,
+    xmin: f32, xmax: f32, ymin: f32, ymax: f32,
+) -> (Vec<f32>, Vec<f32>) {
+    let wf = (w.saturating_sub(1)).max(1) as f32;
+    let hf = (h.saturating_sub(1)).max(1) as f32;
+    (0..(w*h) as usize).map(|i| {
+        let cx = xmin + (i%w as usize) as f32 / wf * (xmax-xmin);
+        let cy = ymin + (i/w as usize) as f32 / hf * (ymax-ymin);
+        crate::fractal::dag_escape_pixel(
+            item.prog, item.warp, item.julia, item.jc, item.phoenix, item.bailout_sq,
+            cx, cy, mi,
+        )
+    }).unzip()
 }
 
 #[cfg(test)]
@@ -271,6 +316,52 @@ mod gpu_dag_tests {
         eprintln!("[dyn-parity] {frac:.3} of pixels agree (<1.0); range [{mn},{mx}]");
         assert!(frac > 0.90, "GPU/CPU dynamics disagree on {:.1}% of pixels", (1.0-frac)*100.0);
         assert!(mx - mn > 1.0, "degenerate render (no structure)");
+    }
+
+    // Exit-angle channel: GPU (dispatch_dag_angle) vs CPU
+    // (render_cpu_seq_dag_angle) must agree on escape time at the same bar
+    // as gpu_dag_dynamics_parity, and on angle (circular distance, since
+    // angle wraps at ±π) for the bulk of pixels.
+    #[test]
+    fn gpu_dag_angle_parity() {
+        init_gpu();
+        if !gpu_available() { eprintln!("[test] no GPU — skipping"); return; }
+        let (w, h, mi) = (96u32, 96u32, 128u32);
+        let view = (-1.8f32, 1.8, -1.8, 1.8);
+        let prog = mandelbrot_prog();
+        let item = DagItem {
+            prog: &prog, warp: &[], julia: false, jc: (0.0,0.0),
+            phoenix: (0.0,0.0), bailout_sq: 16.0,
+        };
+        let (gpu_et, gpu_ang) = render_batch_dag_angle(
+            std::slice::from_ref(&item), &[view], w, h, mi, true,
+        );
+        let (gpu_et, gpu_ang) = (gpu_et.into_iter().next().unwrap(), gpu_ang.into_iter().next().unwrap());
+        let (cpu_et, cpu_ang) = render_cpu_seq_dag_angle(&item, w, h, mi, view.0, view.1, view.2, view.3);
+
+        let n = gpu_et.len();
+        assert_eq!(gpu_ang.len(), n);
+        let et_close = gpu_et.iter().zip(&cpu_et).filter(|(a,b)| (**a - **b).abs() < 1.0).count();
+        let et_frac = et_close as f32 / n as f32;
+        assert!(et_frac > 0.90, "GPU/CPU escape-time disagree on {:.1}% of pixels", (1.0-et_frac)*100.0);
+
+        const TWO_PI: f32 = std::f32::consts::TAU;
+        let circ_dist = |a: f32, b: f32| { let d = (a-b).rem_euclid(TWO_PI); d.min(TWO_PI - d) };
+        let ang_close = gpu_ang.iter().zip(&cpu_ang)
+            .filter(|(a,b)| circ_dist(**a, **b) < 0.1)
+            .count();
+        let ang_frac = ang_close as f32 / n as f32;
+        eprintln!("[angle-parity] escape_time {et_frac:.3}  angle {ang_frac:.3} agree");
+        assert!(ang_frac > 0.90, "GPU/CPU exit-angle disagree on {:.1}% of pixels", (1.0-ang_frac)*100.0);
+
+        // Also confirm capture_angle=false stays fully inert: empty angle vecs,
+        // same escape-time output as the plain (non-angle) dispatch path.
+        let (off_et, off_ang) = render_batch_dag_angle(
+            std::slice::from_ref(&item), &[view], w, h, mi, false,
+        );
+        assert!(off_ang[0].is_empty(), "angle channel should be empty when capture_angle=false");
+        let plain_et = render_batch_dag(std::slice::from_ref(&item), &[view], w, h, mi).remove(0);
+        assert_eq!(off_et[0], plain_et, "capture_angle=false must not perturb the escape-time channel");
     }
 }
 
@@ -533,5 +624,104 @@ impl GpuRenderer {
 
         let p = pix as usize;
         (0..items.len()).map(|i| all[i*p..(i+1)*p].to_vec()).collect()
+    }
+
+    /// Same as `dispatch_dag`, but optionally also captures the exit-angle
+    /// channel (arg(z) at bailout — see fractal.wgsl's `capture_angle`
+    /// param). When `capture_angle` is false this is behaviorally identical
+    /// to `dispatch_dag` (same buffer sizes, same dispatch) plus one extra
+    /// always-empty Vec per item — no GPU cost difference. When true, the
+    /// output buffer is doubled (escape-time channel in the first half,
+    /// angle channel in the second, matching the shader's layout) so the
+    /// angle write only costs bandwidth when actually requested.
+    fn dispatch_dag_angle(
+        &mut self,
+        items: &[DagItem],
+        views: &[(f32,f32,f32,f32)],
+        w: u32, h: u32, mi: u32,
+        capture_angle: bool,
+    ) -> (Vec<Vec<f32>>, Vec<Vec<f32>>) {
+        let gc  = items.len() as u32;
+        let pix = w * h;
+        let channels: u64 = if capture_angle { 2 } else { 1 };
+
+        if gc > self.max_genomes {
+            let fw_sz   = (gc as u64) * (STRIDE_F32S as u64) * 4;
+            let view_sz = (gc as u64) * (VIEW_F32S as u64) * 4;
+            self.fw_buf   = Self::mk_buf(&self.device, "fw",   fw_sz,   wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST);
+            self.view_buf = Self::mk_buf(&self.device, "view", view_sz, wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST);
+            self.max_genomes = gc;
+        }
+        if pix > self.max_pixels { self.max_pixels = pix; }
+        let out_needed = channels * gc as u64 * pix as u64;
+        if out_needed > self.max_out {
+            let out_sz = out_needed * 4;
+            self.out_buf     = Self::mk_buf(&self.device, "out",   out_sz, wgpu::BufferUsages::STORAGE  | wgpu::BufferUsages::COPY_SRC);
+            self.staging_buf = Self::mk_buf(&self.device, "stage", out_sz, wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST);
+            self.max_out = out_needed;
+        }
+
+        // Params (use_dag = 1 at offset 20, capture_angle at offset 24)
+        let mut pb = [0u8; 32];
+        let p32 = |b: &mut [u8], o: usize, v: u32| b[o..o+4].copy_from_slice(&v.to_le_bytes());
+        let pf  = |b: &mut [u8], o: usize, v: f32| b[o..o+4].copy_from_slice(&v.to_le_bytes());
+        p32(&mut pb, 0, w); p32(&mut pb, 4, h); p32(&mut pb, 8, mi); p32(&mut pb, 12, gc);
+        pf(&mut pb, 16, 16.0); p32(&mut pb, 20, 1); p32(&mut pb, 24, capture_angle as u32);
+        self.queue.write_buffer(&self.params_buf, 0, &pb);
+
+        let mut prog_bytes = Vec::with_capacity(gc as usize * PROG_F32S * 4);
+        for it in items {
+            for v in encode_dag_item(it) { prog_bytes.extend_from_slice(&v.to_le_bytes()); }
+        }
+        self.queue.write_buffer(&self.fw_buf, 0, &prog_bytes);
+
+        let mut vb = Vec::with_capacity(views.len() * VIEW_F32S * 4);
+        for &(xn,xx,yn,yx) in views {
+            for v in [xn,xx,yn,yx] { vb.extend_from_slice(&v.to_le_bytes()); }
+        }
+        self.queue.write_buffer(&self.view_buf, 0, &vb);
+
+        let out_sz = channels * (gc as u64) * (pix as u64) * 4;
+        let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None, layout: &self.bgl,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: self.params_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: self.fw_buf.as_entire_binding()     },
+                wgpu::BindGroupEntry { binding: 2, resource: self.view_buf.as_entire_binding()   },
+                wgpu::BindGroupEntry { binding: 3, resource: self.out_buf.as_entire_binding()    },
+            ],
+        });
+
+        let mut enc = self.device.create_command_encoder(&Default::default());
+        {
+            let mut p = enc.begin_compute_pass(&Default::default());
+            p.set_pipeline(&self.pipeline);
+            p.set_bind_group(0, &bg, &[]);
+            p.dispatch_workgroups(pix.div_ceil(WG_SIZE), 1, gc);
+        }
+        enc.copy_buffer_to_buffer(&self.out_buf, 0, &self.staging_buf, 0, out_sz);
+        self.queue.submit(Some(enc.finish()));
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.staging_buf.slice(..out_sz).map_async(wgpu::MapMode::Read, move |r| { tx.send(r).ok(); });
+        self.device.poll(wgpu::PollType::wait_indefinitely()).ok();
+        rx.recv().unwrap().unwrap();
+
+        let mapped = self.staging_buf.slice(..out_sz).get_mapped_range();
+        let all: Vec<f32> = mapped.chunks_exact(4)
+            .map(|b| f32::from_le_bytes([b[0],b[1],b[2],b[3]])).collect();
+        drop(mapped);
+        self.staging_buf.unmap();
+
+        let p = pix as usize;
+        let n = items.len();
+        let escape: Vec<Vec<f32>> = (0..n).map(|i| all[i*p..(i+1)*p].to_vec()).collect();
+        let angle: Vec<Vec<f32>> = if capture_angle {
+            let base = n * p;
+            (0..n).map(|i| all[base + i*p .. base + (i+1)*p].to_vec()).collect()
+        } else {
+            (0..n).map(|_| Vec::new()).collect()
+        };
+        (escape, angle)
     }
 }

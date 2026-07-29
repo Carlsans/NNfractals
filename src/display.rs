@@ -148,6 +148,16 @@ pub fn print_restart(generation: u64, best_fitness: f32) {
     let _ = out.flush();
 }
 
+pub fn print_mass_extinction(generation: u64, kept: usize, total: usize, frac: f32) {
+    let mut out = stdout();
+    let _ = out.execute(MoveTo(0, 29));
+    println!(
+        " ☠ EXTINCTION  gen={}  kept={}/{} ({:.1}%)  refilled random     ",
+        generation, kept, total, frac * 100.0
+    );
+    let _ = out.flush();
+}
+
 pub fn print_save(genome: &Genome, png_path: &str, beauty: f32) {
     let mut out = stdout();
     let _ = out.execute(MoveTo(0, 27));
