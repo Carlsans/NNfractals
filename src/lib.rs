@@ -2,6 +2,7 @@ pub mod config;
 pub mod dd;
 pub mod formula;
 pub mod genome;
+pub mod known_formulas;
 pub mod fractal;
 pub mod recursion_model;
 pub mod colormap;

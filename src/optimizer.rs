@@ -566,6 +566,11 @@ impl Optimizer {
         g.pref_score        = aesthetic_scores.as_ref().map(|s| s.pref).unwrap_or(0.0);
         g.self_replication  = crate::fractal::self_replication_score(&g, &self.config);
         g.fractal_recursion = crate::fractal::fractal_recursion_score(&g, &self.config);
+        // Discovery/curiosity metadata only — never read by fitness/selection/seeding.
+        match crate::fractal::known_formula_match(&g) {
+            Some((name, score)) => { g.known_formula_match = name.to_string(); g.known_formula_score = score; }
+            None => { g.known_formula_match.clear(); g.known_formula_score = 0.0; }
+        }
         if g.clip_score  > self.max_clip_score  { self.max_clip_score  = g.clip_score; }
         if g.laion_score > self.max_laion_score { self.max_laion_score = g.laion_score; }
         g.formula_readable = g.formula_expr();   // human-readable comment in the .nn
@@ -786,6 +791,11 @@ impl Optimizer {
         // actually pass the gate (a handful per generation) — they travel with the .nn.
         g.self_replication  = crate::fractal::self_replication_score(&g, &self.config);
         g.fractal_recursion = crate::fractal::fractal_recursion_score(&g, &self.config);
+        // Discovery/curiosity metadata only — never read by fitness/selection/seeding.
+        match crate::fractal::known_formula_match(&g) {
+            Some((name, score)) => { g.known_formula_match = name.to_string(); g.known_formula_score = score; }
+            None => { g.known_formula_match.clear(); g.known_formula_score = 0.0; }
+        }
         if g.clip_score  > self.max_clip_score  { self.max_clip_score  = g.clip_score; }
         if g.laion_score > self.max_laion_score { self.max_laion_score = g.laion_score; }
         // Blend the human-preference score into the saved fitness so archive seeding

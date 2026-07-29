@@ -315,6 +315,95 @@ pub fn dag_render_with_angle(
     }).unzip()
 }
 
+/// Render a bare DAG program at explicit bounds and mode/bailout, no
+/// warp/phoenix. Used only by known-formula matching (`known_formula_match`)
+/// — `render_bounds` can't be reused here: it hardcodes the legacy
+/// `apply_formula` path and has no notion of a DAG `program`.
+#[allow(clippy::too_many_arguments)]
+fn render_program_bounds(
+    prog: &[crate::formula::OpNode], julia: bool, jc: (f32, f32),
+    w: u32, h: u32, max_iter: u32, bailout_sq: f32,
+    xmin: f32, xmax: f32, ymin: f32, ymax: f32,
+) -> Vec<f32> {
+    let wf = (w.saturating_sub(1)).max(1) as f32;
+    let hf = (h.saturating_sub(1)).max(1) as f32;
+    (0..(w * h) as usize).into_par_iter().map(|idx| {
+        let px = idx % w as usize;
+        let py = idx / w as usize;
+        let cx = xmin + (px as f32 / wf) * (xmax - xmin);
+        let cy = ymin + (py as f32 / hf) * (ymax - ymin);
+        dag_escape_pixel(prog, &[], julia, jc, (0.0, 0.0), bailout_sq, cx, cy, max_iter).0
+    }).collect()
+}
+
+const KF_RES: u32  = 32;    // cheap fingerprint, not a quality render
+const KF_ITER: u32 = 100;
+const KF_PS: usize = 16;    // pooled vector side — mirrors self_replication/recursion's ~2-3x downsample ratio
+const KF_VIEW: (f32, f32, f32, f32) = (-2.0, 2.0, -2.0, 2.0); // standard Mandelbrot-plane window
+/// Similarity floor for reporting a match. Calibrated against a real
+/// ~165-genome archive sample (mode/bailout-matched comparison, see
+/// `known_formula_match`'s doc comment): scores spread roughly uniformly
+/// over [-0.03, 0.93] with median ~0.25, so 0.65 keeps only the top ~8-9%
+/// as confident matches rather than forcing a pick for everything.
+pub const KNOWN_FORMULA_THRESHOLD: f32 = 0.65;
+
+/// Closest named reference formula (`known_formulas::LIBRARY`) to a DAG
+/// genome's BASE `program`, by behavioral correlation — a discovery/curiosity
+/// label for the human user only. **Never used in fitness, selection, or
+/// seed ranking.**
+///
+/// Compares behaviorally (rendered field shape), not symbolically: this
+/// codebase has no canonicalization anywhere (no dead-code pruning —
+/// mutation can and does orphan nodes that stay in the array and get
+/// evaluated forever; no constant-folding; no canonical operand order for
+/// commutative ops), so a symbolic-equality check would both miss
+/// cosmetically-different-but-equivalent programs and hard-reject a formula
+/// that's "basically Mandelbrot but the coefficient is 0.97, not 1.0" —
+/// exactly the near-miss case this feature should catch.
+///
+/// Ignores the genome's `warp` and phoenix memory (not expressible in any
+/// reference, and not part of "which base iteration rule is this"), and
+/// always uses a fixed standard [-2,2]² view rather than the genome's own
+/// (evolved for aesthetic composition, often zoomed deep into an
+/// unrepresentative sub-region). **Does** use the genome's own
+/// `julia_mode`/`julia_cre/cim` and `bailout_radius` for BOTH the candidate
+/// and every reference render — calibrated against a real archive sample:
+/// forcing every genome into Mandelbrot-mode (z0=0, c=pixel) regardless of
+/// its own mode made ~90% of real Julia-mode genomes (the large majority of
+/// the archive) render as a degenerate flat field at the standard view,
+/// since a Julia-mode formula's evolved behavior lives at a specific fixed
+/// c that has no relationship to sweeping c across [-2,2]². Rendering
+/// candidate and references under the SAME mode/c/bailout keeps the
+/// comparison self-consistent (still apples-to-apples between candidate and
+/// reference) while actually producing a structured field for the genomes
+/// that exist in practice.
+///
+/// Returns `None` below `KNOWN_FORMULA_THRESHOLD` rather than forcing a
+/// spurious top-1 pick — "no close match" is the expected, honest answer
+/// for most evolved formulas.
+pub fn known_formula_match(genome: &Genome) -> Option<(&'static str, f32)> {
+    if !genome.uses_program() || genome.program.is_empty() { return None; }
+    let bsq = genome.bailout_radius.max(2.0).powi(2);
+    let julia = genome.julia_mode;
+    let jc = (genome.julia_cre, genome.julia_cim);
+    let (x0, x1, y0, y1) = KF_VIEW;
+
+    let cand_field = render_program_bounds(&genome.program, julia, jc, KF_RES, KF_RES, KF_ITER, bsq, x0, x1, y0, y1);
+    let cand_vec   = structure_vec(&cand_field, KF_RES as usize, KF_RES as usize, KF_PS);
+    if cand_vec.iter().all(|v| *v == 0.0) { return None; } // degenerate/flat candidate field
+
+    let mut best: Option<(&'static str, f32)> = None;
+    for kf in crate::known_formulas::LIBRARY {
+        let prog  = (kf.build)();
+        let field = render_program_bounds(&prog, julia, jc, KF_RES, KF_RES, KF_ITER, bsq, x0, x1, y0, y1);
+        let vref  = structure_vec(&field, KF_RES as usize, KF_RES as usize, KF_PS);
+        if vref.iter().all(|v| *v == 0.0) { continue; }
+        let c = correlation(&cand_vec, &vref);
+        if best.map_or(true, |(_, bc)| c > bc) { best = Some((kf.name, c)); }
+    }
+    best.filter(|&(_, c)| c >= KNOWN_FORMULA_THRESHOLD)
+}
+
 /// Render explicit fractal-plane bounds (GPU when available, else CPU) → escape times.
 pub fn render_bounds(
     fw: &[(f32, f32)], config: &Config, width: u32, height: u32, max_iter: u32,
@@ -864,5 +953,86 @@ mod dag_f64_tests {
         }}
         let frac = agree as f32 / (n * n) as f32;
         assert!(frac > 0.95, "f32/f64 DAG escape disagree on {:.1}% of pixels", (1.0 - frac) * 100.0);
+    }
+}
+
+#[cfg(test)]
+mod known_formula_tests {
+    use super::*;
+    use crate::formula::{op, OpNode};
+    use crate::genome::ProgramBuilder;
+
+    fn dag_genome(program: Vec<OpNode>) -> Genome {
+        Genome { program, bailout_radius: 4.0, view_zoom: 1.0, ..Default::default() }
+    }
+
+    #[test]
+    fn exact_mandelbrot_matches_mandelbrot() {
+        let mut b = ProgramBuilder::new();
+        let z  = b.push(op::Z, 0, 0, 0.0, 0.0).unwrap();
+        let c  = b.push(op::C, 0, 0, 0.0, 0.0).unwrap();
+        let z2 = b.push(op::SQR, z, 0, 0.0, 0.0).unwrap();
+        b.push(op::ADD, z2, c, 0.0, 0.0).unwrap();
+        let genome = dag_genome(b.into_nodes());
+
+        let m = known_formula_match(&genome);
+        assert!(m.is_some(), "exact Mandelbrot program found no match at all");
+        let (name, score) = m.unwrap();
+        assert_eq!(name, "Mandelbrot");
+        assert!(score > 0.95, "exact self-match scored too low: {score}");
+    }
+
+    #[test]
+    fn exact_tricorn_matches_tricorn_not_mandelbrot() {
+        let mut b = ProgramBuilder::new();
+        let z   = b.push(op::Z, 0, 0, 0.0, 0.0).unwrap();
+        let c   = b.push(op::C, 0, 0, 0.0, 0.0).unwrap();
+        let cj  = b.push(op::CONJ, z, 0, 0.0, 0.0).unwrap();
+        let cj2 = b.push(op::SQR, cj, 0, 0.0, 0.0).unwrap();
+        b.push(op::ADD, cj2, c, 0.0, 0.0).unwrap();
+        let genome = dag_genome(b.into_nodes());
+
+        let (name, _) = known_formula_match(&genome)
+            .expect("exact Tricorn program found no match at all");
+        assert_eq!(name, "Tricorn (Mandelbar)",
+            "Tricorn matched something else — metric isn't discriminating");
+    }
+
+    #[test]
+    fn near_miss_coefficient_still_matches_mandelbrot() {
+        // 0.97·z² + c instead of exactly z² + c — the case symbolic equality
+        // would reject outright but behavioral comparison should still catch.
+        let mut b = ProgramBuilder::new();
+        let z    = b.push(op::Z, 0, 0, 0.0, 0.0).unwrap();
+        let c    = b.push(op::C, 0, 0, 0.0, 0.0).unwrap();
+        let z2   = b.push(op::SQR, z, 0, 0.0, 0.0).unwrap();
+        let k    = b.push(op::CONST, 0, 0, 0.97, 0.0).unwrap();
+        let z2s  = b.push(op::MUL, k, z2, 0.0, 0.0).unwrap();
+        b.push(op::ADD, z2s, c, 0.0, 0.0).unwrap();
+        let genome = dag_genome(b.into_nodes());
+
+        let (name, score) = known_formula_match(&genome)
+            .expect("near-miss Mandelbrot (0.97x) found no match — behavioral robustness failed");
+        assert_eq!(name, "Mandelbrot");
+        assert!(score >= KNOWN_FORMULA_THRESHOLD);
+    }
+
+    #[test]
+    fn degenerate_program_has_no_match() {
+        // Root is a bare constant leaf — a flat, structureless field.
+        let mut b = ProgramBuilder::new();
+        b.push(op::CONST, 0, 0, 0.5, 0.5).unwrap();
+        let genome = dag_genome(b.into_nodes());
+        assert!(known_formula_match(&genome).is_none());
+    }
+
+    #[test]
+    fn legacy_genome_has_no_match() {
+        let genome = Genome { terms: vec![
+            crate::genome::FormulaTerm { basis: 0, re: 1.0, im: 0.0 },
+            crate::genome::FormulaTerm { basis: 7, re: 1.0, im: 0.0 },
+        ], view_zoom: 1.0, ..Default::default() };
+        assert!(!genome.uses_program());
+        assert!(known_formula_match(&genome).is_none());
     }
 }

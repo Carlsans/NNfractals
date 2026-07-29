@@ -99,6 +99,13 @@ pub struct Genome {
     /// only — see fitness::angle_structure_score). 0.0 if not measured
     /// (angle_structure_weight = 0). Drives selection when > 0.
     #[serde(default)] pub angle_structure: f32,
+    /// Closest named reference formula (Mandelbrot, Tricorn, Burning Ship, …)
+    /// to this genome's base program, by behavioral correlation — see
+    /// fractal::known_formula_match. Empty = no match above threshold.
+    /// DISCOVERY/CURIOSITY ONLY: never read by fitness, selection, or seeding.
+    #[serde(default)] pub known_formula_match: String,
+    /// Correlation score backing known_formula_match; 0.0 when empty.
+    #[serde(default)] pub known_formula_score: f32,
     /// Expression-DAG program (Phase-1 formula system). When non-empty, this
     /// replaces the flat `terms` basis-sum: z_{n+1} = eval_program(program,z,c).
     /// Empty ⇒ legacy genome that still evaluates via `terms`/`formula_weights`.
@@ -283,6 +290,8 @@ impl Genome {
             pred_clip: 0.0,
             formula_diversity: 0.0,
             angle_structure: 0.0,
+            known_formula_match: String::new(),
+            known_formula_score: 0.0,
             program: Vec::new(),
             julia_mode: false,
             julia_cre: 0.0,

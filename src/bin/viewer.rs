@@ -446,6 +446,12 @@ struct App {
     // files (try_save/force_save in optimizer.rs always use the standard
     // colormap). Silently inert at deep zoom (DD/f64 paths).
     angle_coloring: bool,
+    // Closest known-formula match for the currently loaded genome — computed
+    // once per genome load (fractal::known_formula_match), not persisted
+    // from here (that happens at save time in optimizer.rs). Empty = no
+    // match above threshold.
+    known_formula_label: String,
+    known_formula_score: f32,
 
     // XY bound fields — stored so they survive across frames while being edited
     xmin_str:  String,
@@ -490,6 +496,10 @@ impl App {
         let config = Config::load(Path::new("config.toml"))
             .unwrap_or_else(|_| default_config());
         let genome = load_genome(&nn_path)?;
+        let (known_formula_label, known_formula_score) =
+            nnfractals::fractal::known_formula_match(&genome)
+                .map(|(n, s)| (n.to_string(), s))
+                .unwrap_or_default();
 
         let default_view = View::new_square(
             genome.view_cx as f64,
@@ -643,6 +653,8 @@ impl App {
             save_dir_str,
             ratio_idx, colormap_idx,
             angle_coloring: false,
+            known_formula_label,
+            known_formula_score,
             xmin_str: format!("{:.6}", xmin),
             xmax_str: format!("{:.6}", xmax),
             ymin_str: format!("{:.6}", ymin),
@@ -762,6 +774,11 @@ impl App {
         match load_genome(&path) {
             Ok(genome) => {
                 self.genome = genome;
+                let (label, score) = nnfractals::fractal::known_formula_match(&self.genome)
+                    .map(|(n, s)| (n.to_string(), s))
+                    .unwrap_or_default();
+                self.known_formula_label = label;
+                self.known_formula_score = score;
                 let dv = View::new_square(
                     self.genome.view_cx as f64,
                     self.genome.view_cy as f64,
@@ -1017,6 +1034,28 @@ impl App {
                                 self.request_render(false);
                             }
                         });
+
+                        // Closest known-formula match — discovery/curiosity only,
+                        // computed once per genome load (see App::new/load_new_genome).
+                        // Stable for the lifetime of a loaded genome, so (unlike the
+                        // status bar's render-state indicator, see its own doc comment
+                        // below) showing/hiding this never depends on anything that
+                        // changes mid-render — no risk of the same layout feedback loop.
+                        if !self.known_formula_label.is_empty() {
+                            ui.separator();
+                            let phoenix = self.genome.phoenix_re != 0.0 || self.genome.phoenix_im != 0.0;
+                            let label = if phoenix {
+                                format!("≈ {} + Phoenix", self.known_formula_label)
+                            } else {
+                                format!("≈ {}", self.known_formula_label)
+                            };
+                            ui.colored_label(Color32::from_rgb(180, 180, 255), label)
+                                .on_hover_text(format!(
+                                    "Closest known-formula match (discovery only, r={:.2}) \
+                                     — computed from the base program, ignoring julia/warp/view.",
+                                    self.known_formula_score,
+                                ));
+                        }
 
                         ui.separator();
 
