@@ -4347,8 +4347,31 @@ impl App {
     }
 }
 
+/// Milliseconds since the UI thread last began a frame, as a wall-clock
+/// stamp — read by the watchdog thread in `main` to notice a frozen window.
+/// See `spawn_ui_watchdog` for why this exists at all.
+static UI_LAST_FRAME_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Whether an explore stage is running, as of the last frame the UI thread
+/// managed to draw. The watchdog only judges stalls while this is true: an
+/// idle egui window legitimately draws NOTHING for minutes (it repaints on
+/// events, not on a clock), so an unconditional watchdog would report every
+/// quiet period as a freeze. During a stage the viewer calls
+/// `request_repaint()` on every child log line, so frames are guaranteed —
+/// and their absence is real. If the UI thread freezes, this keeps whatever
+/// value it had at that moment, which is exactly the state to judge by.
+static UI_STAGE_ACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64).unwrap_or(0)
+}
+
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        // Two relaxed stores per frame — see `UI_LAST_FRAME_MS`.
+        UI_LAST_FRAME_MS.store(now_ms(), std::sync::atomic::Ordering::Relaxed);
+        UI_STAGE_ACTIVE.store(self.eo_busy, std::sync::atomic::Ordering::Relaxed);
         let ctx = ui.ctx().clone();
 
         // IPC: load new genome if another launch delegated to us
@@ -4868,10 +4891,141 @@ fn try_delegate(sock: &Path, path: &Path) -> bool {
 
 // ── Entry point ───────────────────────────────────────────────────────────────
 
+/// Reports when the UI thread stops drawing frames.
+///
+/// The window freezes hard during explore stages — niri's close request goes
+/// unanswered and only `killall` clears it, which destroys the evidence. An
+/// external watcher can see a UI thread that is *blocked* (no CPU), but not
+/// one that is *spinning*: a livelock burns CPU and looks healthy from
+/// outside. Only the UI thread itself knows whether frames are still coming,
+/// so it stamps `UI_LAST_FRAME_MS` and this thread notices the gap.
+///
+/// Costs one relaxed atomic store per frame and one wakeup per second.
+const UI_STALL_MS: u64 = 3_000;
+
+/// What the watchdog should say about one sample. Split out from the thread
+/// so the state machine is testable without real time, real threads, or a
+/// window — same reason `video_zoom_explore::usable_leg_span` is a free
+/// function.
+#[derive(Debug, PartialEq, Eq)]
+enum StallVerdict {
+    Quiet,
+    Started(u64),
+    Continuing(u64),
+    Recovered,
+}
+
+/// `reported_at` is `Some(last_frame_stamp)` once an episode has been
+/// announced, so a later sample can tell "still the same freeze" (the stamp
+/// hasn't moved) from "a frame arrived" (it has).
+fn stall_verdict(
+    stage_active: bool, last_frame_ms: u64, now: u64, reported_at: Option<u64>,
+) -> StallVerdict {
+    // Not drawing while idle is normal — see `UI_STAGE_ACTIVE`. A frame
+    // stamp of 0 means no frame has been drawn yet at all (startup).
+    if !stage_active || last_frame_ms == 0 {
+        return if reported_at.is_some() { StallVerdict::Recovered } else { StallVerdict::Quiet };
+    }
+    let age = now.saturating_sub(last_frame_ms);
+    match reported_at {
+        None if age >= UI_STALL_MS => StallVerdict::Started(age),
+        // Same episode: the UI thread has not drawn since it was announced.
+        // Re-report periodically rather than once, so the log shows how long
+        // it lasted even when the process is killed before it recovers.
+        Some(start) if start == last_frame_ms => {
+            if age % 10_000 < 1_100 { StallVerdict::Continuing(age) } else { StallVerdict::Quiet }
+        }
+        Some(_) => StallVerdict::Recovered,
+        None => StallVerdict::Quiet,
+    }
+}
+
+fn spawn_ui_watchdog() {
+    thread::spawn(move || {
+        let mut reported_at: Option<u64> = None;
+        loop {
+            thread::sleep(std::time::Duration::from_secs(1));
+            let last = UI_LAST_FRAME_MS.load(std::sync::atomic::Ordering::Relaxed);
+            let active = UI_STAGE_ACTIVE.load(std::sync::atomic::Ordering::Relaxed);
+            match stall_verdict(active, last, now_ms(), reported_at) {
+                StallVerdict::Started(age) => {
+                    eprintln!("[viewer] UI THREAD STALLED — no frame for {:.1}s (stage: running)",
+                              age as f64 / 1000.0);
+                    reported_at = Some(last);
+                }
+                StallVerdict::Continuing(age) => {
+                    eprintln!("[viewer] UI THREAD STILL STALLED — {:.0}s", age as f64 / 1000.0);
+                }
+                StallVerdict::Recovered => {
+                    eprintln!("[viewer] UI thread recovered");
+                    reported_at = None;
+                }
+                StallVerdict::Quiet => {}
+            }
+        }
+    });
+}
+
+#[cfg(test)]
+mod watchdog_tests {
+    use super::*;
+
+    #[test]
+    fn an_idle_window_is_never_reported_as_stalled() {
+        // The whole reason UI_STAGE_ACTIVE exists: egui draws nothing for
+        // minutes when nothing is happening, which must not look like a hang.
+        assert_eq!(stall_verdict(false, 1_000, 1_000_000, None), StallVerdict::Quiet);
+    }
+
+    #[test]
+    fn startup_before_the_first_frame_is_not_a_stall() {
+        assert_eq!(stall_verdict(true, 0, 60_000, None), StallVerdict::Quiet);
+    }
+
+    #[test]
+    fn a_running_stage_that_stops_drawing_is_reported_once_then_periodically() {
+        // Under the threshold: nothing.
+        assert_eq!(stall_verdict(true, 10_000, 12_000, None), StallVerdict::Quiet);
+        // Over it: announced, with the age.
+        assert_eq!(stall_verdict(true, 10_000, 13_500, None), StallVerdict::Started(3_500));
+        // Same episode (frame stamp unmoved), off the 10s beat: silent.
+        assert_eq!(stall_verdict(true, 10_000, 15_000, Some(10_000)), StallVerdict::Quiet);
+        // Same episode, on the beat: re-reported.
+        assert_eq!(stall_verdict(true, 10_000, 20_000, Some(10_000)), StallVerdict::Continuing(10_000));
+    }
+
+    #[test]
+    fn a_new_frame_ends_the_episode() {
+        // The frame stamp moved, so the UI thread is drawing again.
+        assert_eq!(stall_verdict(true, 21_000, 21_100, Some(10_000)), StallVerdict::Recovered);
+        // A stage that finishes mid-freeze also closes the episode, rather
+        // than leaving it open forever.
+        assert_eq!(stall_verdict(false, 10_000, 30_000, Some(10_000)), StallVerdict::Recovered);
+    }
+}
+
 fn main() -> anyhow::Result<()> {
     let nn_path = std::env::args().nth(1).map(PathBuf::from).ok_or_else(|| {
         anyhow::anyhow!("Usage: nnfractals-viewer <genome.nn>")
     })?;
+
+    // Opt-in: allow an unprivileged watcher to attach and read stacks.
+    // This window freezes hard enough during an explore stage that niri's
+    // close request goes unanswered and only `killall` clears it — which
+    // also destroys the evidence. Yama's ptrace_scope=1 (the setting on this
+    // machine) restricts ptrace to direct ancestors, so a watcher running
+    // ALONGSIDE the viewer cannot dump stacks mid-freeze without root. Gated
+    // behind an env var so an ordinary run keeps the default restriction;
+    // scripts/hang_watch.sh documents the workflow.
+    #[cfg(target_os = "linux")]
+    if std::env::var_os("NNFRACTALS_ALLOW_PTRACE").is_some() {
+        // SAFETY: PR_SET_PTRACER passes no pointers and touches no memory —
+        // its only effect is relaxing who may attach to THIS process.
+        unsafe { libc::prctl(libc::PR_SET_PTRACER, libc::PR_SET_PTRACER_ANY); }
+        eprintln!("[viewer] ptrace attach allowed (NNFRACTALS_ALLOW_PTRACE)");
+    }
+
+    spawn_ui_watchdog();
 
     // ── Single-instance IPC ───────────────────────────────────────────────────
     let sock_path = socket_path();

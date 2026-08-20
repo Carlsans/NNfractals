@@ -53,4 +53,7 @@ rayon      = "1"
 crossterm  = "0.29"
 anyhow     = "1"
 ctrlc      = "3"
+# Only for the opt-in PR_SET_PTRACER call in the viewer (see
+# NNFRACTALS_ALLOW_PTRACE) — already in the lock file as a transitive dep.
+libc       = "0.2"
 

@@ -2387,6 +2387,7 @@ dependencies = [
  "eframe",
  "egui_extras",
  "image",
+ "libc",
  "pollster 0.3.0",
  "rand 0.9.4",
  "rayon",

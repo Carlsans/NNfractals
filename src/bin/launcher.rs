@@ -547,7 +547,18 @@ impl App {
     /// Spawn a sibling binary with the project root as cwd.
     fn spawn(&mut self, bin: PathBuf, args: &[&str], what: &str) {
         match Command::new(&bin).args(args).current_dir(&self.root).spawn() {
-            Ok(_) => self.status = format!("Launched {what}"),
+            Ok(child) => {
+                // Reap it — dropping a `Child` never waits, so every launched
+                // binary that exits (immediately, in the viewer's
+                // single-instance delegate case) would stay a zombie for the
+                // lifetime of this launcher. Same fix as `browser.rs`'s
+                // `open_path`, where three had accumulated in one session.
+                std::thread::spawn(move || {
+                    let mut child = child;
+                    let _ = child.wait();
+                });
+                self.status = format!("Launched {what}");
+            }
             Err(e) => self.status = format!("Could not launch {what}: {e}"),
         }
     }

@@ -570,7 +570,19 @@ impl App {
 
     fn open_path(&mut self, path: &Path) {
         match std::process::Command::new(viewer_path()).arg(path).spawn() {
-            Ok(_) => self.status = format!("Opened {}", path.display()),
+            Ok(child) => {
+                // Reap it. The viewer is single-instance: when one is already
+                // running, the process spawned here hands the path over via
+                // the IPC socket and exits within milliseconds. Dropping the
+                // `Child` never waits, so each of those exits left a zombie
+                // for the lifetime of this window — three of them had piled
+                // up in one 14-hour session.
+                std::thread::spawn(move || {
+                    let mut child = child;
+                    let _ = child.wait();
+                });
+                self.status = format!("Opened {}", path.display());
+            }
             Err(e) => self.status = format!("Could not launch viewer: {e}"),
         }
     }
