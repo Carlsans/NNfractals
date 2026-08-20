@@ -33,14 +33,29 @@ use nnfractals::video_export::{
 /// detached and best-effort — a click on a status label has nowhere
 /// meaningful to surface a launch failure, so errors are silently ignored.
 fn open_file(path: &Path) {
-    let _ = std::process::Command::new("xdg-open").arg(path).spawn();
+    reap(std::process::Command::new("xdg-open").arg(path).spawn());
+}
+
+/// Wait on a spawned helper in the background so it doesn't become a zombie.
+///
+/// Dropping a `Child` never waits, and these helpers all exit within
+/// milliseconds — so each one left a defunct entry for the lifetime of this
+/// window. This process is meant to run for days: 13 of them had accumulated
+/// in one 18-hour session (`xdg-open` per click, `paplay` per finished item).
+fn reap(spawned: std::io::Result<std::process::Child>) {
+    if let Ok(child) = spawned {
+        std::thread::spawn(move || {
+            let mut child = child;
+            let _ = child.wait();
+        });
+    }
 }
 
 /// Open the folder CONTAINING `path` — also via `xdg-open`, so it launches
 /// whatever the user has set as their default file manager.
 fn open_containing_folder(path: &Path) {
     if let Some(dir) = path.parent() {
-        let _ = std::process::Command::new("xdg-open").arg(dir).spawn();
+        reap(std::process::Command::new("xdg-open").arg(dir).spawn());
     }
 }
 
@@ -51,14 +66,16 @@ fn open_containing_folder(path: &Path) {
 fn play_completion_sound() {
     const FREEDESKTOP_SOUND: &str = "/usr/share/sounds/freedesktop/stereo/complete.oga";
     if Path::new(FREEDESKTOP_SOUND).exists() {
-        if std::process::Command::new("paplay").arg(FREEDESKTOP_SOUND).spawn().is_ok() {
+        if let Ok(c) = std::process::Command::new("paplay").arg(FREEDESKTOP_SOUND).spawn() {
+            reap(Ok(c));
             return;
         }
-        if std::process::Command::new("pw-play").arg(FREEDESKTOP_SOUND).spawn().is_ok() {
+        if let Ok(c) = std::process::Command::new("pw-play").arg(FREEDESKTOP_SOUND).spawn() {
+            reap(Ok(c));
             return;
         }
     }
-    let _ = std::process::Command::new("canberra-gtk-play").args(["--id", "complete"]).spawn();
+    reap(std::process::Command::new("canberra-gtk-play").args(["--id", "complete"]).spawn());
 }
 
 // ── Single-instance IPC ──────────────────────────────────────────────────
