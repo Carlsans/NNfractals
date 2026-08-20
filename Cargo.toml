@@ -22,6 +22,11 @@ name = "nnfractals-launcher"
 path = "src/bin/launcher.rs"
 required-features = ["launcher"]
 
+[[bin]]
+name = "nnfractals-queue"
+path = "src/bin/queue.rs"
+required-features = ["queue", "wgpu-backend"]
+
 [features]
 default = ["wgpu-backend"]
 wgpu-backend = ["dep:wgpu", "dep:pollster"]
@@ -29,6 +34,7 @@ ndarray-backend = []
 viewer = ["dep:eframe"]
 browser = ["dep:eframe", "dep:egui_extras"]
 launcher = ["dep:eframe", "dep:sysinfo"]
+queue = ["dep:eframe"]
 
 [dependencies]
 wgpu       = { version = "29", optional = true }

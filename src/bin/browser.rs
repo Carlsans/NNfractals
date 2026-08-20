@@ -328,23 +328,34 @@ fn discover_fractal_dirs(current: &Path) -> Vec<PathBuf> {
     dirs
 }
 
-/// Locate a project binary robustly: sibling of this exe, the other build profile
-/// (target/debug ↔ target/release — the viewer is often only built in release),
-/// then ~/.local/bin, and finally the bare name (OS PATH lookup).
+/// Locate a project binary robustly: target/release/<name> FIRST — even if
+/// this exe is itself a debug build sitting right next to a debug sibling —
+/// then the exe's own dir, then target/debug/<name>, then ~/.local/bin,
+/// finally the bare name (OS PATH lookup). Confirmed necessary the hard
+/// way, not just in theory: a stale `target/debug/nnfractals-viewer`,
+/// launched via a desktop entry that (independently) hardcoded
+/// `target/debug/nnfractals-launcher`, kept absorbing every new launch via
+/// the viewer's single-instance socket long after a `cargo build --release`
+/// — because the OLD version of this function checked "next to me" before
+/// "release", so a debug launcher/browser always found and preferred its
+/// debug siblings regardless of whether a current release build existed.
 fn locate_bin(name: &str) -> PathBuf {
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
+            if let Some(target) = dir.parent() {
+                let c = target.join("release").join(name);
+                if c.exists() {
+                    return c;
+                }
+            }
             let c = dir.join(name);
             if c.exists() {
                 return c;
             }
-            // …/target/{debug,release}/<exe> → also try the sibling profile dir.
             if let Some(target) = dir.parent() {
-                for prof in ["release", "debug"] {
-                    let c = target.join(prof).join(name);
-                    if c.exists() {
-                        return c;
-                    }
+                let c = target.join("debug").join(name);
+                if c.exists() {
+                    return c;
                 }
             }
         }

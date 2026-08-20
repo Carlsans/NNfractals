@@ -40,20 +40,31 @@ fn bin_dir() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."))
 }
 
-/// Locate a project binary robustly: sibling of this exe, the other build profile
-/// (target/debug ↔ target/release), then ~/.local/bin, then the bare name (PATH).
+/// Locate a project binary robustly: target/release/<name> FIRST — even if
+/// this exe is itself a debug build sitting right next to a debug sibling —
+/// then sibling of this exe, then target/debug/<name>, then ~/.local/bin,
+/// then the bare name (PATH). Same fix as `browser.rs::locate_bin` /
+/// `viewer.rs::locate_sibling_bin` (identical bug, independently
+/// duplicated here) — confirmed in practice: a desktop entry hardcoding
+/// `target/debug/nnfractals-launcher` cascaded into debug browser/viewer
+/// siblings indefinitely, because the old check-my-own-dir-first order
+/// never got as far as preferring release.
 fn sibling(name: &str) -> PathBuf {
     let dir = bin_dir();
+    if let Some(target) = dir.parent() {
+        let c = target.join("release").join(name);
+        if c.exists() {
+            return c;
+        }
+    }
     let c = dir.join(name);
     if c.exists() {
         return c;
     }
     if let Some(target) = dir.parent() {
-        for prof in ["release", "debug"] {
-            let c = target.join(prof).join(name);
-            if c.exists() {
-                return c;
-            }
+        let c = target.join("debug").join(name);
+        if c.exists() {
+            return c;
         }
     }
     if let Ok(home) = std::env::var("HOME") {

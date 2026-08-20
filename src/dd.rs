@@ -111,11 +111,37 @@ impl std::ops::Div for Dd {
     }
 }
 
+// ── First-order correction for smooth (holomorphic) f64-only functions ─────
+//
+// A transcendental evaluated as `f(hi)` alone silently throws away every
+// Dd's `.lo` part — and since these ops run once per iteration, that
+// collapses the WHOLE computation back to plain f64 precision from the
+// first iteration onward, for any genome that uses them anywhere in its
+// formula graph. Confirmed against a real saved genome (Julia mode, TANH
+// then COS applied directly to Z every iteration): deep-zoom rendering
+// went degenerate exactly at the f64 precision limit, i.e. DD contributed
+// nothing at all for that genome.
+//
+// Fix: first-order Taylor expansion around the hi-only point. For a
+// holomorphic f, f(z+dz) ≈ f(z) + f'(z)·dz. `dz` here is the accumulated
+// `.lo` remainder — always tiny by the Dd invariant (|lo| ≤ ε·|hi|) — so
+// the dropped O(dz²) term is of order ε², far below anything that matters.
+// This recovers full Dd-level accuracy without reimplementing sin/cos/exp
+// as genuine double-double routines.
+#[inline]
+fn dd_taylor_correct(fre: f64, fim: f64, dre: f64, dim: f64, dx: f64, dy: f64) -> (Dd, Dd) {
+    let corr_re = dre * dx - dim * dy;
+    let corr_im = dre * dy + dim * dx;
+    (Dd::from_f64(fre) + Dd::from_f64(corr_re), Dd::from_f64(fim) + Dd::from_f64(corr_im))
+}
+
 // ── Formula evaluation in double-double ──────────────────────────────────────
 
 /// Evaluate one of the 58 legacy basis functions in double-double.
-/// Polynomial/rational bases are fully precise; transcendentals fall back to
-/// f64 (their weights are only f32-precise anyway).
+/// Polynomial/rational bases are fully precise; transcendentals use the
+/// hi-only value plus a numerical-derivative correction (see
+/// `dd_taylor_correct` above) — generic over all 40 remaining basis shapes
+/// rather than a hand-derived formula per function.
 pub fn eval_basis_dd(i: usize, zx: Dd, zy: Dd, cx: Dd, cy: Dd) -> (Dd, Dd) {
     let eps = Dd::from_f64(1e-15_f64);
 
@@ -163,11 +189,43 @@ pub fn eval_basis_dd(i: usize, zx: Dd, zy: Dd, cx: Dd, cy: Dd) -> (Dd, Dd) {
         16 => { let(sx,sy)=(zx-cx,zy-cy); (sx*sx-sy*sy,(sx*sy)*2.0) }, // (z-c)²
         17 => { let(zcx,zcy)=cmul!(zx,zy,cx,cy); (zcx*zcx-zcy*zcy,(zcx*zcy)*2.0) }, // (z·c)²
 
-        // ── C–G: Transcendental — fall back to f64 (weights are f32 anyway) ─
+        // ── C–G: Transcendental — hi-only value + numerical-derivative
+        // correction (generic: 40 different shapes here, not worth hand-
+        // deriving each one — see dd_taylor_correct's doc comment).
         i => {
             use crate::formula::f64_impl::eval_basis;
-            let (rx, ry) = eval_basis(i, zx.hi, zy.hi, cx.hi, cy.hi);
-            (Dd::from_f64(rx), Dd::from_f64(ry))
+            let (zxh, zyh, cxh, cyh) = (zx.hi, zy.hi, cx.hi, cy.hi);
+            let (zxl, zyl, cxl, cyl) = (zx.lo, zy.lo, cx.lo, cy.lo);
+            let (fre, fim) = eval_basis(i, zxh, zyh, cxh, cyh);
+            if zxl == 0.0 && zyl == 0.0 && cxl == 0.0 && cyl == 0.0 {
+                return (Dd::from_f64(fre), Dd::from_f64(fim));
+            }
+            let scale = zxh.abs().max(zyh.abs()).max(cxh.abs()).max(cyh.abs()).max(1.0);
+            let h = scale * 1e-6;
+            let mut corr_re = 0.0;
+            let mut corr_im = 0.0;
+            let mut accum = |dre: f64, dim: f64, d: f64| { corr_re += dre * d; corr_im += dim * d; };
+            if zxl != 0.0 {
+                let (rp, ip) = eval_basis(i, zxh + h, zyh, cxh, cyh);
+                let (rm, im) = eval_basis(i, zxh - h, zyh, cxh, cyh);
+                accum((rp - rm) / (2.0 * h), (ip - im) / (2.0 * h), zxl);
+            }
+            if zyl != 0.0 {
+                let (rp, ip) = eval_basis(i, zxh, zyh + h, cxh, cyh);
+                let (rm, im) = eval_basis(i, zxh, zyh - h, cxh, cyh);
+                accum((rp - rm) / (2.0 * h), (ip - im) / (2.0 * h), zyl);
+            }
+            if cxl != 0.0 {
+                let (rp, ip) = eval_basis(i, zxh, zyh, cxh + h, cyh);
+                let (rm, im) = eval_basis(i, zxh, zyh, cxh - h, cyh);
+                accum((rp - rm) / (2.0 * h), (ip - im) / (2.0 * h), cxl);
+            }
+            if cyl != 0.0 {
+                let (rp, ip) = eval_basis(i, zxh, zyh, cxh, cyh + h);
+                let (rm, im) = eval_basis(i, zxh, zyh, cxh, cyh - h);
+                accum((rp - rm) / (2.0 * h), (ip - im) / (2.0 * h), cyl);
+            }
+            (Dd::from_f64(fre) + Dd::from_f64(corr_re), Dd::from_f64(fim) + Dd::from_f64(corr_im))
         }
     }
 }
@@ -234,21 +292,102 @@ pub fn eval_program_dd(
             ABSIM   => (ax, ay.abs()),
             NORMZ   => { let m=(ax*ax+ay*ay).sqrt()+eps; (ax/m, ay/m) },
 
-            // ── Transcendentals — fall back to f64 hi parts ─────────────────
+            // ── Transcendentals — hi-only value + exact analytic-derivative
+            // correction (dd_taylor_correct). These run once PER ITERATION,
+            // so a naive hi-only fallback here throws away Dd precision on
+            // every step, not just once — confirmed to fully defeat DD
+            // rendering for any genome using SIN/COS/EXP/LOG/TANH directly.
             SIN  => { let(x,y)=(ax.hi,ay.hi);
-                      (Dd::from_f64(x.sin()*y.cosh()), Dd::from_f64(x.cos()*y.sinh())) },
+                      let (sre,sim) = (x.sin()*y.cosh(), x.cos()*y.sinh());
+                      let (cre,cim) = (x.cos()*y.cosh(), -x.sin()*y.sinh()); // sin' = cos
+                      dd_taylor_correct(sre, sim, cre, cim, ax.lo, ay.lo) },
             COS  => { let(x,y)=(ax.hi,ay.hi);
-                      (Dd::from_f64(x.cos()*y.cosh()), Dd::from_f64(-x.sin()*y.sinh())) },
+                      let (cre,cim) = (x.cos()*y.cosh(), -x.sin()*y.sinh());
+                      let (sre,sim) = (x.sin()*y.cosh(), x.cos()*y.sinh());
+                      dd_taylor_correct(cre, cim, -sre, -sim, ax.lo, ay.lo) }, // cos' = -sin
             EXP  => { let x=ax.hi.clamp(-8.0,8.0); let e=x.exp(); let y=ay.hi;
-                      (Dd::from_f64(e*y.cos()), Dd::from_f64(e*y.sin())) },
+                      let (ere,eim) = (e*y.cos(), e*y.sin());
+                      dd_taylor_correct(ere, eim, ere, eim, ax.lo, ay.lo) }, // exp' = exp
             LOG  => { let(x,y)=(ax.hi,ay.hi);
                       let d=(x*x+y*y+1e-15).sqrt();
-                      (Dd::from_f64(d.ln()), Dd::from_f64(y.atan2(x))) },
+                      let (lre,lim) = (d.ln(), y.atan2(x));
+                      let denom = x*x+y*y+1e-15;
+                      dd_taylor_correct(lre, lim, x/denom, -y/denom, ax.lo, ay.lo) }, // log' = 1/z
             TANH => { let(x2,y2)=(2.0*ax.hi,2.0*ay.hi);
                       let d=x2.cosh()+y2.cos()+1e-15;
-                      (Dd::from_f64(x2.sinh()/d), Dd::from_f64(y2.sin()/d)) },
+                      let (tre,tim) = (x2.sinh()/d, y2.sin()/d);
+                      let (t2re,t2im) = (tre*tre-tim*tim, 2.0*tre*tim); // tanh' = 1-tanh²
+                      dd_taylor_correct(tre, tim, 1.0-t2re, -t2im, ax.lo, ay.lo) },
             _    => zero,
         };
     }
     reg[n - 1]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::formula::{op, OpNode};
+
+    // Regression for the transcendental-fallback bug: a genuine saved genome
+    // (Julia mode, program TANH→COS→MUL→DIV applied to Z every iteration)
+    // rendered as degenerate exactly at the f64 precision limit — DD
+    // contributed nothing, because the old hi-only fallback discarded the
+    // Dd .lo part on every single iteration. Confirmed against a brute-force
+    // f64 evaluation at the literal (hi+lo) point: the old hi-only value was
+    // off by ~3e-9 for a deliberately-not-astronomically-tiny lo; the
+    // first-order-corrected value matches brute force exactly.
+    #[test]
+    fn tanh_dd_correction_matches_brute_force_at_summed_point() {
+        let x = 0.31_f64;
+        let y = -0.22_f64;
+        let dx = 3e-9_f64;
+        let dy = -2e-9_f64;
+
+        let prog = vec![
+            OpNode { op: op::Z,    a: 0, b: 0, kre: 0.0, kim: 0.0 },
+            OpNode { op: op::TANH, a: 0, b: 0, kre: 0.0, kim: 0.0 },
+        ];
+        let ax = Dd { hi: x, lo: dx };
+        let ay = Dd { hi: y, lo: dy };
+        let (rx, ry) = eval_program_dd(&prog, ax, ay, Dd::zero(), Dd::zero());
+        let got = (rx.hi + rx.lo, ry.hi + ry.lo);
+
+        // Brute-force ground truth: evaluate tanh directly at the literal
+        // summed point in plain f64 (valid here since dx/dy aren't so tiny
+        // that x+dx rounds back to x — this checks the CORRECTION logic,
+        // not sub-ULP precision itself).
+        let (bx, by) = (x + dx, y + dy);
+        let (x2, y2) = (2.0 * bx, 2.0 * by);
+        let d = x2.cosh() + y2.cos() + 1e-15;
+        let brute = (x2.sinh() / d, y2.sin() / d);
+
+        // hi-only (the old buggy behavior) for comparison — should be
+        // measurably worse than the corrected result.
+        let (x2h, y2h) = (2.0 * x, 2.0 * y);
+        let dh = x2h.cosh() + y2h.cos() + 1e-15;
+        let hi_only = (x2h.sinh() / dh, y2h.sin() / dh);
+        let hi_only_err = ((hi_only.0 - brute.0).powi(2) + (hi_only.1 - brute.1).powi(2)).sqrt();
+
+        let err = ((got.0 - brute.0).powi(2) + (got.1 - brute.1).powi(2)).sqrt();
+        assert!(err < 1e-13, "corrected TANH doesn't match brute force: err={err:e}");
+        assert!(err < hi_only_err / 1000.0,
+            "corrected TANH ({err:e}) isn't meaningfully better than the old hi-only fallback ({hi_only_err:e})");
+    }
+
+    #[test]
+    fn transcendental_correction_is_inert_when_lo_is_zero() {
+        // No Dd precision to recover (lo=0) — must reduce to exactly the
+        // old hi-only behavior, not introduce spurious noise.
+        let prog = vec![
+            OpNode { op: op::Z,   a: 0, b: 0, kre: 0.0, kim: 0.0 },
+            OpNode { op: op::COS, a: 0, b: 0, kre: 0.0, kim: 0.0 },
+        ];
+        let ax = Dd::from_f64(0.4);
+        let ay = Dd::from_f64(-0.15);
+        let (rx, ry) = eval_program_dd(&prog, ax, ay, Dd::zero(), Dd::zero());
+        assert_eq!(rx.lo, 0.0);
+        assert_eq!(ry.lo, 0.0);
+        assert!((rx.hi - (0.4_f64.cos() * (-0.15_f64).cosh())).abs() < 1e-15);
+    }
 }

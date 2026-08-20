@@ -133,6 +133,17 @@ pub struct OptimizationConfig {
     /// render_gpu::render_batch_dag_angle's "free when disabled" design).
     #[serde(default = "default_angle_structure_weight")]
     pub angle_structure_weight: f32,
+    /// Weight on image-based novelty (novelty_score ∈ [0,∞): avg L2 distance
+    /// to the k nearest archive genomes in a learned DINOv2+VICReg embedding
+    /// space — see novelty_scorer.py / scripts/train_novelty.py). Blended
+    /// into saved fitness AND archive-seed ranking, alongside
+    /// self_replication/fractal_recursion/pref_score: score += weight ·
+    /// novelty_score. 0 disables (default, and inert automatically if no
+    /// trained head/novelty_scorer.py is present). Distinct from
+    /// `novelty_weight` above, which is a different (behavioral-descriptor,
+    /// purely synchronous) novelty signal already live in step()'s fitness.
+    #[serde(default = "default_img_novelty_weight")]
+    pub img_novelty_weight: f32,
 }
 
 fn default_self_replication_weight()    -> f32 { 0.35 }
@@ -152,6 +163,7 @@ fn default_archive_random_ratio()       -> f32 { 0.30 }
 fn default_duplicate_penalty_weight()   -> f32 { 0.50 }
 fn default_archive_seeding_enabled()    -> bool { false }
 fn default_angle_structure_weight()     -> f32 { 0.0 }
+fn default_img_novelty_weight()         -> f32 { 0.0 }
 
 #[derive(Deserialize, Clone, Debug)]
 pub struct OutputConfig {

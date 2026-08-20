@@ -122,11 +122,18 @@ pub fn dag_escape_pixel(
 /// precision, for the viewer's deep-zoom CPU path. Genome dynamics (f32) are
 /// widened to f64. Mirrors `dag_escape_pixel` exactly.
 #[allow(clippy::too_many_arguments)]
+/// Returns (escape time, bailout exit angle `zy.atan2(zx)`) — the same pair
+/// `dag_escape_pixel` (f32) returns, for the same reason: the viewer's "∠"
+/// angle-coloring toggle, extended to this precision tier so it doesn't
+/// silently go inert as soon as a render needs f64 (see
+/// `video_export::render_cpu`'s `want_angle` gate and
+/// `render_f64_with_angle`). Never DD — that tier stays unsupported by
+/// design (scope-limited, see the same doc comment).
 pub fn dag_escape_pixel_f64(
     prog: &[crate::formula::OpNode], warp: &[crate::formula::OpNode],
     julia: bool, jc: (f64, f64), phoenix: (f64, f64), bailout_sq: f64,
     px: f64, py: f64, max_iter: u32,
-) -> f32 {
+) -> (f32, f32) {
     use crate::formula::f64_impl::eval_program;
     let (mut ix, mut iy) = (px, py);
     if !warp.is_empty() {
@@ -142,10 +149,88 @@ pub fn dag_escape_pixel_f64(
         pzx = zx; pzy = zy;
         zx = nx; zy = ny;
         let ms = zx * zx + zy * zy;
-        if ms > bailout_sq { return ((it as f64 + 1.0) - (ms.log2() * 0.5).log2()).max(0.0) as f32; }
-        if !zx.is_finite() || !zy.is_finite() { return it as f32; }
+        if ms > bailout_sq {
+            let et = ((it as f64 + 1.0) - (ms.log2() * 0.5).log2()).max(0.0) as f32;
+            return (et, zy.atan2(zx) as f32);
+        }
+        if !zx.is_finite() || !zy.is_finite() { return (it as f32, 0.0); }
     }
-    max_iter as f32
+    (max_iter as f32, 0.0)
+}
+
+/// Returns `(escape_time, zx, zy)` — the raw complex z components at the
+/// moment of bailout, not just `arg(z)` like `dag_escape_pixel`. Added for
+/// exploring a complex-valued autoencoder (Carl's request, 2026-08-07): the
+/// real/imaginary parts and magnitude of the bailout value are a genuinely
+/// different signal from escape time (which only encodes iteration COUNT,
+/// discarding exactly where in the complex plane the orbit left the
+/// bailout disk). `(0.0, 0.0)` for zx/zy on the non-finite-escape and
+/// max-iter (interior) cases — same "no meaningful bailout value" edge
+/// case `dag_escape_pixel`'s angle already documents. Deliberately a
+/// SEPARATE function rather than changing `dag_escape_pixel`'s return
+/// type — that one has established callers (viewer angle-coloring, GPU
+/// angle rendering) this shouldn't risk disturbing for an exploratory
+/// feature. Same loop body as `dag_escape_pixel`, just a different return.
+#[allow(clippy::too_many_arguments)]
+pub fn dag_escape_pixel_z(
+    prog: &[crate::formula::OpNode], warp: &[crate::formula::OpNode],
+    julia: bool, jc: (f32, f32), phoenix: (f32, f32), bailout_sq: f32,
+    px: f32, py: f32, max_iter: u32,
+) -> (f32, f32, f32) {
+    use crate::formula::eval_program;
+    let (mut ix, mut iy) = (px, py);
+    if !warp.is_empty() {
+        let (wx, wy) = eval_program(warp, px, py, px, py);
+        ix = wx; iy = wy;
+    }
+    let (mut zx, mut zy, cx, cy) = if julia { (ix, iy, jc.0, jc.1) } else { (0.0, 0.0, ix, iy) };
+    let (mut pzx, mut pzy) = (0.0f32, 0.0f32);
+    for it in 0..max_iter {
+        let (fx, fy) = eval_program(prog, zx, zy, cx, cy);
+        let nx = fx + phoenix.0 * pzx - phoenix.1 * pzy;
+        let ny = fy + phoenix.0 * pzy + phoenix.1 * pzx;
+        pzx = zx; pzy = zy;
+        zx = nx; zy = ny;
+        let ms = zx * zx + zy * zy;
+        if ms > bailout_sq {
+            let et = ((it as f32 + 1.0) - (ms.log2() * 0.5).log2()).max(0.0);
+            return (et, zx, zy);
+        }
+        if !zx.is_finite() || !zy.is_finite() { return (it as f32, 0.0, 0.0); }
+    }
+    (max_iter as f32, 0.0, 0.0)
+}
+
+/// f64 sibling of `dag_escape_pixel_z` — same rationale/edge cases as
+/// `dag_escape_pixel_f64` relative to `dag_escape_pixel`.
+#[allow(clippy::too_many_arguments)]
+pub fn dag_escape_pixel_z_f64(
+    prog: &[crate::formula::OpNode], warp: &[crate::formula::OpNode],
+    julia: bool, jc: (f64, f64), phoenix: (f64, f64), bailout_sq: f64,
+    px: f64, py: f64, max_iter: u32,
+) -> (f32, f32, f32) {
+    use crate::formula::f64_impl::eval_program;
+    let (mut ix, mut iy) = (px, py);
+    if !warp.is_empty() {
+        let (wx, wy) = eval_program(warp, px, py, px, py);
+        ix = wx; iy = wy;
+    }
+    let (mut zx, mut zy, cx, cy) = if julia { (ix, iy, jc.0, jc.1) } else { (0.0, 0.0, ix, iy) };
+    let (mut pzx, mut pzy) = (0.0f64, 0.0f64);
+    for it in 0..max_iter {
+        let (fx, fy) = eval_program(prog, zx, zy, cx, cy);
+        let nx = fx + phoenix.0 * pzx - phoenix.1 * pzy;
+        let ny = fy + phoenix.0 * pzy + phoenix.1 * pzx;
+        pzx = zx; pzy = zy;
+        zx = nx; zy = ny;
+        let ms = zx * zx + zy * zy;
+        if ms > bailout_sq {
+            let et = ((it as f64 + 1.0) - (ms.log2() * 0.5).log2()).max(0.0) as f32;
+            return (et, zx as f32, zy as f32);
+        }
+        if !zx.is_finite() || !zy.is_finite() { return (it as f32, 0.0, 0.0); }
+    }
+    (max_iter as f32, 0.0, 0.0)
 }
 
 /// Double-double DAG escape — used for zoom > ~10¹¹ where f64 runs out.
@@ -443,7 +528,7 @@ pub fn render_bounds(
 /// Down-pool an escape-time field to a `PS×PS` contrast-normalised (z-scored) vector.
 /// Z-scoring makes it invariant to the overall escape-time offset, which rises with
 /// zoom depth — what survives is the *shape* of the structure.
-fn structure_vec(field: &[f32], w: usize, h: usize, ps: usize) -> Vec<f32> {
+pub fn structure_vec(field: &[f32], w: usize, h: usize, ps: usize) -> Vec<f32> {
     let mut pooled = vec![0.0f32; ps * ps];
     for py in 0..ps {
         for px in 0..ps {
@@ -515,8 +600,117 @@ pub fn field_intricacy(field: &[f32], w: usize, h: usize) -> f32 {
     flips as f32 / total.max(1) as f32
 }
 
+/// Shared by both exploration candidate-scoring paths (`explore::sweep`'s
+/// `field_to_candidate` and `vae_explore::score_position`) that use
+/// `local_edge_density`/`local_intricacy` — one definition so the two
+/// stay in sync rather than risking silent drift between two copies.
+/// 4 gives 32×32 sub-tiles at `vae_explore::COARSE_SAMPLE_RES`=128 (or
+/// 16×16 at `explore::SWEEP_RES`=64) — small enough to isolate a
+/// localized feature without going so small the per-tile statistic gets
+/// noisy.
+pub const LOCAL_TILE_GRID: usize = 4;
+/// Local edge_density floor for overriding a whole-patch `is_degenerate`/
+/// `rgb_is_degenerate` verdict — NOT yet calibrated against a real
+/// distribution the way some of this project's other thresholds are (e.g.
+/// `vae_explore::DEDUP_POS_TOL`'s own history); a reasonable starting
+/// point, worth revisiting once a few live runs show whether it's over-
+/// or under-permissive.
+pub const LOCAL_EDGE_DEGENERATE_OVERRIDE: f32 = 0.03;
+/// Minimum `local_edge_contrast`/`local_intricacy_contrast` needed before
+/// a candidate's SCORE (not just its degenerate-gate eligibility) gets
+/// rescued by its local max — see `tile_stats`'s doc comment for why a
+/// contrast gate exists at all (a bare max caused a real regression).
+/// A starting value (0.05), NOT exhaustively swept — but confirmed to
+/// work on two independently real cases via `explorer debug-sweep` before
+/// trusting it: it correctly fires for a genuinely-hidden feature (a flat
+/// disc with a thin detailed ring at its edge — Carl's real target,
+/// 2026-08-11, rescued from invisible to rank #4/972 under `edge`
+/// scoring) and, per a live `vae-explore` run of 1336 zones reaching
+/// zoom 5.5×10¹¹× its base, does NOT reintroduce the earlier bare-max
+/// regression (zoom stayed healthily distributed across the whole range,
+/// not clustered near the shallow end). Worth revisiting with a proper
+/// sweep if a future case falls right at this boundary.
+pub const LOCAL_CONTRAST_MIN: f32 = 0.05;
+
+/// Splits `field` into a `tiles` × `tiles` grid and scores each sub-tile
+/// on `metric`, returning `(max, contrast)` where `contrast = max -
+/// mean(all tiles)` — a "local maximum" AND "local peakedness" companion
+/// to a whole-patch statistic like `field_intricacy`/`edge_density`,
+/// which dilutes anything confined to a small part of the patch.
+/// Confirmed a REAL, not theoretical, blind spot (Carl, 2026-08-11): a
+/// crisp circular boundary occupying, say, 10% of a candidate crop's area
+/// still only contributes ~10% of the crop's total edge-pair count, so
+/// even a perfectly sharp boundary reads as "10% edges" on the
+/// whole-patch average.
+///
+/// `contrast` exists because raw `max` ALONE isn't enough to safely act
+/// on (confirmed the hard way: an earlier version of this fix blended
+/// bare `max` straight into the score and caused a REAL regression — a
+/// wide/shallow crop has a much higher a-priori chance of containing
+/// SOME locally-okay tile purely because it covers more ground, so
+/// rewarding "best tile anywhere" made the search systematically avoid
+/// zooming in at all). `contrast` tells the two cases apart: a crop
+/// that's uniformly medium-busy everywhere (the regression case) has
+/// every tile close to the mean, so `max - mean` stays small even if
+/// `max` itself is decent; a crop with one genuinely standout feature
+/// against an otherwise plain/uniform background (Carl's actual case — a
+/// large flat disc with a thin detailed ring at its edge) has a `max`
+/// that towers over the other tiles' mean. Verified directionally on
+/// synthetic data before wiring in: a disc-plus-thin-ring field measured
+/// contrast=0.087 vs. a uniformly-busy field's 0.016 — comparable
+/// whole-patch/max values, clearly different contrast.
+///
+/// Falls back to `(metric(field), 0.0)` if the field is too small to
+/// tile meaningfully.
+fn tile_stats(field: &[f32], w: usize, h: usize, tiles: usize, metric: impl Fn(&[f32], usize, usize) -> f32) -> (f32, f32) {
+    if tiles <= 1 || w < tiles * 2 || h < tiles * 2 {
+        return (metric(field, w, h), 0.0);
+    }
+    let (tw, th) = (w / tiles, h / tiles);
+    let mut vals = Vec::with_capacity(tiles * tiles);
+    for ty in 0..tiles {
+        for tx in 0..tiles {
+            let (x0, y0) = (tx * tw, ty * th);
+            let sub: Vec<f32> = (0..th).flat_map(|dy| (0..tw).map(move |dx| (dy, dx)))
+                .map(|(dy, dx)| field[(y0 + dy) * w + (x0 + dx)])
+                .collect();
+            vals.push(metric(&sub, tw, th));
+        }
+    }
+    let max = vals.iter().cloned().fold(0.0f32, f32::max);
+    let mean = vals.iter().sum::<f32>() / vals.len() as f32;
+    (max, (max - mean).max(0.0))
+}
+
+/// Tile-max companion to `field_intricacy` — see `tile_stats`'s doc
+/// comment. Used ONLY for the `is_degenerate` gate override (a max alone
+/// is safe there — see `tile_stats`'s doc comment for why it's NOT safe
+/// to blend into the actual score).
+pub fn local_intricacy(field: &[f32], w: usize, h: usize, tiles: usize) -> f32 {
+    tile_stats(field, w, h, tiles, field_intricacy).0
+}
+
+/// Tile-max companion to `edge_density` — see `tile_stats`'s doc comment.
+pub fn local_edge_density(field: &[f32], w: usize, h: usize, tiles: usize) -> f32 {
+    tile_stats(field, w, h, tiles, edge_density).0
+}
+
+/// `(local_max, local_contrast)` for `edge_density` — see `tile_stats`'s
+/// doc comment. Unlike `local_edge_density` (max alone), `contrast` is
+/// safe to gate an actual score boost on: it specifically distinguishes a
+/// genuinely-hidden standout feature from a merely uniformly-busy crop.
+pub fn local_edge_contrast(field: &[f32], w: usize, h: usize, tiles: usize) -> (f32, f32) {
+    tile_stats(field, w, h, tiles, edge_density)
+}
+
+/// `(local_max, local_contrast)` for `field_intricacy` — see
+/// `local_edge_contrast`'s doc comment.
+pub fn local_intricacy_contrast(field: &[f32], w: usize, h: usize, tiles: usize) -> (f32, f32) {
+    tile_stats(field, w, h, tiles, field_intricacy)
+}
+
 /// Pearson correlation of two equal-length z-scored vectors → [-1, 1].
-fn correlation(a: &[f32], b: &[f32]) -> f32 {
+pub fn correlation(a: &[f32], b: &[f32]) -> f32 {
     if a.len() != b.len() || a.is_empty() { return 0.0; }
     let n = a.len() as f32;
     a.iter().zip(b).map(|(x, y)| x * y).sum::<f32>() / n
@@ -524,7 +718,7 @@ fn correlation(a: &[f32], b: &[f32]) -> f32 {
 
 /// Fraction of adjacent pixel pairs whose escape time jumps by a notable amount —
 /// a scale-free measure of how much boundary/structure is present in a frame.
-fn edge_density(field: &[f32], w: usize, h: usize) -> f32 {
+pub fn edge_density(field: &[f32], w: usize, h: usize) -> f32 {
     if field.len() < 4 { return 0.0; }
     let maxv = field.iter().cloned().fold(0.0_f32, f32::max).max(1.0);
     let thr  = maxv * 0.01;
@@ -645,7 +839,7 @@ pub fn self_replication_score(genome: &Genome, config: &Config) -> f32 {
 /// vectors. A z-scored field stays z-scored under any of these (they only permute
 /// the entries), so the variants can be fed straight into `correlation`. Used to
 /// match miniature copies that appear rotated or mirrored relative to the whole.
-fn dihedral_variants(v: &[f32], ps: usize) -> Vec<Vec<f32>> {
+pub fn dihedral_variants(v: &[f32], ps: usize) -> Vec<Vec<f32>> {
     // (row, col) -> source (row, col) for each of the 8 transforms.
     let maps: [fn(usize, usize, usize) -> (usize, usize); 8] = [
         |r, c, _| (r, c),                       // identity
@@ -691,6 +885,34 @@ fn cell_edge_density(field: &[f32], w: usize, x0: usize, x1: usize, y0: usize, y
 /// `local_edge_density · (1 + 2·island_bonus)`, where the island bonus rewards a
 /// cell that holds some — but not all — interior. Returns up to `k` cell-centre
 /// pixel coordinates, best first.
+/// Every cell-center of a `grid`×`grid` partition of the frame, unfiltered
+/// — a full dense correlation sweep instead of `recursion_candidates`' cheap
+/// island/edge heuristic prefilter. Confirmed empirically the heuristic
+/// itself (not just how many of its top-K candidates survive) can miss a
+/// genuinely strong candidate entirely, for genomes whose structure doesn't
+/// present as a contained "island" (e.g. concentric rings rather than a
+/// cardioid+bulb): a real archive genome's best embedded copy scored raw
+/// template correlation 0.68 under a dense sweep, vs. a maximum of 0.11 from
+/// anything the heuristic ever proposed at that grid cell density, at any K.
+/// Only used at wormhole descent level 0 (see `wormhole_search_many`):
+/// affordable there (native reference zoom, cheapest arithmetic tier) and
+/// most consequential, since every deeper level's descent starts from
+/// wherever level 0 landed — a wrong level-0 neighborhood can't be recovered
+/// from later.
+fn dense_grid_candidates(w: usize, h: usize, grid: usize) -> Vec<(usize, usize)> {
+    let mut out = Vec::with_capacity(grid * grid);
+    for gy in 0..grid {
+        for gx in 0..grid {
+            let x0 = gx * w / grid;
+            let x1 = ((gx + 1) * w / grid).max(x0 + 1).min(w);
+            let y0 = gy * h / grid;
+            let y1 = ((gy + 1) * h / grid).max(y0 + 1).min(h);
+            out.push(((x0 + x1) / 2, (y0 + y1) / 2));
+        }
+    }
+    out
+}
+
 fn recursion_candidates(
     field: &[f32], w: usize, h: usize, max_iter: u32, grid: usize, k: usize,
 ) -> Vec<(usize, usize)> {
@@ -863,6 +1085,510 @@ fn best_copy_match(
     best
 }
 
+// ── Wormhole: locate (not just detect) an embedded self-similar copy ───────
+
+/// A found self-similar "wormhole": a smaller embedded copy of the
+/// reference view's own structure, found via the same boundary-descent
+/// template matching `fractal_recursion_score` uses to detect the
+/// phenomenon — but tracking the WINNING location instead of only a
+/// scalar score. `dx`/`dy` are offsets from the reference view's own
+/// center (in fractal-plane units) — never absolute coordinates, for the
+/// same reason `find_interesting_square`'s doc comment (viewer.rs) gives:
+/// materializing an absolute position at deep zoom silently collapses
+/// precision. Each descent level's own local offset is safely f64
+/// (bounded by that level's own frame span, which shrinks geometrically
+/// each level), so plain f64 addition across levels never loses anything
+/// — only the final combination with the reference view's own (possibly
+/// astronomically deep) DD center needs `Dd::from_f64(dx)`, done once by
+/// the caller.
+#[derive(Clone, Copy, Debug)]
+pub struct WormholeMatch {
+    pub dx: f64,
+    pub dy: f64,
+    pub zoom: f64,
+    pub score: f32,
+}
+
+const WORMHOLE_RES: u32             = 96;
+const WORMHOLE_PS: usize            = 24;
+// GRID/K confirmed empirically to matter a lot: `recursion_candidates`'
+// "island" heuristic (interior wrapped in boundary) was tuned against
+// Mandelbrot-style cardioid shapes, and a real archive genome with a very
+// different visual structure (concentric rings, no obvious cardioid
+// "island") exposed it missing a strong, real match entirely — a dense
+// brute-force scan of the same frame found it immediately (raw correlation
+// 0.68 vs. nothing comparable in the sparser island-filtered set). Wider
+// grid + more kept candidates costs real render time but was necessary for
+// genomes whose structure doesn't look like the shape the heuristic was
+// calibrated on.
+const WORMHOLE_GRID: usize          = 9;
+const WORMHOLE_K: usize             = 14;
+const WORMHOLE_SCALES: [f64; 4]     = [4.0, 8.0, 16.0, 32.0];
+const WORMHOLE_DESCENT_LEVELS: usize = 4;
+const WORMHOLE_DESCENT_STEP: f64     = 7.0;
+const WORMHOLE_INTRIC_LO: f32 = 0.010;
+const WORMHOLE_INTRIC_HI: f32 = 0.030;
+// Upper ceiling — confirmed empirically against a real archive sample:
+// pixel-noise genomes (no organized structure, just per-pixel escape-time
+// speckle) measure intricacy ~0.6, while genuinely structured matches
+// (visually confirmed) measured 0.12-0.18. Without this, noise trivially
+// self-correlates after contrast normalization (a random speckle field
+// resembles another crop of itself just by having the same statistics)
+// and was scoring as a false "match" as confidently as real structure —
+// `fractal_recursion_score`'s intricacy gate only ramps UP to full credit
+// and never back down, which never mattered there (it's a coarser
+// presence/absence signal) but does here, where the score is trusted
+// enough to literally jump to.
+const WORMHOLE_INTRIC_CEIL_LO: f32 = 0.22;
+const WORMHOLE_INTRIC_CEIL_HI: f32 = 0.40;
+// A candidate whose zoom is only marginally deeper than the reference's own
+// isn't a genuine embedded copy — it's a barely-shifted crop that shares
+// most of its pixels with the reference outright, which trivially
+// correlates near-perfectly without showing any real self-similar
+// structure. Confirmed empirically: at a real archive genome's best-scoring
+// (dx, dy), score peaked at 0.99 at ratio 1.0x-1.5x and fell monotonically
+// with depth from there — refine_match's zoom line-search, seeded from a
+// deeper raw candidate, walked straight back down into that shallow
+// optimum every time, because nothing distinguished "trivially overlaps
+// the reference" from "genuinely resembles the reference at a smaller
+// scale". `zoom > ref_view.zoom` alone (the previous floor) permits this;
+// requiring a minimum multiple does not.
+const WORMHOLE_MIN_DEPTH_RATIO: f64 = 3.0;
+
+fn wormhole_render(genome: &Genome, config: &Config, view: &crate::video_export::View) -> Vec<f32> {
+    use crate::video_export::{needs_f64, render_escape_times};
+    let use_f64 = needs_f64(view, WORMHOLE_RES);
+    render_escape_times(genome, config, view, WORMHOLE_RES, WORMHOLE_RES,
+                         config.rendering.max_iter, use_f64, true)
+}
+
+/// Largest connected component of "interior" pixels (never escaped, or
+/// escaped only in the last 5% of the iteration budget), as a fraction of
+/// the frame — 4-connected flood fill, iterative (a 96x96 frame can have a
+/// component covering most of it; recursion would risk stack depth).
+///
+/// Deliberately the LARGEST component, not total interior area: a real
+/// mini-Mandelbrot copy has ONE dominant body (like the reference's own
+/// single cardioid+bulb); a region sitting among several same-scale
+/// neighboring mini-copies can have comparable TOTAL interior area spread
+/// across multiple similar-sized blobs, which total-area alone can't tell
+/// apart from one genuine dominant body — confirmed empirically: a real
+/// "3-4 clustered blobs" false-positive had 60% MORE total interior area
+/// than a clean single-cardioid true positive, total-area comparison alone
+/// would have rewarded it rather than penalizing it.
+fn largest_interior_component_fraction(field: &[f32], w: usize, h: usize, max_iter: f32) -> f32 {
+    if field.len() != w * h || w == 0 || h == 0 { return 0.0; }
+    let thr = max_iter * 0.95;
+    let mut visited = vec![false; field.len()];
+    let mut best = 0usize;
+    let mut stack: Vec<usize> = Vec::new();
+    for start in 0..field.len() {
+        if visited[start] || field[start] < thr { continue; }
+        visited[start] = true;
+        stack.push(start);
+        let mut size = 0usize;
+        while let Some(idx) = stack.pop() {
+            size += 1;
+            let (x, y) = (idx % w, idx / w);
+            let neighbors = [
+                (x > 0).then(|| idx - 1),
+                (x + 1 < w).then(|| idx + 1),
+                (y > 0).then(|| idx - w),
+                (y + 1 < h).then(|| idx + w),
+            ];
+            for n in neighbors.into_iter().flatten() {
+                if !visited[n] && field[n] >= thr {
+                    visited[n] = true;
+                    stack.push(n);
+                }
+            }
+        }
+        best = best.max(size);
+    }
+    best as f32 / field.len() as f32
+}
+
+/// Multiplicative penalty for a candidate whose largest connected interior
+/// body is much SMALLER than the reference's own — confirmed empirically
+/// to matter: raw structure-vec correlation alone ranked a region with
+/// several comparable-sized clustered blobs ABOVE a visually clean,
+/// obviously-correct single-body mini-copy, because dense multi-blob
+/// filament texture can statistically resemble the reference's own
+/// filament-heavy boundary even with no single coherent body behind it. A
+/// genuine scaled copy of the same set should have ONE dominant body
+/// broadly comparable in proportion to the reference's own; "much
+/// smaller" is the specific, meaningful tell for "this is a cluster of
+/// several unrelated small bodies that happens to correlate, not an
+/// actual single copy." Deliberately asymmetric — NOT penalizing a LARGER
+/// dominant body than the reference's own, since that's still consistent
+/// with a genuine copy centered slightly differently (a more solid crop
+/// of the same body), just not the failure mode observed.
+fn interior_undershoot_penalty(cand_frac: f32, ref_frac: f32) -> f32 {
+    if ref_frac <= 0.0 || cand_frac >= ref_frac { return 1.0; }
+    (cand_frac / ref_frac).max(0.0).powf(0.3)
+}
+
+/// Like the old `best_copy_match`, but DD-safe (works at any zoom depth,
+/// DAG or legacy) and returns EVERY non-degenerate candidate evaluated at
+/// this level — offset from `level_view`'s own center, plus zoom and
+/// score — instead of collapsing immediately to a single winner.
+/// `fractal_recursion_score` only ever needed one number; a wormhole
+/// search that's meant to offer several real options needs the whole
+/// pool, gathered across every level of the descent, so the caller can
+/// rank and refine from all of them at the end rather than being stuck
+/// with whichever one single-mindedly won at each individual level (a
+/// wide correlation peak can have a slightly-better-scoring near neighbor
+/// that this level's "keep only the best" would have discarded).
+#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
+fn collect_copy_matches(
+    genome: &Genome, config: &Config,
+    field: &[f32], res: u32, level_view: &crate::video_export::View,
+    base_ed: f32, base_interior: f32, global_orients: &[Vec<f32>],
+    grid: usize, k: usize, win_res: u32, ps: usize, scales: &[f64], dense: bool,
+) -> Vec<(f64, f64, f64, f32)> {
+    use crate::dd::Dd;
+    let (w, h) = (res as usize, res as usize);
+    let mut centres = if dense {
+        dense_grid_candidates(w, h, grid)
+    } else {
+        recursion_candidates(field, w, h, config.rendering.max_iter, grid, k)
+    };
+    if let Some(p) = richest_boundary_point(field, w, h) { centres.push(p); }
+    if centres.is_empty() { return Vec::new(); }
+
+    let wf = (w - 1).max(1) as f64;
+    let hf = (h - 1).max(1) as f64;
+    let half = 2.0 / level_view.zoom;
+
+    let mut out = Vec::new();
+    for &(px, py) in &centres {
+        // Offset from level_view's own center — NOT an absolute position,
+        // same reasoning as find_interesting_square's candidate sweep.
+        let local_dx = -half + (px as f64 / wf) * (2.0 * half);
+        let local_dy = -half + (py as f64 / hf) * (2.0 * half);
+        for &scale in scales {
+            let cand_zoom = level_view.zoom * scale;
+            let cand_cx = level_view.cx_dd() + Dd::from_f64(local_dx);
+            let cand_cy = level_view.cy_dd() + Dd::from_f64(local_dy);
+            let cand_view = crate::video_export::View {
+                cx: cand_cx.hi, cx_lo: cand_cx.lo, cy: cand_cy.hi, cy_lo: cand_cy.lo,
+                zoom: cand_zoom, aspect: 1.0,
+            };
+            let win = wormhole_render(genome, config, &cand_view);
+            // A window that has smoothed out can't host a copy of a structured whole.
+            if edge_density(&win, win_res as usize, win_res as usize) < base_ed * 0.15 { continue; }
+            // A window that's degenerated into pixel noise (common at extreme
+            // relative depth, where the escape dynamics haven't had enough
+            // iterations yet to resolve real structure — see needs_dd's
+            // sibling discussion) trivially self-correlates with anything
+            // after contrast normalization, the same false-positive the
+            // reference-level ceiling exists to catch (confirmed empirically:
+            // a genuine deep candidate scored intricacy 0.12-0.18; a noisy one
+            // scored 0.63) — apply the identical ceiling here, per-candidate.
+            if field_intricacy(&win, win_res as usize, win_res as usize) > WORMHOLE_INTRIC_CEIL_HI { continue; }
+            let wv = structure_vec(&win, win_res as usize, win_res as usize, ps);
+            if wv.iter().all(|v| *v == 0.0) { continue; }
+            let mut best_c = 0.0f32;
+            for g in global_orients {
+                let c = correlation(&wv, g);
+                if c > best_c { best_c = c; }
+            }
+            let cand_interior = largest_interior_component_fraction(&win, win_res as usize, win_res as usize, config.rendering.max_iter as f32);
+            best_c *= interior_undershoot_penalty(cand_interior, base_interior);
+            if best_c > 0.0 { out.push((local_dx, local_dy, cand_zoom, best_c)); }
+        }
+    }
+    out
+}
+
+/// Two matches (both expressed as offsets from the same reference) count
+/// as "the same spot" if they're within 30% of the shallower one's own
+/// frame width of each other AND within 2x zoom of each other — used to
+/// stop a single wide correlation peak from being reported as several
+/// different wormholes.
+fn same_wormhole_neighborhood(a: (f64, f64, f64), b: (f64, f64, f64)) -> bool {
+    let ref_zoom = a.2.min(b.2);
+    let tol = (2.0 / ref_zoom) * 0.3;
+    (a.0 - b.0).abs() < tol && (a.1 - b.1).abs() < tol && (a.2 / b.2).max(b.2 / a.2) < 2.0
+}
+
+/// Search for smaller embedded copies of `ref_view`'s own structure inside
+/// it — the "wormhole" navigation aid. Reuses the exact template-matching
+/// technique `fractal_recursion_score` already validated (contrast-
+/// normalised structure correlation across all 8 dihedral orientations,
+/// boundary-descent search for the scale at which a copy actually
+/// resolves) but, unlike that function, tracks and returns WINNING
+/// locations rather than only a quality score — and renders through
+/// `video_export::render_escape_times` (DD/f64/f32-tiered, DAG+legacy+
+/// warp+phoenix+julia aware) instead of the legacy-only `render_bounds`,
+/// so it actually works on the DAG genomes this project evolves now.
+/// (Confirmed gap: `fractal_recursion_score` silently scores 0.0 for
+/// every DAG genome sampled from the real archive — `formula_weights()`
+/// returns an all-zero vector whenever `terms` is empty, which it always
+/// is for a DAG genome; `fractal_recursion` in every saved DAG .nn checked
+/// is exactly 0.0. This function does not fix that score — it's a
+/// separate, new capability — but had to route around the same gap to be
+/// useful on real genomes at all.)
+///
+/// Returns up to `max_results` matches, best score first, deduplicated so
+/// one wide correlation peak can't count as several different wormholes.
+/// Empty if no confident match is found, or the reference view itself is
+/// too simple/flat (or too noisy — see `WORMHOLE_INTRIC_CEIL_*`) to have a
+/// template worth matching.
+///
+/// Candidates are gathered across the WHOLE boundary descent (every level,
+/// not just each level's single local winner), because a level's runner-up
+/// can end up scoring higher than its winner once BOTH are actually
+/// refined — committing early to only the pre-refinement winner (the
+/// original single-result design) silently discarded those. The extra
+/// coverage costs real time (refinement — the expensive part — now runs on
+/// several raw candidates instead of one), so callers that only need the
+/// single best match should still prefer `wormhole_search`.
+pub fn wormhole_search_many(
+    genome: &Genome, config: &Config, ref_view: &crate::video_export::View, max_results: usize,
+) -> Vec<WormholeMatch> {
+    use crate::dd::Dd;
+    use crate::video_export::View;
+    let (bw, bh) = (WORMHOLE_RES as usize, WORMHOLE_RES as usize);
+    if max_results == 0 { return Vec::new(); }
+
+    let base = wormhole_render(genome, config, ref_view);
+    let base_ed = edge_density(&base, bw, bh);
+    if base_ed < 0.01 { return Vec::new(); } // reference itself is essentially featureless
+    let base_interior = largest_interior_component_fraction(&base, bw, bh, config.rendering.max_iter as f32);
+
+    // Intricacy gate: reject smooth/monotone fields whose windows would
+    // trivially self-correlate (same rationale as fractal_recursion_score)
+    // — AND reject pixel-noise fields at the other extreme, which do the
+    // same trivial self-correlation trick from the opposite direction (see
+    // WORMHOLE_INTRIC_CEIL_LO/HI's doc comment).
+    let intric = field_intricacy(&base, bw, bh);
+    let ramp_up   = ((intric - WORMHOLE_INTRIC_LO) / (WORMHOLE_INTRIC_HI - WORMHOLE_INTRIC_LO)).clamp(0.0, 1.0);
+    let ramp_down = 1.0 - ((intric - WORMHOLE_INTRIC_CEIL_LO) / (WORMHOLE_INTRIC_CEIL_HI - WORMHOLE_INTRIC_CEIL_LO)).clamp(0.0, 1.0);
+    let gate = ramp_up * ramp_down;
+    if gate <= 0.0 { return Vec::new(); }
+
+    let global = structure_vec(&base, bw, bh, WORMHOLE_PS);
+    if global.iter().all(|v| *v == 0.0) { return Vec::new(); } // flat → no template to match
+    let global_orients = dihedral_variants(&global, WORMHOLE_PS);
+
+    // Boundary descent: search at ref_view, then follow the richest
+    // boundary point down a few zoom levels and keep searching — a copy
+    // small enough to be sub-pixel at the reference scale only resolves
+    // once rendered close enough to it. `total_dx`/`total_dy` accumulate as
+    // plain f64 (safe: each level's own contribution shrinks geometrically
+    // by WORMHOLE_DESCENT_STEP, so the running sum never needs more
+    // precision than f64 already has — only the ONE combination with
+    // ref_view's own DD center, done per render, needs Dd). `pool`
+    // collects EVERY non-degenerate candidate seen at every level.
+    let mut total_dx = 0.0f64;
+    let mut total_dy = 0.0f64;
+    let mut level_zoom = ref_view.zoom;
+    let mut pool: Vec<(f64, f64, f64, f32)> = Vec::new();
+
+    for level in 0..WORMHOLE_DESCENT_LEVELS {
+        let level_cx = ref_view.cx_dd() + Dd::from_f64(total_dx);
+        let level_cy = ref_view.cy_dd() + Dd::from_f64(total_dy);
+        let level_view = View {
+            cx: level_cx.hi, cx_lo: level_cx.lo, cy: level_cy.hi, cy_lo: level_cy.lo,
+            zoom: level_zoom, aspect: 1.0,
+        };
+        let field = if level == 0 { base.clone() } else { wormhole_render(genome, config, &level_view) };
+
+        for (ldx, ldy, lzoom, score) in collect_copy_matches(
+            genome, config, &field, WORMHOLE_RES, &level_view, base_ed, base_interior, &global_orients,
+            WORMHOLE_GRID, WORMHOLE_K, WORMHOLE_RES, WORMHOLE_PS, &WORMHOLE_SCALES, level == 0,
+        ) {
+            pool.push((total_dx + ldx, total_dy + ldy, lzoom, score));
+        }
+
+        if level + 1 < WORMHOLE_DESCENT_LEVELS {
+            match richest_boundary_point(&field, bw, bh) {
+                Some((px, py)) => {
+                    let half = 2.0 / level_zoom;
+                    let wf = (bw - 1).max(1) as f64;
+                    let hf = (bh - 1).max(1) as f64;
+                    total_dx += -half + (px as f64 / wf) * (2.0 * half);
+                    total_dy += -half + (py as f64 / hf) * (2.0 * half);
+                    level_zoom *= WORMHOLE_DESCENT_STEP;
+                }
+                None => break, // boundary smoothed out → nothing deeper to find
+            }
+        }
+    }
+    if pool.is_empty() { return Vec::new(); }
+
+    // Non-max suppression on the RAW pool: keep the best-scoring
+    // representative of each distinct neighborhood, generously more than
+    // `max_results` (refinement can and does reorder the ranking — see
+    // this function's doc comment — so cut early candidates loosely, not
+    // down to the exact final count).
+    pool.sort_by(|a, b| b.3.partial_cmp(&a.3).unwrap_or(std::cmp::Ordering::Equal));
+    let raw_budget = (max_results * 3).max(3);
+    let mut raw_kept: Vec<(f64, f64, f64, f32)> = Vec::new();
+    for &cand in &pool {
+        if raw_kept.len() >= raw_budget { break; }
+        if raw_kept.iter().any(|&k| same_wormhole_neighborhood((cand.0, cand.1, cand.2), (k.0, k.1, k.2))) { continue; }
+        raw_kept.push(cand);
+    }
+
+    // Local refinement: the boundary-descent grid above routinely lands
+    // near a real embedded copy but not precisely ON it — confirmed
+    // visually against the classic Mandelbrot, where the raw descent
+    // result was a genuine but weak (~0.13) partial overlap, not a clean
+    // match. Coordinate-descent-style hill-climbing (shrinking position
+    // grid, alternated with a zoom line-search) locks onto the actual
+    // center once descent has found the right neighborhood.
+    let mut refined: Vec<WormholeMatch> = raw_kept.into_iter().map(|(dx, dy, zoom, score)| {
+        let (rdx, rdy, rzoom, rscore) = refine_match(
+            genome, config, ref_view, &global_orients, base_ed, base_interior, dx, dy, zoom, WORMHOLE_PS, WORMHOLE_RES,
+        );
+        let (dx, dy, zoom, score) = if rscore > score { (rdx, rdy, rzoom, rscore) } else { (dx, dy, zoom, score) };
+        WormholeMatch { dx, dy, zoom, score: score * gate }
+    }).collect();
+    refined.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+
+    // Dedupe again on the REFINED positions: hill-climbing from two
+    // distinct raw starts can converge to the same actual local optimum.
+    let mut out: Vec<WormholeMatch> = Vec::new();
+    for m in refined {
+        if out.len() >= max_results { break; }
+        if out.iter().any(|k| same_wormhole_neighborhood((m.dx, m.dy, m.zoom), (k.dx, k.dy, k.zoom))) { continue; }
+        out.push(m);
+    }
+    out
+}
+
+/// Single best match — see `wormhole_search_many`'s doc comment. Prefer
+/// this over the multi-result form when only one jump target is needed
+/// (interactive use, or the batch scanner): it still evaluates and refines
+/// a handful of raw candidates internally (for the same "the pre-
+/// refinement winner isn't always the post-refinement winner" reason), so
+/// it's more accurate than the original single-track version, just without
+/// the cost of ranking a wide result set.
+pub fn wormhole_search(
+    genome: &Genome, config: &Config, ref_view: &crate::video_export::View,
+) -> Option<WormholeMatch> {
+    wormhole_search_many(genome, config, ref_view, 1).into_iter().next()
+}
+
+/// Coordinate-descent refinement around a candidate match: alternates a
+/// shrinking position grid with a zoom line-search, re-rendering and
+/// re-correlating at each step. See `wormhole_search`'s doc comment for why
+/// this exists — the coarse boundary-descent grid alone finds the right
+/// neighborhood but not a precise lock.
+#[allow(clippy::too_many_arguments)]
+fn refine_match(
+    genome: &Genome, config: &Config, ref_view: &crate::video_export::View,
+    global_orients: &[Vec<f32>], base_ed: f32, base_interior: f32,
+    start_dx: f64, start_dy: f64, start_zoom: f64,
+    ps: usize, win_res: u32,
+) -> (f64, f64, f64, f32) {
+    use crate::dd::Dd;
+
+    let try_at = |dx: f64, dy: f64, zoom: f64| -> Option<f32> {
+        // A wormhole is by definition a SMALLER embedded copy — the zoom
+        // line-search has no other floor tying it to the reference's own
+        // depth, so without this it can (confirmed: a real chain-building
+        // test caught this) drift to a zoom at or below ref_view's own,
+        // which isn't a valid match at all, just a same-or-wider crop. A
+        // bare `> ref_view.zoom` isn't enough on its own — see
+        // WORMHOLE_MIN_DEPTH_RATIO's doc comment.
+        if zoom <= ref_view.zoom * WORMHOLE_MIN_DEPTH_RATIO || !zoom.is_finite() { return None; }
+        let cx = ref_view.cx_dd() + Dd::from_f64(dx);
+        let cy = ref_view.cy_dd() + Dd::from_f64(dy);
+        let view = crate::video_export::View { cx: cx.hi, cx_lo: cx.lo, cy: cy.hi, cy_lo: cy.lo, zoom, aspect: 1.0 };
+        let win = wormhole_render(genome, config, &view);
+        if edge_density(&win, win_res as usize, win_res as usize) < base_ed * 0.15 { return None; }
+        if field_intricacy(&win, win_res as usize, win_res as usize) > WORMHOLE_INTRIC_CEIL_HI { return None; }
+        let wv = structure_vec(&win, win_res as usize, win_res as usize, ps);
+        if wv.iter().all(|v| *v == 0.0) { return None; }
+        let best_c = global_orients.iter().map(|g| correlation(&wv, g)).fold(None, |acc: Option<f32>, c| {
+            Some(acc.map_or(c, |a| a.max(c)))
+        })?;
+        let cand_interior = largest_interior_component_fraction(&win, win_res as usize, win_res as usize, config.rendering.max_iter as f32);
+        Some(best_c * interior_undershoot_penalty(cand_interior, base_interior))
+    };
+
+    // Coordinate-descent hill-climb from one (dx, dy, zoom) seed. Factored
+    // into a closure so it can be re-run from a wide zoom anchor below —
+    // its step size shrinks geometrically every round (0.6, 0.3, 0.15, ...),
+    // so cumulatively it can only ever reach roughly 2.6x away from its
+    // start zoom, never a jump of the size a descent level or scale anchor
+    // routinely represents.
+    let hill_climb = |start: (f64, f64, f64)| -> (f64, f64, f64, f32) {
+        let (mut dx, mut dy, mut zoom) = start;
+        let mut best_score = try_at(dx, dy, zoom).unwrap_or(0.0);
+
+        const ROUNDS: usize = 5;
+        let mut pos_radius = 2.0 / zoom; // one full window's half-width at the starting zoom
+        let mut zoom_span = 0.6f64;      // ± fraction of current zoom explored this round
+
+        for _ in 0..ROUNDS {
+            let mut round_best = (dx, dy, zoom, best_score);
+            for &dzm in &[1.0 - zoom_span, 1.0, 1.0 + zoom_span] {
+                let cand_zoom = zoom * dzm;
+                for iy in -1..=1i32 {
+                    for ix in -1..=1i32 {
+                        let cdx = dx + ix as f64 * pos_radius;
+                        let cdy = dy + iy as f64 * pos_radius;
+                        if let Some(score) = try_at(cdx, cdy, cand_zoom) {
+                            if score > round_best.3 { round_best = (cdx, cdy, cand_zoom, score); }
+                        }
+                    }
+                }
+            }
+            (dx, dy, zoom, best_score) = round_best;
+            pos_radius *= 0.35;
+            zoom_span *= 0.5;
+        }
+        (dx, dy, zoom, best_score)
+    };
+
+    let (mut dx, mut dy, mut zoom, mut best_score) = hill_climb((start_dx, start_dy, start_zoom));
+
+    // A coarse candidate grid routinely lands close enough in (dx, dy) for
+    // the hill-climb above to lock on, but not close enough in ZOOM — a
+    // shallow, nearly-unzoomed crop at the (now correct) position can be a
+    // local optimum in its own right (two crops of similar-looking texture
+    // trivially resemble each other), with a worse-scoring valley between
+    // it and the true, much deeper embedded copy. Confirmed on a real
+    // archive genome: hill-climbing from a raw candidate correctly found
+    // the right (dx, dy) but then walked DOWN to a ~1x non-match instead of
+    // climbing to the true ~25x copy, because that climb needs to cross the
+    // valley, which monotonic hill-climbing can't do. Re-probe the SAME
+    // (now-trusted) position at a wide, discrete spread of zoom multiples —
+    // far outside the hill-climb's own reach — and re-refine from whichever
+    // wins; cheap (a handful of renders) unless it actually finds something
+    // better, in which case a second hill-climb (the expensive part) is
+    // justified.
+    const ZOOM_ANCHOR_MULTS: [f64; 7] = [0.25, 1.0, 4.0, 16.0, 64.0, 256.0, 1024.0];
+    let mut best_anchor: Option<(f64, f32)> = None;
+    for &mult in &ZOOM_ANCHOR_MULTS {
+        let cand_zoom = start_zoom * mult;
+        if let Some(score) = try_at(dx, dy, cand_zoom) {
+            if best_anchor.is_none_or(|(_, s)| score > s) { best_anchor = Some((cand_zoom, score)); }
+        }
+    }
+    // Always re-climb from the best anchor, even when its FIXED-position
+    // score doesn't yet beat the current champion: position precision needs
+    // get tighter as zoom deepens (an absolute dx/dy error that's
+    // negligible in a shallow window can be a large fraction of a much
+    // deeper one), so a genuinely better deep lock can under-score at the
+    // shallow climb's slightly-off position and only reveal itself once
+    // hill-climbing gets to correct position AT that depth. Confirmed
+    // necessary on the same real genome: gating the re-climb on "anchor
+    // already beats best" left every anchor rejected (all under-scored at
+    // the shallow climb's position) and the shallow false optimum was
+    // never displaced.
+    if let Some((anchor_zoom, _)) = best_anchor {
+        let (rdx, rdy, rzoom, rscore) = hill_climb((dx, dy, anchor_zoom));
+        if rscore > best_score { (dx, dy, zoom, best_score) = (rdx, rdy, rzoom, rscore); }
+    }
+    (dx, dy, zoom, best_score)
+}
+
 /// Batch-evaluate all genomes in ONE GPU dispatch with per-genome view bounds.
 /// Returns (raw_png_entropy, multiscale_structured_entropy, angle_structure,
 /// behavioral_descriptor) per genome — see evaluate_fitness_full for the
@@ -927,6 +1653,74 @@ pub fn evaluate_fitness_batch(
 
 
 #[cfg(test)]
+mod local_metric_tests {
+    use super::*;
+
+    /// A field that's uniform EXCEPT for a small checkerboard "hotspot" in
+    /// one corner — the exact failure mode `local_edge_density`/
+    /// `local_intricacy` exist to fix (Carl, 2026-08-11): a small,
+    /// genuinely interesting feature (like a crisp circular boundary)
+    /// diluted into near-invisibility by a whole-patch average.
+    fn field_with_small_hotspot(size: usize, hotspot: usize) -> Vec<f32> {
+        let mut field = vec![0.5f32; size * size];
+        for y in 0..hotspot {
+            for x in 0..hotspot {
+                if (x + y) % 2 == 0 {
+                    field[y * size + x] = 1.0;
+                }
+            }
+        }
+        field
+    }
+
+    #[test]
+    fn local_edge_density_finds_a_small_hotspot_the_whole_patch_average_dilutes_away() {
+        let size = 64;
+        let field = field_with_small_hotspot(size, 8); // hotspot is <2% of the field's area
+        let whole = edge_density(&field, size, size);
+        let local = local_edge_density(&field, size, size, 4);
+        assert!(whole < 0.05, "whole-patch average should read as near-flat, got {whole}");
+        assert!(local > whole * 5.0, "the tile containing the hotspot should clearly register it: local={local} whole={whole}");
+    }
+
+    #[test]
+    fn local_intricacy_finds_a_small_hotspot_the_whole_patch_average_dilutes_away() {
+        let size = 64;
+        let field = field_with_small_hotspot(size, 8);
+        let whole = field_intricacy(&field, size, size);
+        let local = local_intricacy(&field, size, size, 4);
+        assert!(local > whole * 3.0, "local should score well above the diluted whole-patch value: local={local} whole={whole}");
+    }
+
+    #[test]
+    fn tile_max_falls_back_to_whole_patch_for_a_field_too_small_to_tile() {
+        let field = vec![0.5f32; 4 * 4];
+        // tiles=4 on a 4x4 field would mean 1x1 sub-tiles — too small to
+        // mean anything, so this should fall back to the whole-patch call
+        // rather than silently degenerate.
+        assert_eq!(local_edge_density(&field, 4, 4, 4), edge_density(&field, 4, 4));
+    }
+
+    #[test]
+    fn local_metrics_never_score_below_their_whole_patch_counterpart() {
+        // By construction (max over sub-tiles, one of which IS the whole
+        // patch's own statistics folded smaller) local should never be
+        // WORSE than whole — a uniformly-busy field (no hidden hotspot)
+        // should score about the same either way, not lower locally.
+        let size = 64;
+        let mut field = vec![0.0f32; size * size];
+        for y in 0..size {
+            for x in 0..size {
+                if (x + y) % 2 == 0 { field[y * size + x] = 1.0; }
+            }
+        }
+        let whole_edge = edge_density(&field, size, size);
+        let local_edge = local_edge_density(&field, size, size, 4);
+        assert!(local_edge >= whole_edge * 0.9, "local={local_edge} whole={whole_edge}");
+    }
+}
+
+#[cfg(test)]
 mod dag_f64_tests {
     use crate::formula::{op, OpNode};
 
@@ -948,7 +1742,7 @@ mod dag_f64_tests {
             let py = -1.8 + 3.6 * gy as f64 / n as f64;
             let (a, _) = super::dag_escape_pixel(&prog, &[], julia, (jc.0 as f32, jc.1 as f32),
                 (ph.0 as f32, ph.1 as f32), bsq as f32, px as f32, py as f32, 128);
-            let b = super::dag_escape_pixel_f64(&prog, &[], julia, jc, ph, bsq, px, py, 128);
+            let (b, _) = super::dag_escape_pixel_f64(&prog, &[], julia, jc, ph, bsq, px, py, 128);
             if (a - b).abs() < 1.0 { agree += 1; }
         }}
         let frac = agree as f32 / (n * n) as f32;
@@ -1034,5 +1828,180 @@ mod known_formula_tests {
         ], view_zoom: 1.0, ..Default::default() };
         assert!(!genome.uses_program());
         assert!(known_formula_match(&genome).is_none());
+    }
+}
+
+#[cfg(test)]
+mod wormhole_tests {
+    use super::*;
+    use crate::config::{Config, DedupConfig, MassExtinctionConfig, OptimizationConfig, OutputConfig, RenderingConfig};
+    use crate::formula::{op, OpNode};
+    use crate::genome::ProgramBuilder;
+    use crate::video_export::View;
+
+    fn dag_genome(program: Vec<OpNode>) -> Genome {
+        Genome { program, bailout_radius: 4.0, view_zoom: 1.0, ..Default::default() }
+    }
+
+    fn mandelbrot_genome() -> Genome {
+        let mut b = ProgramBuilder::new();
+        let z  = b.push(op::Z, 0, 0, 0.0, 0.0).unwrap();
+        let c  = b.push(op::C, 0, 0, 0.0, 0.0).unwrap();
+        let z2 = b.push(op::SQR, z, 0, 0.0, 0.0).unwrap();
+        b.push(op::ADD, z2, c, 0.0, 0.0).unwrap();
+        dag_genome(b.into_nodes())
+    }
+
+    fn default_config() -> Config {
+        Config {
+            dedup: DedupConfig::default(), mass_extinction: MassExtinctionConfig::default(),
+            rendering: RenderingConfig {
+                default_width: 800, default_height: 800, max_iter: 500, bailout: 4.0,
+                colormap: "turbo".into(), view_x_min: -2.0, view_x_max: 2.0, view_y_min: -2.0, view_y_max: 2.0,
+            },
+            optimization: OptimizationConfig {
+                population_size: 40, elitism_count: 6, mutation_rate: 0.20, mutation_scale: 0.08,
+                eval_width: 64, eval_height: 64, eval_max_iter: 128, restart_after_gens: 30, novelty_weight: 0.45,
+                novelty_k: 5, archive_size: 150, self_replication_weight: 0.35, fractal_recursion_weight: 0.35,
+                recursion_pred_weight: 0.60, formula_diversity_weight: 0.30, clip_pred_weight: 0.50,
+                formula_system: "dag".to_string(), max_nodes: 14, max_depth: 5, ood_weight: 0.0, pref_weight: 0.4,
+                seed_pref_weight: 3.0, musiq_weight: 0.25, pref_elite_count: 4, archive_random_ratio: 0.30,
+                duplicate_penalty_weight: 0.50, archive_seeding_enabled: false, angle_structure_weight: 0.0,
+                img_novelty_weight: 0.0,
+            },
+            output: OutputConfig {
+                save_dir: "./fractals".into(), population_dir: "./populations".into(),
+                min_entropy_prefilter: 0.42, max_entropy_prefilter: 0.65, min_clip_score: 0.512, min_laion_score: 5.30,
+                min_beauty: 0.35, min_save_distance: 0.04, min_ensemble: 4.6, min_musiq: 30.0, min_pref: 0.45,
+            },
+        }
+    }
+
+    #[test]
+    fn classic_mandelbrot_has_a_wormhole() {
+        // The classic Mandelbrot set is famous for embedded baby-Mandelbrots
+        // — if wormhole_search can't find one here, it can't find one
+        // anywhere. Regression for the DAG-rendering gap this function was
+        // specifically built to route around (fractal_recursion_score,
+        // built on the legacy-only formula_weights()/render_bounds() path,
+        // silently scores 0.0 for every DAG genome — confirmed against 40
+        // random real saved genomes, all `terms: []`).
+        let genome = mandelbrot_genome();
+        let config = default_config();
+        let ref_view = View::new_square(-0.5, 0.0, 1.0);
+        let m = wormhole_search(&genome, &config, &ref_view);
+        assert!(m.is_some(), "classic Mandelbrot must have a findable embedded copy");
+        let m = m.unwrap();
+        assert!(m.score > 0.0 && m.score <= 1.0, "score {} out of range", m.score);
+        assert!(m.zoom > ref_view.zoom, "a wormhole match must be a SMALLER (deeper) copy, not wider");
+        assert!(m.dx.is_finite() && m.dy.is_finite() && m.zoom.is_finite());
+    }
+
+    #[test]
+    fn wormhole_match_always_respects_minimum_depth_ratio() {
+        // A match whose zoom is only marginally deeper than the reference
+        // is a barely-shifted crop that shares most of its pixels with the
+        // reference outright — it trivially scores well without showing any
+        // real embedded self-similarity. Confirmed on a real archive genome
+        // this session: the search reliably converged on a ~1.04x "match"
+        // scoring 0.99 at a position whose legitimately-deeper candidates,
+        // once the intricacy ceiling was correctly enforced, scored far
+        // lower — the high score belonged entirely to the trivial overlap,
+        // not to any genuine structure. `zoom > ref_view.zoom` alone (the
+        // previous floor) permits this; WORMHOLE_MIN_DEPTH_RATIO does not.
+        let genome = mandelbrot_genome();
+        let config = default_config();
+        let ref_view = View::new_square(-0.5, 0.0, 1.0);
+        let m = wormhole_search(&genome, &config, &ref_view).expect("classic Mandelbrot must have a match");
+        assert!(m.zoom >= ref_view.zoom * WORMHOLE_MIN_DEPTH_RATIO,
+            "match zoom {} is not at least {}x deeper than ref zoom {}", m.zoom, WORMHOLE_MIN_DEPTH_RATIO, ref_view.zoom);
+    }
+
+    #[test]
+    fn pure_noise_field_does_not_score_as_a_match() {
+        // A formula whose escape times are pixel-noise (no organized
+        // structure) must not exploit contrast-normalization's tendency to
+        // make any two same-statistics noise crops "correlate" — this is
+        // the empirically-discovered false-positive the intricacy CEILING
+        // (as opposed to the floor fractal_recursion_score already had)
+        // exists to catch. RECIP of Z with a near-zero epsilon is exactly
+        // the kind of numerically explosive, per-pixel-chaotic formula
+        // real archive genomes triggering this looked like.
+        let mut b = ProgramBuilder::new();
+        let z = b.push(op::Z, 0, 0, 0.0, 0.0).unwrap();
+        b.push(op::RECIP, z, 0, 0.0, 0.0).unwrap();
+        let genome = dag_genome(b.into_nodes());
+        let config = default_config();
+        // A deep, small view where 1/z is maximally sensitive to per-pixel
+        // position — the regime that produced real noise-like fields.
+        let ref_view = View::new_square(0.0001, 0.0001, 5000.0);
+        let m = wormhole_search(&genome, &config, &ref_view);
+        assert!(m.is_none() || m.unwrap().score < 0.3,
+            "a noise field scored too high to be a false positive: {m:?}");
+    }
+
+    #[test]
+    fn flat_field_has_no_wormhole() {
+        // z_next = 0 (a CONST(0,0) program): every pixel is identical —
+        // no template worth matching, must return None outright rather
+        // than reporting a spurious perfect self-match.
+        let mut b = ProgramBuilder::new();
+        b.push(op::CONST, 0, 0, 0.0, 0.0).unwrap();
+        let genome = dag_genome(b.into_nodes());
+        let config = default_config();
+        let ref_view = View::new_square(0.0, 0.0, 1.0);
+        assert!(wormhole_search(&genome, &config, &ref_view).is_none());
+    }
+
+    #[test]
+    fn largest_component_beats_total_area_for_a_clustered_field() {
+        // Regression for the specific false-positive this session found by
+        // rendering and looking, not trusting the number: raw structure-vec
+        // correlation ranked a region with several comparable-sized
+        // clustered blobs ABOVE a visually clean, obviously-correct single-
+        // body mini-copy — the clustered field even had MORE total interior
+        // area than the clean one, so a naive total-area check would have
+        // rewarded it too; only counting the LARGEST CONNECTED body
+        // discriminates them. 10x10 field, max_iter=100 (>=95 counts as
+        // interior): a single 3x3 solid block vs four separated 2x2 blocks
+        // (more total interior pixels: 16 vs 9) — the single block must
+        // still win on largest-component-fraction.
+        const W: usize = 20;
+        let mi = 100.0f32;
+        let mut single_block = vec![0.0f32; W * W];
+        for y in 5..13 { for x in 5..13 { single_block[y * W + x] = mi; } } // 8x8 = 64 px, one component
+
+        let mut four_blocks = vec![0.0f32; W * W];
+        for &(bx, by) in &[(0usize, 0usize), (0, 15), (15, 0), (15, 15)] {
+            for y in by..by + 5 { for x in bx..bx + 5 { four_blocks[y * W + x] = mi; } } // 4×(5x5=25px) = 100 px total, separated
+        }
+
+        let single_frac = largest_interior_component_fraction(&single_block, W, W, mi);
+        let clustered_frac = largest_interior_component_fraction(&four_blocks, W, W, mi);
+        let total_area_single: f32 = single_block.iter().filter(|&&v| v >= mi * 0.95).count() as f32 / (W * W) as f32;
+        let total_area_clustered: f32 = four_blocks.iter().filter(|&&v| v >= mi * 0.95).count() as f32 / (W * W) as f32;
+
+        assert!(total_area_clustered > total_area_single,
+            "test setup must give the clustered field MORE total area, to prove this isn't just measuring total area");
+        assert!(single_frac > clustered_frac,
+            "largest-component fraction must favor the one dominant body over several small ones: \
+             single={single_frac:.4} clustered={clustered_frac:.4}");
+
+        // And the penalty built on top of it must then rank a "clean, one
+        // dominant body" candidate above a "several small bodies" one, even
+        // when the clustered one's raw correlation score is higher.
+        let ref_frac = single_frac; // pretend the reference looks like the clean field
+        let penalized_clean     = 0.25 * interior_undershoot_penalty(single_frac, ref_frac);
+        let penalized_clustered = 0.32 * interior_undershoot_penalty(clustered_frac, ref_frac);
+        assert!(penalized_clean > penalized_clustered,
+            "penalty didn't fix the ranking: clean={penalized_clean:.4} clustered={penalized_clustered:.4}");
+    }
+
+    #[test]
+    fn interior_penalty_is_inert_when_candidate_has_more_interior_than_reference() {
+        // Deliberately asymmetric — see interior_undershoot_penalty's doc
+        // comment for why overshooting must not be punished.
+        assert_eq!(interior_undershoot_penalty(0.5, 0.1), 1.0);
+        assert_eq!(interior_undershoot_penalty(0.1, 0.1), 1.0);
     }
 }

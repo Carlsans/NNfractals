@@ -161,6 +161,189 @@ pub fn png_compression_entropy(
     png_bytes / raw_bytes  // 0..1+ (>1 theoretically impossible; ~0.3 boring, ~0.9+ rich)
 }
 
+/// Lag-1 horizontal Pearson correlation of an escape-time field — how much a
+/// pixel predicts its right-hand neighbour. **The noise detector.**
+///
+/// Structure is spatially coherent (neighbouring pixels are related), random
+/// dither is not, and the separation is enormous rather than marginal.
+/// Measured on real rendered frames (2026-08-15):
+///
+/// ```text
+///   pure-noise frames:  0.027, 0.016, 0.002
+///   good-structure:     0.333, 0.297, 0.262
+///   rich start frame:   0.928
+/// ```
+///
+/// This exists because BOTH of this project's existing complexity metrics are
+/// blind to speckle noise, in a way that actively rewards it:
+///   * `png_compression_entropy` is MAXIMISED by noise — noise is
+///     incompressible, so garbage scores like rich structure.
+///   * `multiscale_entropy` was supposed to fix that by collapsing the coarse
+///     term, but dense speckle SURVIVES 4x average-pooling, so it doesn't.
+/// A `video-zoom-explore` search ranked a pure noise field as its #1 winner
+/// because of this (Carl's first batch run). Correlation catches it because
+/// it measures a different property entirely — spatial coherence, not
+/// information content — and noise cannot fake coherence.
+///
+/// Returns 0.0 for a degenerate (constant) field, which is correct here: a
+/// flat frame has no structure to preserve either.
+pub fn spatial_coherence(field: &[f32], width: u32, height: u32) -> f32 {
+    let (w, h) = (width as usize, height as usize);
+    if w < 2 || h < 1 || field.len() < w * h { return 0.0; }
+    let (mut sa, mut sb, mut saa, mut sbb, mut sab, mut n) = (0.0f64, 0.0f64, 0.0f64, 0.0f64, 0.0f64, 0.0f64);
+    for y in 0..h {
+        let row = y * w;
+        for x in 0..w - 1 {
+            let a = field[row + x] as f64;
+            let b = field[row + x + 1] as f64;
+            sa += a; sb += b; saa += a * a; sbb += b * b; sab += a * b; n += 1.0;
+        }
+    }
+    if n < 2.0 { return 0.0; }
+    let cov = sab / n - (sa / n) * (sb / n);
+    let va = (saa / n - (sa / n).powi(2)).max(0.0);
+    let vb = (sbb / n - (sb / n).powi(2)).max(0.0);
+    let denom = (va * vb).sqrt();
+    if denom <= 1e-12 { return 0.0; }
+    (cov / denom).clamp(-1.0, 1.0) as f32
+}
+
+/// Below this, a REGION is speckle noise rather than structure. Sits in the
+/// wide empty gap between the two measured regimes — deliberately not a
+/// knife-edge.
+pub const MIN_SPATIAL_COHERENCE: f32 = 0.10;
+
+/// A tile with luminance std below this is FLAT, not noisy. Flat regions
+/// (solid interior, smooth basin) legitimately have zero correlation, so
+/// without this guard they'd be indistinguishable from dither and every
+/// frame containing a solid area would be rejected.
+const TILE_TEXTURE_STD: f32 = 6.0;
+
+/// Fraction of a frame's TEXTURED tiles that are speckle noise, on a 4x4
+/// grid. **Use this, not whole-frame [`spatial_coherence`], to judge a
+/// frame.**
+///
+/// Whole-frame correlation has a real blind spot: a frame that is half
+/// smooth gradient and half dither averages to a healthy-looking score. A
+/// real one measured 0.564 whole-frame — comfortably "coherent" — while
+/// being visibly half garbage. Tiling localises the judgement, and skipping
+/// flat tiles keeps legitimately-empty regions from counting against it.
+///
+/// Measured separation (2026-08-15), which is why the 0.25 threshold is
+/// safe rather than tuned:
+///
+/// ```text
+///   good frames (3 sampled):        0.00, 0.00, 0.00
+///   half-noise frame:               0.56
+///   pure-noise frame:               0.94
+/// ```
+///
+/// Input is expected to be COLORMAPPED luminance on a 0-255 scale — the
+/// thing that actually ships — not the raw escape-time field.
+pub fn noise_tile_fraction(lum: &[f32], width: u32, height: u32) -> f32 {
+    const N: usize = 4;
+    let (w, h) = (width as usize, height as usize);
+    if w < N * 2 || h < N * 2 || lum.len() < w * h { return 0.0; }
+    let (tw, th) = (w / N, h / N);
+    let (mut textured, mut noisy) = (0u32, 0u32);
+    let mut tile = Vec::with_capacity(tw * th);
+    for ty in 0..N {
+        for tx in 0..N {
+            tile.clear();
+            for y in ty * th..(ty + 1) * th {
+                for x in tx * tw..(tx + 1) * tw {
+                    tile.push(lum[y * w + x]);
+                }
+            }
+            let n = tile.len() as f32;
+            let mean = tile.iter().sum::<f32>() / n;
+            let var = tile.iter().map(|v| (v - mean).powi(2)).sum::<f32>() / n;
+            if var.sqrt() < TILE_TEXTURE_STD { continue; } // flat, not noisy
+            textured += 1;
+            if spatial_coherence(&tile, tw as u32, th as u32) < MIN_SPATIAL_COHERENCE {
+                noisy += 1;
+            }
+        }
+    }
+    if textured == 0 { return 0.0; }
+    noisy as f32 / textured as f32
+}
+
+/// Above this fraction of noisy textured tiles, a frame is garbage.
+pub const MAX_NOISE_TILE_FRACTION: f32 = 0.25;
+
+#[cfg(test)]
+mod coherence_tests {
+    use super::*;
+
+    #[test]
+    fn spatial_coherence_separates_noise_from_structure() {
+        let (w, h) = (64u32, 64u32);
+        // Deterministic pseudo-random speckle — no spatial relationship
+        // between neighbours, which is the defining property of the frames
+        // this exists to reject.
+        let mut seed = 12345u32;
+        let noise: Vec<f32> = (0..w * h).map(|_| {
+            seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+            (seed >> 16) as f32
+        }).collect();
+        // A smooth gradient — maximally coherent.
+        let smooth: Vec<f32> = (0..w * h).map(|i| (i % w) as f32).collect();
+
+        let cn = spatial_coherence(&noise, w, h);
+        let cs = spatial_coherence(&smooth, w, h);
+        assert!(cn < MIN_SPATIAL_COHERENCE, "noise must fail the gate, got {cn}");
+        assert!(cs > MIN_SPATIAL_COHERENCE, "structure must pass the gate, got {cs}");
+        assert!(cs > cn, "structure must score above noise ({cs} vs {cn})");
+    }
+
+    #[test]
+    fn noise_tile_fraction_ignores_flat_tiles_but_catches_localised_dither() {
+        let (w, h) = (64u32, 64u32);
+        let mut seed = 99u32;
+        let mut rnd = || { seed = seed.wrapping_mul(1664525).wrapping_add(1013904223); ((seed >> 16) & 0xFF) as f32 };
+
+        // Half smooth gradient, half dither — the case whole-frame
+        // correlation misses, because the smooth half carries the average.
+        let mut half = vec![0.0f32; (w * h) as usize];
+        for y in 0..h as usize {
+            for x in 0..w as usize {
+                half[y * w as usize + x] = if x < 32 { (x * 4) as f32 } else { rnd() };
+            }
+        }
+        assert!(noise_tile_fraction(&half, w, h) > MAX_NOISE_TILE_FRACTION,
+            "half-dither frame must be rejected, got {}", noise_tile_fraction(&half, w, h));
+
+        // Structure with a large FLAT region — must NOT be called noise.
+        let mut with_flat = vec![0.0f32; (w * h) as usize];
+        for y in 0..h as usize {
+            for x in 0..w as usize {
+                with_flat[y * w as usize + x] = if x < 32 { 40.0 } else { (x * 4) as f32 };
+            }
+        }
+        assert_eq!(noise_tile_fraction(&with_flat, w, h), 0.0,
+            "flat regions are empty, not noisy — must not trigger the gate");
+    }
+
+    #[test]
+    fn spatial_coherence_of_a_flat_field_is_zero_not_nan() {
+        // Zero variance would divide by zero; a flat frame is also worthless,
+        // so 0.0 is both safe and semantically right.
+        let flat = vec![7.0f32; 32 * 32];
+        let c = spatial_coherence(&flat, 32, 32);
+        assert_eq!(c, 0.0);
+        assert!(c.is_finite());
+    }
+
+    #[test]
+    fn spatial_coherence_handles_degenerate_dimensions() {
+        assert_eq!(spatial_coherence(&[], 0, 0), 0.0);
+        assert_eq!(spatial_coherence(&[1.0], 1, 1), 0.0);
+        // Field shorter than w*h must not panic.
+        assert_eq!(spatial_coherence(&[1.0, 2.0], 64, 64), 0.0);
+    }
+}
+
 /// Multiscale structured entropy: geometric mean of fine-scale (full res) and
 /// coarse-scale (4× average-pool) PNG compression entropy.
 ///

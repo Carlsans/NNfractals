@@ -106,6 +106,34 @@ pub struct Genome {
     #[serde(default)] pub known_formula_match: String,
     /// Correlation score backing known_formula_match; 0.0 when empty.
     #[serde(default)] pub known_formula_score: f32,
+    /// Image-space novelty [0,∞]: average L2 distance to k nearest archive
+    /// genomes' learned visual embeddings (frozen DINOv2 + small VICReg-trained
+    /// head, trained on this pool's own images — see scripts/train_novelty.py).
+    /// Higher = visually/structurally distinct from the rest of the pool.
+    /// 0.0 if not yet scored. Computed live at save time by novelty_scorer.py
+    /// (src/novelty.rs) and blended into saved fitness + archive-seed ranking
+    /// via optimization.img_novelty_weight (0 = inert); also backfillable in
+    /// bulk via scripts/train_novelty.py --score-only.
+    #[serde(default)] pub novelty_score: f32,
+    /// Numeric k-means cluster id over the same learned embedding space
+    /// (scripts/train_novelty.py --score-only). -1 if not yet clustered. No
+    /// semantic label yet — inspect clusters via the browser's thumbnails.
+    #[serde(default)] pub novelty_cluster: i32,
+    /// Wormhole match quality [0,1]: how strongly a smaller embedded copy
+    /// of this genome's own (saved) view recurs somewhere inside it — see
+    /// fractal::wormhole_search. 0.0 if not measured or no confident match
+    /// found. DISCOVERY/NAVIGATION ONLY: never read by fitness, selection,
+    /// or seeding — distinct from `fractal_recursion`, which is a presence/
+    /// absence signal used in seed ranking (and, unlike this field, was
+    /// found to silently always score 0.0 for DAG genomes).
+    #[serde(default)] pub wormhole_score: f32,
+    /// Offset (fractal-plane units, relative to view_cx/view_cy) of the
+    /// best wormhole match. Meaningless when wormhole_score == 0.0.
+    #[serde(default)] pub wormhole_dx: f32,
+    #[serde(default)] pub wormhole_dy: f32,
+    /// Zoom of the matched window (same convention as view_zoom: half_y =
+    /// 2.0/wormhole_zoom). Meaningless when wormhole_score == 0.0.
+    #[serde(default)] pub wormhole_zoom: f32,
     /// Expression-DAG program (Phase-1 formula system). When non-empty, this
     /// replaces the flat `terms` basis-sum: z_{n+1} = eval_program(program,z,c).
     /// Empty ⇒ legacy genome that still evaluates via `terms`/`formula_weights`.
@@ -292,6 +320,12 @@ impl Genome {
             angle_structure: 0.0,
             known_formula_match: String::new(),
             known_formula_score: 0.0,
+            novelty_score: 0.0,
+            novelty_cluster: -1,
+            wormhole_score: 0.0,
+            wormhole_dx: 0.0,
+            wormhole_dy: 0.0,
+            wormhole_zoom: 0.0,
             program: Vec::new(),
             julia_mode: false,
             julia_cre: 0.0,

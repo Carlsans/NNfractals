@@ -38,6 +38,7 @@ archive_random_ratio     = 0.30   # NEW ARCHITECTURE: 30% of each (re)seeded poo
 duplicate_penalty_weight = 0.50   # NEW ARCHITECTURE: quadratic penalty on formula families that dominate the saved archive (FormulaUsageTracker)
 archive_seeding_enabled  = false # 2026-07-28: reseed purely random on warm-start/restart (was reinforcing whatever formula family the archive had converged toward); set true to restore archive-seeded warm-start
 angle_structure_weight  = 0.0   # 2026-07-28: bonus for angular structure in the bailout exit-angle field (DAG only, fitness.rs::angle_structure_score). 0 = feature fully inert (default; see render_gpu "free when disabled")
+img_novelty_weight      = 0.5   # 2026-07-30: image-based novelty (frozen DINOv2 + VICReg head, novelty_scorer.py), trained+backfilled on this pool. Active here only — other pools have no trained head yet.
 
 [output]
 save_dir                 = "./fractals_1"     # NEW ARCHITECTURE: fresh empty pool, replaces ./fractals

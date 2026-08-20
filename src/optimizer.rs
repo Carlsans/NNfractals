@@ -14,6 +14,7 @@ use crate::fitness::{novelty_score, is_degenerate, behavior_descriptor, beauty_s
 use crate::io::{save_genome, save_png};
 use crate::display;
 use crate::aesthetic::AestheticScorer;
+use crate::novelty::NoveltyScorer;
 use crate::formula_usage::FormulaUsageTracker;
 
 pub struct Optimizer {
@@ -29,6 +30,7 @@ pub struct Optimizer {
     formula_archive:  VecDeque<Vec<f32>>,
     save_descriptors: Vec<Vec<f32>>,
     aesthetic: Option<AestheticScorer>,
+    novelty: Option<NoveltyScorer>,
     last_sub_scores: Option<[f32; 5]>,  // [boundary, edge, entropy, self_sim, cool_zone]
     max_png_entropy: f32,               // max PNG compression ratio seen across all evaluations
     // CYCLE13 diagnostic: population[0]'s structured (multiscale) entropy this gen —
@@ -110,6 +112,11 @@ impl Optimizer {
             display::print_status("Aesthetic scorer: spawning Python sidecar...");
         }
 
+        let novelty = NoveltyScorer::new(&config.output.save_dir);
+        if novelty.is_some() {
+            display::print_status("Novelty scorer: spawning Python sidecar...");
+        }
+
         let recursion_model = crate::recursion_model::RecursionModel::load(
             std::path::Path::new("recursion_model.json"));
         match &recursion_model {
@@ -144,6 +151,7 @@ impl Optimizer {
             behavior_archive,
             formula_archive,
             aesthetic,
+            novelty,
             last_sub_scores: None,
             max_png_entropy: 0.0,
             last_top_structured: 0.0,
@@ -267,7 +275,8 @@ impl Optimizer {
                         + config.optimization.musiq_weight * musiq_norm
                         + 0.15 * (g.laion_score / 10.0)
                         + 0.20 * g.self_replication
-                        + 0.20 * g.fractal_recursion;
+                        + 0.20 * g.fractal_recursion
+                        + config.optimization.img_novelty_weight * g.novelty_score;
                     candidates.push((score, g));
                 }
             }
@@ -542,6 +551,7 @@ impl Optimizer {
         if self.aesthetic.is_some() && aesthetic_scores.is_none() {
             display::print_status("⚠ aesthetic scorer returned no score — genome saved unscored (run backfill_scores later)");
         }
+        let novelty_val = self.novelty.as_mut().and_then(|n| n.score_blocking(png_path.clone()));
         let ensemble = aesthetic_scores.as_ref().map(|s| s.ensemble()).unwrap_or(0.0);
         let final_beauty = if ensemble > 0.0 {
             ensemble / 10.0
@@ -566,6 +576,7 @@ impl Optimizer {
         g.pref_score        = aesthetic_scores.as_ref().map(|s| s.pref).unwrap_or(0.0);
         g.self_replication  = crate::fractal::self_replication_score(&g, &self.config);
         g.fractal_recursion = crate::fractal::fractal_recursion_score(&g, &self.config);
+        g.novelty_score     = novelty_val.unwrap_or(0.0);
         // Discovery/curiosity metadata only — never read by fitness/selection/seeding.
         match crate::fractal::known_formula_match(&g) {
             Some((name, score)) => { g.known_formula_match = name.to_string(); g.known_formula_score = score; }
@@ -717,12 +728,12 @@ impl Optimizer {
         // PNG in the output dir — most candidates fail the gate, and writing-then-deleting a
         // full-size PNG for each one is pure disk churn. The permanent PNG is only written
         // below, after the candidate passes.
+        // PID-scoped so concurrent instances don't overwrite each other's candidate.
+        let score_tmp = std::path::PathBuf::from(format!("/tmp/nnfractals_score_{}.png", std::process::id()));
         let aesthetic_scores = match self.aesthetic.as_mut() {
             Some(aes) => {
-                // PID-scoped so concurrent instances don't overwrite each other's candidate.
-                let score_tmp = std::path::PathBuf::from(format!("/tmp/nnfractals_score_{}.png", std::process::id()));
                 save_png(&rgb, w, h, &score_tmp).unwrap_or(());
-                aes.score_blocking(score_tmp)
+                aes.score_blocking(score_tmp.clone())
             }
             None => None,
         };
@@ -763,6 +774,24 @@ impl Optimizer {
         let png_path = self.config.output.save_dir.join(format!("{name}.png"));
         save_png(&rgb, w, h, &png_path).unwrap_or(());
 
+        // ── Image-based novelty (frozen DINOv2 + VICReg head) — only for
+        // genomes that actually reach this point (already passed the
+        // aesthetic gate above). Deliberately NOT scored for every candidate
+        // that merely clears entropy/diversity like the aesthetic scorer is:
+        // novelty_scorer.py grows its live comparison archive by one entry
+        // per score, so scoring rejected candidates too would silently
+        // densify that archive far faster than the save rate (most
+        // candidates fail the aesthetic gate) — average k-NN distance
+        // shrinks as an archive densifies for purely geometric reasons, so
+        // novelty_score would drift down over a run even with visual
+        // diversity holding steady. Scoring only real saves keeps the
+        // archive's growth rate tied to "fractals actually created," which
+        // is what the score is supposed to mean.
+        let novelty_val = self.novelty.as_mut().and_then(|nov| nov.score_blocking(png_path.clone()));
+        if self.novelty.is_some() && novelty_val.is_none() {
+            display::print_status("⚠ novelty scorer returned no score — genome saved without a novelty score");
+        }
+
         // Stored "beauty" = ensemble aesthetic when available (fractal-tuned), else
         // LAION (wider range than CLIP), else geometric beauty.
         let ensemble = aesthetic_scores.as_ref().map(|s| s.ensemble()).unwrap_or(0.0);
@@ -791,6 +820,7 @@ impl Optimizer {
         // actually pass the gate (a handful per generation) — they travel with the .nn.
         g.self_replication  = crate::fractal::self_replication_score(&g, &self.config);
         g.fractal_recursion = crate::fractal::fractal_recursion_score(&g, &self.config);
+        g.novelty_score     = novelty_val.unwrap_or(0.0);
         // Discovery/curiosity metadata only — never read by fitness/selection/seeding.
         match crate::fractal::known_formula_match(&g) {
             Some((name, score)) => { g.known_formula_match = name.to_string(); g.known_formula_score = score; }
@@ -801,10 +831,13 @@ impl Optimizer {
         // Blend the human-preference score into the saved fitness so archive seeding
         // and elitism favour your taste (config-weighted; 0 = inert). Also reward high
         // MUSIQ technical quality (normalized), kept below pref so pref stays dominant.
+        // img_novelty_weight (also 0 = inert) rewards genomes whose learned visual
+        // embedding is far from the pool already on disk — see novelty_scorer.py.
         let musiq_norm = ((g.musiq - 30.0) / 50.0).clamp(0.0, 1.0);
         g.fitness = final_score
             + self.config.optimization.pref_weight * g.pref_score
-            + self.config.optimization.musiq_weight * musiq_norm;
+            + self.config.optimization.musiq_weight * musiq_norm
+            + self.config.optimization.img_novelty_weight * g.novelty_score;
         g.formula_readable = g.formula_expr();   // human-readable comment in the .nn
         save_genome(&g, &nn_path).unwrap_or(());
         self.formula_usage.record(&g);

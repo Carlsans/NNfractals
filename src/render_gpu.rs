@@ -7,7 +7,19 @@
 use std::sync::{OnceLock, Mutex};
 
 const SHADER_SRC: &str = include_str!("fractal.wgsl");
-const WG_SIZE: u32 = 256;
+pub const WG_SIZE: u32 = 256;
+/// WebGPU's baseline-guaranteed `maxComputeWorkgroupsPerDimension` (the
+/// portable minimum every backend must support, per spec — some GPUs
+/// allow more, but this is the safe floor). `dispatch_workgroups` below
+/// puts the whole per-genome pixel count on the X dimension alone
+/// (`pix.div_ceil(WG_SIZE)`), so a single render whose `width*height`
+/// exceeds `WG_SIZE * MAX_WORKGROUPS_PER_DIM` panics at dispatch time —
+/// confirmed in practice at 4096x4096 (16,777,216 px -> 65,536 workgroups,
+/// one over the line). Exposed so callers considering a large single
+/// render (`vae_explore`'s canvas renders) can check ahead of time and
+/// route to the CPU path instead, rather than discovering this via a
+/// panic.
+pub const MAX_WORKGROUPS_PER_DIM: u32 = 65535;
 const FW_F32S:   usize = 116; // 58 complex weights (legacy stride)
 const PROG_F32S: usize = 248; // DAG stride: 120 main + 120 warp + 8 dynamics
 const STRIDE_F32S: usize = 248; // max(FW_F32S, PROG_F32S): shared fw_buf sizing
