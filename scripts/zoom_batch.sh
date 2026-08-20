@@ -32,6 +32,13 @@ TOPW="${TOPW:-6}"
 # ~8x faster AND slightly cleaner, because resampling softens the aliasing
 # speckle that point-sampling produces. 1 disables it.
 KFSTRIDE="${KFSTRIDE:-16}"
+# ANGLE=1 searches AND renders in exit-angle colouring. It must be set for
+# both halves or neither: the search ranks chains by the compressed size of a
+# real encode, so a chain chosen under one colouring was never evaluated under
+# the other. verify-chain picks it up from the winners manifest on its own;
+# this only needs to force it when re-rendering an older manifest.
+ANGLE_FLAG=""
+[ "${ANGLE:-0}" = "1" ] && ANGLE_FLAG="--angle-coloring"
 # MUST match `explorer video-zoom-explore`'s OWN default output directory,
 # rather than passing one: its positionals are `<genome> [cx] [cy] [zoom]
 # [out_dir]` and parsing stops at the first flag (`pos = &args[..flag_boundary]`),
@@ -64,7 +71,7 @@ else
     # a different aspect checks a different crop of the fractal.
     ./target/release/explorer video-zoom-explore "$GENOME" \
         --depth "$DEPTH" --top-winners "$TOPW" \
-        --final-width "$W" --final-height "$H" >> "$LOG" 2>&1
+        --final-width "$W" --final-height "$H" $ANGLE_FLAG >> "$LOG" 2>&1
     echo "=== [$TAG] $(date +%H:%M:%S) explore done rc=$? ===" | tee -a "$LOG"
 fi
 
@@ -122,7 +129,7 @@ for RANK in $(seq 0 $((NW - 1))); do
             --render-video "$MP4" \
             --render-width "$W" --render-height "$H" \
             --render-steps "$STEPS" --render-fps "$FPS" \
-            --keyframe-stride "$KFSTRIDE" \
+            --keyframe-stride "$KFSTRIDE" $ANGLE_FLAG \
             ${CAP:+--max-frames "$CAP"} >> "$LOG" 2>&1
         echo "=== [$TAG] $(date +%H:%M:%S) render done: $MP4 ===" | tee -a "$LOG"
         exit 0

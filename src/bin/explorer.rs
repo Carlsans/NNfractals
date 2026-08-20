@@ -733,7 +733,7 @@ fn cmd_verify_chain(
     iter_sweep: Option<&str>, sweep_res: u32,
     render_video: Option<&Path>, render_dims: (Option<u32>, Option<u32>), render_steps: Option<u32>,
     winners: Option<&Path>, rank: usize, nn_override: Option<&Path>, fps_override: Option<u32>,
-    max_frames: Option<u32>, keyframe_stride: u32,
+    max_frames: Option<u32>, keyframe_stride: u32, angle_override: bool,
 ) {
     use nnfractals::video_export::{chain_frame_views, render_save, VIDEO_FRAME_ALLOW_DD};
 
@@ -759,7 +759,14 @@ fn cmd_verify_chain(
                 width: render_dims.0.unwrap_or(1080),
                 height: render_dims.1.unwrap_or(1980),
                 invert_coords: false, invert_range: false,
-                colormap: config.rendering.colormap.clone(), angle_coloring: false,
+                colormap: config.rendering.colormap.clone(),
+                // Follow whatever the SEARCH used (recorded per winner by
+                // `write_winners_manifest`), so the render reproduces the
+                // frames the chain was actually scored on. `--angle-coloring`
+                // forces it on for manifests written before that field
+                // existed, or to re-render an old chain in angle mode.
+                angle_coloring: angle_override
+                    || entry["angle_coloring"].as_bool().unwrap_or(false),
             };
             (spec, genome)
         }
@@ -1632,7 +1639,7 @@ fn cmd_video_zoom_explore(
     };
 
     let winners = video_zoom_explore::run(&genome, &config, angle_coloring, &seeds, method_arg, &opts, out_dir, &mut log);
-    video_zoom_explore::write_winners_manifest(out_dir, &winners, &genome, &config)
+    video_zoom_explore::write_winners_manifest(out_dir, &winners, &genome, &config, angle_coloring)
         .unwrap_or_else(|e| panic!("write {}/video_zoom_winners.jsonl: {e}", out_dir.display()));
 
     match winners.first() {
@@ -2126,7 +2133,17 @@ fn main() {
             let out_path = pos.get(6).map(PathBuf::from).unwrap_or_else(|| PathBuf::from("shot.png"));
             let config = load_config();
             let view = View::new_square(cx, cy, zoom);
-            save_shot(&genome, &config, &view, res, &out_path);
+            // --angle-coloring renders through the SAME `render_save` path the
+            // video exporter uses, so what this writes is what a video frame
+            // would look like — the point of having it here is comparing the
+            // two colourings on one view without launching the GUI.
+            if args.iter().any(|a| a == "--angle-coloring") {
+                let rgb = nnfractals::video_export::render_save(
+                    &genome, &config, &view, res, res, true, false);
+                nnfractals::io::save_png(&rgb, res, res, &out_path).expect("save screenshot");
+            } else {
+                save_shot(&genome, &config, &view, res, &out_path);
+            }
             println!("saved {} at cx={cx} cy={cy} zoom={zoom}", out_path.display());
         }
         Some("debug-sweep") => {
@@ -2245,7 +2262,7 @@ fn main() {
                 queue_id.as_deref(), stride, max_iter_override, dump_dir.as_deref(),
                 iter_sweep.as_deref(), sweep_res, render_video.as_deref(), render_dims, render_steps,
                 winners.as_deref(), rank, nn_override.as_deref(), fps_override, max_frames,
-                keyframe_stride,
+                keyframe_stride, args.iter().any(|a| a == "--angle-coloring"),
             );
         }
         _ => {
@@ -2262,8 +2279,8 @@ fn main() {
             eprintln!("  nnfractals-explorer verify-chain [--queue-id ID (default: newest chain item)] [--stride N] [--max-iter N] [--dump-frames DIR]");
             eprintln!("      replays a queued chain's EXACT export frames offline: per-frame png size + 'flood' (fraction of the frame that is one colour).");
             eprintln!("      [--iter-sweep 192,384,768 --sweep-res N] finds the min iteration depth each zoom level needs;");
-            eprintln!("      [--render-video OUT.mp4 --render-width N --render-height N --render-steps N --render-fps N] renders the chain from the CLI;\n      [--max-frames N] stops early; [--keyframe-stride N (default 16)] renders only every Nth frame and warps the rest (~8x faster); 1 = exact.");
-            eprintln!("  nnfractals-explorer shot <genome.nn> [cx] [cy] [zoom] [res=1024] [out.png=shot.png]");
+            eprintln!("      [--render-video OUT.mp4 --render-width N --render-height N --render-steps N --render-fps N] renders the chain from the CLI;\n      [--max-frames N] stops early; [--keyframe-stride N (default 16)] renders only every Nth frame and warps the rest (~8x faster); 1 = exact;\n      [--angle-coloring] forces exit-angle colouring (otherwise follows what the winners manifest recorded for the search).");
+            eprintln!("  nnfractals-explorer shot <genome.nn> [cx] [cy] [zoom] [res=1024] [out.png=shot.png] [--angle-coloring]");
             eprintln!("  nnfractals-explorer saliency-data [out_dir] <pool_dir> [pool_dir...] [--canvas-res 256] [--max-per-pool 3000] [--vae-model path.pt (needed for pool_dirs with no vae_recon_manifest.jsonl, e.g. manual marks)]");
             eprintln!("  nnfractals-explorer retrain-saliency [out_dir] [--canvas-res 256] [--max-per-pool 1500] [--vae-model explorer_out/last_successful_vae.pt] [--epochs 40]");
             eprintln!("  nnfractals-explorer gems <method|method,method,...|mixed> [hours] [n_cols] [n_rows] [out_dir]");

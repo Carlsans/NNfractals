@@ -1114,7 +1114,7 @@ pub fn run(
 /// in the first place — this cleans up only genuine same-run leftovers
 /// from a previous invocation's truncated tail, if `out_dir` is reused.
 pub fn write_winners_manifest(
-    out_dir: &Path, winners: &[Winner], genome: &Genome, config: &Config,
+    out_dir: &Path, winners: &[Winner], genome: &Genome, config: &Config, angle_coloring: bool,
 ) -> std::io::Result<()> {
     let mut log = Logger::new(&out_dir.join("video_zoom_winners.jsonl"))?;
     for (rank, w) in winners.iter().enumerate() {
@@ -1124,7 +1124,17 @@ pub fn write_winners_manifest(
             zoom: last.zoom, aspect: last.aspect,
         };
         let thumb_path = out_dir.join(format!("winner_{rank:04}_end.png"));
-        save_shot(genome, config, &end_view, 512, &thumb_path);
+        // The thumbnail must be in the colouring the search actually
+        // scored and the export will actually use — a gallery of standard
+        // -palette thumbnails for an angle-coloured chain shows the user a
+        // video that will not be produced.
+        if angle_coloring {
+            let rgb = crate::video_export::render_save(
+                genome, config, &end_view, 512, 512, true, crate::video_export::VIDEO_FRAME_ALLOW_DD);
+            let _ = crate::io::save_png(&rgb, 512, 512, &thumb_path);
+        } else {
+            save_shot(genome, config, &end_view, 512, &thumb_path);
+        }
 
         let final_path = out_dir.join(format!("winner_{rank:04}.mp4"));
         // `run` names scratch clips by pre-truncation index, not by this
@@ -1146,6 +1156,11 @@ pub fn write_winners_manifest(
             })).collect::<Vec<_>>(),
             "preview_mp4": format!("winner_{rank:04}.mp4"),
             "thumb_png": format!("winner_{rank:04}_end.png"),
+            // Recorded so a later render reproduces what was SEARCHED. The
+            // video probe scores a real encode, and angle colouring changes
+            // the encoded bytes substantially — a chain picked under one
+            // colouring was not evaluated under the other.
+            "angle_coloring": angle_coloring,
         }));
     }
     // Anything still named `_vz_scratch_*` at this point belongs to a

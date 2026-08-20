@@ -3607,7 +3607,7 @@ impl App {
             return;
         }
         let final_width = self.video_w_str.trim().parse::<u32>().unwrap_or(1280).max(64);
-        let args = vec![
+        let mut args = vec![
             "video-zoom-explore".to_string(),
             seed_path.to_string_lossy().into_owned(),
             self.view.cx.to_string(), self.view.cy.to_string(), self.view.zoom.to_string(),
@@ -3621,6 +3621,13 @@ impl App {
             "--n-seeds".to_string(), self.eo_vz_n_seeds.trim().to_string(),
             "--min-score".to_string(), self.eo_vz_min_score.trim().to_string(),
         ];
+        // Search in whatever colouring the "∠" toggle is currently showing.
+        // The search RANKS chains by the compressed size of a real encode, so
+        // the colouring is not cosmetic here — it changes which chain wins.
+        // Recorded in the winners manifest too, so the final render matches.
+        if self.angle_coloring {
+            args.push("--angle-coloring".to_string());
+        }
         self.eo_vz_winners.clear(); // don't show a stale gallery from a previous run while this one is in flight
         let root = Self::project_root();
         self.spawn_explore_stage("Video-zoom exploring", locate_sibling_bin("explorer"), args, root);

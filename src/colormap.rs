@@ -13,17 +13,28 @@ pub fn apply_colormap(escape_times: &[f32], max_iter: u32, colormap_name: &str) 
     pixels
 }
 
+/// Dimmest an escaped pixel may render. Rank alone would put the darkest
+/// escaped pixel at value 0 — indistinguishable from the interior, and it
+/// throws away the hue that is the whole point of this mode.
+const ANGLE_VALUE_FLOOR: f64 = 0.35;
+/// The set interior: dark, unsaturated, and deliberately BELOW the floor so
+/// the body reads as a silhouette against the escaped filaments.
+const ANGLE_INTERIOR_VALUE: f64 = 0.10;
+const ANGLE_SATURATION: f64 = 0.75;
+
 /// Cosmetic alternative to `apply_colormap`: hue driven by the bailout
-/// exit-angle (arg z at escape — see fractal::dag_escape_pixel), value/
-/// lightness driven by the same normalized escape fraction the standard
-/// palettes use, fixed high saturation. Never called from the GA's save
+/// exit-angle (arg z at escape — see fractal::dag_escape_pixel), value by
+/// the escape time, fixed high saturation. BOTH channels are
+/// histogram-equalized against this render's own distribution — see the
+/// notes on hue below, and on `escape_equalize` for why brightness needs
+/// exactly the same treatment. Never called from the GA's save
 /// path (try_save/force_save always use apply_colormap/turbo) — this is
-/// purely for the viewer's interactive "∠" toggle. `angles` must be the
-/// same length as `escape_times` (interior/non-finite-escape pixels have
-/// angle 0.0, which just renders at whatever hue that maps to below — no
-/// special-casing needed since those pixels are already at the
-/// value-gradient's dark/light extreme, so they stay visually distinct
-/// regardless of exact hue).
+/// purely for the viewer's interactive "∠" toggle, and for video export /
+/// video-zoom search when angle colouring is requested. `angles` must be
+/// the same length as `escape_times`. Interior/non-finite-escape pixels
+/// carry angle 0.0, which is not a real exit direction, so they are
+/// special-cased to a dark unsaturated grey rather than being given a hue
+/// that would read as meaningful.
 ///
 /// Hue is NOT a fixed `angle -> hue` formula — it's HISTOGRAM-EQUALIZED
 /// against whatever distribution of angles this specific render actually
@@ -50,14 +61,29 @@ pub fn apply_colormap(escape_times: &[f32], max_iter: u32, colormap_name: &str) 
 /// `atan2` range with no special-casing for where a cluster happens to
 /// sit relative to ±π.
 pub fn apply_angle_colormap(escape_times: &[f32], angles: &[f32], max_iter: u32) -> Vec<u8> {
-    let max = max_iter as f64;
     let equalize = angle_equalize(escape_times, angles, max_iter);
+    // Brightness gets the SAME treatment as hue, for the same reason. The
+    // raw `escape_time / max_iter` this used to use is not a brightness
+    // scale, it's a ratio against a cap chosen for CORRECTNESS: `max_iter`
+    // has to exceed what the deepest pixel needs, and at depth
+    // `effective_max_iter` scales it with zoom, so typical escape times sit
+    // far below it. Measured on a real view (7cd46280, zoom 38): mean value
+    // 0.028 and EVERY pixel under 10% luma — a black screen with hue
+    // information in it that no display can show. Rank-in-distribution has
+    // no such dependence on the cap: whatever the escape times actually
+    // are, they spread across the full output range.
+    let brighten = escape_equalize(escape_times, max_iter);
     let mut pixels = Vec::with_capacity(escape_times.len() * 3);
     for (i, &t) in escape_times.iter().enumerate() {
-        let norm = (t as f64 / max).clamp(0.0, 1.0);
         let angle = angles.get(i).copied().unwrap_or(0.0);
+        let (sat, val) = if (t as u32) >= max_iter {
+            // Interior: no meaningful exit angle, so hue would be noise.
+            (0.0, ANGLE_INTERIOR_VALUE)
+        } else {
+            (ANGLE_SATURATION, ANGLE_VALUE_FLOOR + (1.0 - ANGLE_VALUE_FLOOR) * brighten(t) as f64)
+        };
         let hue = equalize(angle) as f64 * 360.0;
-        let (r, g, b) = hsv_to_rgb(hue, 0.75, norm);
+        let (r, g, b) = hsv_to_rgb(hue, sat, val);
         pixels.push(r);
         pixels.push(g);
         pixels.push(b);
@@ -85,21 +111,53 @@ pub fn apply_angle_colormap(escape_times: &[f32], angles: &[f32], max_iter: u32)
 /// linear mapping; there's no real distribution to equalize against.
 fn angle_equalize(escape_times: &[f32], angles: &[f32], max_iter: u32) -> impl Fn(f32) -> f32 {
     const TAU: f32 = std::f32::consts::TAU;
-    let mut sorted: Vec<f32> = escape_times.iter().zip(angles.iter())
+    let samples: Vec<f32> = escape_times.iter().zip(angles.iter())
         .filter(|&(&t, _)| (t as u32) < max_iter)
         .map(|(_, &a)| a.rem_euclid(TAU))
         .collect();
-    if sorted.len() < 2 {
+    let Some(cdf) = empirical_cdf(samples) else {
         return Box::new(|a: f32| (a / TAU).rem_euclid(1.0)) as Box<dyn Fn(f32) -> f32>;
-    }
-    sorted.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    let n_f = sorted.len() as f32;
-    Box::new(move |a: f32| {
-        let wrapped = a.rem_euclid(TAU);
-        // Rank = count of reference angles < this one, i.e. where it would
-        // insert to keep `sorted` sorted — exactly the empirical CDF.
-        let rank = sorted.partition_point(|&x| x < wrapped);
-        (rank as f32 / n_f).clamp(0.0, 1.0)
+    };
+    Box::new(move |a: f32| cdf(a.rem_euclid(TAU)))
+}
+
+/// The escape-time counterpart of `angle_equalize`, driving VALUE rather
+/// than hue. Built from escaped pixels only: the interior is a single
+/// spike at `max_iter` that would otherwise dominate the distribution and
+/// squash every real gradient into the remaining range.
+fn escape_equalize(escape_times: &[f32], max_iter: u32) -> impl Fn(f32) -> f32 {
+    let samples: Vec<f32> = escape_times.iter().copied()
+        .filter(|&t| (t as u32) < max_iter)
+        .collect();
+    let max = max_iter.max(1) as f32;
+    let Some(cdf) = empirical_cdf(samples) else {
+        // Nothing escaped (or almost nothing): no distribution to equalize
+        // against, so fall back to the plain normalized ratio.
+        return Box::new(move |t: f32| (t / max).clamp(0.0, 1.0)) as Box<dyn Fn(f32) -> f32>;
+    };
+    Box::new(cdf)
+}
+
+/// Exact empirical CDF over `samples`: sort once, then rank each query by
+/// binary search. `None` when there is nothing to equalize against (fewer
+/// than 2 samples), leaving the fallback to the caller.
+///
+/// Exact rank, not a binned histogram — a binned version (720 buckets) was
+/// tried first and checked against a real render: one genome had 67.5% of
+/// escaped pixels inside a SINGLE 0.5°-wide bin, far tighter than the bin
+/// resolution, so interpolation within that bin had nothing to work with
+/// and collapsed back to one hue. Rank has no resolution floor: however
+/// tightly clustered the real distribution is, sorted order still separates
+/// every distinct value. Cost is one O(n log n) sort per render plus an
+/// O(log n) query per pixel.
+fn empirical_cdf(mut samples: Vec<f32>) -> Option<impl Fn(f32) -> f32> {
+    if samples.len() < 2 { return None; }
+    samples.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let n_f = samples.len() as f32;
+    Some(move |v: f32| {
+        // Rank = count of samples strictly below `v`, i.e. where it would
+        // insert to keep the slice sorted — exactly the empirical CDF.
+        (samples.partition_point(|&x| x < v) as f32 / n_f).clamp(0.0, 1.0)
     })
 }
 
@@ -296,4 +354,94 @@ fn lerp_stops(stops: &[(f64, [u8; 3])], t: f64) -> (u8, u8, u8) {
 
 fn lerp_u8(a: u8, b: u8, t: f64) -> u8 {
     (a as f64 * (1.0 - t) + b as f64 * t).round() as u8
+}
+
+#[cfg(test)]
+mod angle_colormap_tests {
+    use super::*;
+
+    /// Escape times spread over a small range, with a `max_iter` far above
+    /// them — the ordinary situation, since `max_iter` must exceed what the
+    /// DEEPEST pixel needs and `effective_max_iter` raises it further with
+    /// zoom. Angles are varied so hue is not the thing under test.
+    fn sample_field(n: usize, max_iter: u32) -> (Vec<f32>, Vec<f32>) {
+        let ets = (0..n).map(|i| 20.0 + (i % 40) as f32).collect();
+        let angs = (0..n).map(|i| (i as f32 * 0.017).rem_euclid(std::f32::consts::TAU)).collect();
+        (ets, angs)
+    }
+
+    fn mean_value(px: &[u8]) -> f64 {
+        // HSV value is the max channel.
+        let n = px.len() / 3;
+        (0..n).map(|i| *px[i * 3..i * 3 + 3].iter().max().unwrap() as f64 / 255.0).sum::<f64>()
+            / n as f64
+    }
+
+    #[test]
+    fn brightness_does_not_collapse_when_max_iter_dwarfs_escape_times() {
+        // The real bug: value was `escape_time / max_iter`, so raising the
+        // iteration cap (which deep zoom does automatically) faded the whole
+        // image to black. Measured on a real view: mean value 0.028, every
+        // pixel under 10% luma.
+        let (ets, angs) = sample_field(4096, 8192);
+        let px = apply_angle_colormap(&ets, &angs, 8192);
+        assert!(mean_value(&px) > 0.5, "mean value {} — too dark", mean_value(&px));
+    }
+
+    #[test]
+    fn brightness_is_independent_of_the_iteration_cap() {
+        // Rank-in-distribution has no dependence on the cap, so the SAME
+        // escape times must render at the same brightness whether the cap is
+        // 4x or 100x above them. This is the property that actually fixes it.
+        let (ets, angs) = sample_field(4096, 100_000);
+        let low = mean_value(&apply_angle_colormap(&ets, &angs, 256));
+        let high = mean_value(&apply_angle_colormap(&ets, &angs, 100_000));
+        assert!((low - high).abs() < 0.02, "cap changed brightness: {low} vs {high}");
+    }
+
+    #[test]
+    fn interior_pixels_render_dark_and_unsaturated() {
+        // t >= max_iter is the set body: no meaningful exit angle, so hue
+        // would be noise. It must read as a silhouette, below the floor that
+        // escaped pixels get.
+        let mut ets: Vec<f32> = (0..64).map(|i| 10.0 + i as f32).collect();
+        let angs = vec![0.3f32; 65];
+        ets.push(256.0); // interior
+        let px = apply_angle_colormap(&ets, &angs, 256);
+        let last = &px[px.len() - 3..];
+        assert_eq!(last[0], last[1], "interior should be unsaturated (grey)");
+        assert_eq!(last[1], last[2], "interior should be unsaturated (grey)");
+        assert!((last[0] as f64 / 255.0) < ANGLE_VALUE_FLOOR,
+                "interior {} should be darker than any escaped pixel", last[0]);
+    }
+
+    #[test]
+    fn a_dense_cluster_is_spread_across_the_output_range() {
+        // The whole point of equalization over a fixed mapping: 90% of the
+        // samples sit in a 0.001-wide cluster, and must still end up spread
+        // over ~90% of the output range, not collapsed onto one value.
+        let mut vals: Vec<f32> = (0..900).map(|i| 1.0 + i as f32 * 1e-6).collect();
+        vals.extend((0..100).map(|i| 2.0 + i as f32 * 0.01));
+        let cdf = empirical_cdf(vals.clone()).expect("enough samples");
+        let lo = cdf(1.0);
+        let hi = cdf(1.0 + 899.0 * 1e-6);
+        assert!(hi - lo > 0.85, "cluster spread only {} of the range", hi - lo);
+    }
+
+    #[test]
+    fn empirical_cdf_needs_something_to_equalize_against() {
+        assert!(empirical_cdf(vec![]).is_none());
+        assert!(empirical_cdf(vec![1.0]).is_none());
+        assert!(empirical_cdf(vec![1.0, 2.0]).is_some());
+    }
+
+    #[test]
+    fn an_all_interior_field_still_renders() {
+        // Nothing escaped: there is no distribution to equalize against, and
+        // the fallback must not panic or divide by zero.
+        let ets = vec![256.0f32; 16];
+        let angs = vec![0.0f32; 16];
+        let px = apply_angle_colormap(&ets, &angs, 256);
+        assert_eq!(px.len(), 48);
+    }
 }
