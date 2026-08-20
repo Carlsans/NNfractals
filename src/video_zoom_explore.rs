@@ -619,59 +619,6 @@ fn canvas_needs_cpu_tier(view: &View, canvas_res: u32) -> bool {
 /// Called once for the immediate ply and again for every greedy lookahead
 /// extension step in `zoom_level` — the overlay showing that lookahead
 /// activity too is free, desired feedback, not a leak.
-/// Why candidates were discarded before they could be scored — see the
-/// counting filter in `cheap_funnel`.
-#[derive(Default, Clone, Copy)]
-struct Rejections { score: usize, edge: usize, intricacy: usize, step_zoom: usize, dd: usize }
-
-/// Run-level tally of the same, for the end-of-run summary.
-///
-/// Atomics rather than an accumulator threaded through the call chain:
-/// `cheap_funnel` is reached from several nesting levels (real plies and
-/// each greedy lookahead extension), all of which would otherwise need a new
-/// parameter for what is purely diagnostics.
-static REJ_TALLY: [std::sync::atomic::AtomicUsize; 5] = [
-    std::sync::atomic::AtomicUsize::new(0), std::sync::atomic::AtomicUsize::new(0),
-    std::sync::atomic::AtomicUsize::new(0), std::sync::atomic::AtomicUsize::new(0),
-    std::sync::atomic::AtomicUsize::new(0),
-];
-const REJ_NAMES: [&str; 5] = ["--min-score", "--min-edge-density", "--max-intricacy",
-                              "--min-step-zoom", "DD wall (--final-width)"];
-
-fn tally_rejections(r: &Rejections) {
-    use std::sync::atomic::Ordering::Relaxed;
-    for (slot, n) in [r.score, r.edge, r.intricacy, r.step_zoom, r.dd].iter().enumerate() {
-        REJ_TALLY[slot].fetch_add(*n, Relaxed);
-    }
-}
-
-/// The dominant reason candidates were thrown out this run, as a sentence
-/// naming the knob to change. `None` when nothing was rejected pre-scoring.
-///
-/// Exists because the old "0 winners" message guessed — it blamed the DD
-/// boundary or a degenerate neighbourhood, and on a real failing run
-/// (2026-08-20, a visibly rich view at zoom 0.12) BOTH were wrong: every
-/// candidate was cut by `--min-score`, whose scale is a z-score within the
-/// candidate set and so means different things at different views. Relaxing
-/// that one knob to 0.0 turned the same search into 2 winners whose
-/// file-size scores were 0.54 against a 0.18 floor — i.e. the search had
-/// been discarding excellent candidates on a cheap pre-filter.
-pub fn dominant_rejection() -> Option<String> {
-    use std::sync::atomic::Ordering::Relaxed;
-    let counts: Vec<usize> = REJ_TALLY.iter().map(|c| c.load(Relaxed)).collect();
-    let total: usize = counts.iter().sum();
-    if total == 0 { return None; }
-    let (i, n) = counts.iter().copied().enumerate().max_by_key(|&(_, n)| n)?;
-    Some(format!(
-        "{n} of {total} candidates were rejected before scoring by {} \
-         (breakdown: {}). Try relaxing that one first.",
-        REJ_NAMES[i],
-        counts.iter().copied().enumerate().filter(|&(_, c)| c > 0)
-            .map(|(j, c)| format!("{}={c}", REJ_NAMES[j]))
-            .collect::<Vec<_>>().join(" "),
-    ))
-}
-
 #[allow(clippy::too_many_arguments)]
 fn cheap_funnel(
     genome: &Genome, config: &Config, current: &View, method: ScoreMethod,
@@ -692,7 +639,6 @@ fn cheap_funnel(
         coarse_scan(&canvas_field, opts.canvas_res, opts.canvas_res, current, config, method);
     let total_candidates = candidates.len();
     let ranked = rank_by_zscore(&candidates, 0.0);
-    let mut rej = Rejections::default();
 
     let broad: Vec<(Candidate, View)> = ranked
         .into_iter()
@@ -700,21 +646,12 @@ fn cheap_funnel(
             let v = apply_offset(current, c.dx, c.dy, c.zoom);
             (c, v)
         })
-        // Counted per reason, not just filtered. When a run dead-ends at the
-        // first ply the only published numbers were "cands=243 above_floor=0",
-        // which reads as "243 candidates were scored and all fell below the
-        // floor" when the truth can be "none of them ever reached scoring".
-        // Those two have completely different fixes, and the run summary
-        // guesses ("past the DD boundary, or genuinely degenerate") were
-        // wrong for both. Cheap: five counters on a path that then does
-        // hundreds of renders.
         .filter(|(c, v)| {
-            if c.score < opts.min_score { rej.score += 1; return false; }
-            if c.metrics.edge_density < opts.gate.min_edge_density { rej.edge += 1; return false; }
-            if c.metrics.intricacy > opts.gate.max_intricacy { rej.intricacy += 1; return false; }
-            if v.zoom < current.zoom * opts.min_step_zoom { rej.step_zoom += 1; return false; }
-            if needs_dd_with_margin(v, opts.final_export_width, opts.dd_margin_ulps) { rej.dd += 1; return false; }
-            true
+            c.score >= opts.min_score
+                && c.metrics.edge_density >= opts.gate.min_edge_density
+                && c.metrics.intricacy <= opts.gate.max_intricacy
+                && v.zoom >= current.zoom * opts.min_step_zoom
+                && !needs_dd_with_margin(v, opts.final_export_width, opts.dd_margin_ulps)
         })
         .take(FILE_SIZE_ENTROPY_CANDIDATES)
         .collect();
@@ -733,14 +670,8 @@ fn cheap_funnel(
     // is the diagnostic that matters when a run dead-ends early).
     let n_above_floor = scored.iter().filter(|(_, _, s)| *s >= file_size_floor).count();
 
-    vztrace!("[TRACE cheap_funnel] scan_view=({:.9},{:.9})@{:.4e} parent_score={:.4} floor={:.4} real={} cands={} scored={} above_floor={}",
-        current.cx, current.cy, current.zoom, parent_score, file_size_floor, is_real_step,
-        total_candidates, scored.len(), n_above_floor);
-    if scored.len() < total_candidates {
-        vztrace!("[TRACE cheap_funnel]    pre-score rejects: min_score={} min_edge={} max_intricacy={} min_step_zoom={} dd_wall={}",
-            rej.score, rej.edge, rej.intricacy, rej.step_zoom, rej.dd);
-    }
-    tally_rejections(&rej);
+    vztrace!("[TRACE cheap_funnel] scan_view=({:.9},{:.9})@{:.4e} parent_score={:.4} floor={:.4} real={} cands={} above_floor={}",
+        current.cx, current.cy, current.zoom, parent_score, file_size_floor, is_real_step, total_candidates, n_above_floor);
     for (i, (_, v, sc)) in scored.iter().take(3).enumerate() {
         vztrace!("[TRACE cheap_funnel]    cand[{i}] ({:.9},{:.9})@{:.4e} score={:.4} {}",
             v.cx, v.cy, v.zoom, sc, if *sc >= file_size_floor { "PASS" } else { "reject" });

@@ -1647,16 +1647,10 @@ fn cmd_video_zoom_explore(
             "video-zoom-explore: {} winners in {} — best: {:.4} ratio, {} legs, ended={:?}",
             winners.len(), out_dir.display(), w.final_probe_ratio.unwrap_or(0.0), w.chain.len() - 1, w.ended_reason
         ),
-        // Report the measured reason rather than guessing. The old message
-        // blamed the DD boundary or a degenerate neighbourhood; on a real
-        // failing run both were wrong and the actual cause was one knob.
-        None => match video_zoom_explore::dominant_rejection() {
-            Some(why) => println!("video-zoom-explore: 0 winners in {} — {why}", out_dir.display()),
-            None => println!(
-                "video-zoom-explore: 0 winners in {} — every candidate was scored but none cleared the file-size floor (--min-file-size-ratio / --min-file-size-step-ratio), or the start view is past the DD boundary at --final-width {final_width}",
-                out_dir.display()
-            ),
-        },
+        None => println!(
+            "video-zoom-explore: 0 winners in {} — the start view may already be past the DD boundary at --final-width {final_width}, or genuinely degenerate everywhere nearby",
+            out_dir.display()
+        ),
     }
 }
 
