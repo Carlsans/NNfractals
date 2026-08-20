@@ -1156,6 +1156,13 @@ pub fn write_winners_manifest(
             })).collect::<Vec<_>>(),
             "preview_mp4": format!("winner_{rank:04}.mp4"),
             "thumb_png": format!("winner_{rank:04}_end.png"),
+            // Which fractal this chain belongs to. A chain is a path through
+            // ONE genome's coordinate space, and the viewer's output folder
+            // does not automatically follow the loaded genome — so a manifest
+            // and the currently-open fractal can disagree. Rendering a chain
+            // against the wrong genome produces hours of garbage silently, so
+            // consumers check this before queueing.
+            "genome_id": format!("{:016x}", genome.id),
             // Recorded so a later render reproduces what was SEARCHED. The
             // video probe scores a real encode, and angle colouring changes
             // the encoded bytes substantially — a chain picked under one

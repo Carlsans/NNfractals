@@ -555,6 +555,11 @@ struct VideoZoomWinnerUi {
     chain: Vec<CapturedView>,
     thumb: Option<TextureHandle>,
     preview_mp4: PathBuf,
+    /// Which genome this chain was searched against, from the manifest.
+    /// A chain is a path through ONE fractal's coordinate space; rendering
+    /// it against a different genome silently produces hours of garbage.
+    /// Empty for manifests written before this was recorded.
+    genome_id: String,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -889,6 +894,11 @@ struct App {
     // (established discipline throughout this project).
     show_explore_options: bool,
     eo_out_dir_str: String,
+    /// True while `eo_out_dir_str` is the per-genome default rather than a
+    /// path the user typed. Only an auto-derived folder follows the loaded
+    /// genome — see `retarget_explore_out_dir`; a hand-entered one is left
+    /// exactly where it was put.
+    eo_out_dir_auto: bool,
     // Growth (`explorer vae-explore`)
     eo_iterations:      String,
     eo_n_seeds:         String,
@@ -1278,6 +1288,7 @@ impl App {
             explore_message: String::new(),
             show_explore_options: false,
             eo_out_dir_str: String::new(),
+            eo_out_dir_auto: true,
             eo_iterations: "20".to_string(),
             eo_n_seeds: "60".to_string(),
             eo_recursion_depth: "4".to_string(),
@@ -1449,6 +1460,56 @@ impl App {
     }
 
     // Load a new genome into the viewer (IPC single-instance path).
+    /// `<save dir>/vae_explore/<genome id>` — one folder per fractal.
+    fn default_explore_out_dir(&self) -> String {
+        self.save_out_dir()
+            .join("vae_explore")
+            .join(format!("{:016x}", self.genome.id))
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    /// Point the explore pipeline at the newly-loaded genome and drop the
+    /// previous one's results.
+    ///
+    /// The output folder used to be chosen once, the first time the Explore
+    /// window was opened, and then never changed. Opening another fractal
+    /// from the browser therefore left every stage pointed at the FIRST
+    /// genome's folder: video-zoom wrote its winners and `_seed_genome.nn`
+    /// over the old ones, `Grow` appended a second formula's zones into the
+    /// first's corpus (that stage documents itself as append-on-rerun), and
+    /// the winners gallery kept showing chains belonging to a fractal that
+    /// was no longer loaded. Carl hit this as "video explore seems to use
+    /// some stale info" (2026-08-20).
+    ///
+    /// A hand-typed folder is deliberately left alone — see `eo_out_dir_auto`.
+    fn retarget_explore_out_dir(&mut self) {
+        // A stage in flight is still writing into the current folder, and its
+        // results are read from there when it finishes. Moving the folder now
+        // would orphan them (the files land in the previous genome's folder
+        // and the gallery would look in the new one), so leave everything
+        // pointed where the subprocess expects and say why.
+        if self.eo_busy {
+            self.eo_message = format!(
+                "{} is still running against the previous fractal — its output stays in {}",
+                self.eo_stage, self.eo_out_dir_str.trim()
+            );
+            return;
+        }
+        if self.eo_out_dir_auto && !self.eo_out_dir_str.trim().is_empty() {
+            self.eo_out_dir_str = self.default_explore_out_dir();
+        }
+        // Results belong to the genome they were produced from, whether or
+        // not the folder moved.
+        self.eo_vz_winners.clear();
+        self.eo_scan_candidates.clear();
+        self.eo_scan_seed_view = None;
+        self.eo_vz_progress = None;
+        self.eo_preview_texture = None;
+        self.eo_preview_stem.clear();
+        self.eo_preview_view = None;
+    }
+
     fn load_new_genome(&mut self, path: PathBuf) {
         match load_genome(&path) {
             Ok(genome) => {
@@ -1469,6 +1530,7 @@ impl App {
                 self.view.aspect = self.current_aspect();
                 self.view_stack.clear();
                 self.sync_xy = true;
+                self.retarget_explore_out_dir();
                 // Send genome alongside the render request so the thread picks it up
                 self.request_render_genome(false);
             }
@@ -2074,11 +2136,8 @@ impl App {
                     .clicked()
                 {
                     if self.eo_out_dir_str.trim().is_empty() {
-                        self.eo_out_dir_str = self.save_out_dir()
-                            .join("vae_explore")
-                            .join(format!("{:016x}", self.genome.id))
-                            .to_string_lossy()
-                            .into_owned();
+                        self.eo_out_dir_str = self.default_explore_out_dir();
+                        self.eo_out_dir_auto = true;
                     }
                     self.show_explore_options = true;
                 }
@@ -3668,7 +3727,8 @@ impl App {
                 ctx.load_texture(format!("eo_vz_winner_{rank}"), color_image, TextureOptions::LINEAR)
             });
 
-            self.eo_vz_winners.push(VideoZoomWinnerUi { rank, n_legs, final_probe_ratio, ended_reason, chain, thumb, preview_mp4 });
+            let genome_id = v.get("genome_id").and_then(|x| x.as_str()).unwrap_or("").to_string();
+            self.eo_vz_winners.push(VideoZoomWinnerUi { rank, n_legs, final_probe_ratio, ended_reason, chain, thumb, preview_mp4, genome_id });
         }
     }
 
@@ -3683,6 +3743,22 @@ impl App {
     fn queue_video_zoom_winner(&mut self, idx: usize) {
         let keyframe_stride = self.prefs.video_keyframe_stride.max(1);
         let Some(winner) = self.eo_vz_winners.get(idx) else { return };
+        // A chain is a path through ONE genome's coordinate space. The
+        // explore output folder does not follow the loaded genome (it is
+        // fixed the first time the Explore window is opened), so after
+        // opening a different fractal from the browser the gallery can still
+        // be showing the previous genome's winners. Queueing one then renders
+        // the WRONG fractal along the right path — silently, and only
+        // discovered hours later when the video is finished and wrong.
+        let current_id = format!("{:016x}", self.genome.id);
+        if !winner.genome_id.is_empty() && winner.genome_id != current_id {
+            self.eo_message = format!(
+                "Winner #{idx} was searched on genome {} but {current_id} is loaded — \
+                 re-run Video-Zoom Explore for this fractal.",
+                winner.genome_id
+            );
+            return;
+        }
         let chain = winner.chain.clone();
         let (Some(start), Some(end)) = (chain.first().copied(), chain.last().copied()) else { return };
 
@@ -3849,8 +3925,15 @@ impl App {
                          growing VAE checkpoint, complex-export channels, and the diversity/\
                          cluster results. One folder per genome by default."
                     );
-                    ui.add(egui::TextEdit::singleline(&mut self.eo_out_dir_str).desired_width(320.0))
-                        .on_hover_text("Where this genome's exploration pipeline reads/writes everything.");
+                    // A hand-typed path is the user's, and must not be
+                    // silently retargeted when another fractal is opened.
+                    if ui.add(egui::TextEdit::singleline(&mut self.eo_out_dir_str).desired_width(320.0))
+                        .on_hover_text("Where this genome's exploration pipeline reads/writes everything. \
+                                        Follows the loaded fractal automatically until you edit it.")
+                        .changed()
+                    {
+                        self.eo_out_dir_auto = false;
+                    }
                 });
                 ui.label(egui::RichText::new(
                     "All four stages below share this folder — grow, then export, then \
