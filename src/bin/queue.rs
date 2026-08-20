@@ -303,6 +303,42 @@ struct App {
     cancelling: Arc<AtomicBool>,
 
     wake_rx: mpsc::Receiver<()>,
+
+    /// This executable's path and mtime, both captured AT STARTUP — see
+    /// `binary_is_stale`. `None` disables the check.
+    exe_stamp: Option<(PathBuf, std::time::SystemTime)>,
+    /// Cached so the banner doesn't stat the binary on every repaint.
+    stale_checked: std::cell::Cell<Option<(std::time::Instant, bool)>>,
+}
+
+impl App {
+    /// True when this binary has been rebuilt since the process started.
+    ///
+    /// The path MUST come from the stamp captured at startup, not from
+    /// `current_exe()` here. Cargo replaces the executable rather than
+    /// rewriting it, so once a rebuild has happened `/proc/self/exe` reads as
+    /// `".../nnfractals-queue (deleted)"` — a path that cannot be stat'd, so
+    /// asking the running process where it lives returns exactly nothing in
+    /// the one case this check exists to catch. Verified against the real
+    /// stale process (pid 555691) before trusting it.
+    ///
+    /// Rechecked at most once a second: it's a filesystem stat on the UI
+    /// thread, and a rebuild does not need frame-rate latency.
+    fn binary_is_stale(&self) -> bool {
+        const RECHECK: std::time::Duration = std::time::Duration::from_secs(1);
+        if let Some((at, verdict)) = self.stale_checked.get()
+            && at.elapsed() < RECHECK {
+            return verdict;
+        }
+        let verdict = self.exe_stamp.as_ref().is_some_and(|(path, at_launch)| {
+            // A failed stat means the binary was deleted and not replaced —
+            // nothing useful to warn about, and not worth a false alarm.
+            std::fs::metadata(path).and_then(|m| m.modified())
+                .is_ok_and(|now| now != *at_launch)
+        });
+        self.stale_checked.set(Some((std::time::Instant::now(), verdict)));
+        verdict
+    }
 }
 
 const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
@@ -337,6 +373,12 @@ impl App {
             current_pid,
             cancelling,
             wake_rx,
+            // Captured now, while `/proc/self/exe` still resolves to a file
+            // that exists — see `binary_is_stale`.
+            exe_stamp: std::env::current_exe().ok().and_then(|p| {
+                std::fs::metadata(&p).and_then(|m| m.modified()).ok().map(|t| (p, t))
+            }),
+            stale_checked: std::cell::Cell::new(None),
         }
     }
 
@@ -390,6 +432,22 @@ impl eframe::App for App {
         let running = self.running.load(Ordering::SeqCst);
         let current_id = self.current_id.lock().unwrap().clone();
         let progress = *self.progress.lock().unwrap();
+
+        // This window is typically left open for days while renders are
+        // queued into it, so a rebuild lands while it is running and it keeps
+        // executing the OLD code with nothing to say so. Real cost, 2026-08-20:
+        // a colormap fix made the viewer render correctly and this process
+        // silently produced a 3200-frame video with the pre-fix (near-black)
+        // colouring — hours of render, indistinguishable from a code bug.
+        if self.binary_is_stale() {
+            egui::Panel::top("stale_binary").show(ui, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    ui.colored_label(Color32::from_rgb(255, 170, 60), "⚠ REBUILT SINCE LAUNCH");
+                    ui.label("— this window is still running the old binary. Renders started now \
+                              will use the OLD code. Close and reopen it to pick up the changes.");
+                });
+            });
+        }
 
         egui::Panel::top("controls").show(ui, |ui| {
             ui.horizontal(|ui| {
