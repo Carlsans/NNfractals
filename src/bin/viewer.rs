@@ -3732,6 +3732,66 @@ impl App {
         }
     }
 
+    /// Jumps the main canvas to a winner's deepest view so it can be
+    /// explored by hand from there.
+    ///
+    /// Lands on the LAST waypoint deliberately: that is the end of the
+    /// discovered zoom and exactly what the gallery thumbnail
+    /// (`winner_NNNN_end.png`) shows, so clicking goes where the picture
+    /// promised. `cx_lo`/`cy_lo` are carried across — past ~1e13 zoom the
+    /// low word is the only thing separating adjacent pixels, and dropping
+    /// it would silently land somewhere else entirely.
+    ///
+    /// Pushes the previous view so the jump is undoable, and logs a
+    /// `goto_vz_winner` nav event. That action name is deliberately NOT one
+    /// of `prep-nav-data`'s qualifying actions (`drag_zoom`/`zoom_in_btn`/
+    /// `zoom_in_key`), so a target the SEARCH chose never gets mined as a
+    /// target CARL chose — see [[project-nav-imitation-model]].
+    fn goto_video_zoom_winner(&mut self, idx: usize) {
+        let Some(winner) = self.eo_vz_winners.get(idx) else { return };
+        let current_id = format!("{:016x}", self.genome.id);
+        if !winner.genome_id.is_empty() && winner.genome_id != current_id {
+            self.eo_message = format!(
+                "Winner #{idx} belongs to genome {} but {current_id} is loaded — \
+                 those coordinates mean nothing here.",
+                winner.genome_id
+            );
+            return;
+        }
+        let Some(target) = winner.chain.last().copied() else { return };
+        let rank = winner.rank;
+
+        let before = self.push_view();
+        self.view.cx = target.cx;
+        self.view.cx_lo = target.cx_lo;
+        self.view.cy = target.cy;
+        self.view.cy_lo = target.cy_lo;
+        self.view.zoom = target.zoom.clamp(MIN_ZOOM, MAX_ZOOM);
+        // The chain's own aspect came from the search's export geometry
+        // (e.g. 1080x1980); the canvas keeps its own shape and just centres
+        // on the same point at the same zoom.
+        self.view.aspect = self.current_aspect();
+        self.sync_xy = true;
+
+        // Deep winners are routinely past the f64 wall. Without this the
+        // canvas renders as precision mush at exactly the place the user
+        // asked to look at, which reads as "the winner is garbage" rather
+        // than "turn on DD". The bottom-bar checkbox shows the change.
+        let canvas_w = self.frac_rect.width().round() as u32;
+        let needed_dd = canvas_w > 0 && needs_dd(&self.view, canvas_w);
+        if needed_dd && !self.manual_dd {
+            self.manual_dd = true;
+        }
+
+        self.request_render(false);
+        self.log_nav_event("goto_vz_winner", &before);
+        self.eo_message = format!(
+            "Jumped to winner #{rank} @ zoom {:.4e}{}",
+            self.view.zoom,
+            if needed_dd { " (DD enabled)" } else { "" }
+        );
+    }
+
     /// Queues one gallery winner's full discovered chain for full-quality
     /// export — same copy-genome-into-queue-dir, `QueueItem`, `save_queue`,
     /// and `wake_or_launch_queue_window` sequence as `add_to_queue`, just
@@ -4290,6 +4350,7 @@ impl App {
                         // the actual `&mut self` call happens once, after
                         // the closure (and that borrow) ends.
                         let mut queue_idx: Option<usize> = None;
+                        let mut goto_idx: Option<usize> = None;
                         egui::ScrollArea::horizontal().id_salt("eo_vz_gallery").show(ui, |ui| {
                             ui.horizontal(|ui| {
                                 for (i, w) in self.eo_vz_winners.iter().enumerate() {
@@ -4303,15 +4364,29 @@ impl App {
                                         )).on_hover_text(format!(
                                             "Ended: {} · preview: {}", w.ended_reason, w.preview_mp4.display()
                                         ));
-                                        if ui.button("Queue this winner")
-                                            .on_hover_text("Adds this winner's full discovered path to the video export queue, using the Add-to-Queue settings below (steps/fps/width/height).")
-                                            .clicked()
-                                        { queue_idx = Some(i); }
+                                        ui.horizontal(|ui| {
+                                            if ui.button("⇢ Go to")
+                                                .on_hover_text(
+                                                    "Moves the canvas to this winner's DEEPEST view — the one \
+                                                     in the thumbnail — so you can keep exploring by hand from \
+                                                     there. Undoable, and switches on DD automatically if the \
+                                                     target is past the f64 limit."
+                                                )
+                                                .clicked()
+                                            { goto_idx = Some(i); }
+                                            if ui.button("Queue this winner")
+                                                .on_hover_text("Adds this winner's full discovered path to the video export queue, using the Add-to-Queue settings below (steps/fps/width/height).")
+                                                .clicked()
+                                            { queue_idx = Some(i); }
+                                        });
                                     });
                                     ui.separator();
                                 }
                             });
                         });
+                        if let Some(i) = goto_idx {
+                            self.goto_video_zoom_winner(i);
+                        }
                         if let Some(i) = queue_idx {
                             self.queue_video_zoom_winner(i);
                         }
