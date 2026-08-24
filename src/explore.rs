@@ -655,6 +655,53 @@ pub fn debug_sweep_candidates(
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Chooses which ranked candidates become seeds: per-tier coverage when the
+/// budget allows it, otherwise the globally best.
+///
+/// `ranked` is in global rank order, each entry `(scale_idx, (dx, dy, zoom))`.
+/// Split out of `pick_seeds` so the selection rule is testable without a
+/// genome, a GPU or a sweep — the bug below was invisible in every existing
+/// test precisely because it needed all three to reproduce.
+///
+/// The per-tier pass fills in SCALE-INDEX order and the truncate at the end
+/// drops the tail, so when `n < n_scales` it would return "the best candidate
+/// from each of the first `n` tiers" and never consult the global ranking at
+/// all — which tiers won was decided by their position in the scale constant
+/// rather than by quality. With `WIDE_SCALES` (which starts at 4096x OUT)
+/// and `n = 2`, that always seeded from the 4096x and 1024x tiers. Measured
+/// on Carl's genome 04d2a8fb17d32339 from his own view at zoom 2.26e-2
+/// (2026-08-24): both seeds rendered 99.9% one colour and the run reported
+/// "0 winners" within seconds, reproducibly, since the sweep is
+/// deterministic. Below that budget the honest choice is the global ranking.
+fn select_seed_positions(
+    ranked: &[(usize, (f64, f64, f64))], n: usize, n_scales: usize,
+) -> Vec<(f64, f64, f64)> {
+    let mut kept: Vec<(f64, f64, f64)> = Vec::new();
+    let n_scales = n_scales.max(1);
+    let per_scale_floor = (n / n_scales).max(1);
+    // Guarantee at least `per_scale_floor` seeds from EVERY tier — but only
+    // when there is budget to cover them all (see above).
+    if n >= n_scales {
+        for scale_idx in 0..n_scales {
+            let mut taken = 0;
+            for &(_, pos) in ranked.iter().filter(|(idx, _)| *idx == scale_idx) {
+                if taken >= per_scale_floor { break; }
+                if kept.iter().any(|&k| same_region(pos, k)) { continue; }
+                kept.push(pos);
+                taken += 1;
+            }
+        }
+    }
+    // Fill any remaining budget from whatever ranks next-best globally.
+    for &(_, pos) in ranked {
+        if kept.len() >= n { break; }
+        if kept.iter().any(|&k| same_region(pos, k)) { continue; }
+        kept.push(pos);
+    }
+    kept.truncate(n);
+    kept
+}
+
 pub fn pick_seeds(
     genome: &Genome, config: &Config, view: &View, method: ScoreMethod, n: usize, log: &mut Logger,
     radius_mult: f64, scales: &[f64],
@@ -686,29 +733,10 @@ pub fn pick_seeds(
     // structure) — global ranking alone had no way to know it should have
     // looked at the shallower tiers harder. Explicit per-tier floors don't
     // depend on getting that comparison right.
-    let mut kept: Vec<(f64, f64, f64)> = Vec::new();
     let n_scales = scales.len().max(1);
-    let per_scale_floor = (n / n_scales).max(1);
-    for scale_idx in 0..n_scales {
-        let mut taken = 0;
-        for c in ranked.iter().filter(|c| c.scale_idx == scale_idx) {
-            if taken >= per_scale_floor { break; }
-            let pos = (c.dx, c.dy, c.zoom);
-            if kept.iter().any(|&k| same_region(pos, k)) { continue; }
-            kept.push(pos);
-            taken += 1;
-        }
-    }
-    // Fill any budget left over (a tier without `per_scale_floor` distinct
-    // candidates, or `n` not evenly divisible by `n_scales`) from whatever
-    // ranks next-best globally.
-    for c in &ranked {
-        if kept.len() >= n { break; }
-        let pos = (c.dx, c.dy, c.zoom);
-        if kept.iter().any(|&k| same_region(pos, k)) { continue; }
-        kept.push(pos);
-    }
-    kept.truncate(n);
+    let ranked_pos: Vec<(usize, (f64, f64, f64))> =
+        ranked.iter().map(|c| (c.scale_idx, (c.dx, c.dy, c.zoom))).collect();
+    let kept = select_seed_positions(&ranked_pos, n, n_scales);
 
     kept.into_iter().map(|(dx, dy, zoom)| apply_offset(view, dx, dy, zoom)).collect()
 }
@@ -915,4 +943,70 @@ pub fn explore_config(base: &Config) -> Config {
     let mut cfg = base.clone();
     cfg.rendering.max_iter = cfg.rendering.max_iter.max(1000);
     cfg
+}
+
+#[cfg(test)]
+mod seed_selection_tests {
+    use super::*;
+
+    /// Positions far enough apart that `same_region` never merges them, so
+    /// the tests exercise selection rather than deduplication.
+    fn ranked(entries: &[(usize, f64)]) -> Vec<(usize, (f64, f64, f64))> {
+        entries.iter().enumerate()
+            .map(|(i, &(scale_idx, zoom))| (scale_idx, (i as f64 * 10.0, i as f64 * -10.0, zoom)))
+            .collect()
+    }
+
+    #[test]
+    fn a_small_budget_takes_the_globally_best_not_the_first_tiers() {
+        // The real failure: WIDE_SCALES has 12 tiers and tier 0 is 4096x OUT.
+        // Asking for 2 seeds used to return "best of tier 0, best of tier 1"
+        // — the two most zoomed-out tiers — no matter how bad they were,
+        // because the per-tier pass filled in scale order and the truncate
+        // dropped everything after it.
+        let r = ranked(&[
+            (7, 1.0),   // globally best, a sensible tier
+            (8, 0.5),   // globally second
+            (0, 4096.0),// tier 0: only reachable via the per-tier pass
+            (1, 1024.0),
+        ]);
+        let got = select_seed_positions(&r, 2, 12);
+        assert_eq!(got, vec![r[0].1, r[1].1], "small budget must follow the global ranking");
+    }
+
+    #[test]
+    fn a_full_budget_still_guarantees_one_seed_per_tier() {
+        // The per-tier floor exists because z-score is normalized WITHIN a
+        // tier and cannot compare tiers, so coverage must not regress when
+        // there is budget for it.
+        let mut entries = Vec::new();
+        for tier in (0..4).rev() {           // worst-ranked tier first...
+            entries.push((tier, 1.0 + tier as f64));
+        }
+        let r = ranked(&entries);
+        let got = select_seed_positions(&r, 4, 4);
+        let tiers: Vec<usize> = got.iter()
+            .map(|p| r.iter().find(|(_, q)| q == p).unwrap().0)
+            .collect();
+        let mut sorted = tiers.clone();
+        sorted.sort_unstable();
+        assert_eq!(sorted, vec![0, 1, 2, 3], "every tier must be represented, got {tiers:?}");
+    }
+
+    #[test]
+    fn the_budget_is_never_exceeded_and_order_follows_rank() {
+        let r = ranked(&[(3, 1.0), (2, 2.0), (1, 3.0), (0, 4.0)]);
+        assert_eq!(select_seed_positions(&r, 1, 12).len(), 1);
+        assert_eq!(select_seed_positions(&r, 3, 12), vec![r[0].1, r[1].1, r[2].1]);
+        // Asking for more than exists yields what exists, not padding.
+        assert_eq!(select_seed_positions(&r, 99, 12).len(), 4);
+    }
+
+    #[test]
+    fn duplicates_in_the_same_region_are_not_seeded_twice() {
+        let a = (0.0, 0.0, 1.0);
+        let dup: Vec<(usize, (f64, f64, f64))> = vec![(5, a), (6, a), (7, (500.0, -500.0, 1.0))];
+        let got = select_seed_positions(&dup, 3, 12);
+        assert_eq!(got.len(), 2, "same_region duplicates must collapse, got {got:?}");
+    }
 }
