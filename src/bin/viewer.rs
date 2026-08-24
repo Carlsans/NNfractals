@@ -1172,13 +1172,20 @@ impl App {
                     // empty here too, which is misleading precisely when
                     // picking a deep target by hand.
                     //
-                    // Assigned into `config` as well as passed as the step
-                    // cap because `render_cpu` takes its COLORMAP
-                    // normalisation cap from `config.rendering.max_iter` —
-                    // raising compute depth alone would clamp every escape
-                    // time above the base to one colour and change nothing.
+                    // COMPUTE depth only. `render_cpu` takes its COLORMAP
+                    // normalisation cap from `config.rendering.max_iter`,
+                    // which stays at the configured base — this used to
+                    // assign `full_iter` into the config so the two matched,
+                    // and that washed the image out, because the palette
+                    // spans `0..cap` and a cap far above the escape times
+                    // actually present leaves most of the gradient
+                    // unreachable. Carl spotted it by comparing a fresh
+                    // render against the same genome's archived thumbnail:
+                    // 66 distinct colours vs 147, at identical coordinates
+                    // and palette. See `video_export::render_save` for the
+                    // measurements.
                     let full_iter = effective_max_iter(&latest.view, base_full_iter);
-                    config.rendering.max_iter = full_iter;
+                    config.rendering.max_iter = base_full_iter;
                     let quick_steps: &[u32] = &[8, 64];
                     let single_step = [full_iter];
                     let full_steps = [8u32, 24, 64, full_iter];

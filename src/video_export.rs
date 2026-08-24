@@ -632,12 +632,25 @@ pub fn render_save(genome: &Genome, config: &Config, view: &View, w: u32, h: u32
     };
 
     let eff_iter = effective_max_iter(view, config.rendering.max_iter);
-    // `render_cpu` reads its colormap normalisation cap from
-    // `config.rendering.max_iter`, so the raised depth has to go through the
-    // config, not just the `compute_iter` argument — see this function's
-    // doc comment for why the two must not diverge.
-    let mut cfg = config.clone();
-    cfg.rendering.max_iter = eff_iter;
+    // COMPUTE depth is raised with zoom; the COLORMAP normalisation cap is
+    // NOT. `render_cpu` reads its colour cap from `config.rendering.max_iter`,
+    // and this used to overwrite that with `eff_iter` so the two stayed
+    // equal. That silently washed every render out: the palette spans
+    // `0..cap`, so a cap far above the escape times actually present leaves
+    // most of the gradient unreachable. Measured on the genome Carl compared
+    // against its own archived thumbnail (e0d2755cd1a2029a at zoom 22.57):
+    // every pixel escapes by iteration 411 while the cap had become 1338, so
+    // only 30.7% of the palette was in use — 66 distinct colours where the
+    // thumbnail has 147, and visibly bland. Worse at depth: at zoom 2.57e12
+    // the deepest escape is 162 against a cap of 4102, i.e. 4% of the
+    // palette and 10 distinct colours.
+    //
+    // Raising compute alone does NOT "change nothing" (the previous comment's
+    // reasoning): it fixes iteration starvation, which is a compute problem,
+    // while colour normalisation is a separate question answered by the
+    // configured base — the same base every image in the archive was
+    // rendered with.
+    let cfg = config.clone();
     let ss = supersample_factor();
     let use_f64 = needs_f64(view, fw * ss);
     let fractal = if ss > 1 {
