@@ -160,6 +160,16 @@ pub struct Genome {
     /// directly: `at_time` bakes it into a per-frame `Genome` clone instead, so
     /// the CPU/f64/DD kernels and the WGSL shader are all untouched.
     #[serde(default)] pub time_mod: Vec<TimeMod>,
+    /// Evolved time formulas — the same expression-DAG system as `program`,
+    /// read as a function of `t` instead of of the iterate (see
+    /// `crate::time_program`). Applied by `at_time` exactly like `time_mod`,
+    /// and additive with it: a genome may carry both.
+    ///
+    /// Kept as its own list rather than folded into `TimeMod` because the two
+    /// are different objects — five scalars against a graph — and because
+    /// `TimeMod` is `Copy`, which a `Vec<OpNode>` would take away from every
+    /// site that holds one.
+    #[serde(default)] pub time_prog: Vec<crate::time_program::TimeProgram>,
     pub id: u64,
     #[serde(default)]
     pub view_cx: f32,
@@ -247,6 +257,12 @@ impl Genome {
                     m.target.label(), m.shape.label(), m.amp, m.freq
                 ));
             }
+            for tp in &self.time_prog {
+                s.push_str(&format!(
+                    "   [tprog: {} amp={:.3} freq={:.2} {}]",
+                    tp.target.label(), tp.amp, tp.freq, tp.expr()
+                ));
+            }
             s
         } else {
             let parts: Vec<String> = self.terms.iter()
@@ -272,44 +288,24 @@ impl Genome {
     /// wobble). An empty `time_mod` returns a plain clone, so a static genome is
     /// bit-identical to not calling this at all.
     pub fn at_time(&self, t: f32) -> Genome {
-        if self.time_mod.is_empty() {
+        if self.time_mod.is_empty() && self.time_prog.is_empty() {
             return self.clone();
         }
         let mut g = self.clone();
         for m in &self.time_mod {
             let (dre, dim) = mod_offset(m, t);
-            match m.target {
-                ModTarget::JuliaC => {
-                    g.julia_cre += dre;
-                    g.julia_cim += dim;
-                }
-                ModTarget::Phoenix => {
-                    g.phoenix_re += dre;
-                    g.phoenix_im += dim;
-                }
-                ModTarget::Bailout => {
-                    // A non-positive escape radius makes every orbit escape on
-                    // iteration 0 and the frame goes flat, so floor it rather
-                    // than let a large amplitude destroy the clip.
-                    g.bailout_radius = (g.bailout_radius + dre).max(MIN_BAILOUT_RADIUS);
-                }
-                ModTarget::ProgConst { node } => {
-                    offset_const(&mut g.program, node, dre, dim);
-                }
-                ModTarget::WarpConst { node } => {
-                    offset_const(&mut g.warp, node, dre, dim);
-                }
-                ModTarget::ProgScale { node } => {
-                    // k = 1 + offset, NOT the offset itself: a multiplier of 0
-                    // would annihilate the subtree, and `amp = 0` has to stay
-                    // the identity like every other target.
-                    if let Some(next) = splice_scale(&g.program, node, 1.0 + dre, dim) {
-                        g.program = next;
-                    }
-                }
-            }
+            apply_offset(&mut g, m.target, dre, dim);
+        }
+        for tp in &self.time_prog {
+            let (dre, dim) = tp.eval(t);
+            apply_offset(&mut g, tp.target, dre, dim);
         }
         g
+    }
+
+    /// Whether anything about this genome's formula changes over `t`.
+    pub fn animates(&self) -> bool {
+        !self.time_mod.is_empty() || !self.time_prog.is_empty()
     }
 
     /// Why `self` and `other` cannot be blended, or `Ok(())` if they can.
@@ -489,6 +485,7 @@ impl Genome {
             bailout_radius: default_bailout_radius(),
             warp: Vec::new(),
             time_mod: Vec::new(),
+            time_prog: Vec::new(),
             id: rng.random(),
             view_cx: view.0,
             view_cy: view.1,
@@ -812,6 +809,45 @@ pub const MIN_BAILOUT_RADIUS: f32 = 0.25;
 /// Add `(dre, dim)` to node `idx`'s constant, if that node exists and is
 /// actually a CONST. Silently does nothing otherwise — a stale node index in a
 /// hand-edited `.nn` should render a static fractal, not panic.
+/// Add a complex offset to whichever scalar `target` names.
+///
+/// The one place the two animation systems meet: a fixed-shape `TimeMod` and an
+/// evolved `TimeProgram` differ entirely in how they produce `(dre, dim)` and
+/// not at all in what they do with it, so `at_time` computes the offset two ways
+/// and lands here either way.
+fn apply_offset(g: &mut Genome, target: ModTarget, dre: f32, dim: f32) {
+    match target {
+        ModTarget::JuliaC => {
+            g.julia_cre += dre;
+            g.julia_cim += dim;
+        }
+        ModTarget::Phoenix => {
+            g.phoenix_re += dre;
+            g.phoenix_im += dim;
+        }
+        ModTarget::Bailout => {
+            // A non-positive escape radius makes every orbit escape on
+            // iteration 0 and the frame goes flat, so floor it rather
+            // than let a large amplitude destroy the clip.
+            g.bailout_radius = (g.bailout_radius + dre).max(MIN_BAILOUT_RADIUS);
+        }
+        ModTarget::ProgConst { node } => {
+            offset_const(&mut g.program, node, dre, dim);
+        }
+        ModTarget::WarpConst { node } => {
+            offset_const(&mut g.warp, node, dre, dim);
+        }
+        ModTarget::ProgScale { node } => {
+            // k = 1 + offset, NOT the offset itself: a multiplier of 0
+            // would annihilate the subtree, and `amp = 0` has to stay
+            // the identity like every other target.
+            if let Some(next) = splice_scale(&g.program, node, 1.0 + dre, dim) {
+                g.program = next;
+            }
+        }
+    }
+}
+
 fn offset_const(prog: &mut [OpNode], idx: u8, dre: f32, dim: f32) {
     if let Some(n) = prog.get_mut(idx as usize) {
         if n.op == op::CONST {
@@ -932,15 +968,27 @@ fn fmt_c(re: f32, im: f32) -> String {
 /// Render a DAG node as an infix/functional expression string. Shared nodes are
 /// expanded (the program is a DAG; the readable form is a tree). Depth-guarded.
 fn render_node(prog: &[OpNode], i: usize, depth: usize) -> String {
+    render_node_with(prog, i, depth, "z", "c")
+}
+
+/// `render_node` with the two leaves named by the caller.
+///
+/// The DAG is the same graph whether it is iterating a fractal or driving the
+/// time axis, but the leaves are not the same thing: `crate::time_program`
+/// reads `op::C` as a phasor and `op::Z` as a ramp, and printing those as
+/// `c` and `z` would describe a formula nobody wrote.
+pub(crate) fn render_node_with(
+    prog: &[OpNode], i: usize, depth: usize, z_label: &str, c_label: &str,
+) -> String {
     if depth > 14 || i >= prog.len() { return "…".into(); }
     let n = prog[i];
     let a = (n.a as usize).min(i.saturating_sub(1));
     let b = (n.b as usize).min(i.saturating_sub(1));
-    let ra = || render_node(prog, a, depth + 1);
-    let rb = || render_node(prog, b, depth + 1);
+    let ra = || render_node_with(prog, a, depth + 1, z_label, c_label);
+    let rb = || render_node_with(prog, b, depth + 1, z_label, c_label);
     match n.op {
-        op::Z       => "z".into(),
-        op::C       => "c".into(),
+        op::Z       => z_label.into(),
+        op::C       => c_label.into(),
         op::CONST   => fmt_c(n.kre, n.kim),
         op::SQR     => format!("({})²", ra()),
         op::CUBE    => format!("({})³", ra()),
@@ -1244,6 +1292,149 @@ mod at_time_tests {
         ];
         g.bailout_radius = 4.0;
         g
+    }
+
+    // ── Evolved time formulas (crate::time_program) ──────────────────────────
+
+    /// The phasor leaf alone: `f(t) = e^{2πit}`, the canonical looping program.
+    fn phasor_prog(target: ModTarget, amp: f32) -> crate::time_program::TimeProgram {
+        crate::time_program::TimeProgram::new(
+            target,
+            vec![OpNode { op: op::C, a: 0, b: 0, kre: 0.0, kim: 0.0 }],
+            amp,
+        )
+    }
+
+    #[test]
+    fn an_empty_time_prog_is_a_plain_clone_at_every_t() {
+        // Same guarantee as the `time_mod` version: adding the field must not
+        // change how a single already-archived genome renders.
+        let g = mandelbrot();
+        let base = serde_json::to_string(&g).unwrap();
+        assert!(g.time_prog.is_empty());
+        for i in 0..25 {
+            let t = i as f32 / 25.0;
+            assert_eq!(serde_json::to_string(&g.at_time(t)).unwrap(), base, "t={t}");
+        }
+    }
+
+    #[test]
+    fn a_time_program_drives_julia_c_around_its_stored_value() {
+        let mut g = mandelbrot();
+        g.julia_mode = true;
+        g.julia_cre = -0.4;
+        g.julia_cim = 0.6;
+        g.time_prog = vec![phasor_prog(ModTarget::JuliaC, 0.1)];
+
+        // t=0 puts the phasor at (1,0), so c moves along +re by exactly amp.
+        let a = g.at_time(0.0);
+        assert!((a.julia_cre - (-0.4 + 0.1)).abs() < 1e-5, "got {}", a.julia_cre);
+        assert!((a.julia_cim - 0.6).abs() < 1e-5, "got {}", a.julia_cim);
+
+        // A quarter turn later it is on +im, still at radius amp from centre.
+        let b = g.at_time(0.25);
+        assert!((b.julia_cre - (-0.4)).abs() < 1e-5, "got {}", b.julia_cre);
+        assert!((b.julia_cim - (0.6 + 0.1)).abs() < 1e-5, "got {}", b.julia_cim);
+    }
+
+    #[test]
+    fn a_time_program_with_zero_amp_leaves_the_genome_untouched() {
+        let mut g = mandelbrot();
+        g.julia_mode = true;
+        g.julia_cre = -0.4;
+        g.julia_cim = 0.6;
+        let base = serde_json::to_string(&g).unwrap();
+        g.time_prog = vec![phasor_prog(ModTarget::JuliaC, 0.0)];
+
+        let mut expected: Genome = serde_json::from_str(&base).unwrap();
+        expected.time_prog = g.time_prog.clone();
+        let want = serde_json::to_string(&expected).unwrap();
+        for i in 0..10 {
+            assert_eq!(serde_json::to_string(&g.at_time(i as f32 / 10.0)).unwrap(), want,
+                       "amp=0 must be the identity, exactly as it is for TimeMod");
+        }
+    }
+
+    #[test]
+    fn time_mod_and_time_prog_stack_additively() {
+        let mut g = mandelbrot();
+        g.julia_mode = true;
+        g.julia_cre = 0.0;
+        g.julia_cim = 0.0;
+        // Cosine at t=0 is +1 → +0.2 on re; phasor at t=0 is (1,0) → +0.05 on re.
+        g.time_mod = vec![TimeMod::new(ModTarget::JuliaC, ModShape::Cosine, 0.2)];
+        g.time_prog = vec![phasor_prog(ModTarget::JuliaC, 0.05)];
+        let a = g.at_time(0.0);
+        assert!((a.julia_cre - 0.25).abs() < 1e-5,
+                "both channels must apply, got {}", a.julia_cre);
+    }
+
+    #[test]
+    fn a_rejected_time_program_renders_the_fractal_unchanged() {
+        // A constant f(t) is not an animation; it must not corrupt the genome.
+        let mut g = mandelbrot();
+        g.julia_mode = true;
+        g.julia_cre = -0.4;
+        g.time_prog = vec![crate::time_program::TimeProgram::new(
+            ModTarget::JuliaC,
+            vec![OpNode { op: op::CONST, a: 0, b: 0, kre: 9.0, kim: 9.0 }],
+            1.0,
+        )];
+        assert!(!g.time_prog[0].profile().passed());
+        assert!((g.at_time(0.7).julia_cre - (-0.4)).abs() < 1e-6);
+    }
+
+    #[test]
+    fn animates_reports_either_channel() {
+        let mut g = mandelbrot();
+        assert!(!g.animates());
+        g.time_prog = vec![phasor_prog(ModTarget::Bailout, 1.0)];
+        assert!(g.animates(), "an evolved time formula animates the formula too");
+        g.time_prog.clear();
+        g.time_mod = vec![TimeMod::new(ModTarget::Bailout, ModShape::Sine, 1.0)];
+        assert!(g.animates());
+    }
+
+    #[test]
+    fn a_genome_without_time_prog_still_loads() {
+        // Backward compatibility, against the shape every archived .nn has.
+        let json = r#"{"terms":[],"fitness":0.0,"program":[{"op":0,"a":0,"b":0}],"id":7}"#;
+        let g: Genome = serde_json::from_str(json).unwrap();
+        assert!(g.time_prog.is_empty());
+        assert!(g.time_mod.is_empty());
+        assert!(!g.animates());
+    }
+
+    #[test]
+    fn a_genome_with_time_prog_round_trips() {
+        let mut g = mandelbrot();
+        g.time_prog = vec![crate::time_program::TimeProgram {
+            target: ModTarget::ProgScale { node: 2 },
+            prog: vec![
+                OpNode { op: op::C, a: 0, b: 0, kre: 0.0, kim: 0.0 },
+                OpNode { op: op::SIN, a: 0, b: 0, kre: 0.0, kim: 0.0 },
+            ],
+            amp: 0.3,
+            freq: 2.0,
+            phase: 0.125,
+        }];
+        let s = serde_json::to_string(&g).unwrap();
+        let back: Genome = serde_json::from_str(&s).unwrap();
+        assert_eq!(back.time_prog, g.time_prog);
+        // And the saved formula is self-describing.
+        assert!(g.formula_expr().contains("[tprog:"), "{}", g.formula_expr());
+    }
+
+    #[test]
+    fn a_time_program_that_scales_a_subtree_keeps_the_dag_valid() {
+        // ProgScale splices two nodes at render time; the result still has to
+        // be a legal program for every kernel that will evaluate it.
+        let mut g = mandelbrot();
+        g.time_prog = vec![phasor_prog(ModTarget::ProgScale { node: 2 }, 0.5)];
+        for i in 0..12 {
+            let a = g.at_time(i as f32 / 12.0);
+            assert!(is_valid_dag(&a.program), "t={i}/12 produced an invalid DAG: {:?}", a.program);
+        }
     }
 
     #[test]

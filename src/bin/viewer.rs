@@ -27,6 +27,7 @@ use nnfractals::dd::Dd;
 use nnfractals::explore::{self, ScoreMethod};
 use nnfractals::genome::Genome;
 use nnfractals::formula::{blend_fraction, ModShape, ModTarget, TimeMod};
+use nnfractals::time_program::TimeProgram;
 use nnfractals::time_explore;
 use nnfractals::io::{load_genome, save_genome, save_png};
 use nnfractals::aesthetic::AestheticScorer;
@@ -798,6 +799,9 @@ struct App {
     /// `genome` so loading a different fractal does not silently inherit it
     /// and so the loaded genome stays exactly what is on disk.
     time_mod:     Vec<TimeMod>,
+    /// Evolved time formulas being previewed, alongside `time_mod` and on the
+    /// App for the same reason. See `nnfractals::time_program`.
+    time_prog:    Vec<TimeProgram>,
     time_frames_str: String,
     /// Results of the last `explorer time-explore` run, newest first.
     time_winners: Vec<TimeWinnerUi>,
@@ -1360,6 +1364,7 @@ impl App {
             time_playing: false,
             time_period: 6.0,
             time_mod: Vec::new(),
+            time_prog: Vec::new(),
             time_frames_str: prefs.time_frames.to_string(),
             time_winners: Vec::new(),
             time_winners_genome: String::new(),
@@ -1515,11 +1520,12 @@ impl App {
     /// live time modulation baked in at the current scrub position. Identical
     /// to the loaded genome when nothing is animating.
     fn render_genome(&self) -> Genome {
-        let g = if self.time_mod.is_empty() {
+        let g = if self.time_mod.is_empty() && self.time_prog.is_empty() {
             self.genome.clone()
         } else {
             let mut g = self.genome.clone();
             g.time_mod = self.time_mod.clone();
+            g.time_prog = self.time_prog.clone();
             g.at_time(self.time_t)
         };
         // The morph runs on top of any scalar modulation, so both axes can be
@@ -1537,7 +1543,7 @@ impl App {
     /// Whether anything is animating, i.e. whether the worker's cached genome
     /// goes stale as `time_t` moves.
     fn time_axis_active(&self) -> bool {
-        !self.time_mod.is_empty() || self.blend_partner.is_some()
+        !self.time_mod.is_empty() || !self.time_prog.is_empty() || self.blend_partner.is_some()
     }
 
     fn push_view(&mut self) -> View {
@@ -3121,46 +3127,14 @@ impl App {
         let keyframe_stride = if include_time { 1 } else { self.prefs.video_keyframe_stride.max(1) };
         let (Some(start), Some(end)) = (self.video_start, self.video_end) else { return };
 
-        let id = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| format!("{:x}", d.as_nanos()))
-            .unwrap_or_else(|_| format!("{:016x}", self.genome.id));
-        let created_at = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
         let genome_label = self.nn_path.file_stem().and_then(|s| s.to_str())
             .unwrap_or("fractal").to_string();
 
-        let qdir = nnfractals::video_export::queue_dir();
-        if let Err(e) = std::fs::create_dir_all(&qdir) {
-            self.video_status = format!("Add to queue FAILED: {e}");
-            return;
-        }
-        let nn_filename = format!("{id}.nn");
-        if let Err(e) = std::fs::copy(&self.nn_path, qdir.join(&nn_filename)) {
-            self.video_status = format!("Add to queue FAILED: {e}");
-            return;
-        }
-        let blend_file = match (include_time, &self.blend_partner) {
-            (true, Some(p)) => {
-                let name = format!("{id}_partner.nn");
-                if let Err(e) = nnfractals::io::save_genome(p, &qdir.join(&name)) {
-                    self.video_status = format!("Add to queue FAILED: {e}");
-                    return;
-                }
-                Some(name)
-            }
-            _ => None,
-        };
-
         // Zoom export; carries the ⏱ Time modulation too when asked.
-        let item = nnfractals::video_export::QueueItem {
-            id,
-            nn_filename,
+        let spec = nnfractals::video_export::QueueSpec {
+            nn_src: self.nn_path.clone(),
             genome_label,
-            start,
-            end,
+            waypoints: vec![start, end],
             steps,
             fps,
             width: w,
@@ -3170,24 +3144,18 @@ impl App {
             colormap: self.config.rendering.colormap.clone(),
             angle_coloring: self.angle_coloring,
             output_dir: self.save_out_dir().to_string_lossy().into_owned(),
-            status: nnfractals::video_export::QueueStatus::Pending,
-            output_path: None,
-            error: None,
-            created_at,
-            waypoints: Vec::new(),
-            chain_label: None,
             keyframe_stride,
             time_mod: if include_time { self.time_mod.clone() } else { Vec::new() },
-            time_frames: 0,
-            blend_nn_filename: blend_file,
+            time_prog: if include_time { self.time_prog.clone() } else { Vec::new() },
+            blend_partner: if include_time { self.blend_partner.clone() } else { None },
             blend_shape: self.blend_shape.label().to_string(),
             blend_amp: self.blend_amp,
-            // Set per item in the queue window, not here.
-            rife_fps: 0,
+            ..Default::default()
         };
-        let mut items = nnfractals::video_export::load_queue();
-        items.push(item);
-        nnfractals::video_export::save_queue(&items);
+        if let Err(e) = nnfractals::video_export::enqueue(spec) {
+            self.video_status = format!("Add to queue FAILED: {e}");
+            return;
+        }
 
         wake_or_launch_queue_window();
         self.video_status = if include_time {
@@ -3239,51 +3207,22 @@ impl App {
                 return;
             }
 
-            let id = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| format!("{:x}", d.as_nanos()))
-                .unwrap_or_else(|_| format!("{:016x}", genome_id));
-            let created_at = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs())
-                .unwrap_or(0);
-
-            let qdir = nnfractals::video_export::queue_dir();
-            if let Err(e) = std::fs::create_dir_all(&qdir) {
-                let _ = tx.send(Err(format!("Add to queue FAILED: {e}")));
-                return;
-            }
-            let nn_filename = format!("{id}.nn");
-            if let Err(e) = std::fs::copy(&nn_path, qdir.join(&nn_filename)) {
-                let _ = tx.send(Err(format!("Add to queue FAILED: {e}")));
-                return;
-            }
-
             // Camera-path export: no time modulation (see QueueItem::time_mod).
-        let item = nnfractals::video_export::QueueItem {
-                id,
-                nn_filename,
+            let spec = nnfractals::video_export::QueueSpec {
+                nn_src: nn_path.clone(),
                 genome_label,
-                start: waypoints[0],
-                end: *waypoints.last().unwrap(),
+                waypoints,
+                chain_label: Some("wormhole chain".to_string()),
                 steps, fps, width: w, height: h,
                 invert_coords, invert_range, colormap, angle_coloring,
                 output_dir,
-                status: nnfractals::video_export::QueueStatus::Pending,
-                output_path: None,
-                error: None,
-                created_at,
-                waypoints,
-                chain_label: Some("wormhole chain".to_string()),
-            keyframe_stride,
-            time_mod: Vec::new(), time_frames: 0,
-            blend_nn_filename: None, blend_shape: String::new(), blend_amp: 0.0,
-            // Set per item in the queue window, not here.
-            rife_fps: 0,
-        };
-            let mut items = nnfractals::video_export::load_queue();
-            items.push(item);
-            nnfractals::video_export::save_queue(&items);
+                keyframe_stride,
+                ..Default::default()
+            };
+            if let Err(e) = nnfractals::video_export::enqueue(spec) {
+                let _ = tx.send(Err(format!("Add to queue FAILED: {e}")));
+                return;
+            }
 
             wake_or_launch_queue_window();
             let _ = tx.send(Ok(()));
@@ -3726,7 +3665,7 @@ impl App {
 
     /// Queue a time video of the current modulation at the current view.
     fn queue_time_video(&mut self) {
-        if self.time_mod.is_empty() && self.blend_partner.is_none() {
+        if !self.time_axis_active() {
             self.time_message =
                 "add a modulation or a morph partner first — there would be nothing to animate".into();
             return;
@@ -3758,71 +3697,39 @@ impl App {
         let genome_label = self.nn_path.file_stem().and_then(|s| s.to_str())
             .unwrap_or("fractal").to_string();
 
-        let qdir = nnfractals::video_export::queue_dir();
-        if let Err(e) = std::fs::create_dir_all(&qdir) {
-            self.time_message = format!("queue FAILED: {e}");
-            return;
-        }
         if let Err(e) = std::fs::create_dir_all(self.time_video_out_dir()) {
             self.time_message = format!("queue FAILED: {e}");
             return;
         }
-        let nn_filename = format!("{id}.nn");
-        if let Err(e) = std::fs::copy(&self.nn_path, qdir.join(&nn_filename)) {
-            self.time_message = format!("queue FAILED: {e}");
-            return;
-        }
-        // The morph partner goes into the queue dir as its own .nn: the item
-        // references it by filename, exactly as it does the main genome.
-        let blend_file = match &self.blend_partner {
-            Some(p) => {
-                let name = format!("{id}_partner.nn");
-                if let Err(e) = nnfractals::io::save_genome(p, &qdir.join(&name)) {
-                    self.time_message = format!("queue FAILED: {e}");
-                    return;
-                }
-                Some(name)
-            }
-            None => None,
-        };
 
-        // start == end: a time video's camera does not move. `keyframe_stride`
-        // is 1 rather than the video panel's value — save_queue would force it
-        // anyway, and writing the panel's 16 into the file would make the
-        // intent look ambiguous to anyone reading the JSON later.
-        let item = nnfractals::video_export::QueueItem {
-            id,
-            nn_filename,
+        // The same view twice: a time video's camera does not move.
+        // `keyframe_stride` is 1 rather than the video panel's value — the
+        // queue would force it anyway, and writing the panel's 16 into the file
+        // would make the intent look ambiguous to anyone reading the JSON.
+        let spec = nnfractals::video_export::QueueSpec {
+            nn_src: self.nn_path.clone(),
             genome_label,
-            start: captured,
-            end: captured,
+            waypoints: vec![captured, captured],
             steps: frames,
             fps,
             width: w,
             height: h,
-            invert_coords: false,
-            invert_range: false,
             colormap: self.config.rendering.colormap.clone(),
             angle_coloring: self.angle_coloring,
             output_dir: self.time_video_out_dir().to_string_lossy().into_owned(),
-            status: nnfractals::video_export::QueueStatus::Pending,
-            output_path: None,
-            error: None,
-            created_at,
-            waypoints: Vec::new(),
-            chain_label: None,
             keyframe_stride: 1,
             time_mod: self.time_mod.clone(),
+            time_prog: self.time_prog.clone(),
             time_frames: frames,
-            blend_nn_filename: blend_file,
+            blend_partner: self.blend_partner.clone(),
             blend_shape: self.blend_shape.label().to_string(),
             blend_amp: self.blend_amp,
-            // Set per item in the queue window, not here.
-            rife_fps: 0,
+            ..Default::default()
         };
-        let mut items = nnfractals::video_export::load_queue();
-        items.push(item);
-        nnfractals::video_export::save_queue(&items);
+        if let Err(e) = nnfractals::video_export::enqueue(spec) {
+            self.time_message = format!("queue FAILED: {e}");
+            return;
+        }
 
         wake_or_launch_queue_window();
         self.time_message = format!("queued a {frames}-frame time video ✓");
@@ -3969,6 +3876,9 @@ impl App {
         let mut do_search = false;
         let mut do_queue = false;
         let mut remove: Option<usize> = None;
+        let mut remove_prog: Option<usize> = None;
+        let mut add_random_prog = false;
+        let mut clear_progs = false;
         let mut apply_winner: Option<usize> = None;
         let mut add_winner: Option<usize> = None;
         let mut load_partner = false;
@@ -4017,7 +3927,7 @@ impl App {
                     ui.add(egui::DragValue::new(&mut self.time_period).range(0.5..=60.0).speed(0.1))
                         .on_hover_text("Seconds of wall clock for one full loop during playback.");
                 });
-                if self.time_mod.is_empty() {
+                if self.time_mod.is_empty() && self.time_prog.is_empty() {
                     ui.label(egui::RichText::new(
                         "No modulation yet — add one below, or run the search."
                     ).color(Color32::GRAY).small());
@@ -4099,6 +4009,80 @@ impl App {
                         self.time_playing = false;
                         changed = true;
                     }
+                });
+
+                // ── Evolved time formulas ─────────────────────────────────
+                ui.separator();
+                ui.horizontal(|ui| {
+                    ui.strong("🧬 Time formulas");
+                    ui.label(egui::RichText::new(
+                        "the same expression-DAG the fractal itself uses, read as f(t)"
+                    ).color(Color32::GRAY).small());
+                });
+                for (i, tp) in self.time_prog.iter_mut().enumerate() {
+                    let prof = tp.profile();
+                    ui.horizontal(|ui| {
+                        egui::ComboBox::from_id_salt(("tp_target", i))
+                            .selected_text(tp.target.label())
+                            .width(150.0)
+                            .show_ui(ui, |ui| {
+                                for t in &targets {
+                                    if ui.selectable_value(&mut tp.target, *t, t.label()).clicked() {
+                                        changed = true;
+                                    }
+                                }
+                            });
+                        ui.label("amp");
+                        if ui.add(egui::DragValue::new(&mut tp.amp).speed(0.005).range(-4.0..=4.0))
+                            .on_hover_text("Peak offset from the genome's own value, applied AFTER \
+                                            the formula is normalised — so it means the same thing \
+                                            whatever the graph's raw range happens to be. 0 = no \
+                                            change.")
+                            .changed() { changed = true; }
+                        ui.label("freq");
+                        if ui.add(egui::DragValue::new(&mut tp.freq).speed(0.1).range(0.25..=8.0))
+                            .on_hover_text("Cycles per clip. A formula built only from the phasor \
+                                            loops seamlessly at a WHOLE number and nowhere else.")
+                            .changed() { changed = true; }
+                        ui.label("phase");
+                        if ui.add(egui::DragValue::new(&mut tp.phase).speed(0.01).range(0.0..=1.0))
+                            .changed() { changed = true; }
+                        match prof.rejected {
+                            Some(why) => { ui.colored_label(Color32::from_rgb(240, 120, 100), why); }
+                            None if prof.loops => { ui.colored_label(Color32::from_rgb(120, 255, 180), "loops"); }
+                            None => { ui.colored_label(Color32::from_rgb(230, 200, 120), "one-shot"); }
+                        }
+                        if ui.button("✕").on_hover_text("Remove this formula").clicked() {
+                            remove_prog = Some(i);
+                        }
+                    });
+                    ui.horizontal(|ui| {
+                        time_prog_plot(ui, tp, self.time_t, 240.0, 46.0);
+                        ui.vertical(|ui| {
+                            ui.label(egui::RichText::new(tp.expr()).monospace().small());
+                            ui.label(egui::RichText::new(format!(
+                                "travel {:.3}  ·  worst step {:.3} of {:.2}",
+                                prof.travel_rel, prof.max_step, nnfractals::time_program::MAX_STEP_FRACTION
+                            )).color(Color32::GRAY).small())
+                              .on_hover_text("`travel` is how far the function moves relative to \
+                                              its own average — a constant scores 0. `worst step` \
+                                              is the largest jump between adjacent samples; past \
+                                              the limit shown, the graph has a pole and the clip \
+                                              would cut rather than morph.");
+                        });
+                    });
+                }
+                ui.horizontal(|ui| {
+                    if ui.add_enabled(!targets.is_empty(), egui::Button::new("🎲 Random formula"))
+                        .on_hover_text("Grow a random DAG on an un-driven scalar and keep it only \
+                                        if it is finite, actually moves, and has no pole. Cheap — \
+                                        press it until something looks interesting. This is also \
+                                        exactly how the evolutionary search seeds itself.")
+                        .clicked()
+                    { add_random_prog = true; }
+                    if ui.add_enabled(!self.time_prog.is_empty(), egui::Button::new("Clear formulas"))
+                        .clicked()
+                    { clear_progs = true; }
                 });
 
                 // ── Gates ─────────────────────────────────────────────────
@@ -4344,7 +4328,7 @@ impl App {
                             if v >= 2 { self.prefs.time_frames = v; self.prefs.save(&self.prefs_path); }
                         }
                     }
-                    let can_queue = !self.time_mod.is_empty() || self.blend_partner.is_some();
+                    let can_queue = self.time_axis_active();
                     if ui.add_enabled(can_queue, egui::Button::new("＋ Queue time video"))
                         .on_hover_text("Adds a queue item that holds THIS view still and sweeps the \
                                         modulation, at the Video panel's resolution and fps. Output \
@@ -4392,6 +4376,39 @@ impl App {
         if let Some(i) = remove {
             self.time_mod.remove(i);
             changed = true;
+        }
+        if let Some(i) = remove_prog {
+            self.time_prog.remove(i);
+            changed = true;
+        }
+        if clear_progs {
+            self.time_prog.clear();
+            changed = true;
+        }
+        if add_random_prog {
+            let targets = time_explore::enumerate_targets(&self.genome);
+            // Prefer a scalar nothing is driving yet, so pressing this twice
+            // gives a genuinely new layer rather than a louder version of one.
+            let used: Vec<ModTarget> = self.time_mod.iter().map(|m| m.target)
+                .chain(self.time_prog.iter().map(|p| p.target)).collect();
+            let target = targets.iter().find(|t| !used.contains(t)).or(targets.first()).copied();
+            match target {
+                Some(target) => {
+                    let mut rng = rand::rng();
+                    // Tries, not one shot: most random DAGs are a pole or a
+                    // constant, and the free gates catch them without rendering.
+                    match nnfractals::time_program::random(&mut rng, target, 0.08, true, 64) {
+                        Some(tp) => {
+                            self.time_prog.push(tp);
+                            self.time_message.clear();
+                            changed = true;
+                        }
+                        None => self.time_message =
+                            "64 random formulas in a row were a pole or a constant — try again".into(),
+                    }
+                }
+                None => self.time_message = "this genome has nothing animatable".into(),
+            }
         }
         if let Some(i) = apply_winner {
             if let Some(w) = self.time_winners.get(i) {
@@ -4943,45 +4960,30 @@ impl App {
         let genome_label = self.nn_path.file_stem().and_then(|s| s.to_str())
             .unwrap_or("fractal").to_string();
 
-        let qdir = nnfractals::video_export::queue_dir();
-        if let Err(e) = std::fs::create_dir_all(&qdir) {
-            self.eo_message = format!("Queue winner FAILED: {e}");
-            return;
-        }
-        let nn_filename = format!("{id}.nn");
-        if let Err(e) = std::fs::copy(&self.nn_path, qdir.join(&nn_filename)) {
-            self.eo_message = format!("Queue winner FAILED: {e}");
-            return;
-        }
-
         let w = self.video_w_str.trim().parse::<u32>().unwrap_or(1280).max(64);
         let h = self.video_h_str.trim().parse::<u32>().unwrap_or(720).max(64);
         let steps = self.video_steps_str.trim().parse::<u32>().unwrap_or(60).max(2);
         let fps = self.video_fps_str.trim().parse::<u32>().unwrap_or(30).max(1);
 
         // Camera-path export: no time modulation (see QueueItem::time_mod).
-        let item = nnfractals::video_export::QueueItem {
-            id, nn_filename, genome_label, start, end, steps, fps, width: w, height: h,
+        let spec = nnfractals::video_export::QueueSpec {
+            nn_src: self.nn_path.clone(),
+            genome_label,
+            waypoints: chain,
+            chain_label: Some("zoom-explore chain".to_string()),
+            steps, fps, width: w, height: h,
             invert_coords: self.prefs.video_invert_coords,
             invert_range: self.prefs.video_invert_range,
             colormap: self.config.rendering.colormap.clone(),
             angle_coloring: self.angle_coloring,
             output_dir: self.save_out_dir().to_string_lossy().into_owned(),
-            status: nnfractals::video_export::QueueStatus::Pending,
-            output_path: None,
-            error: None,
-            created_at,
-            waypoints: chain,
-            chain_label: Some("zoom-explore chain".to_string()),
             keyframe_stride,
-            time_mod: Vec::new(), time_frames: 0,
-            blend_nn_filename: None, blend_shape: String::new(), blend_amp: 0.0,
-            // Set per item in the queue window, not here.
-            rife_fps: 0,
+            ..Default::default()
         };
-        let mut items = nnfractals::video_export::load_queue();
-        items.push(item);
-        nnfractals::video_export::save_queue(&items);
+        if let Err(e) = nnfractals::video_export::enqueue(spec) {
+            self.eo_message = format!("Queue winner FAILED: {e}");
+            return;
+        }
 
         wake_or_launch_queue_window();
         self.eo_message = format!("Winner #{idx} queued ✓");
@@ -6138,6 +6140,50 @@ fn queue_socket_path() -> PathBuf {
 ///
 /// `Orbit` is the nicest default where it means something, but it degenerates to
 /// a plain cosine on a single-channel target, so those get `Sine` instead.
+
+/// Draw `f(t)` across one clip: real channel bright, imaginary dimmer, with a
+/// playhead at the current scrub position.
+///
+/// A time program's TEXT is close to unreadable at a glance — a nested DAG of
+/// `sin`/`mul`/`div` says nothing about whether it is a gentle sway or a spike.
+/// Its SHAPE says it instantly, which makes this the cheapest useful widget in
+/// the window. Plots the normalised, `amp`-scaled offset, i.e. exactly what
+/// `at_time` will add to the target.
+fn time_prog_plot(ui: &mut egui::Ui, tp: &TimeProgram, t_now: f32, width: f32, height: f32) {
+    const N: usize = 160;
+    let (rect, _) = ui.allocate_exact_size(egui::Vec2::new(width, height), egui::Sense::hover());
+    let p = ui.painter_at(rect);
+    p.rect_filled(rect, 2.0, Color32::from_gray(18));
+
+    let samples: Vec<(f32, f32)> = (0..=N).map(|i| tp.eval(i as f32 / N as f32)).collect();
+    // Scale to the plot's own peak, not to `amp`: a rejected program evaluates
+    // to a flat zero and must draw as a flat line, not as a divide-by-zero.
+    let peak = samples.iter()
+        .map(|&(re, im)| re.abs().max(im.abs()))
+        .fold(0.0f32, f32::max)
+        .max(1e-6);
+    let mid = rect.center().y;
+    let y = |v: f32| mid - (v / peak) * (height * 0.42);
+    let x = |i: usize| rect.left() + (i as f32 / N as f32) * width;
+
+    p.line_segment([egui::pos2(rect.left(), mid), egui::pos2(rect.right(), mid)],
+                   egui::Stroke::new(1.0, Color32::from_gray(50)));
+    let px = rect.left() + t_now.clamp(0.0, 1.0) * width;
+    p.line_segment([egui::pos2(px, rect.top()), egui::pos2(px, rect.bottom())],
+                   egui::Stroke::new(1.0, Color32::from_gray(80)));
+
+    let re_pts: Vec<egui::Pos2> =
+        samples.iter().enumerate().map(|(i, &(re, _))| egui::pos2(x(i), y(re))).collect();
+    p.add(egui::Shape::line(re_pts, egui::Stroke::new(1.5, Color32::from_rgb(120, 210, 255))));
+    // Only two-channel targets have an imaginary part to show; drawing a flat
+    // zero line for `Bailout` would suggest the channel exists and is idle.
+    if tp.target.is_two_channel() {
+        let im_pts: Vec<egui::Pos2> =
+            samples.iter().enumerate().map(|(i, &(_, im))| egui::pos2(x(i), y(im))).collect();
+        p.add(egui::Shape::line(im_pts, egui::Stroke::new(1.5, Color32::from_rgb(255, 150, 120))));
+    }
+}
+
 fn next_layer(targets: &[ModTarget], used: &[ModTarget]) -> Option<TimeMod> {
     let next = targets.iter().copied()
         .find(|t| !used.contains(t))

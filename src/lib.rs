@@ -1,6 +1,7 @@
 pub mod config;
 pub mod dd;
 pub mod formula;
+pub mod time_program;
 pub mod genome;
 pub mod known_formulas;
 pub mod fractal;
@@ -26,6 +27,8 @@ pub mod vae_explore;
 pub mod video_zoom_explore;
 #[cfg(feature = "wgpu-backend")]
 pub mod time_explore;
+#[cfg(feature = "wgpu-backend")]
+pub mod auto_reel;
 #[cfg(any(feature = "viewer", feature = "browser", feature = "launcher", feature = "queue"))]
 pub mod gui_font;
 #[cfg(feature = "wgpu-backend")]

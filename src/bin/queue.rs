@@ -148,6 +148,7 @@ fn process_item(
     );
     let kf_stride = item.keyframe_stride;
     let time_mod = item.time_mod.clone();
+    let time_prog = item.time_prog.clone();
     // The morph partner travels as its own .nn beside the item's, same as the
     // main genome — a whole genome inside the queue JSON would be unreadable.
     let blend_partner = item.blend_nn_filename.as_ref()
@@ -167,6 +168,7 @@ fn process_item(
         if animates_formula {
             let mut g_anim = g2.clone();
             g_anim.time_mod = time_mod;
+            g_anim.time_prog = time_prog;
             if camera_moves {
                 // Both axes at once: the camera travels the chain exactly as a
                 // normal zoom does while the formula animates across the clip.

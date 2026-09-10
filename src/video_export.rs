@@ -681,7 +681,7 @@ pub fn render_save(genome: &Genome, config: &Config, view: &View, w: u32, h: u32
 /// but decoupled from it so capturing doesn't alias the live, still-changing
 /// view the user keeps navigating with. Serializable so a queued export job
 /// can be persisted to disk (`nnfractals-queue`'s `queue.json`).
-#[derive(Clone, Copy, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 pub struct CapturedView {
     pub cx: f64, pub cx_lo: f64,
     pub cy: f64, pub cy_lo: f64,
@@ -704,7 +704,7 @@ impl QueueItem {
 
     /// Whether the formula animates — a scalar modulation, a morph, or both.
     pub fn animates_formula(&self) -> bool {
-        !self.time_mod.is_empty() || self.blend_nn_filename.is_some()
+        !self.time_mod.is_empty() || !self.time_prog.is_empty() || self.blend_nn_filename.is_some()
     }
 }
 
@@ -1480,7 +1480,7 @@ pub fn export_time_video(
     view: &View, frames: u32, fps: u32, w: u32, h: u32,
     out_path: &Path, tx: &mpsc::Sender<VideoMsg>, on_progress: &(dyn Fn() + Sync),
 ) {
-    if genome.time_mod.is_empty() {
+    if !genome.animates() {
         let _ = tx.send(VideoMsg::Failed(
             "this genome has no time modulation — nothing would change between frames".into(),
         ));
@@ -1523,7 +1523,7 @@ pub fn export_chain_time_video(
         on_progress();
         return;
     }
-    if genome.time_mod.is_empty() && partner.is_none() {
+    if !genome.animates() && partner.is_none() {
         let _ = tx.send(VideoMsg::Failed(
             "no time modulation and no morph partner — this is just a zoom".into()));
         on_progress();
@@ -1966,6 +1966,11 @@ pub struct QueueItem {
     /// How far toward the partner formula to travel, in [0,1].
     #[serde(default)]
     pub blend_amp: f32,
+    /// Evolved time formulas (see `crate::time_program`). Additive with
+    /// `time_mod` and routed identically — non-empty means the formula
+    /// animates, so the item must never take a keyframe-warping path.
+    #[serde(default)]
+    pub time_prog: Vec<crate::time_program::TimeProgram>,
     /// Target frame rate for a RIFE interpolation pass after rendering.
     /// 0 = off. The rendered clip is kept; the interpolated one is written
     /// beside it as `<name>_rife<fps>.mp4`.
@@ -1978,6 +1983,152 @@ pub struct QueueItem {
     /// `#[serde(default)]`, which yields 0 and therefore "off".
     #[serde(default)]
     pub keyframe_stride: u32,
+}
+
+/// Everything a caller must decide to queue one export.
+///
+/// Exists because building a `QueueItem` is not just filling a struct: it also
+/// mints an id, copies the genome (and any morph partner) into `queue_dir()`,
+/// and decides which of `waypoints`/`start`/`end` to populate. That sequence was
+/// duplicated three times in `viewer.rs` — each copy having to be found and
+/// edited every time the item grew a field — and a fourth copy is exactly what
+/// an automated pipeline would add. `Default` covers the tail so a caller states
+/// only what it means.
+#[derive(Clone)]
+pub struct QueueSpec {
+    /// The `.nn` to copy into the queue directory.
+    pub nn_src: PathBuf,
+    pub genome_label: String,
+    /// The camera path, first to last. Two entries is a plain start→end export;
+    /// more is a chain. Two IDENTICAL entries is a still camera, which is what a
+    /// pure time video wants.
+    pub waypoints: Vec<CapturedView>,
+    pub chain_label: Option<String>,
+    pub steps: u32,
+    pub fps: u32,
+    pub width: u32,
+    pub height: u32,
+    pub invert_coords: bool,
+    pub invert_range: bool,
+    pub colormap: String,
+    pub angle_coloring: bool,
+    pub output_dir: String,
+    pub keyframe_stride: u32,
+    pub time_mod: Vec<crate::formula::TimeMod>,
+    pub time_prog: Vec<crate::time_program::TimeProgram>,
+    pub time_frames: u32,
+    pub blend_partner: Option<Genome>,
+    pub blend_shape: String,
+    pub blend_amp: f32,
+    pub rife_fps: u32,
+}
+
+impl Default for QueueSpec {
+    fn default() -> Self {
+        QueueSpec {
+            nn_src: PathBuf::new(),
+            genome_label: "fractal".into(),
+            waypoints: Vec::new(),
+            chain_label: None,
+            steps: 60,
+            fps: 30,
+            width: 1280,
+            height: 720,
+            invert_coords: false,
+            invert_range: false,
+            colormap: "turbo".into(),
+            angle_coloring: false,
+            output_dir: ".".into(),
+            keyframe_stride: 1,
+            time_mod: Vec::new(),
+            time_prog: Vec::new(),
+            time_frames: 0,
+            blend_partner: None,
+            blend_shape: String::new(),
+            blend_amp: 0.0,
+            rife_fps: 0,
+        }
+    }
+}
+
+/// Copy the genome into `queue_dir()`, build the item, and append it to the
+/// persisted queue. Returns the item as stored.
+///
+/// Does NOT wake the queue window — that is a GUI concern and headless callers
+/// have no use for it.
+pub fn enqueue(spec: QueueSpec) -> Result<QueueItem, String> {
+    if spec.waypoints.len() < 2 {
+        return Err("need at least two camera waypoints (use the same view twice \
+                    for a still camera)".into());
+    }
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).ok();
+    let id = now.map(|d| format!("{:x}", d.as_nanos()))
+        .unwrap_or_else(|| format!("{:016x}", spec.waypoints[0].zoom.to_bits()));
+    let created_at = now.map(|d| d.as_secs()).unwrap_or(0);
+
+    let qdir = queue_dir();
+    std::fs::create_dir_all(&qdir).map_err(|e| format!("cannot create {}: {e}", qdir.display()))?;
+    let nn_filename = format!("{id}.nn");
+    std::fs::copy(&spec.nn_src, qdir.join(&nn_filename))
+        .map_err(|e| format!("cannot copy {}: {e}", spec.nn_src.display()))?;
+
+    let blend_nn_filename = match &spec.blend_partner {
+        Some(p) => {
+            let name = format!("{id}_partner.nn");
+            crate::io::save_genome(p, &qdir.join(&name))
+                .map_err(|e| format!("cannot save morph partner: {e}"))?;
+            Some(name)
+        }
+        None => None,
+    };
+
+    let start = spec.waypoints[0];
+    let end = *spec.waypoints.last().expect("checked non-empty above");
+    // A two-point path is stored as start/end with NO waypoints, which is what
+    // every item written before chains existed looks like — `process_item`
+    // reconstructs `[start, end]` for it, and `camera_moves()` reads a
+    // non-empty waypoint list as "always moves".
+    let waypoints = if spec.waypoints.len() > 2 { spec.waypoints } else { Vec::new() };
+
+    let item = QueueItem {
+        id,
+        nn_filename,
+        genome_label: spec.genome_label,
+        start,
+        end,
+        steps: spec.steps,
+        fps: spec.fps,
+        width: spec.width,
+        height: spec.height,
+        invert_coords: spec.invert_coords,
+        invert_range: spec.invert_range,
+        colormap: spec.colormap,
+        angle_coloring: spec.angle_coloring,
+        output_dir: spec.output_dir,
+        status: QueueStatus::Pending,
+        output_path: None,
+        error: None,
+        created_at,
+        waypoints,
+        chain_label: spec.chain_label,
+        keyframe_stride: spec.keyframe_stride.max(1),
+        time_mod: spec.time_mod,
+        time_prog: spec.time_prog,
+        time_frames: spec.time_frames,
+        blend_nn_filename,
+        blend_shape: spec.blend_shape,
+        blend_amp: spec.blend_amp,
+        rife_fps: spec.rife_fps,
+    };
+
+    let mut items = load_queue();
+    items.push(item.clone());
+    save_queue(&items);
+    // `save_queue` re-applies the time invariants, so report what was stored
+    // rather than what was asked for.
+    let mut stored = vec![item];
+    enforce_time_invariants(&mut stored);
+    Ok(stored.pop().expect("one item"))
 }
 
 /// Load the persisted queue, or an empty list if the file is absent/corrupt
@@ -2003,7 +2154,7 @@ pub fn load_queue() -> Vec<QueueItem> {
 /// relying on every producer to remember.
 fn enforce_time_invariants(items: &mut [QueueItem]) {
     for it in items.iter_mut() {
-        if !it.time_mod.is_empty() || it.blend_nn_filename.is_some() {
+        if it.animates_formula() {
             it.keyframe_stride = 1;
             if it.time_frames < 2 {
                 it.time_frames = DEFAULT_TIME_FRAMES;
@@ -2571,7 +2722,7 @@ mod tests {
             angle_coloring: false, output_dir: ".".into(),
             status: QueueStatus::Pending, output_path: None, error: None, created_at: 0,
             waypoints: Vec::new(), chain_label: None, keyframe_stride: 0,
-            time_mod: Vec::new(), time_frames: 0,
+            time_mod: Vec::new(), time_prog: Vec::new(), time_frames: 0,
             blend_nn_filename: None, blend_shape: String::new(), blend_amp: 0.0,
             rife_fps: 0,
         }
@@ -2608,6 +2759,61 @@ mod tests {
         let mut m = qitem(cv(0.0, 0.0, 1.0), cv(0.0, 0.0, 1.0));
         m.blend_nn_filename = Some("p.nn".into());
         assert!(m.animates_formula(), "a morph counts even with no scalar modulation");
+    }
+
+    #[test]
+    fn an_evolved_time_formula_also_loses_its_keyframe_stride() {
+        // Same hazard as `time_mod`, and a separate field, so a separate check:
+        // keyframe warping reconstructs frames assuming only the camera moved.
+        use crate::formula::{op, ModTarget, OpNode};
+        use crate::time_program::TimeProgram;
+        let mut it = qitem(cv(0.0, 0.0, 1.0), cv(0.0, 0.0, 40.0));
+        it.keyframe_stride = 16;
+        it.time_prog = vec![TimeProgram::new(
+            ModTarget::JuliaC,
+            vec![OpNode { op: op::C, a: 0, b: 0, kre: 0.0, kim: 0.0 }],
+            0.1,
+        )];
+        assert!(it.animates_formula(), "a time program animates the formula");
+        let mut items = vec![it];
+        enforce_time_invariants(&mut items);
+        assert_eq!(items[0].keyframe_stride, 1);
+        assert_eq!(items[0].time_frames, DEFAULT_TIME_FRAMES);
+    }
+
+    #[test]
+    fn a_queue_item_without_time_prog_still_loads() {
+        // Every item already in Carl's queue.json predates this field.
+        let json = r#"{"id":"a","nn_filename":"a.nn","genome_label":"a",
+            "start":{"cx":0.0,"cx_lo":0.0,"cy":0.0,"cy_lo":0.0,"zoom":1.0,"aspect":1.0},
+            "end":{"cx":0.0,"cx_lo":0.0,"cy":0.0,"cy_lo":0.0,"zoom":8.0,"aspect":1.0},
+            "steps":60,"fps":30,"width":640,"height":480,
+            "invert_coords":false,"invert_range":false,"colormap":"turbo",
+            "angle_coloring":false,"output_dir":".","status":"Pending",
+            "output_path":null,"error":null,"created_at":0}"#;
+        let it: QueueItem = serde_json::from_str(json).expect("older item must still parse");
+        assert!(it.time_prog.is_empty());
+        assert!(!it.animates_formula());
+    }
+
+    #[test]
+    fn queue_spec_defaults_describe_a_plain_still_export() {
+        // The defaults are what every `..Default::default()` call site inherits,
+        // so they are load-bearing rather than cosmetic.
+        let d = QueueSpec::default();
+        assert!(d.time_mod.is_empty() && d.time_prog.is_empty() && d.blend_partner.is_none());
+        assert_eq!(d.keyframe_stride, 1, "never inherit a warping stride by accident");
+        assert_eq!(d.rife_fps, 0, "a post-process must not run unasked");
+        assert!(d.waypoints.is_empty(), "a caller must state its own camera path");
+    }
+
+    #[test]
+    fn enqueue_refuses_a_path_that_is_not_a_path() {
+        // Guards the one thing a caller can get structurally wrong. Checked
+        // BEFORE anything is written, so this does not touch the real queue.
+        let r = enqueue(QueueSpec { waypoints: vec![cv(0.0, 0.0, 1.0)], ..Default::default() });
+        let err = r.err().expect("one waypoint is not a camera path");
+        assert!(err.contains("two camera waypoints"), "{err}");
     }
 
     #[test]
@@ -2777,8 +2983,25 @@ mod tests {
         Genome { program: b.into_nodes(), bailout_radius: 4.0, view_zoom: 1.0, ..Default::default() }
     }
 
+    /// Config for every render-comparing test in this module — and, as a side
+    /// effect, the one place that pins which backend those renders use.
+    ///
+    /// `render_cpu` picks the GPU tier when `render_gpu::gpu_available()` says
+    /// so, and that answer FLIPS mid-process: `GPU` is a `OnceLock`, so it reads
+    /// false until something calls `init_gpu()` — which, in a test binary, is
+    /// whenever `render_gpu`'s own parity tests happen to be scheduled. A test
+    /// that renders twice could therefore take the CPU f32 path once and the
+    /// GPU f32 path once and compare them, and the two do not agree bit for bit.
+    ///
+    /// Measured 2026-09-10: `at_time_is_byte_identical_for_a_static_genome`
+    /// failed 1 of 3 whole-suite runs while passing 5 of 5 alone, and the
+    /// `refactor_parity_harness` MD5 came out different on each whole-suite run.
+    /// Both were this, not a real regression. Initialising here makes the choice
+    /// the same for every test in the module regardless of scheduling order.
     pub(super) fn chain_test_config() -> Config {
         use crate::config::{DedupConfig, MassExtinctionConfig, OptimizationConfig, OutputConfig, RenderingConfig};
+        #[cfg(feature = "wgpu-backend")]
+        crate::render_gpu::init_gpu();
         Config {
             dedup: DedupConfig::default(), mass_extinction: MassExtinctionConfig::default(),
             rendering: RenderingConfig { default_width: 800, default_height: 800, max_iter: 300, bailout: 4.0,
@@ -2812,8 +3035,25 @@ mod tests {
 mod refactor_parity_harness {
     use super::*;
 
+    /// Writes one short clip through the real `export_video_chain` so a
+    /// refactor of the shipping video path can be checked byte-for-byte.
+    ///
+    /// Reference MD5: `5a3eb95d9a867062a6cbf403146b89f2`
+    ///
+    /// **Run it ALONE**, e.g.
+    /// `NNF_PARITY_OUT=/tmp/p.mp4 cargo test --lib -- --ignored refactor_parity_harness`.
+    ///
+    /// Run as part of the whole suite instead (`--include-ignored`) the hash
+    /// comes out different, and different again on the next run — measured
+    /// 2026-09-10, three runs, three hashes, while two isolated runs both
+    /// reproduced the reference exactly. The frames are deterministic; the
+    /// ENCODE is not, because ffmpeg sizes libx264's thread pool from the
+    /// machine and x264's frame-threaded output depends on that count. So a
+    /// mismatch from a full-suite run is a concurrency artifact and says
+    /// nothing about the change under test — which is exactly the kind of
+    /// false alarm that costs an afternoon.
     #[test]
-    #[ignore = "writes a file for manual MD5 comparison; run explicitly"]
+    #[ignore = "writes a file for manual MD5 comparison; run explicitly, ALONE — see the doc comment"]
     fn export_reference_clip() {
         let out = std::path::PathBuf::from(
             std::env::var("NNF_PARITY_OUT").expect("set NNF_PARITY_OUT"),
