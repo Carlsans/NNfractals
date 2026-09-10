@@ -8,6 +8,9 @@
 #   evo_daemon.sh restart [N]         stop all, then start [N] (picks up a rebuilt binary)
 #   evo_daemon.sh status              print running/stopped + pids for all 4 slots
 #
+# Each slot can also carry a fitness profile (profiles/<name>.toml), overlaid on
+# top of its config — see PROFILES below. Empty = config file's own weights.
+#
 # Instance 1: --config config.toml  → fractals_1/ populations_1/
 # Instance 2: --config config2.toml → fractals_2/ populations_2/
 # Instance 3: --config config3.toml → fractals_3/ populations_3/
@@ -26,6 +29,10 @@ DEFAULT_N=2
 
 # Per-instance configuration (4 slots; only the first N are started by default)
 CONFIGS=("config.toml" "config2.toml" "config3.toml" "config4.toml")
+# Fitness profile per slot; "" = none (use the config file's weights as-is).
+# Setting different profiles here is how you A/B two fitness mixes against each
+# other on separate pools.
+PROFILES=("" "" "" "")
 PIDFILES=("evolution.pid" "evolution2.pid" "evolution3.pid" "evolution4.pid")
 LOGS=("evo1.log" "evo2.log" "evo3.log" "evo4.log")
 PATS=(
@@ -46,12 +53,14 @@ start_instance() {
   if [ ! -x "$BIN" ]; then echo "binary missing: $BIN (cargo build --release)"; return 1; fi
   local log="${LOGS[$idx]}"
   echo "=== $(date '+%F %T') daemon start instance $((idx+1)) ===" >> "$log"
-  setsid "$BIN" --config "${CONFIGS[$idx]}" >> "$log" 2>&1 < /dev/null &
+  local profile_args=()
+  [ -n "${PROFILES[$idx]}" ] && profile_args=(--profile "${PROFILES[$idx]}")
+  setsid "$BIN" --config "${CONFIGS[$idx]}" "${profile_args[@]}" >> "$log" 2>&1 < /dev/null &
   sleep 1
   pid="$(running_pid $idx)"
   if [ -n "$pid" ]; then
     echo "$pid" > "${PIDFILES[$idx]}"
-    echo "[$((idx+1))] started pid $pid (${CONFIGS[$idx]})"
+    echo "[$((idx+1))] started pid $pid (${CONFIGS[$idx]}${PROFILES[$idx]:+ +${PROFILES[$idx]}})"
   else
     echo "[$((idx+1))] FAILED to start"
     return 1

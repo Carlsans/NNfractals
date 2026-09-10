@@ -270,12 +270,17 @@ impl Optimizer {
                     // that STARTS evolution is the best-by-your-taste genomes; aesthetic /
                     // recursion / self-replication act as secondary tiebreakers + diversity.
                     let musiq_norm = ((g.musiq - 30.0) / 50.0).clamp(0.0, 1.0);
+                    // These four used to be hardcoded 1.0 / 0.15 / 0.20 / 0.20 here
+                    // while config.rs carried `self_replication_weight` and
+                    // `fractal_recursion_weight` keys that nothing ever read. The
+                    // keys are now honoured; their defaults are the old hardcodes,
+                    // so a config that omits them behaves exactly as before.
                     let score = config.optimization.seed_pref_weight * g.pref_score
-                        + 1.0 * aesthetic
+                        + config.optimization.seed_aesthetic_weight * aesthetic
                         + config.optimization.musiq_weight * musiq_norm
-                        + 0.15 * (g.laion_score / 10.0)
-                        + 0.20 * g.self_replication
-                        + 0.20 * g.fractal_recursion
+                        + config.optimization.seed_laion_weight * (g.laion_score / 10.0)
+                        + config.optimization.self_replication_weight * g.self_replication
+                        + config.optimization.fractal_recursion_weight * g.fractal_recursion
                         + config.optimization.img_novelty_weight * g.novelty_score;
                     candidates.push((score, g));
                 }
@@ -321,6 +326,8 @@ impl Optimizer {
         let oodw = self.config.optimization.ood_weight;
         let dpw = self.config.optimization.duplicate_penalty_weight;
         let asw = self.config.optimization.angle_structure_weight;
+        let ew  = self.config.optimization.entropy_weight;
+        let cxw = self.config.optimization.complexity_penalty;
         self.formula_usage.maybe_periodic_rescan(&self.config.output.save_dir, DUPLICATE_RESCAN_GENS);
         let formula_snap: Vec<Vec<f32>> = self.formula_archive.iter().cloned().collect();
         // Snapshot of already-saved behavioral descriptors for OOD novelty.
@@ -345,8 +352,7 @@ impl Optimizer {
             // Anti-bloat: small penalty on DAG program size so the GA prefers
             // compact expressions over ones that pad to noise (multiscale entropy
             // is the other backstop). Legacy genomes have no program → no penalty.
-            const COMPLEXITY_PENALTY: f32 = 0.012;
-            let cxpen = COMPLEXITY_PENALTY * self.population[i].program.len() as f32;
+            let cxpen = cxw * self.population[i].program.len() as f32;
             // OOD novelty: distance to the NEAREST already-saved genome's behavior.
             // High = unlike anything saved → drives "completely unusual" fractals.
             let ood = if saved_snap.is_empty() { 0.0 } else {
@@ -366,7 +372,7 @@ impl Optimizer {
             self.population[i].formula_diversity = formula_div;
             self.population[i].angle_structure   = angle_score;
             self.population[i].fitness =
-                structured_ent + nw * novelty + rpw * pred_rec + fdw * formula_div
+                ew * structured_ent + nw * novelty + rpw * pred_rec + fdw * formula_div
                 + cpw * pred_clip_val + oodw * ood + asw * angle_score - cxpen - dup_pen;
             if self.behavior_archive.len() >= archive_max { self.behavior_archive.pop_front(); }
             self.behavior_archive.push_back(descriptor);

@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 # run.sh — run N evolution instances that share one fractal gallery.
 #
-#   ./run.sh [N] [--config FILE] [--build] [--fg]
+#   ./run.sh [N] [--config FILE] [--profile NAME] [--build] [--fg]
 #
 #   N           number of instances to launch (default: 1)
 #   --config F  base config file (default: config.toml)
+#   --profile P fitness profile to overlay (profiles/P.toml); default: none
 #   --build     cargo build --release before launching
 #   --fg        run a single instance in the foreground (ignores N; Ctrl-C to stop)
 #
@@ -17,6 +18,7 @@
 #   ./run.sh 4               four instances, background
 #   ./run.sh --fg            one instance in the foreground
 #   ./run.sh 3 --build       rebuild, then launch three instances
+#   ./run.sh 2 --profile explore-wide   two instances on the explore-wide mix
 #   ./run.sh stop            stop all instances started by this script
 #   ./run.sh status          show running instances
 set -u
@@ -26,6 +28,7 @@ BIN="./target/release/nnfractals"
 LOG="evolution.log"
 PIDFILE=".run_pids"
 CONFIG="config.toml"
+PROFILE=""
 N=1
 BUILD=0
 FG=0
@@ -68,12 +71,19 @@ esac
 while [ $# -gt 0 ]; do
   case "$1" in
     --config) CONFIG="$2"; shift 2 ;;
+    --profile) PROFILE="$2"; shift 2 ;;
     --build)  BUILD=1; shift ;;
     --fg)     FG=1; shift ;;
-    ''|*[!0-9]*) echo "unknown arg: $1"; echo "usage: $0 [N] [--config FILE] [--build] [--fg] | stop | status"; exit 1 ;;
+    ''|*[!0-9]*) echo "unknown arg: $1"; echo "usage: $0 [N] [--config FILE] [--profile NAME] [--build] [--fg] | stop | status"; exit 1 ;;
     *)        N="$1"; shift ;;
   esac
 done
+
+# Optional --profile pass-through, as an array so that when PROFILE is unset
+# "${PROFILE_ARGS[@]}" expands to ZERO arguments rather than one empty string
+# (which clap would reject). Safe under `set -u` on bash >= 4.4.
+PROFILE_ARGS=()
+[ -n "$PROFILE" ] && PROFILE_ARGS=(--profile "$PROFILE")
 
 # ── Build if requested (or if the binary is missing) ────────────────────────
 if [ "$BUILD" = 1 ] || [ ! -x "$BIN" ]; then
@@ -83,15 +93,15 @@ fi
 
 # ── Foreground: single instance, no PID tracking ────────────────────────────
 if [ "$FG" = 1 ]; then
-  echo "running 1 instance (foreground) --config $CONFIG — Ctrl-C to stop"
-  exec "$BIN" --config "$CONFIG"
+  echo "running 1 instance (foreground) --config $CONFIG ${PROFILE:+--profile $PROFILE} — Ctrl-C to stop"
+  exec "$BIN" --config "$CONFIG" "${PROFILE_ARGS[@]}"
 fi
 
 # ── Background: launch N instances, track PIDs ──────────────────────────────
 : > "$PIDFILE"
-echo "=== $(date '+%F %T') run.sh launching $N instance(s) --config $CONFIG ===" >> "$LOG"
+echo "=== $(date '+%F %T') run.sh launching $N instance(s) --config $CONFIG ${PROFILE:+--profile $PROFILE} ===" >> "$LOG"
 for i in $(seq 1 "$N"); do
-  setsid "$BIN" --config "$CONFIG" >> "$LOG" 2>&1 < /dev/null &
+  setsid "$BIN" --config "$CONFIG" "${PROFILE_ARGS[@]}" >> "$LOG" 2>&1 < /dev/null &
   pid=$!
   echo "$pid" >> "$PIDFILE"
   echo "[$i/$N] started pid $pid"

@@ -7,6 +7,7 @@ pub mod fractal;
 pub mod recursion_model;
 pub mod colormap;
 pub mod fitness;
+pub mod fitness_profile;
 pub mod io;
 pub mod display;
 pub mod optimizer;

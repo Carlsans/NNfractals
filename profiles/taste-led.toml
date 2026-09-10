@@ -1,0 +1,44 @@
+name = "taste-led"
+notes = """
+"More of what I already like." Preference dominates both the saved fitness and
+the seed ranking, the taste floor at the gate is raised, and the exploration
+pressure that pulls away from known-good territory is cut back.
+
+Expect fewer saves and a tighter, more consistent gallery. If the pool starts
+looking samey, that is this profile working as designed — switch to
+`explore-wide` for a while.
+
+Requires a trained preference model (browser Rate mode + scripts/train_pref.py).
+Without one, pref_score is 0 and this profile degenerates into a weak version of
+`current` with a lower diversity pressure.
+"""
+
+# ── selection ──
+entropy_weight           = 1.0
+novelty_weight           = 0.35
+formula_diversity_weight = 0.40
+ood_weight               = 0.10
+angle_structure_weight   = 0.0
+recursion_pred_weight    = 0.0
+clip_pred_weight         = 0.0
+complexity_penalty       = 0.012
+duplicate_penalty_weight = 0.40
+
+# ── saved fitness + seeding ──
+pref_weight              = 0.8
+musiq_weight             = 0.30
+img_novelty_weight       = 0.0
+seed_pref_weight         = 4.0
+seed_aesthetic_weight    = 1.0
+seed_laion_weight        = 0.15
+self_replication_weight  = 0.35
+fractal_recursion_weight = 0.35
+
+# ── save gate ──
+min_ensemble          = 4.6
+min_entropy_prefilter = 0.38
+max_entropy_prefilter = 0.70
+min_save_distance     = 0.05
+min_beauty            = 0.35
+min_musiq             = 58.0
+min_pref              = 0.65

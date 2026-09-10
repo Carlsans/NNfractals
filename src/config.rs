@@ -39,12 +39,14 @@ pub struct OptimizationConfig {
     pub novelty_k: usize,
     pub archive_size: usize,
     /// How strongly to favour zoom-self-replicating fractals when ranking archive
-    /// seeds for the next epoch. seed_rank = beauty + weight · self_replication.
+    /// seeds for the next epoch: `seed_rank += weight · self_replication`.
+    /// Only has any effect when `archive_seeding_enabled = true`.
     #[serde(default = "default_self_replication_weight")]
     pub self_replication_weight: f32,
     /// How strongly to favour fractals with embedded miniature copies of the whole
-    /// set (baby-Mandelbrots) when ranking archive seeds for the next epoch.
-    /// seed_rank += weight · fractal_recursion.
+    /// set (baby-Mandelbrots) when ranking archive seeds for the next epoch:
+    /// `seed_rank += weight · fractal_recursion`.
+    /// Only has any effect when `archive_seeding_enabled = true`.
     #[serde(default = "default_fractal_recursion_weight")]
     pub fractal_recursion_weight: f32,
     /// Major per-generation selection weight on the formula-only predicted
@@ -144,10 +146,89 @@ pub struct OptimizationConfig {
     /// purely synchronous) novelty signal already live in step()'s fitness.
     #[serde(default = "default_img_novelty_weight")]
     pub img_novelty_weight: f32,
+    /// Weight on the base complexity term of the per-generation fitness —
+    /// `fitness::multiscale_entropy`, the geometric mean of fine (full-res) and
+    /// coarse (4x-pooled) PNG-compression entropy. This term used to carry an
+    /// implicit, unconfigurable weight of 1.0; it is the anchor every other
+    /// weight is implicitly scaled against, so 1.0 remains the default and
+    /// changing it rescales the meaning of all of them at once. 0 disables the
+    /// only signal that punishes noise — see `multiscale_entropy`'s doc comment.
+    #[serde(default = "default_entropy_weight")]
+    pub entropy_weight: f32,
+    /// Anti-bloat penalty per DAG node: `fitness -= complexity_penalty *
+    /// program.len()`, so the GA prefers compact expressions over ones padded
+    /// out to noise. Legacy (non-DAG) genomes have an empty program and pay
+    /// nothing. Previously a hardcoded `COMPLEXITY_PENALTY` in optimizer.rs.
+    #[serde(default = "default_complexity_penalty")]
+    pub complexity_penalty: f32,
+    /// Weight on the aesthetic score when ranking archive genomes to SEED a
+    /// population (`ensemble/10`, else `clip_score`, else `beauty`).
+    /// Previously hardcoded to 1.0 in `load_archive_seeds`.
+    /// Only has any effect when `archive_seeding_enabled = true`.
+    #[serde(default = "default_seed_aesthetic_weight")]
+    pub seed_aesthetic_weight: f32,
+    /// Weight on normalised LAION (`laion_score/10`) in that same seed ranking.
+    /// Previously hardcoded to 0.15. Note LAION is no longer produced by the
+    /// scorer sidecar (it returns 0.0), so this is inert for anything saved
+    /// after the CLIP/LAION removal and only affects older archive entries.
+    #[serde(default = "default_seed_laion_weight")]
+    pub seed_laion_weight: f32,
 }
 
-fn default_self_replication_weight()    -> f32 { 0.35 }
-fn default_fractal_recursion_weight()   -> f32 { 0.35 }
+impl Default for OptimizationConfig {
+    /// NOT used for deserialization — the fields above without a
+    /// `#[serde(default)]` stay required, so a config file that omits
+    /// `novelty_weight` still fails loudly instead of silently inheriting a
+    /// value. This exists purely so the handful of hardcoded `Config` literals
+    /// in the codebase can say `..Default::default()` instead of enumerating
+    /// every field and drifting out of sync (which `viewer.rs::default_config`
+    /// had already done, by up to 0.6 on some weights).
+    fn default() -> Self {
+        OptimizationConfig {
+            population_size: 100,
+            elitism_count: 6,
+            mutation_rate: 0.20,
+            mutation_scale: 0.08,
+            eval_width: 64,
+            eval_height: 64,
+            eval_max_iter: 128,
+            restart_after_gens: 20,
+            novelty_weight: 0.60,
+            novelty_k: 5,
+            archive_size: 150,
+            self_replication_weight:  default_self_replication_weight(),
+            fractal_recursion_weight: default_fractal_recursion_weight(),
+            recursion_pred_weight:    default_recursion_pred_weight(),
+            formula_diversity_weight: default_formula_diversity_weight(),
+            clip_pred_weight:         default_clip_pred_weight(),
+            formula_system:           default_formula_system(),
+            max_nodes:                default_max_nodes(),
+            max_depth:                default_max_depth(),
+            ood_weight:               default_ood_weight(),
+            pref_weight:              default_pref_weight(),
+            seed_pref_weight:         default_seed_pref_weight(),
+            musiq_weight:             default_musiq_weight(),
+            pref_elite_count:         default_pref_elite_count(),
+            archive_random_ratio:     default_archive_random_ratio(),
+            duplicate_penalty_weight: default_duplicate_penalty_weight(),
+            archive_seeding_enabled:  default_archive_seeding_enabled(),
+            angle_structure_weight:   default_angle_structure_weight(),
+            img_novelty_weight:       default_img_novelty_weight(),
+            entropy_weight:           default_entropy_weight(),
+            complexity_penalty:       default_complexity_penalty(),
+            seed_aesthetic_weight:    default_seed_aesthetic_weight(),
+            seed_laion_weight:        default_seed_laion_weight(),
+        }
+    }
+}
+
+// 0.20, not the 0.35 these keys used to default to: until this commit both were
+// parsed and then IGNORED, with `load_archive_seeds` using a hardcoded 0.20 for
+// each. 0.20 is therefore what "unchanged behaviour" means for a config that
+// omits them. A config that sets them explicitly (all four shipped ones say
+// 0.35) now gets the value it asked for.
+fn default_self_replication_weight()    -> f32 { 0.20 }
+fn default_fractal_recursion_weight()   -> f32 { 0.20 }
 fn default_recursion_pred_weight()      -> f32 { 0.60 }
 fn default_formula_diversity_weight()   -> f32 { 0.30 }
 fn default_clip_pred_weight()           -> f32 { 0.50 }
@@ -164,6 +245,10 @@ fn default_duplicate_penalty_weight()   -> f32 { 0.50 }
 fn default_archive_seeding_enabled()    -> bool { false }
 fn default_angle_structure_weight()     -> f32 { 0.0 }
 fn default_img_novelty_weight()         -> f32 { 0.0 }
+fn default_entropy_weight()             -> f32 { 1.0 }
+fn default_complexity_penalty()         -> f32 { 0.012 }
+fn default_seed_aesthetic_weight()      -> f32 { 1.0 }
+fn default_seed_laion_weight()          -> f32 { 0.15 }
 
 #[derive(Deserialize, Clone, Debug)]
 pub struct OutputConfig {
@@ -176,10 +261,15 @@ pub struct OutputConfig {
     /// (high compression entropy but visually incoherent → poor CLIP). Rejected.
     #[serde(default = "default_max_entropy_prefilter")]
     pub max_entropy_prefilter: f32,
-    /// Minimum CLIP zero-shot score [0,1] (Stage 2). Both clip AND laion must pass.
+    /// Minimum CLIP zero-shot score [0,1] — legacy Stage-2 fallback gate.
+    /// UNREACHABLE IN PRACTICE: the scorer sidecar hardcodes `clip, laion =
+    /// 0.0, 0.0` (aesthetic_scorer.py, "CLIP/LAION removed — kept as 0.0 for
+    /// protocol stability"), and this branch only runs when the ensemble is
+    /// absent or `min_ensemble = 0`. Kept so old configs still parse.
     #[serde(default = "default_min_clip_score")]
     pub min_clip_score: f32,
-    /// Minimum LAION MLP aesthetic score [0,10] (Stage 2).
+    /// Minimum LAION MLP aesthetic score [0,10] — same legacy fallback gate,
+    /// same caveat as `min_clip_score` above.
     #[serde(default = "default_min_laion_score")]
     pub min_laion_score: f32,
     /// Minimum beauty score [0, 1] for a fractal to be saved (fallback when CLIP unavailable).
@@ -204,6 +294,27 @@ pub struct OutputConfig {
     /// out of the gallery. Applied only when pref is scored (>0). 0 disables.
     #[serde(default = "default_min_pref")]
     pub min_pref: f32,
+}
+
+impl Default for OutputConfig {
+    /// See `OptimizationConfig::default` — for `..Default::default()` in
+    /// hardcoded `Config` literals only, not for deserialization. `save_dir`
+    /// and `population_dir` stay required in a real config file.
+    fn default() -> Self {
+        OutputConfig {
+            save_dir:              PathBuf::from("./fractals_1"),
+            population_dir:        PathBuf::from("./populations_1"),
+            min_entropy_prefilter: default_min_entropy_prefilter(),
+            max_entropy_prefilter: default_max_entropy_prefilter(),
+            min_clip_score:        default_min_clip_score(),
+            min_laion_score:       default_min_laion_score(),
+            min_beauty:            default_min_beauty(),
+            min_save_distance:     default_min_save_distance(),
+            min_ensemble:          default_min_ensemble(),
+            min_musiq:             default_min_musiq(),
+            min_pref:              default_min_pref(),
+        }
+    }
 }
 
 /// Periodic near-duplicate cleanup run by the evolution loop.

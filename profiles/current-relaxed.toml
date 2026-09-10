@@ -1,0 +1,40 @@
+name = "current-relaxed"
+notes = """
+config3.toml / config4.toml's mix. Two deltas from `current-no-imgnovelty`:
+formula diversity 0.45 instead of 0.60, and the MUSIQ floor at 50 instead of
+58.
+
+Those two configs are byte-identical apart from their pool directories, so this
+one profile covers both. Lower gates mean a higher save rate at slightly lower
+median quality — useful for filling a new pool quickly.
+"""
+
+# ── selection ──
+entropy_weight           = 1.0
+novelty_weight           = 0.60
+formula_diversity_weight = 0.45
+ood_weight               = 0.25
+angle_structure_weight   = 0.0
+recursion_pred_weight    = 0.0
+clip_pred_weight         = 0.0
+complexity_penalty       = 0.012
+duplicate_penalty_weight = 0.50
+
+# ── saved fitness + seeding ──
+pref_weight              = 0.4
+musiq_weight             = 0.25
+img_novelty_weight       = 0.0
+seed_pref_weight         = 3.0
+seed_aesthetic_weight    = 1.0
+seed_laion_weight        = 0.15
+self_replication_weight  = 0.35
+fractal_recursion_weight = 0.35
+
+# ── save gate ──
+min_ensemble          = 4.6
+min_entropy_prefilter = 0.38
+max_entropy_prefilter = 0.70
+min_save_distance     = 0.05
+min_beauty            = 0.35
+min_musiq             = 50.0
+min_pref              = 0.55

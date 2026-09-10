@@ -1,0 +1,44 @@
+name = "pure-entropy"
+notes = """
+The ablation baseline: multiscale entropy alone, every other selection term off.
+Only expressible now that entropy_weight is a real knob rather than an implicit
+hardcoded 1.0.
+
+Use it to answer "how much is the rest of the mix actually buying me?" Run it on
+a scratch pool for a few hours and compare the gallery against the same wall
+time under `current`. It is not meant for a production pool — with no novelty or
+duplicate pressure the population converges on one formula family fast.
+
+The save gate is left at normal strength on purpose: this ablates SELECTION, not
+quality control, so the two effects stay separable.
+"""
+
+# ── selection ──
+entropy_weight           = 1.0
+novelty_weight           = 0.0
+formula_diversity_weight = 0.0
+ood_weight               = 0.0
+angle_structure_weight   = 0.0
+recursion_pred_weight    = 0.0
+clip_pred_weight         = 0.0
+complexity_penalty       = 0.012
+duplicate_penalty_weight = 0.0
+
+# ── saved fitness + seeding ──
+pref_weight              = 0.0
+musiq_weight             = 0.0
+img_novelty_weight       = 0.0
+seed_pref_weight         = 0.0
+seed_aesthetic_weight    = 1.0
+seed_laion_weight        = 0.15
+self_replication_weight  = 0.35
+fractal_recursion_weight = 0.35
+
+# ── save gate ──
+min_ensemble          = 4.6
+min_entropy_prefilter = 0.38
+max_entropy_prefilter = 0.70
+min_save_distance     = 0.05
+min_beauty            = 0.35
+min_musiq             = 58.0
+min_pref              = 0.55

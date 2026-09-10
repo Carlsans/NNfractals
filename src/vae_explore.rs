@@ -651,16 +651,11 @@ mod tests {
             dedup: DedupConfig::default(), mass_extinction: MassExtinctionConfig::default(),
             rendering: RenderingConfig { default_width: 512, default_height: 512, max_iter: 100, bailout: 4.0,
                 colormap: "turbo".into(), view_x_min: -2.0, view_x_max: 2.0, view_y_min: -2.0, view_y_max: 2.0 },
-            optimization: OptimizationConfig { population_size: 40, elitism_count: 6, mutation_rate: 0.20, mutation_scale: 0.08,
-                eval_width: 64, eval_height: 64, eval_max_iter: 128, restart_after_gens: 30, novelty_weight: 0.45,
-                novelty_k: 5, archive_size: 150, self_replication_weight: 0.35, fractal_recursion_weight: 0.35,
-                recursion_pred_weight: 0.60, formula_diversity_weight: 0.30, clip_pred_weight: 0.50,
-                formula_system: "dag".to_string(), max_nodes: 14, max_depth: 5, ood_weight: 0.0, pref_weight: 0.4,
-                seed_pref_weight: 3.0, musiq_weight: 0.25, pref_elite_count: 4, archive_random_ratio: 0.30,
-                duplicate_penalty_weight: 0.50, archive_seeding_enabled: false, angle_structure_weight: 0.0, img_novelty_weight: 0.0 },
+            // Only `rendering` matters to these tests; the selection weights are
+            // irrelevant here and were drifting out of sync with config.rs.
+            optimization: OptimizationConfig::default(),
             output: OutputConfig { save_dir: "./fractals".into(), population_dir: "./populations".into(),
-                min_entropy_prefilter: 0.42, max_entropy_prefilter: 0.65, min_clip_score: 0.512, min_laion_score: 5.30,
-                min_beauty: 0.35, min_save_distance: 0.04, min_ensemble: 4.6, min_musiq: 30.0, min_pref: 0.45 },
+                ..Default::default() },
         }
     }
 

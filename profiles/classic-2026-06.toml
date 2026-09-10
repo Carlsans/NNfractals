@@ -1,0 +1,49 @@
+name = "classic-2026-06"
+notes = """
+HISTORICAL RECORD, not a recommendation. This is the fitness function described
+in PRINCIPLES.md section 7, from before the DAG formula system and the
+nima/topiq/ap25 aesthetic ensemble:
+
+  fitness = entropy + 0.45*novelty + 0.80*pred_recursion
+          + 0.30*formula_diversity + 0.50*pred_clip
+
+Two of those five terms are INERT on today's genomes. recursion_model.json and
+clip_model.json were both trained on the old flat 58-basis representation and
+return near-constants for DAG genomes (about 0.682 and 0.5197), which is exactly
+why every shipped config zeroed them. Running this profile re-activates two
+known-broken signals as constant offsets — harmless to correctness, but they
+add nothing and dilute the terms that work.
+
+Kept so the old behaviour is reproducible for comparison. Retrain both models on
+DAG genomes before treating either weight as meaningful.
+"""
+
+# ── selection ──
+entropy_weight           = 1.0
+novelty_weight           = 0.45
+formula_diversity_weight = 0.30
+ood_weight               = 0.0
+angle_structure_weight   = 0.0
+recursion_pred_weight    = 0.80
+clip_pred_weight         = 0.50
+complexity_penalty       = 0.012
+duplicate_penalty_weight = 0.0
+
+# ── saved fitness + seeding ──
+pref_weight              = 0.0
+musiq_weight             = 0.0
+img_novelty_weight       = 0.0
+seed_pref_weight         = 0.0
+seed_aesthetic_weight    = 1.0
+seed_laion_weight        = 0.15
+self_replication_weight  = 0.35
+fractal_recursion_weight = 0.35
+
+# ── save gate ──
+min_ensemble          = 0.0     # 0 = fall back to the legacy clip/laion gate
+min_entropy_prefilter = 0.38
+max_entropy_prefilter = 0.70
+min_save_distance     = 0.05
+min_beauty            = 0.35
+min_musiq             = 0.0
+min_pref              = 0.0

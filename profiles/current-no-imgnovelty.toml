@@ -1,0 +1,40 @@
+name = "current-no-imgnovelty"
+notes = """
+config2.toml's mix: identical to `current` except image-embedding novelty is
+off. This is what pools without a trained novelty head actually run, so it is
+the right baseline for fractals_2 and for any new pool.
+
+Use this rather than `current` when starting a fresh pool — img_novelty_weight
+0.5 against a pool with no cache is inert anyway, but stating 0.0 makes that
+explicit instead of accidental.
+"""
+
+# ── selection ──
+entropy_weight           = 1.0
+novelty_weight           = 0.60
+formula_diversity_weight = 0.60
+ood_weight               = 0.25
+angle_structure_weight   = 0.0
+recursion_pred_weight    = 0.0
+clip_pred_weight         = 0.0
+complexity_penalty       = 0.012
+duplicate_penalty_weight = 0.50
+
+# ── saved fitness + seeding ──
+pref_weight              = 0.4
+musiq_weight             = 0.25
+img_novelty_weight       = 0.0
+seed_pref_weight         = 3.0
+seed_aesthetic_weight    = 1.0
+seed_laion_weight        = 0.15
+self_replication_weight  = 0.35
+fractal_recursion_weight = 0.35
+
+# ── save gate ──
+min_ensemble          = 4.6
+min_entropy_prefilter = 0.38
+max_entropy_prefilter = 0.70
+min_save_distance     = 0.05
+min_beauty            = 0.35
+min_musiq             = 58.0
+min_pref              = 0.55

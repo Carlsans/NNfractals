@@ -31,11 +31,32 @@ struct Args {
     /// Path to config file
     #[arg(long, default_value = "config.toml")]
     config: PathBuf,
+
+    /// Fitness profile to overlay on the config: a bare name looked up as
+    /// `profiles/<name>.toml`, or a path to a .toml file. A profile carries
+    /// only the fitness weights it wants to change, so the config file stays
+    /// authoritative for everything else (pool dirs, population size, mutation
+    /// rates) and keeps its tuning comments.
+    #[arg(long)]
+    profile: Option<String>,
 }
 
 fn main() -> anyhow::Result<()> {
     let args = Args::parse();
-    let config = Config::load(&args.config)?;
+    let mut config = Config::load(&args.config)?;
+
+    // A missing or malformed profile is fatal, not a warning: silently running
+    // days of evolution under weights you didn't ask for is far worse than
+    // failing at startup.
+    if let Some(name) = &args.profile {
+        let path = nnfractals::fitness_profile::resolve(&nnfractals::project_root(), name);
+        let profile = nnfractals::fitness_profile::FitnessProfile::load(&path)
+            .map_err(|e| anyhow::anyhow!("could not load fitness profile {}: {e}", path.display()))?;
+        profile.apply(&mut config);
+        eprintln!("fitness profile '{}' applied from {}", profile.name, path.display());
+        eprintln!("  {}", profile.fitness_expression(&config));
+    }
+    let config = config;
 
     if let Some(nn_path) = args.render {
         // ── Single render mode ───────────────────────────────────────────
