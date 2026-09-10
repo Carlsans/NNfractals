@@ -175,15 +175,20 @@ profile_fields! {
          sidecar no longer produces LAION (returns 0.0), so this only affects genomes \
          saved before that change.";
     self_replication_weight, Group::Blend, Sign::Positive, 0.20,
-        "Seed: self-replication",
+        "Seed: self-replication  [dead on DAG]",
         "Weight on the measured zoom self-replication score in seed ranking — does the \
          fractal keep producing structure as you zoom its boundary. Until recently this \
-         config key was parsed and then ignored, with 0.20 hardcoded in its place.";
+         config key was parsed and then ignored, with 0.20 hardcoded in its place. \
+         MEASURED DEAD FOR DAG GENOMES: across all 75,670 archived DAG genomes \
+         (fractals_1 + fractals_dag) this score is 0.0000 without exception, while 98.8% \
+         of the old legacy pool has a real value. Whatever weight you give it multiplies \
+         zero on anything evolved today.";
     fractal_recursion_weight, Group::Blend, Sign::Positive, 0.20,
-        "Seed: fractal recursion",
+        "Seed: fractal recursion  [dead on DAG]",
         "Weight on the measured baby-Mandelbrot recursion score in seed ranking. Same \
-         history as self-replication above. Note this measurement is reported to be \
-         always 0 for DAG genomes, so verify before relying on it.";
+         history, and the same measured result as self-replication above: identically 0 \
+         across every archived DAG genome. Fix fractal_recursion_score's DAG path before \
+         treating either of these two as a working lever.";
 
     // ── Save gate ──────────────────────────────────────────────────────────
     min_ensemble, Group::Gate, Sign::Threshold, 4.6,
