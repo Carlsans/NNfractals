@@ -26,6 +26,8 @@ use nnfractals::dd::Dd;
 #[cfg(feature = "wgpu-backend")]
 use nnfractals::explore::{self, ScoreMethod};
 use nnfractals::genome::Genome;
+use nnfractals::formula::{ModShape, ModTarget, TimeMod};
+use nnfractals::time_explore;
 use nnfractals::io::{load_genome, save_genome, save_png};
 use nnfractals::aesthetic::AestheticScorer;
 use nnfractals::novelty::NoveltyScorer;
@@ -697,12 +699,43 @@ impl ViewerPrefs {
     }
 }
 
+/// One row of the time-axis winners gallery, read back from
+/// `time_winners.jsonl`.
+#[derive(Clone, Debug)]
+struct TimeWinnerUi {
+    tmod: TimeMod,
+    score: f64,
+    coherence: f32,
+    mean_change: f32,
+    loops: bool,
+    clip: Option<PathBuf>,
+}
+
 // ── Application ───────────────────────────────────────────────────────────────
 
 struct App {
     genome:       Genome,
     config:       Config,
     nn_path:      PathBuf,
+
+    // ── Time axis (the third dimension) ───────────────────────────────────
+    show_time:    bool,
+    /// Live scrub position in [0,1). Only meaningful when `time_mod` is set.
+    time_t:       f32,
+    time_playing: bool,
+    /// Seconds of wall clock for one full loop while playing.
+    time_period:  f32,
+    /// The modulation being previewed. Kept on the App rather than on
+    /// `genome` so loading a different fractal does not silently inherit it
+    /// and so the loaded genome stays exactly what is on disk.
+    time_mod:     Vec<TimeMod>,
+    time_frames_str: String,
+    /// Results of the last `explorer time-explore` run, newest first.
+    time_winners: Vec<TimeWinnerUi>,
+    /// Genome the winners were found for — queuing or applying a winner
+    /// against a different fractal is meaningless, so it is refused.
+    time_winners_genome: String,
+    time_message: String,
 
     view:         View,
     default_view: View,
@@ -1236,6 +1269,15 @@ impl App {
         let video_h_str     = prefs.video_height.to_string();
         let mut app = Self {
             genome, config, nn_path,
+            show_time: false,
+            time_t: 0.0,
+            time_playing: false,
+            time_period: 6.0,
+            time_mod: Vec::new(),
+            time_frames_str: "96".to_string(),
+            time_winners: Vec::new(),
+            time_winners_genome: String::new(),
+            time_message: String::new(),
             view: default_view.clone(),
             default_view,
             view_stack: Vec::new(),
@@ -1363,8 +1405,25 @@ impl App {
             colormap: self.config.rendering.colormap.clone(),
             angle_coloring: self.angle_coloring,
             allow_dd: self.manual_dd,
-            genome: None,
+            // `None` means "keep whatever the worker already has". With a live
+            // time modulation the worker's copy is stale the moment the
+            // scrubber moves, so the animated genome has to travel with every
+            // request. No new field: `at_time` returns a plain Genome, which is
+            // exactly what this slot already carries.
+            genome: (!self.time_mod.is_empty()).then(|| self.render_genome()),
         });
+    }
+
+    /// The genome as it should be RENDERED right now: what is on disk, with any
+    /// live time modulation baked in at the current scrub position. Identical
+    /// to the loaded genome when nothing is animating.
+    fn render_genome(&self) -> Genome {
+        if self.time_mod.is_empty() {
+            return self.genome.clone();
+        }
+        let mut g = self.genome.clone();
+        g.time_mod = self.time_mod.clone();
+        g.at_time(self.time_t)
     }
 
     fn push_view(&mut self) -> View {
@@ -1556,7 +1615,7 @@ impl App {
             colormap: self.config.rendering.colormap.clone(),
             angle_coloring: self.angle_coloring,
             allow_dd: self.manual_dd,
-            genome: Some(self.genome.clone()),
+            genome: Some(self.render_genome()),
         });
     }
 
@@ -2147,6 +2206,16 @@ impl App {
                         self.eo_out_dir_auto = true;
                     }
                     self.show_explore_options = true;
+                }
+                if ui.button("⏱ Time")
+                    .on_hover_text(
+                        "Animate the fractal along a third dimension: hold the camera still and \
+                         move one scalar inside the formula. Scrub it live, or search for the \
+                         axis worth animating."
+                    )
+                    .clicked()
+                {
+                    self.show_time = true;
                 }
                 if self.explore_busy {
                     ui.colored_label(Color32::YELLOW, "exploring…");
@@ -2908,6 +2977,7 @@ impl App {
             return;
         }
 
+        // Camera-path export: no time modulation (see QueueItem::time_mod).
         let item = nnfractals::video_export::QueueItem {
             id,
             nn_filename,
@@ -2930,6 +3000,7 @@ impl App {
             waypoints: Vec::new(),
             chain_label: None,
             keyframe_stride,
+            time_mod: Vec::new(), time_frames: 0,
         };
         let mut items = nnfractals::video_export::load_queue();
         items.push(item);
@@ -3001,7 +3072,8 @@ impl App {
                 return;
             }
 
-            let item = nnfractals::video_export::QueueItem {
+            // Camera-path export: no time modulation (see QueueItem::time_mod).
+        let item = nnfractals::video_export::QueueItem {
                 id,
                 nn_filename,
                 genome_label,
@@ -3017,7 +3089,8 @@ impl App {
                 waypoints,
                 chain_label: Some("wormhole chain".to_string()),
             keyframe_stride,
-            };
+            time_mod: Vec::new(), time_frames: 0,
+        };
             let mut items = nnfractals::video_export::load_queue();
             items.push(item);
             nnfractals::video_export::save_queue(&items);
@@ -3350,6 +3423,395 @@ impl App {
     /// binary and `scripts/*.py` (this project's two kinds of exploration
     /// subprocess) so a long `vae-explore` run's `iteration N: ...`
     /// progress is visible without leaving the viewer.
+    // ── Time axis ─────────────────────────────────────────────────────────
+
+    /// Directory this genome's time sweep reads and writes.
+    fn time_out_dir(&self) -> PathBuf {
+        let stem = self.nn_path.file_stem().and_then(|s| s.to_str()).unwrap_or("genome");
+        nnfractals::project_root().join(format!("viewer_output/time_explore/{stem}"))
+    }
+
+    fn start_time_explore(&mut self) {
+        if self.eo_busy {
+            self.time_message = "a pipeline stage is already running".to_string();
+            return;
+        }
+        let out_dir = self.time_out_dir();
+        if let Err(e) = std::fs::create_dir_all(&out_dir) {
+            self.time_message = format!("cannot create {}: {e}", out_dir.display());
+            return;
+        }
+        // The sweep needs the genome on disk; the viewer may be showing an
+        // unsaved edit, so write the seed explicitly rather than assume
+        // `nn_path` is current.
+        let seed = out_dir.join("_seed_genome.nn");
+        if let Err(e) = nnfractals::io::save_genome(&self.genome, &seed) {
+            self.time_message = format!("cannot save seed genome: {e}");
+            return;
+        }
+        let mut args: Vec<String> = vec![
+            "time-explore".into(),
+            seed.to_string_lossy().into_owned(),
+            format!("{}", self.view.cx),
+            format!("{}", self.view.cy),
+            format!("{}", self.view.zoom),
+            "--out".into(),
+            out_dir.to_string_lossy().into_owned(),
+            "--keep-clips".into(),
+        ];
+        if self.angle_coloring {
+            args.push("--angle-coloring".into());
+        }
+        self.time_winners.clear();
+        self.time_winners_genome = format!("{:016x}", self.genome.id);
+        self.time_message = "searching the time axis…".to_string();
+        let program = locate_sibling_bin("explorer");
+        let cwd = nnfractals::project_root();
+        self.spawn_explore_stage("Time exploring", program, args, cwd);
+    }
+
+    /// Read `time_winners.jsonl` back into the gallery. Best-effort and
+    /// tolerant: a malformed line is skipped rather than losing the whole run.
+    fn load_time_winners(&mut self) {
+        let path = self.time_out_dir().join("time_winners.jsonl");
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            self.time_message = format!("no results at {}", path.display());
+            return;
+        };
+        let dir = self.time_out_dir();
+        let mut out = Vec::new();
+        let mut rejected = 0usize;
+        for line in text.lines() {
+            let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else { continue };
+            if !v["rejected"].is_null() {
+                rejected += 1;
+                continue;
+            }
+            let Some(shape) = v["shape"].as_str().and_then(ModShape::parse) else { continue };
+            let node = v["target"]["node"].as_u64().unwrap_or(0) as u8;
+            let target = match v["target"]["kind"].as_str().unwrap_or("") {
+                "julia_c" => ModTarget::JuliaC,
+                "phoenix" => ModTarget::Phoenix,
+                "bailout" => ModTarget::Bailout,
+                "prog_const" => ModTarget::ProgConst { node },
+                "warp_const" => ModTarget::WarpConst { node },
+                "prog_scale" => ModTarget::ProgScale { node },
+                _ => continue,
+            };
+            out.push(TimeWinnerUi {
+                tmod: TimeMod {
+                    target,
+                    shape,
+                    amp: v["amp"].as_f64().unwrap_or(0.0) as f32,
+                    freq: v["freq"].as_f64().unwrap_or(1.0) as f32,
+                    phase: v["phase"].as_f64().unwrap_or(0.0) as f32,
+                },
+                score: v["score"].as_f64().unwrap_or(0.0),
+                coherence: v["min_coherence"].as_f64().unwrap_or(0.0) as f32,
+                mean_change: v["mean_change"].as_f64().unwrap_or(0.0) as f32,
+                loops: v["loops"].as_bool().unwrap_or(false),
+                clip: v["clip"].as_str().map(|c| dir.join(c)),
+            });
+        }
+        self.time_message = if out.is_empty() {
+            format!("no candidate passed the gates ({rejected} rejected) — see the log above")
+        } else {
+            format!("{} winners ({rejected} rejected)", out.len())
+        };
+        self.time_winners = out;
+    }
+
+    /// Queue a time video of the current modulation at the current view.
+    fn queue_time_video(&mut self) {
+        if self.time_mod.is_empty() {
+            self.time_message = "add a modulation first — there would be nothing to animate".into();
+            return;
+        }
+        let frames: u32 = self.time_frames_str.trim().parse().unwrap_or(96).max(2);
+        let (w, h) = (
+            self.video_w_str.trim().parse::<u32>().unwrap_or(1280).max(16),
+            self.video_h_str.trim().parse::<u32>().unwrap_or(720).max(16),
+        );
+        let fps: u32 = self.video_fps_str.trim().parse().unwrap_or(24).max(1);
+        let captured = CapturedView::from_view(&self.view);
+
+        let id = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| format!("{:x}", d.as_nanos()))
+            .unwrap_or_else(|_| format!("{:016x}", self.genome.id));
+        let created_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let genome_label = self.nn_path.file_stem().and_then(|s| s.to_str())
+            .unwrap_or("fractal").to_string();
+
+        let qdir = nnfractals::video_export::queue_dir();
+        if let Err(e) = std::fs::create_dir_all(&qdir) {
+            self.time_message = format!("queue FAILED: {e}");
+            return;
+        }
+        let nn_filename = format!("{id}.nn");
+        if let Err(e) = std::fs::copy(&self.nn_path, qdir.join(&nn_filename)) {
+            self.time_message = format!("queue FAILED: {e}");
+            return;
+        }
+
+        // start == end: a time video's camera does not move. `keyframe_stride`
+        // is 1 rather than the video panel's value — save_queue would force it
+        // anyway, and writing the panel's 16 into the file would make the
+        // intent look ambiguous to anyone reading the JSON later.
+        let item = nnfractals::video_export::QueueItem {
+            id,
+            nn_filename,
+            genome_label,
+            start: captured,
+            end: captured,
+            steps: frames,
+            fps,
+            width: w,
+            height: h,
+            invert_coords: false,
+            invert_range: false,
+            colormap: self.config.rendering.colormap.clone(),
+            angle_coloring: self.angle_coloring,
+            output_dir: self.save_out_dir().to_string_lossy().into_owned(),
+            status: nnfractals::video_export::QueueStatus::Pending,
+            output_path: None,
+            error: None,
+            created_at,
+            waypoints: Vec::new(),
+            chain_label: None,
+            keyframe_stride: 1,
+            time_mod: self.time_mod.clone(),
+            time_frames: frames,
+        };
+        let mut items = nnfractals::video_export::load_queue();
+        items.push(item);
+        nnfractals::video_export::save_queue(&items);
+
+        wake_or_launch_queue_window();
+        self.time_message = format!("queued a {frames}-frame time video ✓");
+    }
+
+    fn show_time_window(&mut self, ctx: &egui::Context) {
+        if !self.show_time { return; }
+
+        let mut do_close = false;
+        let mut do_search = false;
+        let mut do_queue = false;
+        let mut remove: Option<usize> = None;
+        let mut apply_winner: Option<usize> = None;
+        let mut open_clip: Option<PathBuf> = None;
+        let mut changed = false;
+        let winners = self.time_winners.clone();
+        let winners_match = self.time_winners_genome == format!("{:016x}", self.genome.id);
+
+        egui::Window::new("⏱ Time")
+            .collapsible(false)
+            .resizable(true)
+            .default_width(560.0)
+            .show(ctx, |ui| {
+                ui.label(egui::RichText::new(
+                    "A third dimension: the camera holds still and one scalar INSIDE the formula \
+                     moves. Amplitude 0 is always exactly the fractal you loaded, so you can dial \
+                     any of these up from nothing."
+                ).color(Color32::GRAY).small());
+                ui.separator();
+
+                // ── Scrubber ──────────────────────────────────────────────
+                ui.horizontal(|ui| {
+                    let play = if self.time_playing { "⏸" } else { "▶" };
+                    if ui.button(play)
+                        .on_hover_text("Play the modulation on a loop. Only shapes marked 'loops' \
+                                        return to their start seamlessly.")
+                        .clicked()
+                    {
+                        self.time_playing = !self.time_playing;
+                    }
+                    if ui.add(egui::Slider::new(&mut self.time_t, 0.0..=0.999).text("t"))
+                        .on_hover_text("Scrub position through one loop.")
+                        .changed()
+                    {
+                        changed = true;
+                        self.time_playing = false;
+                    }
+                    ui.label("loop s:");
+                    ui.add(egui::DragValue::new(&mut self.time_period).range(0.5..=60.0).speed(0.1))
+                        .on_hover_text("Seconds of wall clock for one full loop during playback.");
+                });
+                if self.time_mod.is_empty() {
+                    ui.label(egui::RichText::new(
+                        "No modulation yet — add one below, or run the search."
+                    ).color(Color32::GRAY).small());
+                }
+
+                // ── Modulation rows ───────────────────────────────────────
+                ui.separator();
+                let targets = time_explore::enumerate_targets(&self.genome);
+                if targets.is_empty() {
+                    ui.colored_label(Color32::from_rgb(240, 160, 80),
+                        "This genome has nothing animatable — every candidate scalar is either \
+                         absent or unread by the formula.");
+                }
+                for (i, m) in self.time_mod.iter_mut().enumerate() {
+                    ui.horizontal(|ui| {
+                        egui::ComboBox::from_id_salt(("tm_target", i))
+                            .selected_text(m.target.label())
+                            .width(150.0)
+                            .show_ui(ui, |ui| {
+                                for t in &targets {
+                                    if ui.selectable_value(&mut m.target, *t, t.label()).clicked() {
+                                        changed = true;
+                                    }
+                                }
+                            });
+                        egui::ComboBox::from_id_salt(("tm_shape", i))
+                            .selected_text(m.shape.label())
+                            .width(95.0)
+                            .show_ui(ui, |ui| {
+                                for sh in ModShape::ALL {
+                                    let label = if sh.loops() {
+                                        format!("{} (loops)", sh.label())
+                                    } else {
+                                        sh.label().to_string()
+                                    };
+                                    if ui.selectable_value(&mut m.shape, *sh, label).clicked() {
+                                        changed = true;
+                                    }
+                                }
+                            });
+                        ui.label("amp");
+                        if ui.add(egui::DragValue::new(&mut m.amp).speed(0.005).range(-4.0..=4.0))
+                            .on_hover_text("Peak offset from the genome's own value. 0 = no change.")
+                            .changed() { changed = true; }
+                        ui.label("freq");
+                        if ui.add(egui::DragValue::new(&mut m.freq).speed(0.1).range(0.25..=8.0))
+                            .on_hover_text("Cycles per clip. Whole numbers loop cleanly.")
+                            .changed() { changed = true; }
+                        ui.label("phase");
+                        if ui.add(egui::DragValue::new(&mut m.phase).speed(0.01).range(0.0..=1.0))
+                            .changed() { changed = true; }
+                        if ui.button("✕").on_hover_text("Remove this modulation").clicked() {
+                            remove = Some(i);
+                        }
+                    });
+                }
+                ui.horizontal(|ui| {
+                    if ui.add_enabled(!targets.is_empty(), egui::Button::new("+ Add modulation"))
+                        .on_hover_text("Stack another channel. Two aimed at the same scalar sum, \
+                                        which is how you get a slow drift plus a fast wobble.")
+                        .clicked()
+                    {
+                        self.time_mod.push(TimeMod::new(targets[0], ModShape::Orbit, 0.08));
+                        changed = true;
+                    }
+                    if ui.add_enabled(!self.time_mod.is_empty(), egui::Button::new("Clear"))
+                        .clicked()
+                    {
+                        self.time_mod.clear();
+                        self.time_t = 0.0;
+                        self.time_playing = false;
+                        changed = true;
+                    }
+                });
+
+                // ── Search ────────────────────────────────────────────────
+                ui.separator();
+                ui.horizontal(|ui| {
+                    if ui.add_enabled(!self.eo_busy, egui::Button::new("🔍 Find time axis"))
+                        .on_hover_text("Runs `explorer time-explore` at this view: renders a short \
+                                        clip for every (target x shape x amplitude), gates out the \
+                                        ones that flicker, stall, flash or dither, and ranks what \
+                                        is left by how well it resists video compression.")
+                        .clicked()
+                    { do_search = true; }
+                    if ui.button("Load last results")
+                        .on_hover_text("Re-read time_winners.jsonl for this genome.")
+                        .clicked()
+                    { apply_winner = None; self.load_time_winners(); }
+                });
+
+                if !winners.is_empty() {
+                    if !winners_match {
+                        ui.colored_label(Color32::from_rgb(240, 160, 80),
+                            "These results were found for a different fractal — load it again \
+                             before applying them.");
+                    }
+                    egui::ScrollArea::vertical().max_height(180.0).show(ui, |ui| {
+                        for (i, w) in winners.iter().enumerate() {
+                            ui.horizontal(|ui| {
+                                ui.label(egui::RichText::new(format!("{:>2}.", i + 1)).monospace());
+                                ui.label(egui::RichText::new(format!("{:.4}", w.score))
+                                    .monospace().color(Color32::LIGHT_BLUE))
+                                    .on_hover_text("Compressed/raw ratio — higher resists \
+                                                    compression more, i.e. more happens.");
+                                ui.label(format!("{} {}", w.tmod.target.label(), w.tmod.shape.label()));
+                                ui.label(egui::RichText::new(format!("amp {:.3}", w.tmod.amp)).monospace());
+                                ui.label(egui::RichText::new(
+                                    format!("coh {:.2} · move {:.1}{}", w.coherence, w.mean_change,
+                                            if w.loops { " · loops" } else { "" })
+                                ).small().color(Color32::GRAY));
+                                if ui.add_enabled(winners_match, egui::Button::new("Apply"))
+                                    .on_hover_text("Load this into the scrubber above.")
+                                    .clicked()
+                                { apply_winner = Some(i); }
+                                if let Some(c) = &w.clip {
+                                    if c.exists() && ui.button("▶ clip").clicked() {
+                                        open_clip = Some(c.clone());
+                                    }
+                                }
+                            });
+                        }
+                    });
+                }
+
+                // ── Export ────────────────────────────────────────────────
+                ui.separator();
+                ui.horizontal(|ui| {
+                    ui.label("Frames:");
+                    ui.add(egui::TextEdit::singleline(&mut self.time_frames_str).desired_width(60.0))
+                        .on_hover_text("Frames in the exported loop. Resolution and fps come from \
+                                        the Video panel.");
+                    if ui.add_enabled(!self.time_mod.is_empty(), egui::Button::new("＋ Queue time video"))
+                        .on_hover_text("Adds a queue item that holds THIS view still and sweeps the \
+                                        modulation. Keyframe warping is forced off for these — it \
+                                        assumes only the camera moved.")
+                        .clicked()
+                    { do_queue = true; }
+                });
+
+                if !self.time_message.is_empty() {
+                    ui.label(egui::RichText::new(&self.time_message).color(Color32::LIGHT_GREEN).small());
+                }
+                ui.separator();
+                if ui.button("Close").clicked() { do_close = true; }
+            });
+
+        if let Some(i) = remove {
+            self.time_mod.remove(i);
+            changed = true;
+        }
+        if let Some(i) = apply_winner {
+            if let Some(w) = self.time_winners.get(i) {
+                self.time_mod = vec![w.tmod];
+                self.time_t = 0.0;
+                changed = true;
+            }
+        }
+        if let Some(c) = open_clip {
+            // Reap it: dropping a Child never waits, and this window can open
+            // many clips in a session.
+            if let Ok(child) = Command::new("xdg-open").arg(&c).spawn() {
+                std::thread::spawn(move || { let mut c = child; let _ = c.wait(); });
+            }
+        }
+        if do_search { self.start_time_explore(); }
+        if do_queue { self.queue_time_video(); }
+        if changed { self.request_render(true); }
+        if do_close { self.show_time = false; }
+    }
+
     fn spawn_explore_stage(&mut self, stage: &str, program: PathBuf, args: Vec<String>, cwd: PathBuf) {
         if self.eo_busy {
             self.eo_message = "a pipeline stage is already running".to_string();
@@ -3856,6 +4318,7 @@ impl App {
         let steps = self.video_steps_str.trim().parse::<u32>().unwrap_or(60).max(2);
         let fps = self.video_fps_str.trim().parse::<u32>().unwrap_or(30).max(1);
 
+        // Camera-path export: no time modulation (see QueueItem::time_mod).
         let item = nnfractals::video_export::QueueItem {
             id, nn_filename, genome_label, start, end, steps, fps, width: w, height: h,
             invert_coords: self.prefs.video_invert_coords,
@@ -3870,6 +4333,7 @@ impl App {
             waypoints: chain,
             chain_label: Some("zoom-explore chain".to_string()),
             keyframe_stride,
+            time_mod: Vec::new(), time_frames: 0,
         };
         let mut items = nnfractals::video_export::load_queue();
         items.push(item);
@@ -4801,6 +5265,7 @@ impl eframe::App for App {
             // acted on afterward, same deferral `finished` below already
             // relies on.
             let mut just_finished_video_zoom = false;
+            let mut just_finished_time = false;
             while let Ok(msg) = rx.try_recv() {
                 match msg {
                     ExploreOpsMsg::Line(l) => {
@@ -4810,6 +5275,7 @@ impl eframe::App for App {
                     ExploreOpsMsg::Done => {
                         self.eo_message = format!("{} finished ✓", self.eo_stage);
                         just_finished_video_zoom = self.eo_stage == "Video-zoom exploring";
+                        just_finished_time = self.eo_stage == "Time exploring";
                         finished = true;
                     }
                     ExploreOpsMsg::Failed(e) => {
@@ -4825,6 +5291,9 @@ impl eframe::App for App {
             if just_finished_video_zoom {
                 self.load_video_zoom_winners(&ctx);
             }
+            if just_finished_time {
+                self.load_time_winners();
+            }
             if finished {
                 self.eo_busy = false;
                 self.eo_rx = None;
@@ -4839,6 +5308,20 @@ impl eframe::App for App {
             ctx.request_repaint();
         }
 
+        // Time playback: advance by WALL CLOCK, not per frame, so the loop
+        // takes `time_period` seconds whatever the render is costing. A
+        // per-frame step would make a slow deep view crawl and a cheap one
+        // race.
+        if self.time_playing && !self.time_mod.is_empty() {
+            let dt = ctx.input(|i| i.stable_dt).clamp(0.0, 0.25);
+            self.time_t = (self.time_t + dt / self.time_period.max(0.1)).fract();
+            self.request_render(true);
+            ctx.request_repaint();
+        } else if self.time_playing {
+            // Nothing to animate — do not spin the render loop.
+            self.time_playing = false;
+        }
+
         self.poll_render(&ctx);
         self.handle_keyboard(&ctx);
         self.show_toolbar(ui);
@@ -4849,6 +5332,7 @@ impl eframe::App for App {
         self.show_save_window(&ctx);
         self.update_explore_preview(&ctx);
         self.show_explore_options_window(&ctx);
+        self.show_time_window(&ctx);
 
         // Auto-upgrade: if the settled render was a preview (user paused after panning/zooming),
         // kick off a full-quality render.  Using the is_preview flag instead of a size heuristic

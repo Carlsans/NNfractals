@@ -22,7 +22,8 @@ use eframe::egui::{self, Color32};
 use nnfractals::config::Config;
 use nnfractals::io::load_genome;
 use nnfractals::video_export::{
-    export_video_chain_interpolated, load_queue, queue_dir, save_queue, QueueItem, QueueStatus, VideoMsg,
+    export_time_video, export_video_chain_interpolated, load_queue, queue_dir, save_queue,
+    QueueItem, QueueStatus, VideoMsg, DEFAULT_TIME_FRAMES,
 };
 
 // ── Small utilities (moved from viewer.rs — this window owns the "job
@@ -142,9 +143,23 @@ fn process_item(
         item.invert_coords, item.invert_range, item.angle_coloring,
     );
     let kf_stride = item.keyframe_stride;
+    let time_mod = item.time_mod.clone();
+    let time_frames = if item.time_frames >= 2 { item.time_frames } else { DEFAULT_TIME_FRAMES };
     let out_path2 = out_path.clone();
     let ctx2 = ctx.clone();
     let render_handle = thread::spawn(move || {
+        // A time item animates the FORMULA with the camera held still, so it
+        // must not go anywhere near the camera-path exporters — and in
+        // particular not near the interpolated one, which warps intermediate
+        // frames on the assumption that only the camera moved.
+        if !time_mod.is_empty() {
+            let mut g_anim = g2.clone();
+            g_anim.time_mod = time_mod;
+            let view = start.to_view();
+            export_time_video(&g_anim, &c2, ang, &view, time_frames, fps, w, h,
+                              &out_path2, &tx, &|| ctx2.request_repaint());
+            return;
+        }
         // A wormhole-chain item carries its own waypoint sequence — render
         // ALL of it as one continuous multi-leg video, not just start→end
         // (which for a chain item are only the first/last waypoint, kept
@@ -557,10 +572,21 @@ impl eframe::App for App {
                             };
                             ui.colored_label(color, label);
                             ui.strong(&it.genome_label);
-                            if it.keyframe_stride > 1 {
-        ui.colored_label(Color32::from_rgb(120, 200, 255), format!("⚡kf/{}", it.keyframe_stride))
-            .on_hover_text("Keyframe-interpolated: only every Nth frame is rendered, the rest are warped from neighbours");
-    }
+                            if !it.time_mod.is_empty() {
+                                let m = &it.time_mod[0];
+                                ui.colored_label(
+                                    Color32::from_rgb(255, 190, 90),
+                                    format!("⏱ {} {}", m.target.label(), m.shape.label()),
+                                )
+                                .on_hover_text(
+                                    "Time video: the CAMERA holds still and the FORMULA animates. \
+                                     Rendered frame by frame — keyframe warping assumes only the \
+                                     camera moved, so it is forced off for these.",
+                                );
+                            } else if it.keyframe_stride > 1 {
+                                ui.colored_label(Color32::from_rgb(120, 200, 255), format!("⚡kf/{}", it.keyframe_stride))
+                                    .on_hover_text("Keyframe-interpolated: only every Nth frame is rendered, the rest are warped from neighbours");
+                            }
     if it.waypoints.len() >= 2 {
                                 let label = it.chain_label.as_deref().unwrap_or("chain");
                                 ui.colored_label(Color32::from_rgb(230, 80, 230),

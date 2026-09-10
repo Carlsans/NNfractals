@@ -693,6 +693,13 @@ impl CapturedView {
     pub fn from_view(v: &View) -> Self {
         CapturedView { cx: v.cx, cx_lo: v.cx_lo, cy: v.cy, cy_lo: v.cy_lo, zoom: v.zoom, aspect: v.aspect }
     }
+    /// The inverse of `from_view`. A time video holds one captured view fixed
+    /// while the genome animates, so it needs this rather than the two-point
+    /// interpolation the camera-path exporters use.
+    pub fn to_view(&self) -> View {
+        View { cx: self.cx, cx_lo: self.cx_lo, cy: self.cy, cy_lo: self.cy_lo,
+               zoom: self.zoom, aspect: if self.aspect > 0.0 { self.aspect } else { 1.0 } }
+    }
     pub fn cx_dd(&self) -> Dd { Dd { hi: self.cx, lo: self.cx_lo } }
     pub fn cy_dd(&self) -> Dd { Dd { hi: self.cy, lo: self.cy_lo } }
 }
@@ -1648,6 +1655,19 @@ pub struct QueueItem {
     /// (video-zoom-explore) exists.
     #[serde(default)]
     pub chain_label: Option<String>,
+    /// Time modulation to sweep while the camera holds still. Non-empty routes
+    /// this item to `export_time_video` instead of the camera-path exporters,
+    /// and FORCES `keyframe_stride` to 1 — see that field's doc comment for
+    /// why warping is incompatible with a changing formula. `#[serde(default)]`
+    /// so every queue item written before this existed still deserializes as a
+    /// plain camera export.
+    #[serde(default)]
+    pub time_mod: Vec<crate::formula::TimeMod>,
+    /// How many frames a time video renders. Ignored unless `time_mod` is
+    /// non-empty; `steps` means something different for a camera path (frames
+    /// per leg) so it would be misleading to reuse it.
+    #[serde(default)]
+    pub time_frames: u32,
     /// Render only every Nth frame and warp the rest out of the two
     /// bracketing keyframes (see `export_video_chain_interpolated`). 0 or 1
     /// means every frame is rendered exactly, which is the behaviour of
@@ -1660,11 +1680,37 @@ pub struct QueueItem {
 /// Load the persisted queue, or an empty list if the file is absent/corrupt
 /// (e.g. first run — `video_queue/` doesn't exist yet).
 pub fn load_queue() -> Vec<QueueItem> {
-    std::fs::read_to_string(queue_json_path())
+    let mut items: Vec<QueueItem> = std::fs::read_to_string(queue_json_path())
         .ok()
         .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_default()
+        .unwrap_or_default();
+    enforce_time_invariants(&mut items);
+    items
 }
+
+/// A time item must never carry a keyframe stride, and must have a usable frame
+/// count.
+///
+/// Keyframe warping reconstructs intermediate frames on the assumption that
+/// consecutive frames differ only by a scale-and-shift of the SAME fractal —
+/// exactly what animating the formula breaks. The viewer's default stride is 16,
+/// so an item that picked it up before gaining a `time_mod` would silently
+/// render a smeared mess. Applied on BOTH load and save so the invariant holds
+/// no matter which binary or which version produced the file, rather than
+/// relying on every producer to remember.
+fn enforce_time_invariants(items: &mut [QueueItem]) {
+    for it in items.iter_mut() {
+        if !it.time_mod.is_empty() {
+            it.keyframe_stride = 1;
+            if it.time_frames < 2 {
+                it.time_frames = DEFAULT_TIME_FRAMES;
+            }
+        }
+    }
+}
+
+/// Frames a time item renders when it does not say.
+pub const DEFAULT_TIME_FRAMES: u32 = 48;
 
 /// Persist the queue. Best-effort (creates `queue_dir()` if missing);
 /// callers that need to know about a write failure should check
@@ -1672,7 +1718,9 @@ pub fn load_queue() -> Vec<QueueItem> {
 /// mirroring `ViewerPrefs::save`'s same best-effort contract.
 pub fn save_queue(items: &[QueueItem]) {
     let _ = std::fs::create_dir_all(queue_dir());
-    if let Ok(s) = serde_json::to_string_pretty(items) {
+    let mut items = items.to_vec();
+    enforce_time_invariants(&mut items);
+    if let Ok(s) = serde_json::to_string_pretty(&items) {
         let _ = std::fs::write(queue_json_path(), s);
     }
 }
@@ -2164,6 +2212,66 @@ mod tests {
     fn probe_frames_score_needs_at_least_two_frames() {
         assert_eq!(probe_frames_score(&[], 24, 32, 32, None), None);
         assert_eq!(probe_frames_score(&[vec![0u8; 32 * 32 * 3]], 24, 32, 32, None), None);
+    }
+
+    #[test]
+    fn a_time_item_can_never_carry_a_keyframe_stride() {
+        // The viewer's default stride is 16, so an item that acquired one before
+        // gaining a time_mod would silently render through the warping exporter
+        // and come out smeared. Enforced at the persistence layer rather than in
+        // every producer.
+        use crate::formula::{ModShape, ModTarget, TimeMod};
+        let json = serde_json::json!({
+            "id": "x", "nn_filename": "x.nn", "genome_label": "x",
+            "start": { "cx": 0.0, "cx_lo": 0.0, "cy": 0.0, "cy_lo": 0.0, "zoom": 1.0, "aspect": 1.0 },
+            "end":   { "cx": 0.0, "cx_lo": 0.0, "cy": 0.0, "cy_lo": 0.0, "zoom": 1.0, "aspect": 1.0 },
+            "steps": 100, "fps": 24, "width": 640, "height": 480,
+            "invert_coords": false, "invert_range": false,
+            "colormap": "turbo", "angle_coloring": false, "output_dir": ".",
+            "status": "Pending", "output_path": null, "error": null, "created_at": 0,
+            "keyframe_stride": 16,
+            "time_mod": [ TimeMod::new(ModTarget::Phoenix, ModShape::Orbit, 0.1) ],
+        });
+        let mut items: Vec<QueueItem> = vec![serde_json::from_value(json).unwrap()];
+        assert_eq!(items[0].keyframe_stride, 16, "fixture should start with a stride");
+        enforce_time_invariants(&mut items);
+        assert_eq!(items[0].keyframe_stride, 1, "a time item must render every frame");
+        assert_eq!(items[0].time_frames, DEFAULT_TIME_FRAMES, "must get a usable frame count");
+    }
+
+    #[test]
+    fn a_camera_item_keeps_its_keyframe_stride() {
+        // The control: the invariant must not quietly disable the ~12x speedup
+        // for the exports that legitimately use it.
+        let json = serde_json::json!({
+            "id": "x", "nn_filename": "x.nn", "genome_label": "x",
+            "start": { "cx": 0.0, "cx_lo": 0.0, "cy": 0.0, "cy_lo": 0.0, "zoom": 1.0, "aspect": 1.0 },
+            "end":   { "cx": 0.0, "cx_lo": 0.0, "cy": 0.0, "cy_lo": 0.0, "zoom": 1.0, "aspect": 1.0 },
+            "steps": 100, "fps": 24, "width": 640, "height": 480,
+            "invert_coords": false, "invert_range": false,
+            "colormap": "turbo", "angle_coloring": false, "output_dir": ".",
+            "status": "Pending", "output_path": null, "error": null, "created_at": 0,
+            "keyframe_stride": 16,
+        });
+        let mut items: Vec<QueueItem> = vec![serde_json::from_value(json).unwrap()];
+        enforce_time_invariants(&mut items);
+        assert_eq!(items[0].keyframe_stride, 16);
+    }
+
+    #[test]
+    fn captured_view_round_trips_through_to_view() {
+        let v = View { cx: -0.743, cx_lo: 1e-18, cy: 0.126, cy_lo: -2e-19, zoom: 1e9, aspect: 1.777 };
+        let back = CapturedView::from_view(&v).to_view();
+        assert_eq!((back.cx, back.cx_lo, back.cy, back.cy_lo, back.zoom, back.aspect),
+                   (v.cx, v.cx_lo, v.cy, v.cy_lo, v.zoom, v.aspect));
+    }
+
+    #[test]
+    fn to_view_repairs_a_zero_aspect() {
+        // Older queue items predate the aspect field and deserialize to 0.0,
+        // which would make the render bounds collapse.
+        let cv = CapturedView { cx: 0.0, cx_lo: 0.0, cy: 0.0, cy_lo: 0.0, zoom: 1.0, aspect: 0.0 };
+        assert_eq!(cv.to_view().aspect, 1.0);
     }
 
     pub(super) fn mandelbrot_genome() -> Genome {
