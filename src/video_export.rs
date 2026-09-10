@@ -757,6 +757,7 @@ pub fn lerp_view(start: &CapturedView, end: &CapturedView, t: f64) -> View {
 }
 
 /// Progress messages from a background video-export → the UI.
+#[derive(Debug)]
 pub enum VideoMsg {
     /// Sent once, right after the `ffmpeg` child process is spawned —
     /// lets a caller that needs to cancel an in-progress export (e.g.
@@ -1235,6 +1236,59 @@ pub fn export_video_chain_limited(
     let (_, budget_frames) = chain_frame_budget(steps, legs);
     let total_frames = max_frames.map_or(budget_frames, |m| m.min(budget_frames).max(1));
 
+    // The requested OUTPUT resolution's aspect wins, not whatever aspect the
+    // waypoints happened to be captured at (typically square, from the
+    // interactive viewer's default ratio) — otherwise render_save
+    // letterboxes the captured (square) content into the requested canvas
+    // instead of filling it, e.g. a 1080×1920 export showing a square frame
+    // with black bars top/bottom.
+    //
+    // Take only `total_frames` from the full sequence — the frames themselves
+    // must still be generated against the FULL chain so the camera path is
+    // identical; capping here shortens the video without changing where the
+    // retained frames look.
+    //
+    // allow_dd=false: see this function's doc comment — DD-tier rendering
+    // combined with a panning camera produces a visible shift artifact, never
+    // validated for a moving-camera video the way it was for the viewer's
+    // stationary single-view case. `VIDEO_FRAME_ALLOW_DD` names this so any
+    // offline validator can render on exactly the same precision tier.
+    let frames = chain_frame_views(waypoints, steps, w, h, invert_coords, invert_range)
+        .into_iter()
+        .take(total_frames as usize)
+        .map(|frame_view| {
+            save_pool().install(|| {
+                render_save(genome, config, &frame_view, w, h, angle_coloring, VIDEO_FRAME_ALLOW_DD)
+            })
+        });
+
+    encode_rgb_frames(frames, total_frames, fps, w, h, out_path, tx, on_progress);
+}
+
+/// Pipe `total` RGB24 frames of `w`×`h` (so `w*h*3` bytes each) into one ffmpeg
+/// process, reporting progress and lifecycle over `tx`.
+///
+/// The frame source is a lazy iterator on purpose: `next()` is what does the
+/// rendering, so a frame is only produced once the encoder is ready for it and
+/// the pause check below sits between whole frames. That keeps the invariant
+/// the previous inline loop had — a pause never splits a frame, so a partially
+/// written video stays valid and ffmpeg simply waits on its stdin.
+///
+/// **Does not pass `-crf`, `-b:v` or `-qp`, and must never start.** libx264's
+/// own constant-QUALITY default applies, which is the only reason file size
+/// tracks content complexity — the premise every compression-based score in
+/// this codebase depends on (`probe_video_score`, `probe_time_score`,
+/// `video_zoom_explore`). A constant-BITRATE encode would make all of them
+/// silently meaningless rather than visibly broken.
+pub fn encode_rgb_frames<I>(
+    mut frames: I, total: u32, fps: u32, w: u32, h: u32,
+    out_path: &Path, tx: &mpsc::Sender<VideoMsg>, on_progress: &(dyn Fn() + Sync),
+) where
+    I: Iterator<Item = Vec<u8>>,
+{
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+
     let mut child = match Command::new("ffmpeg")
         .args(["-y", "-f", "rawvideo", "-pix_fmt", "rgb24",
                "-s", &format!("{w}x{h}"), "-r", &fps.to_string(), "-i", "-",
@@ -1268,33 +1322,11 @@ pub fn export_video_chain_limited(
     };
     let _ = tx.send(VideoMsg::Started { pid: child.id() });
 
-    // The requested OUTPUT resolution's aspect wins, not whatever aspect the
-    // waypoints happened to be captured at (typically square, from the
-    // interactive viewer's default ratio) — otherwise render_save
-    // letterboxes the captured (square) content into the requested canvas
-    // instead of filling it, e.g. a 1080×1920 export showing a square frame
-    // with black bars top/bottom.
-    use std::io::Write;
     let mut frame_idx = 0u32;
-    // Take only `total_frames` from the full sequence — the frames
-    // themselves must still be generated against the FULL chain so the
-    // camera path is identical; capping here shortens the video without
-    // changing where the retained frames look.
-    for frame_view in chain_frame_views(waypoints, steps, w, h, invert_coords, invert_range)
-        .into_iter().take(total_frames as usize)
-    {
-        // Between frames only — a pause never splits a frame, so the
-        // partially written video stays valid and ffmpeg just waits.
+    loop {
+        // Between frames only — see this function's doc comment.
         RENDER_CONTROL.wait_while_paused();
-        // allow_dd=false: see this function's doc comment — DD-tier
-        // rendering combined with a panning camera produces a visible
-        // shift artifact, never validated for a moving-camera video the
-        // way it was for the viewer's stationary single-view case.
-        // `VIDEO_FRAME_ALLOW_DD` names this so any offline validator can
-        // render on exactly the same precision tier (see its doc comment).
-        let rgb = save_pool().install(|| {
-            render_save(genome, config, &frame_view, w, h, angle_coloring, VIDEO_FRAME_ALLOW_DD)
-        });
+        let Some(rgb) = frames.next() else { break };
         if let Err(e) = stdin.write_all(&rgb) {
             drop(stdin);
             let _ = child.kill();
@@ -1303,7 +1335,7 @@ pub fn export_video_chain_limited(
             return;
         }
         frame_idx += 1;
-        let _ = tx.send(VideoMsg::Progress { done: frame_idx, total: total_frames });
+        let _ = tx.send(VideoMsg::Progress { done: frame_idx, total });
         on_progress();
     }
     drop(stdin);
@@ -1322,6 +1354,120 @@ pub fn export_video_chain_limited(
         }
     }
     on_progress();
+}
+
+/// The frame sequence of a time video: the camera is FIXED and the GENOME
+/// varies, which is the exact mirror of `chain_frame_views` (where the genome is
+/// fixed and the camera moves).
+///
+/// `t` runs `i / frames`, so it reaches `(frames-1)/frames` and never 1.0. That
+/// is deliberate: for a looping shape at integer `freq`, `t = 1` would render a
+/// duplicate of `t = 0` and the loop would stutter on one repeated frame.
+///
+/// Lazy — a frame is rendered when the encoder pulls it. See
+/// `encode_rgb_frames`.
+pub fn time_frames<'a>(
+    genome: &'a Genome, config: &'a Config, angle_coloring: bool,
+    view: &'a View, frames: u32, w: u32, h: u32,
+) -> impl Iterator<Item = Vec<u8>> + 'a {
+    let n = frames.max(1);
+    (0..n).map(move |i| {
+        let t = i as f32 / n as f32;
+        let g = genome.at_time(t);
+        // VIDEO_FRAME_ALLOW_DD (false), same as the chain exporter. Worth
+        // knowing that the reason DD is disabled there — a shift artifact when
+        // DD-tier rendering is combined with a MOVING camera — does not apply
+        // here, because a time video's camera is stationary and that is the
+        // case the viewer already validated DD against. Left conservative
+        // because it has not been checked on this path specifically; a deep
+        // time video is the thing to test before flipping it.
+        save_pool().install(|| {
+            render_save(&g, config, view, w, h, angle_coloring, VIDEO_FRAME_ALLOW_DD)
+        })
+    })
+}
+
+/// Export a time video: one fixed view, the genome's `time_mod` swept across
+/// `frames` frames.
+///
+/// Never routes through `export_video_chain_interpolated`. That exporter renders
+/// every Nth frame and warps the rest, which is only valid when consecutive
+/// frames differ by a scale-and-shift of the SAME fractal — precisely what time
+/// modulation breaks. The viewer's default keyframe stride is 16, so anything
+/// that queues a time video must force it to 1.
+pub fn export_time_video(
+    genome: &Genome, config: &Config, angle_coloring: bool,
+    view: &View, frames: u32, fps: u32, w: u32, h: u32,
+    out_path: &Path, tx: &mpsc::Sender<VideoMsg>, on_progress: &(dyn Fn() + Sync),
+) {
+    if genome.time_mod.is_empty() {
+        let _ = tx.send(VideoMsg::Failed(
+            "this genome has no time modulation — nothing would change between frames".into(),
+        ));
+        on_progress();
+        return;
+    }
+    let n = frames.max(2);
+    encode_rgb_frames(
+        time_frames(genome, config, angle_coloring, view, n, w, h),
+        n, fps, w, h, out_path, tx, on_progress,
+    );
+}
+
+/// Encode an ALREADY-RENDERED set of RGB24 frames and return the same
+/// normalized compressed/raw ratio the camera-path probes use, so time scores
+/// and zoom scores are directly comparable.
+///
+/// Takes rendered frames rather than rendering its own because the time sweep
+/// has to inspect every frame anyway (for the spatial noise gate and the
+/// temporal-coherence gate), and rendering them twice would double the cost of
+/// the whole search.
+///
+/// `out_path` keeps the clip; `None` writes to a scratch file and deletes it.
+pub fn probe_frames_score(
+    frames: &[Vec<u8>], fps: u32, w: u32, h: u32, out_path: Option<&Path>,
+) -> Option<f64> {
+    if frames.len() < 2 {
+        return None;
+    }
+    let scratch = out_path.is_none();
+    let path = match out_path {
+        Some(p) => p.to_path_buf(),
+        None => {
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0);
+            std::env::temp_dir().join(format!("nnfractals_tprobe_{}_{nanos}.mp4", std::process::id()))
+        }
+    };
+
+    let (tx, rx) = mpsc::channel();
+    encode_rgb_frames(
+        frames.iter().cloned(), frames.len() as u32, fps, w, h, &path, &tx, &|| {},
+    );
+    let bytes = rx.try_iter().find_map(|m| match m {
+        VideoMsg::Done(p) => std::fs::metadata(&p).ok().map(|m| m.len()),
+        _ => None,
+    });
+    if scratch {
+        let _ = std::fs::remove_file(&path);
+    }
+    bytes.map(|b| b as f64 / (w as f64 * h as f64 * 3.0 * frames.len() as f64))
+}
+
+/// Convenience: render a time video to a scratch file and return its normalized
+/// compression ratio. Ungated — callers that need the noise and
+/// temporal-coherence floors should render frames themselves and use
+/// `probe_frames_score`, which is what `time_explore` does.
+pub fn probe_time_score(
+    genome: &Genome, config: &Config, angle_coloring: bool,
+    view: &View, frames: u32, fps: u32, w: u32, h: u32,
+) -> Option<f64> {
+    let n = frames.max(2);
+    let rendered: Vec<Vec<u8>> =
+        time_frames(genome, config, angle_coloring, view, n, w, h).collect();
+    probe_frames_score(&rendered, fps, w, h, None)
 }
 
 /// Shared implementation for `probe_video_score`/`probe_video_score_keep`:
@@ -1902,6 +2048,122 @@ mod tests {
             let via = render_save(&g.at_time(t), &config, &view, 64, 64, false, false);
             assert_eq!(via, plain, "at_time({t}) changed the pixels of a static genome");
         }
+    }
+
+    fn julia_animated() -> Genome {
+        use crate::formula::{ModShape, ModTarget, TimeMod};
+        let mut g = mandelbrot_genome();
+        g.julia_mode = true;
+        g.julia_cre = -0.4;
+        g.julia_cim = 0.6;
+        g.time_mod = vec![TimeMod::new(ModTarget::JuliaC, ModShape::Orbit, 0.08)];
+        g
+    }
+
+    #[test]
+    fn time_frames_yields_the_requested_count_and_never_repeats_the_loop_point() {
+        let g = julia_animated();
+        let config = chain_test_config();
+        let view = View::new_square(0.0, 0.0, 1.0);
+        let frames: Vec<Vec<u8>> = time_frames(&g, &config, false, &view, 8, 32, 32).collect();
+        assert_eq!(frames.len(), 8);
+        // t never reaches 1.0, so the last frame must not be a copy of the
+        // first — otherwise a loop would stutter on one duplicated frame.
+        assert_ne!(frames[0], frames[7], "last frame duplicates the first");
+    }
+
+    #[test]
+    fn a_time_video_actually_changes_between_frames() {
+        // The whole point: with the camera fixed, the pixels must still move.
+        let g = julia_animated();
+        let config = chain_test_config();
+        let view = View::new_square(0.0, 0.0, 1.0);
+        let frames: Vec<Vec<u8>> = time_frames(&g, &config, false, &view, 6, 48, 48).collect();
+        let changed = frames.windows(2).filter(|w| w[0] != w[1]).count();
+        assert_eq!(changed, 5, "every consecutive pair should differ");
+    }
+
+    #[test]
+    fn a_static_genome_produces_identical_frames() {
+        // The control for the test above: no time_mod means nothing moves, so
+        // any difference measured there really is the modulation.
+        let g = mandelbrot_genome();
+        let config = chain_test_config();
+        let view = View::new_square(-0.5, 0.0, 1.0);
+        let frames: Vec<Vec<u8>> = time_frames(&g, &config, false, &view, 4, 32, 32).collect();
+        assert!(frames.windows(2).all(|w| w[0] == w[1]), "static genome should not move");
+    }
+
+    #[test]
+    fn export_time_video_refuses_a_genome_with_no_modulation() {
+        // Silently writing a video of N identical frames would look like a bug
+        // in the renderer rather than a missing modulation.
+        let g = mandelbrot_genome();
+        let config = chain_test_config();
+        let view = View::new_square(-0.5, 0.0, 1.0);
+        let out = std::env::temp_dir().join(format!("nnf_notimemod_{}.mp4", std::process::id()));
+        let (tx, rx) = mpsc::channel();
+        export_time_video(&g, &config, false, &view, 8, 24, 32, 32, &out, &tx, &|| {});
+        let msgs: Vec<_> = rx.try_iter().collect();
+        assert!(msgs.iter().any(|m| matches!(m, VideoMsg::Failed(s) if s.contains("no time modulation"))),
+            "expected a clear refusal, got {msgs:?}");
+        assert!(!out.exists(), "should not have written a file");
+    }
+
+    #[test]
+    fn encode_rgb_frames_writes_a_real_file_and_reports_progress() {
+        // Synthetic frames — no fractal involved, so this tests the encoder
+        // alone: a moving white square on black.
+        let (w, h, n) = (32u32, 32u32, 10u32);
+        let frames: Vec<Vec<u8>> = (0..n).map(|i| {
+            let mut f = vec![0u8; (w * h * 3) as usize];
+            let x = (i * 2) as usize % (w as usize - 4);
+            for y in 4..8usize {
+                for dx in 0..4usize {
+                    let o = (y * w as usize + x + dx) * 3;
+                    f[o] = 255; f[o + 1] = 255; f[o + 2] = 255;
+                }
+            }
+            f
+        }).collect();
+
+        let out = std::env::temp_dir().join(format!("nnf_encode_{}.mp4", std::process::id()));
+        let (tx, rx) = mpsc::channel();
+        encode_rgb_frames(frames.into_iter(), n, 24, w, h, &out, &tx, &|| {});
+        let msgs: Vec<_> = rx.try_iter().collect();
+        assert!(msgs.iter().any(|m| matches!(m, VideoMsg::Done(_))), "no Done: {msgs:?}");
+        let progress = msgs.iter().filter(|m| matches!(m, VideoMsg::Progress { .. })).count();
+        assert_eq!(progress, n as usize, "one Progress per frame");
+        assert!(std::fs::metadata(&out).map(|m| m.len() > 0).unwrap_or(false));
+        let _ = std::fs::remove_file(&out);
+    }
+
+    #[test]
+    fn probe_frames_score_is_a_ratio_and_ranks_noise_above_flat() {
+        // Sanity on the metric's direction: incompressible noise must score
+        // higher than a flat field. (That it ALSO beats real structure is
+        // exactly why time_explore gates before scoring.)
+        let (w, h, n) = (64u32, 64u32, 8u32);
+        let flat: Vec<Vec<u8>> = (0..n).map(|_| vec![7u8; (w * h * 3) as usize]).collect();
+        let noise: Vec<Vec<u8>> = (0..n).map(|i| {
+            let mut st = 0x2545F491u32.wrapping_add(i);
+            (0..(w * h * 3)).map(|_| {
+                st ^= st << 13; st ^= st >> 17; st ^= st << 5;
+                (st & 0xff) as u8
+            }).collect()
+        }).collect();
+
+        let flat_score = probe_frames_score(&flat, 24, w, h, None).expect("flat probe failed");
+        let noise_score = probe_frames_score(&noise, 24, w, h, None).expect("noise probe failed");
+        assert!(flat_score > 0.0 && flat_score < 1.0, "ratio out of range: {flat_score}");
+        assert!(noise_score > flat_score * 5.0,
+            "noise {noise_score} should dwarf flat {flat_score}");
+    }
+
+    #[test]
+    fn probe_frames_score_needs_at_least_two_frames() {
+        assert_eq!(probe_frames_score(&[], 24, 32, 32, None), None);
+        assert_eq!(probe_frames_score(&[vec![0u8; 32 * 32 * 3]], 24, 32, 32, None), None);
     }
 
     pub(super) fn mandelbrot_genome() -> Genome {
