@@ -621,7 +621,7 @@ enum WormholeState {
 
 // ── Preferences ───────────────────────────────────────────────────────────────
 
-#[derive(Serialize, Deserialize, PartialEq)]
+#[derive(Serialize, Deserialize, PartialEq, Clone)]
 struct ViewerPrefs {
     last_save_width:  u32,
     last_save_height: u32,
@@ -657,6 +657,13 @@ struct ViewerPrefs {
     #[serde(default = "default_gate_max_level_jump")] gate_max_level_jump: f32,
     #[serde(default = "default_gate_min_coherence")]  gate_min_coherence: f32,
     #[serde(default = "default_probe_frames")]        probe_frames: u32,
+    // Per-gate on/off. Off keeps the threshold you chose but passes the
+    // NEUTRAL value to the search, so toggling back does not lose it.
+    #[serde(default = "yes")] gate_noise_on: bool,
+    #[serde(default = "yes")] gate_static_on: bool,
+    #[serde(default = "yes")] gate_stalls_on: bool,
+    #[serde(default = "yes")] gate_flash_on: bool,
+    #[serde(default = "yes")] gate_coherence_on: bool,
     #[serde(default = "default_probe_samples")]       probe_samples: u32,
     #[serde(default)] video_invert_coords: bool,
     #[serde(default)] video_invert_range:  bool,
@@ -681,6 +688,20 @@ fn default_gate_max_still_run()  -> f32 { time_explore::MAX_STILL_RUN }
 fn default_gate_max_level_jump() -> f32 { time_explore::MAX_LEVEL_JUMP }
 fn default_gate_min_coherence()  -> f32 { time_explore::MIN_TEMPORAL_COHERENCE }
 fn default_probe_frames()        -> u32 { 48 }
+fn yes() -> bool { true }
+
+// Values at which each gate can never fire. Not arbitrary large numbers: every
+// one is the exact bound of what its measurement can produce, so "disabled"
+// really is disabled rather than merely unlikely.
+//   noise / still-run  are fractions, so 1.0 is their maximum
+//   change             is an absolute difference, so 0.0 is its minimum
+//   level jump         is 0-255 luminance, so 255.0 is its maximum
+//   coherence          is a correlation, so -1.0 is its minimum
+const GATE_OFF_MAX_NOISE: f32      = 1.0;
+const GATE_OFF_MIN_CHANGE: f32     = 0.0;
+const GATE_OFF_MAX_STILL_RUN: f32  = 1.0;
+const GATE_OFF_MAX_LEVEL_JUMP: f32 = 255.0;
+const GATE_OFF_MIN_COHERENCE: f32  = -1.0;
 fn default_probe_samples()       -> u32 { 40 }
 
 impl Default for ViewerPrefs {
@@ -705,6 +726,11 @@ impl Default for ViewerPrefs {
             gate_max_level_jump: default_gate_max_level_jump(),
             gate_min_coherence: default_gate_min_coherence(),
             probe_frames: default_probe_frames(),
+            gate_noise_on: true,
+            gate_static_on: true,
+            gate_stalls_on: true,
+            gate_flash_on: true,
+            gate_coherence_on: true,
             probe_samples: default_probe_samples(),
             video_invert_coords: false,
             video_invert_range:  false,
@@ -3751,13 +3777,19 @@ impl App {
     /// The gate thresholds, as CLI flags. Both searches share them so a change
     /// means the same thing on either axis.
     fn gate_args(&self) -> Vec<String> {
+        let pick = |on: bool, v: f32, off: f32| if on { v } else { off };
         vec![
-            "--max-noise".into(),      self.prefs.gate_max_noise.to_string(),
-            "--min-change".into(),     self.prefs.gate_min_change.to_string(),
-            "--max-still-run".into(),  self.prefs.gate_max_still_run.to_string(),
-            "--max-level-jump".into(), self.prefs.gate_max_level_jump.to_string(),
-            "--min-coherence".into(),  self.prefs.gate_min_coherence.to_string(),
-            "--frames".into(),         self.prefs.probe_frames.to_string(),
+            "--max-noise".into(),
+            pick(self.prefs.gate_noise_on, self.prefs.gate_max_noise, GATE_OFF_MAX_NOISE).to_string(),
+            "--min-change".into(),
+            pick(self.prefs.gate_static_on, self.prefs.gate_min_change, GATE_OFF_MIN_CHANGE).to_string(),
+            "--max-still-run".into(),
+            pick(self.prefs.gate_stalls_on, self.prefs.gate_max_still_run, GATE_OFF_MAX_STILL_RUN).to_string(),
+            "--max-level-jump".into(),
+            pick(self.prefs.gate_flash_on, self.prefs.gate_max_level_jump, GATE_OFF_MAX_LEVEL_JUMP).to_string(),
+            "--min-coherence".into(),
+            pick(self.prefs.gate_coherence_on, self.prefs.gate_min_coherence, GATE_OFF_MIN_COHERENCE).to_string(),
+            "--frames".into(), self.prefs.probe_frames.to_string(),
         ]
     }
 
@@ -4030,42 +4062,47 @@ impl App {
                          flashes and the winner count did not move."
                     ).color(Color32::GRAY).small());
 
-                    egui::Grid::new("gate_grid").num_columns(3).spacing([10.0, 4.0]).striped(true).show(ui, |ui| {
-                        let row = |ui: &mut egui::Ui, label: &str, v: &mut f32, range: std::ops::RangeInclusive<f32>,
-                                   speed: f64, default: f32, help: &str| -> bool {
-                            ui.label(label);
-                            let ch = ui.add(egui::DragValue::new(v).range(range).speed(speed))
-                                .on_hover_text(help).changed();
-                            let c = if (*v - default).abs() < 1e-6 { Color32::DARK_GRAY } else { Color32::from_rgb(255, 200, 100) };
-                            ui.colored_label(c, format!("default {default}"));
-                            ui.end_row();
-                            ch
-                        };
-                        gates_changed |= row(ui, "noise  (max)", &mut self.prefs.gate_max_noise, 0.0..=1.0, 0.01,
-                            default_gate_max_noise(),
-                            "Worst frame's fraction of dithered tiles. A compression score cannot \
-                             tell speckle from detail, so this is the floor that stops the search \
-                             picking noise. Raise it to allow grainier fractals; 1.0 disables it.");
-                        gates_changed |= row(ui, "static  (min move)", &mut self.prefs.gate_min_change, 0.0..=20.0, 0.1,
-                            default_gate_min_change(),
-                            "Mean luminance change per frame, 0-255. Below this nothing visibly \
-                             happens. Lower it to keep very subtle animations.");
-                        gates_changed |= row(ui, "stalls  (max still run)", &mut self.prefs.gate_max_still_run, 0.0..=1.0, 0.01,
-                            default_gate_max_still_run(),
-                            "Longest run of near-identical frames, as a fraction of the clip. \
-                             Catches a clip that freezes partway. A sinusoid's turning point is ONE \
-                             slow frame and does not count — that mistake is why this measures a \
-                             run rather than the minimum.");
-                        gates_changed |= row(ui, "flash  (max jump)", &mut self.prefs.gate_max_level_jump, 0.0..=255.0, 0.5,
-                            default_gate_max_level_jump(),
-                            "Largest jump in average frame brightness, 0-255. Correlation cannot \
-                             see a flash — it is invariant to brightness — so this is a separate \
-                             measure. Raise it if legitimate bright pulses are being rejected.");
-                        gates_changed |= row(ui, "incoherent  (min corr)", &mut self.prefs.gate_min_coherence, -1.0..=1.0, 0.01,
-                            default_gate_min_coherence(),
-                            "Worst consecutive-frame correlation: how connected the least-related \
-                             pair of frames is. Below this the clip is a sequence of cuts rather \
-                             than a morph. -1 disables it.");
+                    egui::Grid::new("gate_grid").num_columns(5).spacing([8.0, 4.0]).striped(true).show(ui, |ui| {
+                        gates_changed |= gate_row(ui,
+                            &mut self.prefs.gate_noise_on, &mut self.prefs.gate_max_noise,
+                            "noise", "dithered tiles in the worst frame", true,
+                            0.0..=1.0, 0.01, default_gate_max_noise(), 2,
+                            "A compression score cannot tell speckle from detail, so without this \
+                             the search picks noise — it once returned a pure speckle field as its \
+                             top result. Measured on the worst single frame, as a fraction of the \
+                             frame's textured tiles.");
+                        gates_changed |= gate_row(ui,
+                            &mut self.prefs.gate_static_on, &mut self.prefs.gate_min_change,
+                            "static", "average movement per frame", false,
+                            0.0..=20.0, 0.1, default_gate_min_change(), 2,
+                            "Mean luminance change between frames, on a 0-255 scale. Below this \
+                             the modulation is present but invisible, and a winner where nothing \
+                             happens is worse than no winner.");
+                        gates_changed |= gate_row(ui,
+                            &mut self.prefs.gate_stalls_on, &mut self.prefs.gate_max_still_run,
+                            "stalls", "longest frozen run, as a fraction of the clip", true,
+                            0.0..=1.0, 0.01, default_gate_max_still_run(), 2,
+                            "A RUN of near-identical frames — the clip hangs partway through. \
+                             Deliberately a run and not the minimum: a sinusoid's velocity is zero \
+                             at its turning points, so a minimum-based version rejected every sine \
+                             and triangle candidate, including clips moving 13 units per frame.");
+                        gates_changed |= gate_row(ui,
+                            &mut self.prefs.gate_flash_on, &mut self.prefs.gate_max_level_jump,
+                            "flash", "biggest jump in frame brightness", true,
+                            0.0..=255.0, 0.5, default_gate_max_level_jump(), 1,
+                            "Largest change in AVERAGE frame brightness between consecutive \
+                             frames, 0-255. This exists as its own measure because correlation is \
+                             invariant to brightness — the same structure at twice the brightness \
+                             still correlates at 1.0, so 'incoherent' below is structurally blind \
+                             to a flash.");
+                        gates_changed |= gate_row(ui,
+                            &mut self.prefs.gate_coherence_on, &mut self.prefs.gate_min_coherence,
+                            "incoherent", "worst frame-to-frame correlation", false,
+                            -1.0..=1.0, 0.01, default_gate_min_coherence(), 2,
+                            "How connected the LEAST related pair of consecutive frames is. Below \
+                             this the clip is a sequence of cuts rather than a morph. Worst pair, \
+                             not the average: an average is dragged up by the good frames and hides \
+                             exactly the moment the eye is drawn to.");
                     });
 
                     ui.horizontal(|ui| {
@@ -4077,8 +4114,8 @@ impl App {
                                             the result rather than just refining it.")
                             .changed()
                         { gates_changed = true; }
-                        if ui.button("Reset to defaults")
-                            .on_hover_text("Back to the calibrated values.")
+                        if ui.button("Reset all")
+                            .on_hover_text("Every criterion back on, at its calibrated value.")
                             .clicked()
                         { reset_gates = true; }
                     });
@@ -4346,6 +4383,11 @@ impl App {
             self.prefs.gate_max_level_jump = default_gate_max_level_jump();
             self.prefs.gate_min_coherence = default_gate_min_coherence();
             self.prefs.probe_frames = default_probe_frames();
+            self.prefs.gate_noise_on = true;
+            self.prefs.gate_static_on = true;
+            self.prefs.gate_stalls_on = true;
+            self.prefs.gate_flash_on = true;
+            self.prefs.gate_coherence_on = true;
             gates_changed = true;
         }
         if gates_changed { self.prefs.save(&self.prefs_path); }
@@ -6086,6 +6128,37 @@ fn legacy_prefs_candidates(nn_path: &Path, root: &Path) -> Vec<PathBuf> {
     out
 }
 
+/// Reconcile gate thresholds that were parked at their neutral value.
+///
+/// Before the per-criterion checkboxes existed, the only way to switch a gate
+/// off was to set it to an extreme — and that is exactly what Carl did (noise
+/// 1.0, coherence -1.0, level jump 255.0). Loading those as "enabled, at a
+/// threshold that never fires" would show three ticked boxes for gates he means
+/// to be off. Turn them off and restore the default threshold instead: same
+/// behaviour, and the checkbox now says what he meant.
+fn normalize_gates(p: &mut ViewerPrefs) {
+    if p.gate_max_noise >= GATE_OFF_MAX_NOISE {
+        p.gate_noise_on = false;
+        p.gate_max_noise = default_gate_max_noise();
+    }
+    if p.gate_min_change <= GATE_OFF_MIN_CHANGE {
+        p.gate_static_on = false;
+        p.gate_min_change = default_gate_min_change();
+    }
+    if p.gate_max_still_run >= GATE_OFF_MAX_STILL_RUN {
+        p.gate_stalls_on = false;
+        p.gate_max_still_run = default_gate_max_still_run();
+    }
+    if p.gate_max_level_jump >= GATE_OFF_MAX_LEVEL_JUMP {
+        p.gate_flash_on = false;
+        p.gate_max_level_jump = default_gate_max_level_jump();
+    }
+    if p.gate_min_coherence <= GATE_OFF_MIN_COHERENCE {
+        p.gate_coherence_on = false;
+        p.gate_min_coherence = default_gate_min_coherence();
+    }
+}
+
 /// Load preferences, adopting a legacy per-folder file the first time.
 ///
 /// Prefers the folder the genome came from, then the most recently touched of
@@ -6099,19 +6172,80 @@ fn legacy_prefs_candidates(nn_path: &Path, root: &Path) -> Vec<PathBuf> {
 fn load_viewer_prefs(nn_path: &Path) -> ViewerPrefs {
     let root_file = viewer_prefs_path();
     if root_file.exists() {
-        return ViewerPrefs::load(&root_file);
+        let mut p = ViewerPrefs::load(&root_file);
+        normalize_gates(&mut p);
+        return p;
     }
     let root = nnfractals::project_root();
     for legacy in legacy_prefs_candidates(nn_path, &root) {
-        let p = ViewerPrefs::load(&legacy);
+        let mut p = ViewerPrefs::load(&legacy);
         // `load` falls back to Default on a parse failure, so check the file
         // really carried something rather than trusting its mere existence.
         if p != ViewerPrefs::default() {
             eprintln!("adopted viewer preferences from {}", legacy.display());
+            normalize_gates(&mut p);
             return p;
         }
     }
     ViewerPrefs::load(&root_file)
+}
+
+/// One rejection-criterion row: enable, value, reset, and — the part that
+/// matters — the rule spelled out with its real operator.
+///
+/// Three of the five gates reject a measurement ABOVE their threshold and two
+/// reject BELOW, which is not something a label like "noise (max)" conveys. So
+/// each row states the comparison literally against the live value: "reject if
+/// noise > 0.15" or "reject if movement < 1.0". No inference required.
+#[allow(clippy::too_many_arguments)]
+fn gate_row(
+    ui: &mut egui::Ui,
+    on: &mut bool,
+    value: &mut f32,
+    label: &str,
+    measured: &str,
+    reject_above: bool,
+    range: std::ops::RangeInclusive<f32>,
+    speed: f64,
+    default: f32,
+    decimals: usize,
+    help: &str,
+) -> bool {
+    let mut changed = false;
+    changed |= ui.checkbox(on, "")
+        .on_hover_text("Apply this criterion. Unticking it leaves your threshold alone and \
+                        simply stops the gate firing, so you can toggle it back without \
+                        retyping.")
+        .changed();
+
+    let name = egui::RichText::new(label);
+    ui.label(if *on { name } else { name.color(Color32::DARK_GRAY).strikethrough() })
+        .on_hover_text(help);
+
+    changed |= ui.add_enabled(*on, egui::DragValue::new(value).range(range).speed(speed))
+        .on_hover_text(help)
+        .changed();
+
+    let at_default = (*value - default).abs() < 1e-6;
+    if ui.add_enabled(!at_default, egui::Button::new("↺").small())
+        .on_hover_text(format!("Back to the calibrated default, {default}"))
+        .clicked()
+    {
+        *value = default;
+        changed = true;
+    }
+
+    if *on {
+        let op = if reject_above { ">" } else { "<" };
+        ui.colored_label(
+            if at_default { Color32::GRAY } else { Color32::from_rgb(255, 200, 100) },
+            format!("reject if {measured} {op} {:.*}", decimals, value),
+        );
+    } else {
+        ui.colored_label(Color32::DARK_GRAY, "off — never rejects");
+    }
+    ui.end_row();
+    changed
 }
 
 fn locate_sibling_bin(name: &str) -> PathBuf {
@@ -6909,5 +7043,124 @@ mod gate_ui_tests {
         let (passed, breakdown) = App::reject_breakdown(r#"{"rejected":null}"#);
         assert_eq!(passed, 1);
         assert!(breakdown.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod gate_arg_tests {
+    use super::*;
+
+    /// The flag names the searches actually parse. A typo here is silent — the
+    /// subprocess falls back to its default and the control looks inert — so
+    /// they are pinned.
+    const EXPECTED: &[&str] = &[
+        "--max-noise", "--min-change", "--max-still-run",
+        "--max-level-jump", "--min-coherence", "--frames",
+    ];
+
+    fn args_of(prefs: &ViewerPrefs) -> Vec<String> {
+        // Mirrors App::gate_args without needing a whole App.
+        let pick = |on: bool, v: f32, off: f32| if on { v } else { off };
+        vec![
+            "--max-noise".into(),
+            pick(prefs.gate_noise_on, prefs.gate_max_noise, GATE_OFF_MAX_NOISE).to_string(),
+            "--min-change".into(),
+            pick(prefs.gate_static_on, prefs.gate_min_change, GATE_OFF_MIN_CHANGE).to_string(),
+            "--max-still-run".into(),
+            pick(prefs.gate_stalls_on, prefs.gate_max_still_run, GATE_OFF_MAX_STILL_RUN).to_string(),
+            "--max-level-jump".into(),
+            pick(prefs.gate_flash_on, prefs.gate_max_level_jump, GATE_OFF_MAX_LEVEL_JUMP).to_string(),
+            "--min-coherence".into(),
+            pick(prefs.gate_coherence_on, prefs.gate_min_coherence, GATE_OFF_MIN_COHERENCE).to_string(),
+            "--frames".into(), prefs.probe_frames.to_string(),
+        ]
+    }
+
+    #[test]
+    fn a_gate_parked_at_its_neutral_value_loads_as_off() {
+        // Carl had switched three gates off the only way that was possible
+        // before checkboxes existed — by setting them to an extreme. Loading
+        // those as "enabled at a threshold that never fires" would show ticked
+        // boxes for gates he means to be off.
+        let mut p = ViewerPrefs::default();
+        p.gate_max_noise = GATE_OFF_MAX_NOISE;
+        p.gate_min_coherence = GATE_OFF_MIN_COHERENCE;
+        p.gate_max_level_jump = GATE_OFF_MAX_LEVEL_JUMP;
+        normalize_gates(&mut p);
+
+        assert!(!p.gate_noise_on && !p.gate_coherence_on && !p.gate_flash_on);
+        // The thresholds come back so the checkbox is meaningful when re-ticked.
+        assert_eq!(p.gate_max_noise, default_gate_max_noise());
+        assert_eq!(p.gate_min_coherence, default_gate_min_coherence());
+        assert_eq!(p.gate_max_level_jump, default_gate_max_level_jump());
+        // Untouched gates stay on.
+        assert!(p.gate_static_on && p.gate_stalls_on);
+    }
+
+    #[test]
+    fn normalizing_is_behaviour_preserving() {
+        // Off-with-default must send the same flags as on-at-neutral did.
+        let mut before = ViewerPrefs::default();
+        before.gate_max_noise = GATE_OFF_MAX_NOISE;
+        let sent_before = args_of(&before);
+        let mut after = before.clone();
+        normalize_gates(&mut after);
+        assert_eq!(args_of(&after), sent_before, "the search must see no change");
+    }
+
+    #[test]
+    fn ordinary_settings_are_left_alone() {
+        let mut p = ViewerPrefs::default();
+        p.gate_max_noise = 0.05;
+        let before = p.clone();
+        normalize_gates(&mut p);
+        assert_eq!(p.gate_max_noise, before.gate_max_noise);
+        assert!(p.gate_noise_on);
+    }
+
+    #[test]
+    fn every_gate_flag_is_emitted() {
+        let a = args_of(&ViewerPrefs::default());
+        for f in EXPECTED {
+            assert!(a.iter().any(|x| x == f), "{f} missing from {a:?}");
+        }
+    }
+
+    #[test]
+    fn a_disabled_gate_sends_its_neutral_value_not_the_users() {
+        let mut p = ViewerPrefs::default();
+        p.gate_max_noise = 0.05;      // a strict value the user chose
+        p.gate_noise_on = false;      // ...but switched off
+        let a = args_of(&p);
+        let i = a.iter().position(|x| x == "--max-noise").unwrap();
+        assert_eq!(a[i + 1], GATE_OFF_MAX_NOISE.to_string(),
+            "off must send the neutral value, not the user's threshold");
+
+        p.gate_noise_on = true;
+        let a = args_of(&p);
+        let i = a.iter().position(|x| x == "--max-noise").unwrap();
+        assert_eq!(a[i + 1], "0.05", "back on must restore the user's own value");
+    }
+
+    #[test]
+    fn every_gate_can_be_switched_off_independently() {
+        for k in 0..5 {
+            let mut p = ViewerPrefs::default();
+            match k {
+                0 => p.gate_noise_on = false,
+                1 => p.gate_static_on = false,
+                2 => p.gate_stalls_on = false,
+                3 => p.gate_flash_on = false,
+                _ => p.gate_coherence_on = false,
+            }
+            let a = args_of(&p);
+            let neutral = [
+                GATE_OFF_MAX_NOISE, GATE_OFF_MIN_CHANGE, GATE_OFF_MAX_STILL_RUN,
+                GATE_OFF_MAX_LEVEL_JUMP, GATE_OFF_MIN_COHERENCE,
+            ][k];
+            let flag = EXPECTED[k];
+            let i = a.iter().position(|x| x == flag).unwrap();
+            assert_eq!(a[i + 1], neutral.to_string(), "{flag} did not go neutral");
+        }
     }
 }

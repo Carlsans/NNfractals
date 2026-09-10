@@ -973,6 +973,34 @@ mod tests {
     }
 
     #[test]
+    fn the_neutral_values_really_disable_every_gate() {
+        // The viewer's per-gate "off" switch passes these instead of the user's
+        // threshold, and the row says "never rejects". Each is the exact bound
+        // of what its measurement can produce, so that claim has to hold even
+        // for the worst clip imaginable — verified end to end on a real genome
+        // (42/42 candidates passed with all five neutral).
+        let off = TimeExploreOpts {
+            max_noise: 1.0,
+            min_change: 0.0,
+            max_still_run: 1.0,
+            max_level_jump: 255.0,
+            min_coherence: -1.0,
+            ..Default::default()
+        };
+        let worst = ClipStats {
+            max_noise: 1.0,          // every textured tile is dither
+            min_coherence: -1.0,     // perfectly anti-correlated frames
+            mean_coherence: -1.0,
+            mean_change: 0.0,        // and it does not move
+            min_change: 0.0,
+            longest_still_run: 1.0,  // frozen throughout
+            max_level_jump: 255.0,   // black to white in one frame
+        };
+        assert_eq!(gate(&worst, &off), None,
+            "a gate at its neutral value must not fire even on the worst possible clip");
+    }
+
+    #[test]
     fn the_noise_gate_fires_before_the_others() {
         // Order matters: a noisy clip is also usually incoherent, and "noise"
         // is the more actionable diagnosis.

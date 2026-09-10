@@ -29,6 +29,9 @@ colormap_loop_state.json
 .run_pids
 browser_prefs.toml
 launcher_prefs.toml
+# Per-user viewer state (window size, export resolution, search gates). Was
+# briefly committed by accident when it moved to the project root.
+viewer_prefs.toml
 breeding/
 pref_model.npz
 ratings.jsonl
