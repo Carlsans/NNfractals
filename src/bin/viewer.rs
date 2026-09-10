@@ -26,7 +26,7 @@ use nnfractals::dd::Dd;
 #[cfg(feature = "wgpu-backend")]
 use nnfractals::explore::{self, ScoreMethod};
 use nnfractals::genome::Genome;
-use nnfractals::formula::{ModShape, ModTarget, TimeMod};
+use nnfractals::formula::{blend_fraction, ModShape, ModTarget, TimeMod};
 use nnfractals::time_explore;
 use nnfractals::io::{load_genome, save_genome, save_png};
 use nnfractals::aesthetic::AestheticScorer;
@@ -706,6 +706,18 @@ impl ViewerPrefs {
 
 /// One row of the time-axis winners gallery, read back from
 /// `time_winners.jsonl`.
+/// One row of the formula-morph winners gallery, from `blend_winners.jsonl`.
+#[derive(Clone, Debug)]
+struct BlendWinnerUi {
+    partner_path: PathBuf,
+    partner_id: String,
+    shape: ModShape,
+    amp: f32,
+    score: f64,
+    coherence: f32,
+    clip: Option<PathBuf>,
+}
+
 #[derive(Clone, Debug)]
 struct TimeWinnerUi {
     tmod: TimeMod,
@@ -741,6 +753,20 @@ struct App {
     /// against a different fractal is meaningless, so it is refused.
     time_winners_genome: String,
     time_message: String,
+
+    // ── Formula morphing: a second fractal as the axis ────────────────────
+    /// The fractal being morphed toward. `None` = no morph.
+    blend_partner: Option<Genome>,
+    blend_partner_path: String,
+    blend_shape: ModShape,
+    /// How far toward the partner to travel, in [0,1]. Rarely 1: a full sweep
+    /// usually crosses a bifurcation and reads as a cut.
+    blend_amp: f32,
+    blend_freq: f32,
+    blend_pool_str: String,
+    blend_samples_str: String,
+    blend_winners: Vec<BlendWinnerUi>,
+    blend_message: String,
 
     view:         View,
     default_view: View,
@@ -1282,6 +1308,15 @@ impl App {
             time_winners: Vec::new(),
             time_winners_genome: String::new(),
             time_message: String::new(),
+            blend_partner: None,
+            blend_partner_path: String::new(),
+            blend_shape: ModShape::Sine,
+            blend_amp: 0.15,
+            blend_freq: 1.0,
+            blend_pool_str: "fractals_1".to_string(),
+            blend_samples_str: "40".to_string(),
+            blend_winners: Vec::new(),
+            blend_message: String::new(),
             view: default_view.clone(),
             default_view,
             view_stack: Vec::new(),
@@ -1414,7 +1449,7 @@ impl App {
             // scrubber moves, so the animated genome has to travel with every
             // request. No new field: `at_time` returns a plain Genome, which is
             // exactly what this slot already carries.
-            genome: (!self.time_mod.is_empty()).then(|| self.render_genome()),
+            genome: self.time_axis_active().then(|| self.render_genome()),
         });
     }
 
@@ -1422,12 +1457,29 @@ impl App {
     /// live time modulation baked in at the current scrub position. Identical
     /// to the loaded genome when nothing is animating.
     fn render_genome(&self) -> Genome {
-        if self.time_mod.is_empty() {
-            return self.genome.clone();
+        let g = if self.time_mod.is_empty() {
+            self.genome.clone()
+        } else {
+            let mut g = self.genome.clone();
+            g.time_mod = self.time_mod.clone();
+            g.at_time(self.time_t)
+        };
+        // The morph runs on top of any scalar modulation, so both axes can be
+        // active at once. An incompatible pair falls back to the unblended
+        // genome rather than failing the render.
+        match &self.blend_partner {
+            Some(p) => {
+                let s = blend_fraction(self.blend_shape, self.blend_freq, 0.0, self.blend_amp, self.time_t);
+                g.blend_with(p, s).unwrap_or(g)
+            }
+            None => g,
         }
-        let mut g = self.genome.clone();
-        g.time_mod = self.time_mod.clone();
-        g.at_time(self.time_t)
+    }
+
+    /// Whether anything is animating, i.e. whether the worker's cached genome
+    /// goes stale as `time_t` moves.
+    fn time_axis_active(&self) -> bool {
+        !self.time_mod.is_empty() || self.blend_partner.is_some()
     }
 
     fn push_view(&mut self) -> View {
@@ -3030,6 +3082,7 @@ impl App {
             chain_label: None,
             keyframe_stride,
             time_mod: Vec::new(), time_frames: 0,
+            blend_nn_filename: None, blend_shape: String::new(), blend_amp: 0.0,
         };
         let mut items = nnfractals::video_export::load_queue();
         items.push(item);
@@ -3119,6 +3172,7 @@ impl App {
                 chain_label: Some("wormhole chain".to_string()),
             keyframe_stride,
             time_mod: Vec::new(), time_frames: 0,
+            blend_nn_filename: None, blend_shape: String::new(), blend_amp: 0.0,
         };
             let mut items = nnfractals::video_export::load_queue();
             items.push(item);
@@ -3562,8 +3616,9 @@ impl App {
 
     /// Queue a time video of the current modulation at the current view.
     fn queue_time_video(&mut self) {
-        if self.time_mod.is_empty() {
-            self.time_message = "add a modulation first — there would be nothing to animate".into();
+        if self.time_mod.is_empty() && self.blend_partner.is_none() {
+            self.time_message =
+                "add a modulation or a morph partner first — there would be nothing to animate".into();
             return;
         }
         let frames: u32 = self.time_frames_str.trim().parse().unwrap_or(96).max(2);
@@ -3607,6 +3662,19 @@ impl App {
             self.time_message = format!("queue FAILED: {e}");
             return;
         }
+        // The morph partner goes into the queue dir as its own .nn: the item
+        // references it by filename, exactly as it does the main genome.
+        let blend_file = match &self.blend_partner {
+            Some(p) => {
+                let name = format!("{id}_partner.nn");
+                if let Err(e) = nnfractals::io::save_genome(p, &qdir.join(&name)) {
+                    self.time_message = format!("queue FAILED: {e}");
+                    return;
+                }
+                Some(name)
+            }
+            None => None,
+        };
 
         // start == end: a time video's camera does not move. `keyframe_stride`
         // is 1 rather than the video panel's value — save_queue would force it
@@ -3636,6 +3704,9 @@ impl App {
             keyframe_stride: 1,
             time_mod: self.time_mod.clone(),
             time_frames: frames,
+            blend_nn_filename: blend_file,
+            blend_shape: self.blend_shape.label().to_string(),
+            blend_amp: self.blend_amp,
         };
         let mut items = nnfractals::video_export::load_queue();
         items.push(item);
@@ -3643,6 +3714,102 @@ impl App {
 
         wake_or_launch_queue_window();
         self.time_message = format!("queued a {frames}-frame time video ✓");
+    }
+
+    fn blend_out_dir(&self) -> PathBuf {
+        let stem = self.nn_path.file_stem().and_then(|s| s.to_str()).unwrap_or("genome");
+        nnfractals::project_root().join(format!("viewer_output/blend_explore/{stem}"))
+    }
+
+    /// Load a specific fractal as the morph partner, reporting exactly why if
+    /// it cannot be one.
+    fn set_blend_partner(&mut self, path: &Path) {
+        match nnfractals::io::load_genome(path) {
+            Ok(p) => match self.genome.blend_compatibility(&p) {
+                Ok(()) => {
+                    self.blend_partner_path = path.to_string_lossy().into_owned();
+                    self.blend_message = format!(
+                        "morphing toward {:016x} ({} live nodes + {} = {} of 24 slots)",
+                        p.id,
+                        nnfractals::genome::live_len(&self.genome.program),
+                        nnfractals::genome::live_len(&p.program),
+                        nnfractals::genome::live_len(&self.genome.program)
+                            + nnfractals::genome::live_len(&p.program)
+                            + nnfractals::genome::BLEND_GLUE_NODES,
+                    );
+                    self.blend_partner = Some(p);
+                    self.time_t = 0.0;
+                    self.request_render(true);
+                }
+                Err(why) => self.blend_message = format!("cannot morph into that one — {why}"),
+            },
+            Err(e) => self.blend_message = format!("cannot load {}: {e}", path.display()),
+        }
+    }
+
+    fn start_blend_explore(&mut self) {
+        if self.eo_busy {
+            self.blend_message = "a pipeline stage is already running".to_string();
+            return;
+        }
+        let out_dir = self.blend_out_dir();
+        if let Err(e) = std::fs::create_dir_all(&out_dir) {
+            self.blend_message = format!("cannot create {}: {e}", out_dir.display());
+            return;
+        }
+        let seed_path = out_dir.join("_seed_genome.nn");
+        if let Err(e) = nnfractals::io::save_genome(&self.genome, &seed_path) {
+            self.blend_message = format!("cannot save seed genome: {e}");
+            return;
+        }
+        let samples: usize = self.blend_samples_str.trim().parse().unwrap_or(40).max(1);
+        let mut args: Vec<String> = vec![
+            "blend-explore".into(),
+            seed_path.to_string_lossy().into_owned(),
+            format!("{}", self.view.cx),
+            format!("{}", self.view.cy),
+            format!("{}", self.view.zoom),
+            "--pool".into(), self.blend_pool_str.trim().to_string(),
+            "--samples".into(), samples.to_string(),
+            "--out".into(), out_dir.to_string_lossy().into_owned(),
+            "--keep-clips".into(),
+        ];
+        if self.angle_coloring { args.push("--angle-coloring".into()); }
+        self.blend_winners.clear();
+        self.blend_message = format!("searching {samples} fractals for one that morphs well…");
+        let program = locate_sibling_bin("explorer");
+        let cwd = nnfractals::project_root();
+        self.spawn_explore_stage("Blend exploring", program, args, cwd);
+    }
+
+    fn load_blend_winners(&mut self) {
+        let dir = self.blend_out_dir();
+        let Ok(text) = std::fs::read_to_string(dir.join("blend_winners.jsonl")) else {
+            self.blend_message = "no results yet".into();
+            return;
+        };
+        let mut out = Vec::new();
+        let mut rejected = 0usize;
+        for line in text.lines() {
+            let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else { continue };
+            if !v["rejected"].is_null() { rejected += 1; continue; }
+            let Some(shape) = v["shape"].as_str().and_then(ModShape::parse) else { continue };
+            out.push(BlendWinnerUi {
+                partner_path: PathBuf::from(v["partner_path"].as_str().unwrap_or_default()),
+                partner_id: v["partner_id"].as_str().unwrap_or_default().to_string(),
+                shape,
+                amp: v["amp"].as_f64().unwrap_or(0.15) as f32,
+                score: v["score"].as_f64().unwrap_or(0.0),
+                coherence: v["min_coherence"].as_f64().unwrap_or(0.0) as f32,
+                clip: v["clip"].as_str().map(|c| dir.join(c)),
+            });
+        }
+        self.blend_message = if out.is_empty() {
+            format!("nothing morphed well ({rejected} tried) — try more samples, or a smaller travel")
+        } else {
+            format!("{} partners morph well ({rejected} rejected)", out.len())
+        };
+        self.blend_winners = out;
     }
 
     fn show_time_window(&mut self, ctx: &egui::Context) {
@@ -3654,9 +3821,15 @@ impl App {
         let mut remove: Option<usize> = None;
         let mut apply_winner: Option<usize> = None;
         let mut add_winner: Option<usize> = None;
+        let mut load_partner = false;
+        let mut remove_partner = false;
+        let mut do_blend_search = false;
+        let mut load_blend_results = false;
+        let mut apply_blend: Option<usize> = None;
         let mut open_clip: Option<PathBuf> = None;
         let mut changed = false;
         let winners = self.time_winners.clone();
+        let blend_winners = self.blend_winners.clone();
         let winners_match = self.time_winners_genome == format!("{:016x}", self.genome.id);
 
         egui::Window::new("⏱ Time")
@@ -3776,6 +3949,98 @@ impl App {
                     }
                 });
 
+                // ── Second fractal as the axis ────────────────────────────
+                ui.separator();
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("Morph into another fractal").strong());
+                    if self.blend_partner.is_some() && ui.small_button("✕ remove").clicked() {
+                        remove_partner = true;
+                    }
+                });
+                ui.label(egui::RichText::new(
+                    "Blends the two FORMULAS, not the images: z' = f_A + s·(f_B − f_A), so every \
+                     frame is a real fractal rather than a cross-fade. Travel is rarely worth \
+                     taking to 1 — the linear blend usually passes through a point where the \
+                     dynamics change abruptly, and the clip reads as a cut. Measured on real \
+                     pairs: coherence averaged 0.66 at travel 0.15 and 0.25 at 1.0."
+                ).color(Color32::GRAY).small());
+
+                ui.horizontal(|ui| {
+                    ui.label("Partner:");
+                    ui.add(egui::TextEdit::singleline(&mut self.blend_partner_path)
+                        .desired_width(280.0)
+                        .hint_text("path to a .nn file"));
+                    if ui.button("＋ Add fractal")
+                        .on_hover_text("Load this .nn as the fractal to morph toward.")
+                        .clicked()
+                    { load_partner = true; }
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Travel:");
+                    if ui.add(egui::Slider::new(&mut self.blend_amp, 0.0..=1.0).fixed_decimals(2))
+                        .on_hover_text("How far toward the other formula the morph goes. 0 is your \
+                                        fractal untouched; 1 fully becomes the other one.")
+                        .changed()
+                    { changed = true; }
+                    egui::ComboBox::from_id_salt("blend_shape")
+                        .selected_text(self.blend_shape.label())
+                        .width(95.0)
+                        .show_ui(ui, |ui| {
+                            for sh in ModShape::ALL {
+                                let label = if sh.loops() { format!("{} (loops)", sh.label()) }
+                                            else { sh.label().to_string() };
+                                if ui.selectable_value(&mut self.blend_shape, *sh, label).clicked() {
+                                    changed = true;
+                                }
+                            }
+                        });
+                });
+
+                ui.horizontal(|ui| {
+                    ui.label("Pool:");
+                    ui.add(egui::TextEdit::singleline(&mut self.blend_pool_str).desired_width(120.0))
+                        .on_hover_text("Folder of .nn files to draw partners from.");
+                    ui.label("Samples:");
+                    ui.add(egui::TextEdit::singleline(&mut self.blend_samples_str).desired_width(50.0))
+                        .on_hover_text("How many random fractals to draw and try. Each costs a short \
+                                        clip, so this is the search budget. Draws that cannot blend \
+                                        at all (julia-mode mismatch, or two programs too big to fit \
+                                        together) are rejected without rendering, so they are cheap.");
+                    if ui.add_enabled(!self.eo_busy, egui::Button::new("🔍 Find a partner"))
+                        .on_hover_text("Samples the pool, morphs into each candidate and ranks them \
+                                        with the same gates as the time-axis search.")
+                        .clicked()
+                    { do_blend_search = true; }
+                    if ui.button("Load last").clicked() { load_blend_results = true; }
+                });
+
+                if !self.blend_winners.is_empty() {
+                    egui::ScrollArea::vertical().max_height(140.0).id_salt("blend_winners").show(ui, |ui| {
+                        for (i, w) in blend_winners.iter().enumerate() {
+                            ui.horizontal(|ui| {
+                                ui.label(egui::RichText::new(format!("{:>2}.", i + 1)).monospace());
+                                ui.label(egui::RichText::new(format!("{:.4}", w.score))
+                                    .monospace().color(Color32::LIGHT_BLUE));
+                                ui.label(egui::RichText::new(&w.partner_id).monospace().small());
+                                ui.label(egui::RichText::new(
+                                    format!("{} travel {:.2} · coh {:.2}", w.shape.label(), w.amp, w.coherence)
+                                ).small().color(Color32::GRAY));
+                                if ui.button("Apply").on_hover_text("Use this partner and its settings.").clicked() {
+                                    apply_blend = Some(i);
+                                }
+                                if let Some(c) = &w.clip {
+                                    if c.exists() && ui.small_button("▶").clicked() {
+                                        open_clip = Some(c.clone());
+                                    }
+                                }
+                            });
+                        }
+                    });
+                }
+                if !self.blend_message.is_empty() {
+                    ui.label(egui::RichText::new(&self.blend_message).color(Color32::LIGHT_BLUE).small());
+                }
+
                 // ── Search ────────────────────────────────────────────────
                 ui.separator();
                 ui.horizontal(|ui| {
@@ -3844,7 +4109,8 @@ impl App {
                             if v >= 2 { self.prefs.time_frames = v; self.prefs.save(&self.prefs_path); }
                         }
                     }
-                    if ui.add_enabled(!self.time_mod.is_empty(), egui::Button::new("＋ Queue time video"))
+                    let can_queue = !self.time_mod.is_empty() || self.blend_partner.is_some();
+                    if ui.add_enabled(can_queue, egui::Button::new("＋ Queue time video"))
                         .on_hover_text("Adds a queue item that holds THIS view still and sweeps the \
                                         modulation, at the Video panel's resolution and fps. Output \
                                         goes to viewer_output/time_videos. Keyframe warping is \
@@ -3858,12 +4124,13 @@ impl App {
                 // else for a minute and a half — which reads as a hang. The
                 // subprocess's stdout already streams into eo_log; surface the
                 // tail of it here rather than only in the Explore window.
-                let searching = self.eo_busy && self.eo_stage == "Time exploring";
+                let searching = self.eo_busy
+                    && (self.eo_stage == "Time exploring" || self.eo_stage == "Blend exploring");
                 if searching {
                     ui.separator();
                     ui.horizontal(|ui| {
                         ui.spinner();
-                        ui.label(egui::RichText::new("searching the time axis…").color(Color32::YELLOW));
+                        ui.label(egui::RichText::new(format!("{}…", self.eo_stage)).color(Color32::YELLOW));
                         if ui.small_button("Cancel").clicked() {
                             self.cancel_explore_stage();
                         }
@@ -3912,6 +4179,24 @@ impl App {
                 std::thread::spawn(move || { let mut c = child; let _ = c.wait(); });
             }
         }
+        if load_partner {
+            let p = PathBuf::from(self.blend_partner_path.trim());
+            self.set_blend_partner(&p);
+        }
+        if remove_partner {
+            self.blend_partner = None;
+            self.blend_message = "morph removed".into();
+            changed = true;
+        }
+        if let Some(i) = apply_blend {
+            if let Some(w) = self.blend_winners.get(i).cloned() {
+                self.blend_shape = w.shape;
+                self.blend_amp = w.amp;
+                self.set_blend_partner(&w.partner_path);
+            }
+        }
+        if do_blend_search { self.start_blend_explore(); }
+        if load_blend_results { self.load_blend_winners(); }
         if do_search { self.start_time_explore(); }
         if do_queue { self.queue_time_video(); }
         if changed { self.request_render(true); }
@@ -4440,6 +4725,7 @@ impl App {
             chain_label: Some("zoom-explore chain".to_string()),
             keyframe_stride,
             time_mod: Vec::new(), time_frames: 0,
+            blend_nn_filename: None, blend_shape: String::new(), blend_amp: 0.0,
         };
         let mut items = nnfractals::video_export::load_queue();
         items.push(item);
@@ -5372,6 +5658,7 @@ impl eframe::App for App {
             // relies on.
             let mut just_finished_video_zoom = false;
             let mut just_finished_time = false;
+            let mut just_finished_blend = false;
             while let Ok(msg) = rx.try_recv() {
                 match msg {
                     ExploreOpsMsg::Line(l) => {
@@ -5382,6 +5669,7 @@ impl eframe::App for App {
                         self.eo_message = format!("{} finished ✓", self.eo_stage);
                         just_finished_video_zoom = self.eo_stage == "Video-zoom exploring";
                         just_finished_time = self.eo_stage == "Time exploring";
+                        just_finished_blend = self.eo_stage == "Blend exploring";
                         finished = true;
                     }
                     ExploreOpsMsg::Failed(e) => {
@@ -5399,6 +5687,9 @@ impl eframe::App for App {
             }
             if just_finished_time {
                 self.load_time_winners();
+            }
+            if just_finished_blend {
+                self.load_blend_winners();
             }
             if finished {
                 self.eo_busy = false;
@@ -5418,7 +5709,7 @@ impl eframe::App for App {
         // takes `time_period` seconds whatever the render is costing. A
         // per-frame step would make a slow deep view crawl and a cheap one
         // race.
-        if self.time_playing && !self.time_mod.is_empty() {
+        if self.time_playing && self.time_axis_active() {
             let dt = ctx.input(|i| i.stable_dt).clamp(0.0, 0.25);
             self.time_t = (self.time_t + dt / self.time_period.max(0.1)).fract();
             self.request_render(true);

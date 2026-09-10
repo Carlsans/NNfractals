@@ -438,6 +438,22 @@ fn gate(stats: &ClipStats, opts: &TimeExploreOpts) -> Option<&'static str> {
     None
 }
 
+/// Gate and score an already-rendered clip. The one place the two searches —
+/// scalar modulation and formula morph — agree on what "good" means.
+pub fn score_clip(frames: &[Vec<u8>], opts: &TimeExploreOpts) -> (ClipStats, Option<&'static str>, f64) {
+    if frames.len() < 2 {
+        return (ClipStats::default(), Some("empty"), 0.0);
+    }
+    let stats = clip_stats(frames, opts.probe_w, opts.probe_h);
+    let rejected = gate(&stats, opts);
+    let score = if rejected.is_none() {
+        probe_frames_score(frames, opts.fps, opts.probe_w, opts.probe_h, None).unwrap_or(0.0)
+    } else {
+        0.0
+    };
+    (stats, rejected, score)
+}
+
 /// Every (target × shape × amplitude) combination this sweep will try.
 pub fn candidate_mods(g: &Genome, opts: &TimeExploreOpts) -> Vec<TimeMod> {
     let mut out = Vec::new();
@@ -468,13 +484,7 @@ pub fn run(
             &probe, config, opts.angle_coloring, view, opts.frames, opts.probe_w, opts.probe_h,
         ).collect();
 
-        let stats = clip_stats(&frames, opts.probe_w, opts.probe_h);
-        let rejected = gate(&stats, opts);
-        let score = if rejected.is_none() {
-            probe_frames_score(&frames, opts.fps, opts.probe_w, opts.probe_h, None).unwrap_or(0.0)
-        } else {
-            0.0
-        };
+        let (stats, rejected, score) = score_clip(&frames, opts);
         // Frames are dropped here — a full sweep holds one clip at a time.
         let cand = TimeCandidate { tmod, score, stats, rejected };
         on_progress(i + 1, total, &tmod, &cand);
@@ -1024,5 +1034,256 @@ mod tests {
         for reason in ["noise", "static", "stalls", "flash", "incoherent"] {
             assert!(s.contains(&format!("1 {reason}")), "{reason} missing from: {s}");
         }
+    }
+}
+
+// ── Formula morphing: search the pool for a fractal that blends well ────────
+
+/// One candidate partner fractal, and how well morphing into it went.
+#[derive(Clone, Debug)]
+pub struct BlendCandidate {
+    pub partner_path: PathBuf,
+    pub partner_id: String,
+    pub shape: ModShape,
+    /// How far toward the partner the morph travels, in [0,1].
+    pub amp: f32,
+    pub score: f64,
+    pub stats: ClipStats,
+    /// Which gate stopped it, or why it could not be blended at all.
+    pub rejected: Option<&'static str>,
+    /// Detail for the incompatible case, which is not a gate result.
+    pub note: String,
+}
+
+impl BlendCandidate {
+    pub fn passed(&self) -> bool {
+        self.rejected.is_none()
+    }
+}
+
+/// Shapes tried per partner. Periodic ones give an A→B→A ping-pong that loops;
+/// a one-way ramp cannot, so it is not in the default set.
+pub const BLEND_SHAPES: &[ModShape] = &[ModShape::Sine, ModShape::Triangle];
+
+/// How far toward the partner formula to travel. Measured on real archive
+/// pairs, a full 0→1 sweep crosses a bifurcation for most of them and the clip
+/// reads as a cut; a partial morph is continuous and watchable. Swept like the
+/// scalar search sweeps amplitudes.
+pub const BLEND_AMPS: &[f32] = &[0.15, 0.35, 0.7, 1.0];
+
+/// Sample `max_samples` genomes from `pool_dir`, keep the ones that can blend
+/// with `g`, render a short morph for each and rank them.
+///
+/// Sampling rather than exhausting the pool is the point: a pool holds tens of
+/// thousands of genomes and each candidate costs a clip. `max_samples` is the
+/// budget, and incompatible draws are cheap to reject (no render), so the real
+/// cost is the number that survive compatibility.
+#[allow(clippy::too_many_arguments)]
+pub fn blend_pool_search(
+    g: &Genome, config: &Config, view: &View, pool_dir: &Path,
+    max_samples: usize, seed: u64, opts: &TimeExploreOpts,
+    on_progress: &dyn Fn(usize, usize, &BlendCandidate),
+) -> Vec<BlendCandidate> {
+    use rand::seq::SliceRandom;
+    use rand::SeedableRng;
+
+    let mut paths: Vec<PathBuf> = std::fs::read_dir(pool_dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("nn"))
+        .collect();
+    let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
+    paths.shuffle(&mut rng);
+
+    let self_id = format!("{:016x}", g.id);
+    let mut out: Vec<BlendCandidate> = Vec::new();
+    let mut looked = 0usize;
+
+    for path in paths {
+        if looked >= max_samples {
+            break;
+        }
+        let Ok(partner) = crate::io::load_genome(&path) else { continue };
+        let pid = format!("{:016x}", partner.id);
+        if pid == self_id {
+            continue;
+        }
+        looked += 1;
+
+        if let Err(why) = g.blend_compatibility(&partner) {
+            let cand = BlendCandidate {
+                partner_path: path.clone(), partner_id: pid, shape: BLEND_SHAPES[0], amp: 0.0,
+                score: 0.0, stats: ClipStats::default(),
+                rejected: Some("incompatible"), note: why,
+            };
+            on_progress(looked, max_samples, &cand);
+            out.push(cand);
+            continue;
+        }
+
+        for &shape in BLEND_SHAPES {
+            for &amp in BLEND_AMPS {
+                let frames: Vec<Vec<u8>> = crate::video_export::blend_frames(
+                    g, &partner, config, opts.angle_coloring, view,
+                    opts.frames, opts.probe_w, opts.probe_h, shape, 1.0, 0.0, amp,
+                ).collect();
+                let (stats, rejected, score) = score_clip(&frames, opts);
+                let cand = BlendCandidate {
+                    partner_path: path.clone(), partner_id: pid.clone(), shape, amp,
+                    score, stats, rejected, note: String::new(),
+                };
+                on_progress(looked, max_samples, &cand);
+                out.push(cand);
+            }
+        }
+    }
+
+    out.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+    out
+}
+
+/// Write `blend_winners.jsonl` plus a clip per surviving winner.
+#[allow(clippy::too_many_arguments)]
+pub fn write_blend_manifest(
+    out_dir: &Path, cands: &[BlendCandidate], g: &Genome, config: &Config,
+    view: &View, opts: &TimeExploreOpts, keep_clips: bool,
+) -> std::io::Result<Vec<PathBuf>> {
+    std::fs::create_dir_all(out_dir)?;
+    let mut clips = Vec::new();
+    if keep_clips {
+        for (rank, c) in cands.iter().filter(|c| c.passed()).take(opts.top_k).enumerate() {
+            let Ok(partner) = crate::io::load_genome(&c.partner_path) else { continue };
+            let path = out_dir.join(format!("blend_{rank:02}.mp4"));
+            let frames: Vec<Vec<u8>> = crate::video_export::blend_frames(
+                g, &partner, config, opts.angle_coloring, view,
+                opts.frames, opts.probe_w, opts.probe_h, c.shape, 1.0, 0.0, c.amp,
+            ).collect();
+            if probe_frames_score(&frames, opts.fps, opts.probe_w, opts.probe_h, Some(&path)).is_some() {
+                clips.push(path);
+            }
+        }
+    }
+
+    let mut lines = String::new();
+    for (rank, c) in cands.iter().enumerate() {
+        let clip = if c.passed() && rank < clips.len() {
+            serde_json::Value::String(
+                clips[rank].file_name().unwrap_or_default().to_string_lossy().into_owned())
+        } else {
+            serde_json::Value::Null
+        };
+        let v = serde_json::json!({
+            "rank": rank,
+            "genome_id": format!("{:016x}", g.id),
+            "partner_id": c.partner_id,
+            "partner_path": c.partner_path.to_string_lossy(),
+            "shape": c.shape.label(),
+            "amp": c.amp,
+            "score": c.score,
+            "min_coherence": c.stats.min_coherence,
+            "mean_change": c.stats.mean_change,
+            "longest_still_run": c.stats.longest_still_run,
+            "max_level_jump": c.stats.max_level_jump,
+            "max_noise": c.stats.max_noise,
+            "rejected": c.rejected,
+            "note": c.note,
+            "clip": clip,
+            "view": { "cx": view.cx, "cy": view.cy, "zoom": view.zoom },
+        });
+        lines.push_str(&v.to_string());
+        lines.push('\n');
+    }
+    std::fs::write(out_dir.join("blend_winners.jsonl"), lines)?;
+    Ok(clips)
+}
+
+/// One-line summary of a blend search, naming why nothing survived when
+/// nothing does.
+pub fn blend_summary(cands: &[BlendCandidate]) -> String {
+    let passed = cands.iter().filter(|c| c.passed()).count();
+    if passed > 0 {
+        let best = &cands[0];
+        return format!(
+            "{passed} of {} tried; best partner {} ({} amp {:.2}) score {:.4}  worst-coherence {:.2}  change {:.1}",
+            cands.len(), best.partner_id, best.shape.label(), best.amp,
+            best.score, best.stats.min_coherence, best.stats.mean_change,
+        );
+    }
+    let mut counts: std::collections::BTreeMap<&'static str, usize> = std::collections::BTreeMap::new();
+    for c in cands {
+        if let Some(why) = c.rejected {
+            *counts.entry(why).or_insert(0) += 1;
+        }
+    }
+    let breakdown: Vec<String> = counts.iter().map(|(k, n)| format!("{n} {k}")).collect();
+    let mut advice = String::new();
+    if counts.get("incompatible").copied().unwrap_or(0) > cands.len() / 2 {
+        advice = " Most draws could not be blended at all — usually a julia-mode mismatch \
+                  or two programs too large to fit together. Raising --samples helps; so does \
+                  starting from a genome with a short formula.".into();
+    }
+    format!("0 of {} candidates passed ({}).{advice}", cands.len(), breakdown.join(", "))
+}
+
+#[cfg(test)]
+mod blend_search_tests {
+    use super::*;
+    use crate::formula::{blend_fraction, ModShape};
+
+    #[test]
+    fn travel_caps_how_far_the_morph_goes() {
+        // The measured fix: a full sweep crosses a bifurcation on most real
+        // pairs (mean coherence 0.25 at travel 1.0 vs 0.66 at 0.15), so the
+        // amplitude has to actually bound s.
+        for amp in [0.15f32, 0.35, 0.7, 1.0] {
+            let mut hi = 0.0f32;
+            for i in 0..200 {
+                let t = i as f32 / 200.0;
+                let s = blend_fraction(ModShape::Sine, 1.0, 0.0, amp, t);
+                assert!((0.0..=amp + 1e-5).contains(&s), "s={s} outside [0,{amp}]");
+                hi = hi.max(s);
+            }
+            assert!((hi - amp).abs() < 0.05, "travel {amp} should be reached, peaked at {hi}");
+        }
+    }
+
+    #[test]
+    fn zero_travel_never_leaves_the_first_fractal() {
+        for i in 0..50 {
+            let t = i as f32 / 50.0;
+            assert_eq!(blend_fraction(ModShape::Sine, 1.0, 0.0, 0.0, t), 0.0);
+        }
+    }
+
+    #[test]
+    fn periodic_shapes_return_to_where_they_started() {
+        for shape in [ModShape::Sine, ModShape::Triangle, ModShape::Cosine, ModShape::Orbit] {
+            let a = blend_fraction(shape, 1.0, 0.0, 0.5, 0.0);
+            let b = blend_fraction(shape, 1.0, 0.0, 0.5, 1.0);
+            assert!((a - b).abs() < 1e-5, "{shape:?} does not loop: {a} vs {b}");
+        }
+    }
+
+    #[test]
+    fn a_ramp_reaches_the_partner_and_stops() {
+        assert_eq!(blend_fraction(ModShape::Ramp, 1.0, 0.0, 1.0, 0.0), 0.0);
+        assert!((blend_fraction(ModShape::Ramp, 1.0, 0.0, 1.0, 0.99) - 0.99).abs() < 0.02);
+    }
+
+    #[test]
+    fn the_blend_summary_explains_a_mostly_incompatible_pool() {
+        let cands: Vec<BlendCandidate> = (0..10).map(|i| BlendCandidate {
+            partner_path: PathBuf::from("x.nn"),
+            partner_id: format!("{i:016x}"),
+            shape: ModShape::Sine, amp: 1.0, score: 0.0,
+            stats: ClipStats::default(),
+            rejected: Some("incompatible"),
+            note: "julia mode differs".into(),
+        }).collect();
+        let s = blend_summary(&cands);
+        assert!(s.contains("10 incompatible"), "{s}");
+        assert!(s.contains("julia-mode mismatch"), "must say why: {s}");
     }
 }

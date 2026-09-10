@@ -2249,6 +2249,70 @@ fn main() {
             let keep_clips = args.iter().any(|a| a == "--keep-clips");
             cmd_time_explore(&formula, genome_override, cx, cy, zoom, &out_dir, opts, keep_clips);
         }
+        Some("blend-explore") => {
+            // Search the pool for a fractal whose FORMULA morphs well into this
+            // one's. Same gates and the same compression score as
+            // `time-explore`; the axis is a second genome instead of a scalar.
+            let formula = pos.get(1).cloned().unwrap_or_default();
+            let formula_path = Path::new(&formula);
+            let Some(genome) = io::load_genome(formula_path).ok() else {
+                eprintln!("cannot load genome {}: blend-explore needs a .nn file", formula_path.display());
+                std::process::exit(2);
+            };
+            let cx: f64 = pos.get(2).and_then(|s| s.parse().ok()).unwrap_or(genome.view_cx as f64);
+            let cy: f64 = pos.get(3).and_then(|s| s.parse().ok()).unwrap_or(genome.view_cy as f64);
+            let zoom: f64 = pos.get(4).and_then(|s| s.parse().ok()).unwrap_or(genome.view_zoom as f64);
+            let stem = formula_path.file_stem().and_then(|s| s.to_str()).unwrap_or("genome");
+            let out_dir = get_flag(&args, "--out").map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from(format!("explorer_out/{stem}_blend")));
+            let pool = get_flag(&args, "--pool")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| formula_path.parent().unwrap_or(Path::new(".")).to_path_buf());
+            let samples: usize = get_flag_or(&args, "--samples", 40);
+            let seed: u64 = get_flag_or(&args, "--seed", 0);
+
+            let opts = time_explore::TimeExploreOpts {
+                probe_w: get_flag_or(&args, "--probe-w", 160),
+                probe_h: get_flag_or(&args, "--probe-h", 120),
+                frames: get_flag_or(&args, "--frames", 24),
+                fps: get_flag_or(&args, "--fps", 24),
+                top_k: get_flag_or(&args, "--top-k", 8),
+                angle_coloring: args.iter().any(|a| a == "--angle-coloring"),
+                min_coherence: get_flag_or(&args, "--min-coherence", time_explore::MIN_TEMPORAL_COHERENCE),
+                min_change: get_flag_or(&args, "--min-change", time_explore::MIN_TEMPORAL_CHANGE),
+                max_noise: get_flag_or(&args, "--max-noise", time_explore::MAX_CLIP_NOISE),
+                max_still_run: get_flag_or(&args, "--max-still-run", time_explore::MAX_STILL_RUN),
+                max_level_jump: get_flag_or(&args, "--max-level-jump", time_explore::MAX_LEVEL_JUMP),
+                ..Default::default()
+            };
+            let keep_clips = args.iter().any(|a| a == "--keep-clips");
+            let seed = if seed == 0 {
+                std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs()).unwrap_or(1)
+            } else { seed };
+
+            std::fs::create_dir_all(&out_dir).unwrap_or_else(|e| panic!("create {}: {e}", out_dir.display()));
+            let config = load_config();
+            let view = View::new_square(cx, cy, zoom);
+            println!("blend-explore: {stem} vs up to {samples} draws from {} ({}x{} x {} frames)",
+                     pool.display(), opts.probe_w, opts.probe_h, opts.frames);
+
+            let started = std::time::Instant::now();
+            let cands = time_explore::blend_pool_search(
+                &genome, &config, &view, &pool, samples, seed, &opts,
+                &|i, total, c| {
+                    let verdict = match c.rejected {
+                        Some("incompatible") => format!("incompatible: {}", c.note),
+                        Some(why) => format!("rejected: {why}"),
+                        None => format!("score {:.4}", c.score),
+                    };
+                    println!("  [{i}/{total}] {} {} amp {:.2} -> {verdict}", c.partner_id, c.shape.label(), c.amp);
+                });
+            time_explore::write_blend_manifest(&out_dir, &cands, &genome, &config, &view, &opts, keep_clips)
+                .unwrap_or_else(|e| panic!("write {}/blend_winners.jsonl: {e}", out_dir.display()));
+            println!("blend-explore: {} in {:.1}s -> {}",
+                     time_explore::blend_summary(&cands), started.elapsed().as_secs_f32(), out_dir.display());
+        }
         Some("shot") => {
             // Ad-hoc visual inspection utility: render one genome+view
             // straight to a PNG, no pool/manifest/out_dir bookkeeping.
@@ -2409,6 +2473,8 @@ fn main() {
             eprintln!("  nnfractals-explorer time-explore <formula|genome.nn> [cx] [cy] [zoom] [out_dir | --out DIR] [--frames N (48)] [--fps N (24)] [--probe-w N (192)] [--probe-h N (144)] [--amps 0.02,0.08,0.25] [--shapes sine,cosine,triangle,sawtooth,pulse,ramp,orbit] [--top-k N (8)] [--min-coherence F (0.55)] [--min-change F (1.0)] [--max-noise F (0.15)] [--max-still-run F (0.15)] [--max-level-jump F (12)] [--angle-coloring] [--keep-clips]");
             eprintln!("      searches the TIME axis: animates one scalar inside the formula (julia c / phoenix / bailout / a program or warp constant / an inserted scale node) and ranks by how well the clip resists video compression.");
             eprintln!("      three gates, all reported per candidate: 'noise' (spatially dithered frames), 'static' (amplitude too small to see — raise --amps), 'incoherent' (amplitude so large consecutive frames are unrelated: cuts, not a morph — lower --amps).");
+            eprintln!("  nnfractals-explorer blend-explore <genome.nn> [cx] [cy] [zoom] [--out DIR] [--pool DIR] [--samples N (40)] [--seed N] [--frames N (24)] [--probe-w/h N] [--top-k N (8)] [--angle-coloring] [--keep-clips]");
+            eprintln!("      morphs this fractal's FORMULA into other genomes from the pool (z' = f_A + s*(f_B - f_A)) and ranks the partners that morph best, using the same gates as time-explore.");
             eprintln!("  nnfractals-explorer complex-export <zone.nn|zone_dir> [out_dir] [--res 512] [--limit 20]");
             eprintln!("  nnfractals-explorer verify-chain [--queue-id ID (default: newest chain item)] [--stride N] [--max-iter N] [--dump-frames DIR]");
             eprintln!("      replays a queued chain's EXACT export frames offline: per-frame png size + 'flood' (fraction of the frame that is one colour).");

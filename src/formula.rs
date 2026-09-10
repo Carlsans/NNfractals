@@ -274,6 +274,41 @@ impl TimeMod {
     }
 }
 
+/// How far along a blend between two formulas we are at time `t`, in `[0,amp]`.
+///
+/// 0 is entirely the first fractal, 1 entirely the second; `amp` caps how far
+/// the morph travels. Reuses [`ModShape`]
+/// so the same vocabulary drives both kinds of animation — and so the periodic
+/// shapes give a seamless A→B→A ping-pong rather than a one-way sweep that has
+/// to cut back to the start.
+pub fn blend_fraction(shape: ModShape, freq: f32, phase: f32, amp: f32, t: f32) -> f32 {
+    let unit = TimeMod { target: ModTarget::Bailout, shape, amp: 1.0, freq, phase };
+    let v = match shape {
+        // Periodic and continuous: map [-1,1] onto [0,1] so the clip returns to
+        // the fractal it started from.
+        ModShape::Sine | ModShape::Cosine | ModShape::Triangle | ModShape::Orbit => {
+            0.5 + 0.5 * mod_offset(&unit, t).0
+        }
+        // One-way sweeps. Sawtooth repeats (with a cut each cycle); Ramp runs
+        // once and stops at B.
+        ModShape::Sawtooth => {
+            let x = freq * t + phase;
+            x - x.floor()
+        }
+        ModShape::Ramp => freq * t + phase,
+        // Visits B briefly and comes back.
+        ModShape::Pulse => mod_offset(&unit, t).0,
+    };
+    // `amp` caps how far toward the other formula the morph travels. It does
+    // NOT have to reach 1: the linear blend passes through maps whose dynamics
+    // change abruptly — a bifurcation — and measurements on real archive pairs
+    // put that transition somewhere in the middle for most of them. Stopping
+    // short of it gives "A deformed toward B", which is continuous and
+    // watchable, where the full sweep is a cut. Exactly the role `amp` plays
+    // for a scalar modulation.
+    v.clamp(0.0, 1.0) * amp.clamp(0.0, 1.0)
+}
+
 /// The scalar offset for `m` at time `t ∈ [0,1)`.
 ///
 /// This is the real channel; for two-channel targets see [`mod_offset`].

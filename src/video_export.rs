@@ -1401,6 +1401,53 @@ pub fn time_frames<'a>(
     })
 }
 
+/// Frames of a morph between two formulas: the camera is fixed, and the
+/// ITERATION FUNCTION travels from `a` to `b` and (for a periodic shape) back.
+///
+/// `a`'s own `time_mod` still applies, evaluated before the blend, so a scalar
+/// modulation and a formula morph can run at once.
+///
+/// Yields nothing if the pair cannot be blended — see
+/// `Genome::blend_compatibility`.
+#[allow(clippy::too_many_arguments)]
+pub fn blend_frames<'a>(
+    a: &'a Genome, b: &'a Genome, config: &'a Config, angle_coloring: bool,
+    view: &'a View, frames: u32, w: u32, h: u32,
+    shape: crate::formula::ModShape, freq: f32, phase: f32, amp: f32,
+) -> impl Iterator<Item = Vec<u8>> + 'a {
+    let n = frames.max(1);
+    let mut view = view.clone();
+    view.aspect = if h > 0 { w as f64 / h as f64 } else { 1.0 };
+    (0..n).filter_map(move |i| {
+        let t = i as f32 / n as f32;
+        let s = crate::formula::blend_fraction(shape, freq, phase, amp, t);
+        let g = a.at_time(t).blend_with(b, s)?;
+        Some(save_pool().install(|| {
+            render_save(&g, config, &view, w, h, angle_coloring, VIDEO_FRAME_ALLOW_DD)
+        }))
+    })
+}
+
+/// Export a formula-morph video.
+#[allow(clippy::too_many_arguments)]
+pub fn export_blend_video(
+    a: &Genome, b: &Genome, config: &Config, angle_coloring: bool,
+    view: &View, frames: u32, fps: u32, w: u32, h: u32,
+    shape: crate::formula::ModShape, freq: f32, phase: f32, amp: f32,
+    out_path: &Path, tx: &mpsc::Sender<VideoMsg>, on_progress: &(dyn Fn() + Sync),
+) {
+    if let Err(why) = a.blend_compatibility(b) {
+        let _ = tx.send(VideoMsg::Failed(format!("cannot blend these two fractals: {why}")));
+        on_progress();
+        return;
+    }
+    let n = frames.max(2);
+    encode_rgb_frames(
+        blend_frames(a, b, config, angle_coloring, view, n, w, h, shape, freq, phase, amp),
+        n, fps, w, h, out_path, tx, on_progress,
+    );
+}
+
 /// Export a time video: one fixed view, the genome's `time_mod` swept across
 /// `frames` frames.
 ///
@@ -1675,6 +1722,16 @@ pub struct QueueItem {
     /// per leg) so it would be misleading to reuse it.
     #[serde(default)]
     pub time_frames: u32,
+    /// Filename (inside `queue_dir()`) of the fractal this item morphs INTO.
+    /// `None` = no formula morph. Routes the item to `export_blend_video`.
+    #[serde(default)]
+    pub blend_nn_filename: Option<String>,
+    /// Shape driving the morph, by [`crate::formula::ModShape`] label.
+    #[serde(default)]
+    pub blend_shape: String,
+    /// How far toward the partner formula to travel, in [0,1].
+    #[serde(default)]
+    pub blend_amp: f32,
     /// Render only every Nth frame and warp the rest out of the two
     /// bracketing keyframes (see `export_video_chain_interpolated`). 0 or 1
     /// means every frame is rendered exactly, which is the behaviour of
@@ -1707,7 +1764,7 @@ pub fn load_queue() -> Vec<QueueItem> {
 /// relying on every producer to remember.
 fn enforce_time_invariants(items: &mut [QueueItem]) {
     for it in items.iter_mut() {
-        if !it.time_mod.is_empty() {
+        if !it.time_mod.is_empty() || it.blend_nn_filename.is_some() {
             it.keyframe_stride = 1;
             if it.time_frames < 2 {
                 it.time_frames = DEFAULT_TIME_FRAMES;
