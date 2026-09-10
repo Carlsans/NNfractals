@@ -649,6 +649,15 @@ struct ViewerPrefs {
     /// Frames in an exported time video (the ⏱ Time window). Persisted like
     /// the other video knobs.
     #[serde(default = "default_time_frames")] time_frames: u32,
+    // ── Search gates. Persisted so an experiment survives a restart; the
+    // defaults are the calibrated constants in time_explore.
+    #[serde(default = "default_gate_max_noise")]      gate_max_noise: f32,
+    #[serde(default = "default_gate_min_change")]     gate_min_change: f32,
+    #[serde(default = "default_gate_max_still_run")]  gate_max_still_run: f32,
+    #[serde(default = "default_gate_max_level_jump")] gate_max_level_jump: f32,
+    #[serde(default = "default_gate_min_coherence")]  gate_min_coherence: f32,
+    #[serde(default = "default_probe_frames")]        probe_frames: u32,
+    #[serde(default = "default_probe_samples")]       probe_samples: u32,
     #[serde(default)] video_invert_coords: bool,
     #[serde(default)] video_invert_range:  bool,
 }
@@ -666,6 +675,13 @@ fn default_video_height() -> u32 { 720 }
 // verified clean. Set the KF field to 1 in the video row to disable.
 fn default_video_keyframe_stride() -> u32 { 16 }
 fn default_time_frames() -> u32 { 96 }
+fn default_gate_max_noise()      -> f32 { time_explore::MAX_CLIP_NOISE }
+fn default_gate_min_change()     -> f32 { time_explore::MIN_TEMPORAL_CHANGE }
+fn default_gate_max_still_run()  -> f32 { time_explore::MAX_STILL_RUN }
+fn default_gate_max_level_jump() -> f32 { time_explore::MAX_LEVEL_JUMP }
+fn default_gate_min_coherence()  -> f32 { time_explore::MIN_TEMPORAL_COHERENCE }
+fn default_probe_frames()        -> u32 { 48 }
+fn default_probe_samples()       -> u32 { 40 }
 
 impl Default for ViewerPrefs {
     fn default() -> Self {
@@ -683,6 +699,13 @@ impl Default for ViewerPrefs {
             video_height: default_video_height(),
             video_keyframe_stride: default_video_keyframe_stride(),
             time_frames: default_time_frames(),
+            gate_max_noise: default_gate_max_noise(),
+            gate_min_change: default_gate_min_change(),
+            gate_max_still_run: default_gate_max_still_run(),
+            gate_max_level_jump: default_gate_max_level_jump(),
+            gate_min_coherence: default_gate_min_coherence(),
+            probe_frames: default_probe_frames(),
+            probe_samples: default_probe_samples(),
             video_invert_coords: false,
             video_invert_range:  false,
         }
@@ -753,6 +776,9 @@ struct App {
     /// against a different fractal is meaningless, so it is refused.
     time_winners_genome: String,
     time_message: String,
+    /// "12 noise · 5 stalls · 3 flash" — what the last run threw out and why.
+    /// The point of exposing the gates is seeing this move when you change one.
+    time_rejects: String,
 
     // ── Formula morphing: a second fractal as the axis ────────────────────
     /// The fractal being morphed toward. `None` = no morph.
@@ -767,6 +793,7 @@ struct App {
     blend_samples_str: String,
     blend_winners: Vec<BlendWinnerUi>,
     blend_message: String,
+    blend_rejects: String,
 
     view:         View,
     default_view: View,
@@ -1308,6 +1335,7 @@ impl App {
             time_winners: Vec::new(),
             time_winners_genome: String::new(),
             time_message: String::new(),
+            time_rejects: String::new(),
             blend_partner: None,
             blend_partner_path: String::new(),
             blend_shape: ModShape::Sine,
@@ -1317,6 +1345,7 @@ impl App {
             blend_samples_str: "40".to_string(),
             blend_winners: Vec::new(),
             blend_message: String::new(),
+            blend_rejects: String::new(),
             view: default_view.clone(),
             default_view,
             view_stack: Vec::new(),
@@ -3552,6 +3581,7 @@ impl App {
             out_dir.to_string_lossy().into_owned(),
             "--keep-clips".into(),
         ];
+        args.extend(self.gate_args());
         if self.angle_coloring {
             args.push("--angle-coloring".into());
         }
@@ -3606,8 +3636,10 @@ impl App {
                 clip: v["clip"].as_str().map(|c| dir.join(c)),
             });
         }
+        let (_, breakdown) = Self::reject_breakdown(&text);
+        self.time_rejects = breakdown;
         self.time_message = if out.is_empty() {
-            format!("no candidate passed the gates ({rejected} rejected) — see the log above")
+            format!("no candidate passed the gates ({rejected} rejected)")
         } else {
             format!("{} winners ({rejected} rejected)", out.len())
         };
@@ -3716,6 +3748,34 @@ impl App {
         self.time_message = format!("queued a {frames}-frame time video ✓");
     }
 
+    /// The gate thresholds, as CLI flags. Both searches share them so a change
+    /// means the same thing on either axis.
+    fn gate_args(&self) -> Vec<String> {
+        vec![
+            "--max-noise".into(),      self.prefs.gate_max_noise.to_string(),
+            "--min-change".into(),     self.prefs.gate_min_change.to_string(),
+            "--max-still-run".into(),  self.prefs.gate_max_still_run.to_string(),
+            "--max-level-jump".into(), self.prefs.gate_max_level_jump.to_string(),
+            "--min-coherence".into(),  self.prefs.gate_min_coherence.to_string(),
+            "--frames".into(),         self.prefs.probe_frames.to_string(),
+        ]
+    }
+
+    /// Count rejections by reason from a manifest, newest run wins.
+    fn reject_breakdown(text: &str) -> (usize, String) {
+        let mut counts: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+        let mut passed = 0usize;
+        for line in text.lines() {
+            let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else { continue };
+            match v["rejected"].as_str() {
+                Some(why) => *counts.entry(why.to_string()).or_insert(0) += 1,
+                None => passed += 1,
+            }
+        }
+        let parts: Vec<String> = counts.iter().map(|(k, n)| format!("{n} {k}")).collect();
+        (passed, parts.join(" · "))
+    }
+
     fn blend_out_dir(&self) -> PathBuf {
         let stem = self.nn_path.file_stem().and_then(|s| s.to_str()).unwrap_or("genome");
         nnfractals::project_root().join(format!("viewer_output/blend_explore/{stem}"))
@@ -3762,7 +3822,8 @@ impl App {
             self.blend_message = format!("cannot save seed genome: {e}");
             return;
         }
-        let samples: usize = self.blend_samples_str.trim().parse().unwrap_or(40).max(1);
+        let samples: usize = self.blend_samples_str.trim().parse()
+            .unwrap_or(self.prefs.probe_samples as usize).max(1);
         let mut args: Vec<String> = vec![
             "blend-explore".into(),
             seed_path.to_string_lossy().into_owned(),
@@ -3774,6 +3835,7 @@ impl App {
             "--out".into(), out_dir.to_string_lossy().into_owned(),
             "--keep-clips".into(),
         ];
+        args.extend(self.gate_args());
         if self.angle_coloring { args.push("--angle-coloring".into()); }
         self.blend_winners.clear();
         self.blend_message = format!("searching {samples} fractals for one that morphs well…");
@@ -3804,6 +3866,8 @@ impl App {
                 clip: v["clip"].as_str().map(|c| dir.join(c)),
             });
         }
+        let (_, breakdown) = Self::reject_breakdown(&text);
+        self.blend_rejects = breakdown;
         self.blend_message = if out.is_empty() {
             format!("nothing morphed well ({rejected} tried) — try more samples, or a smaller travel")
         } else {
@@ -3826,6 +3890,8 @@ impl App {
         let mut do_blend_search = false;
         let mut load_blend_results = false;
         let mut apply_blend: Option<usize> = None;
+        let mut gates_changed = false;
+        let mut reset_gates = false;
         let mut open_clip: Option<PathBuf> = None;
         let mut changed = false;
         let winners = self.time_winners.clone();
@@ -3946,6 +4012,84 @@ impl App {
                         self.time_t = 0.0;
                         self.time_playing = false;
                         changed = true;
+                    }
+                });
+
+                // ── Gates ─────────────────────────────────────────────────
+                ui.separator();
+                egui::CollapsingHeader::new("Rejection criteria").default_open(false).show(ui, |ui| {
+                    ui.label(egui::RichText::new(
+                        "Both searches score a candidate by how well its clip resists video \
+                         compression — but that measure is maximised by NOISE, so these five \
+                         floors decide what counts as an animation at all before anything is \
+                         scored.\n\nThey are checked IN ORDER (noise, static, stalls, flash, \
+                         incoherent), so a candidate's reason is the FIRST gate it failed, not its \
+                         only problem — loosening one often just moves the rejection to the next \
+                         one rather than adding a winner. The breakdown at the bottom shows exactly \
+                         that: on one real genome, relaxing 'stalls' turned 21 stalls into 23 \
+                         flashes and the winner count did not move."
+                    ).color(Color32::GRAY).small());
+
+                    egui::Grid::new("gate_grid").num_columns(3).spacing([10.0, 4.0]).striped(true).show(ui, |ui| {
+                        let row = |ui: &mut egui::Ui, label: &str, v: &mut f32, range: std::ops::RangeInclusive<f32>,
+                                   speed: f64, default: f32, help: &str| -> bool {
+                            ui.label(label);
+                            let ch = ui.add(egui::DragValue::new(v).range(range).speed(speed))
+                                .on_hover_text(help).changed();
+                            let c = if (*v - default).abs() < 1e-6 { Color32::DARK_GRAY } else { Color32::from_rgb(255, 200, 100) };
+                            ui.colored_label(c, format!("default {default}"));
+                            ui.end_row();
+                            ch
+                        };
+                        gates_changed |= row(ui, "noise  (max)", &mut self.prefs.gate_max_noise, 0.0..=1.0, 0.01,
+                            default_gate_max_noise(),
+                            "Worst frame's fraction of dithered tiles. A compression score cannot \
+                             tell speckle from detail, so this is the floor that stops the search \
+                             picking noise. Raise it to allow grainier fractals; 1.0 disables it.");
+                        gates_changed |= row(ui, "static  (min move)", &mut self.prefs.gate_min_change, 0.0..=20.0, 0.1,
+                            default_gate_min_change(),
+                            "Mean luminance change per frame, 0-255. Below this nothing visibly \
+                             happens. Lower it to keep very subtle animations.");
+                        gates_changed |= row(ui, "stalls  (max still run)", &mut self.prefs.gate_max_still_run, 0.0..=1.0, 0.01,
+                            default_gate_max_still_run(),
+                            "Longest run of near-identical frames, as a fraction of the clip. \
+                             Catches a clip that freezes partway. A sinusoid's turning point is ONE \
+                             slow frame and does not count — that mistake is why this measures a \
+                             run rather than the minimum.");
+                        gates_changed |= row(ui, "flash  (max jump)", &mut self.prefs.gate_max_level_jump, 0.0..=255.0, 0.5,
+                            default_gate_max_level_jump(),
+                            "Largest jump in average frame brightness, 0-255. Correlation cannot \
+                             see a flash — it is invariant to brightness — so this is a separate \
+                             measure. Raise it if legitimate bright pulses are being rejected.");
+                        gates_changed |= row(ui, "incoherent  (min corr)", &mut self.prefs.gate_min_coherence, -1.0..=1.0, 0.01,
+                            default_gate_min_coherence(),
+                            "Worst consecutive-frame correlation: how connected the least-related \
+                             pair of frames is. Below this the clip is a sequence of cuts rather \
+                             than a morph. -1 disables it.");
+                    });
+
+                    ui.horizontal(|ui| {
+                        ui.label("Probe frames:");
+                        if ui.add(egui::DragValue::new(&mut self.prefs.probe_frames).range(8..=240))
+                            .on_hover_text("Frames per candidate clip during a search. More is a \
+                                            truer preview of the final export and a slower search — \
+                                            and for a MORPH it also slows the travel, which changes \
+                                            the result rather than just refining it.")
+                            .changed()
+                        { gates_changed = true; }
+                        if ui.button("Reset to defaults")
+                            .on_hover_text("Back to the calibrated values.")
+                            .clicked()
+                        { reset_gates = true; }
+                    });
+
+                    if !self.time_rejects.is_empty() {
+                        ui.label(egui::RichText::new(format!("last time-axis run: {}", self.time_rejects))
+                            .small().color(Color32::from_rgb(255, 190, 90)));
+                    }
+                    if !self.blend_rejects.is_empty() {
+                        ui.label(egui::RichText::new(format!("last morph run: {}", self.blend_rejects))
+                            .small().color(Color32::from_rgb(200, 150, 255)));
                     }
                 });
 
@@ -4195,6 +4339,16 @@ impl App {
                 self.set_blend_partner(&w.partner_path);
             }
         }
+        if reset_gates {
+            self.prefs.gate_max_noise = default_gate_max_noise();
+            self.prefs.gate_min_change = default_gate_min_change();
+            self.prefs.gate_max_still_run = default_gate_max_still_run();
+            self.prefs.gate_max_level_jump = default_gate_max_level_jump();
+            self.prefs.gate_min_coherence = default_gate_min_coherence();
+            self.prefs.probe_frames = default_probe_frames();
+            gates_changed = true;
+        }
+        if gates_changed { self.prefs.save(&self.prefs_path); }
         if do_blend_search { self.start_blend_explore(); }
         if load_blend_results { self.load_blend_winners(); }
         if do_search { self.start_time_explore(); }
@@ -6720,5 +6874,40 @@ mod prefs_migration_tests {
         let nn = root.join("fractals_1/a.nn");
         assert!(legacy_prefs_candidates(&nn, &root).is_empty());
         let _ = std::fs::remove_dir_all(&root);
+    }
+}
+
+#[cfg(test)]
+mod gate_ui_tests {
+    use super::App;
+
+    #[test]
+    fn the_breakdown_counts_reasons_and_passes() {
+        let text = concat!(
+            r#"{"rejected":"noise"}"#, "\n",
+            r#"{"rejected":"stalls"}"#, "\n",
+            r#"{"rejected":"stalls"}"#, "\n",
+            r#"{"rejected":null}"#, "\n",
+            r#"{"rejected":null}"#, "\n",
+        );
+        let (passed, breakdown) = App::reject_breakdown(text);
+        assert_eq!(passed, 2);
+        assert!(breakdown.contains("2 stalls"), "{breakdown}");
+        assert!(breakdown.contains("1 noise"), "{breakdown}");
+    }
+
+    #[test]
+    fn a_malformed_line_does_not_lose_the_whole_run() {
+        let text = concat!("not json\n", r#"{"rejected":"flash"}"#, "\n", r#"{"rejected":null}"#, "\n");
+        let (passed, breakdown) = App::reject_breakdown(text);
+        assert_eq!(passed, 1);
+        assert_eq!(breakdown, "1 flash");
+    }
+
+    #[test]
+    fn an_all_passing_run_has_an_empty_breakdown() {
+        let (passed, breakdown) = App::reject_breakdown(r#"{"rejected":null}"#);
+        assert_eq!(passed, 1);
+        assert!(breakdown.is_empty());
     }
 }
