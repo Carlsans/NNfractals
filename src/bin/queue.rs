@@ -113,8 +113,10 @@ fn process_item(
     item: &QueueItem,
     progress: &Arc<Mutex<Option<(u32, u32)>>>,
     current_pid: &Arc<Mutex<Option<u32>>>,
+    rife_status: &Arc<Mutex<Option<String>>>,
     ctx: &egui::Context,
 ) -> Result<String, String> {
+    let rife_fps = item.rife_fps;
     let nn_path = queue_dir().join(&item.nn_filename);
     let genome = load_genome(&nn_path).map_err(|e| format!("failed to load {}: {e}", nn_path.display()))?;
     // Project-root-relative, NOT CWD-relative — see
@@ -221,7 +223,50 @@ fn process_item(
     }
     let _ = render_handle.join();
     *progress.lock().unwrap() = None;
+
+    // Optional RIFE pass. A failure here does NOT fail the item: the render
+    // succeeded and that file is real and kept. Interpolation is a bonus pass
+    // over it, so the worst case is a note saying why there is no smoothed
+    // version — losing a finished render because a post-process could not find
+    // its binary would be indefensible.
+    if let Some(Ok(path)) = &result {
+        if rife_fps > 0 {
+            let src = PathBuf::from(path);
+            let frames = rendered_frame_count(&src).unwrap_or(0);
+            *rife_status.lock().unwrap() = Some("interpolating…".to_string());
+            ctx.request_repaint();
+            match nnfractals::video_export::interpolate_with_rife(
+                &src, frames, fps, rife_fps,
+                &|stage| {
+                    *rife_status.lock().unwrap() = Some(format!("RIFE: {stage}"));
+                    ctx.request_repaint();
+                },
+            ) {
+                Ok(out) => {
+                    *rife_status.lock().unwrap() =
+                        Some(format!("interpolated → {}", out.file_name().unwrap_or_default().to_string_lossy()));
+                }
+                Err(e) => {
+                    *rife_status.lock().unwrap() = Some(format!("RIFE skipped: {e}"));
+                }
+            }
+            ctx.request_repaint();
+        }
+    }
+
     result.unwrap_or_else(|| Err("export thread ended without a result".to_string()))
+}
+
+/// Frame count of a rendered clip, straight from the container.
+fn rendered_frame_count(path: &Path) -> Option<u32> {
+    let out = std::process::Command::new("ffprobe")
+        .args(["-v", "error", "-select_streams", "v:0",
+               "-count_frames", "-show_entries", "stream=nb_read_frames",
+               "-of", "csv=p=0"])
+        .arg(path)
+        .output()
+        .ok()?;
+    String::from_utf8_lossy(&out.stdout).trim().parse().ok()
 }
 
 /// One-time recovery for a previous ungraceful shutdown: an item still
@@ -246,6 +291,7 @@ fn spawn_processing_thread(
     progress: Arc<Mutex<Option<(u32, u32)>>>,
     current_id: Arc<Mutex<Option<String>>>,
     current_pid: Arc<Mutex<Option<u32>>>,
+    rife_status: Arc<Mutex<Option<String>>>,
     cancelling: Arc<AtomicBool>,
     ctx: egui::Context,
 ) {
@@ -271,7 +317,7 @@ fn spawn_processing_thread(
         ctx.request_repaint();
 
         let item = items[idx].clone();
-        let result = process_item(&item, &progress, &current_pid, &ctx);
+        let result = process_item(&item, &progress, &current_pid, &rife_status, &ctx);
 
         // A cancelled render surfaces through the exact same path a real
         // ffmpeg failure would (killing the process breaks its stdin pipe
@@ -324,6 +370,8 @@ struct EditBuf {
     fps: String,
     width: String,
     height: String,
+    /// Target fps for the post-render RIFE pass; empty or 0 = off.
+    rife: String,
 }
 
 impl EditBuf {
@@ -331,6 +379,7 @@ impl EditBuf {
         EditBuf {
             steps: it.steps.to_string(),
             fps: it.fps.to_string(),
+            rife: if it.rife_fps > 0 { it.rife_fps.to_string() } else { String::new() },
             width: it.width.to_string(),
             height: it.height.to_string(),
         }
@@ -358,6 +407,10 @@ struct App {
     // ffmpeg); the Cancel button just kills this PID directly, same
     // pattern `viewer.rs`'s `cancel_explore_stage` already uses.
     current_pid: Arc<Mutex<Option<u32>>>,
+    /// What the post-render RIFE pass is doing, or why it did not run. Kept
+    /// separate from the render's own progress: the render is already finished
+    /// and kept by the time this has anything to say.
+    rife_status: Arc<Mutex<Option<String>>>,
     cancelling: Arc<AtomicBool>,
 
     wake_rx: mpsc::Receiver<()>,
@@ -413,10 +466,11 @@ impl App {
         let progress = Arc::new(Mutex::new(None));
         let current_id = Arc::new(Mutex::new(None));
         let current_pid = Arc::new(Mutex::new(None));
+        let rife_status = Arc::new(Mutex::new(None));
         let cancelling = Arc::new(AtomicBool::new(false));
         spawn_processing_thread(
             running.clone(), progress.clone(), current_id.clone(),
-            current_pid.clone(), cancelling.clone(), cc.egui_ctx.clone(),
+            current_pid.clone(), rife_status.clone(), cancelling.clone(), cc.egui_ctx.clone(),
         );
 
         App {
@@ -429,6 +483,7 @@ impl App {
             progress,
             current_id,
             current_pid,
+            rife_status,
             cancelling,
             wake_rx,
             // Captured now, while `/proc/self/exe` still resolves to a file
@@ -470,6 +525,9 @@ impl App {
             if let Ok(v) = buf.fps.trim().parse::<u32>() { it.fps = v.max(1); }
             if let Ok(v) = buf.width.trim().parse::<u32>() { it.width = v.max(64); }
             if let Ok(v) = buf.height.trim().parse::<u32>() { it.height = v.max(64); }
+            // Blank or unparseable means off, rather than silently becoming a
+            // number the user never typed.
+            it.rife_fps = buf.rife.trim().parse::<u32>().unwrap_or(0);
         }
         save_queue(&self.items);
     }
@@ -490,6 +548,7 @@ impl eframe::App for App {
         let running = self.running.load(Ordering::SeqCst);
         let current_id = self.current_id.lock().unwrap().clone();
         let progress = *self.progress.lock().unwrap();
+        let rife_status = self.rife_status.lock().unwrap().clone();
 
         // This window is typically left open for days while renders are
         // queued into it, so a rebuild lands while it is running and it keeps
@@ -574,6 +633,18 @@ impl eframe::App for App {
                 } else {
                     ui.label(status);
                 }
+                // The post-render pass reports separately: by the time it has
+                // anything to say the render is already finished and kept, so
+                // folding it into the render status would misrepresent a RIFE
+                // failure as a failed export.
+                if let Some(rs) = &rife_status {
+                    let col = if rs.starts_with("RIFE skipped") {
+                        Color32::from_rgb(255, 170, 80)
+                    } else {
+                        Color32::from_rgb(140, 210, 255)
+                    };
+                    ui.colored_label(col, rs);
+                }
             });
         });
 
@@ -620,6 +691,12 @@ impl eframe::App for App {
                                      for these.",
                                 );
                             }
+                            if it.rife_fps > 0 {
+                                ui.colored_label(Color32::from_rgb(140, 210, 255),
+                                                 format!("⇶ rife {}fps", it.rife_fps))
+                                    .on_hover_text("A RIFE interpolation pass runs after this \
+                                                    render; the original is kept alongside.");
+                            }
                             if it.animates_formula() && it.camera_moves() {
                                 ui.colored_label(Color32::from_rgb(120, 255, 180), "＋zoom")
                                     .on_hover_text(
@@ -656,7 +733,25 @@ impl eframe::App for App {
                                 let r3 = ui.add(egui::TextEdit::singleline(&mut buf.width).desired_width(55.0));
                                 ui.label("×");
                                 let r4 = ui.add(egui::TextEdit::singleline(&mut buf.height).desired_width(55.0));
-                                if r1.lost_focus() || r2.lost_focus() || r3.lost_focus() || r4.lost_focus() {
+                                ui.label("RIFE fps:");
+                                let r5 = ui.add(egui::TextEdit::singleline(&mut buf.rife)
+                                    .desired_width(40.0)
+                                    .hint_text("off"))
+                                    .on_hover_text(
+                                        "After rendering, interpolate the clip up to this frame \
+                                         rate with RIFE. Blank or 0 leaves it alone. The rendered \
+                                         file is KEPT — the interpolated one is written beside it \
+                                         as <name>_rife<fps>.mp4, so you can compare them.\n\n\
+                                         Duration is preserved: 30 fps means smoother, not longer. \
+                                         Needs rife-ncnn-vulkan on PATH (or NNFRACTALS_RIFE_BIN); \
+                                         if it is missing the render still succeeds and the item \
+                                         just says so.\n\n\
+                                         Worth knowing on fractals: self-similar detail is the \
+                                         hardest case for the motion estimation this relies on, \
+                                         and a formula morph has no motion to estimate at all. \
+                                         Compare against the real render before trusting it.");
+                                if r1.lost_focus() || r2.lost_focus() || r3.lost_focus()
+                                    || r4.lost_focus() || r5.lost_focus() {
                                     save_edit_id = Some(it.id.clone());
                                 }
                                 ui.label(format!("(colormap: {}, invert coords={}, range={})",

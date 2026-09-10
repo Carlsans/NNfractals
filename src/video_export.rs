@@ -1566,6 +1566,149 @@ pub fn export_chain_time_video(
     encode_rgb_frames(frames, n as u32, fps, w, h, out_path, tx, on_progress);
 }
 
+/// Where to find `rife-ncnn-vulkan`, or why we cannot.
+///
+/// Checked in order: `NNFRACTALS_RIFE_BIN`, then PATH under the names the
+/// common builds ship as, then a couple of conventional install locations.
+pub fn locate_rife() -> Result<PathBuf, String> {
+    use std::process::Command;
+    if let Some(p) = std::env::var_os("NNFRACTALS_RIFE_BIN") {
+        let p = PathBuf::from(p);
+        if p.exists() {
+            return Ok(p);
+        }
+        return Err(format!("NNFRACTALS_RIFE_BIN points at {}, which does not exist", p.display()));
+    }
+    const NAMES: &[&str] = &["rife-ncnn-vulkan", "rife-ncnn-vulkan-bin", "rife"];
+    for n in NAMES {
+        if let Ok(out) = Command::new("which").arg(n).output() {
+            if out.status.success() {
+                let path = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                if !path.is_empty() {
+                    return Ok(PathBuf::from(path));
+                }
+            }
+        }
+    }
+    for dir in ["/opt/rife-ncnn-vulkan", "/usr/local/bin"] {
+        for n in NAMES {
+            let c = Path::new(dir).join(n);
+            if c.exists() {
+                return Ok(c);
+            }
+        }
+    }
+    Err(
+        "rife-ncnn-vulkan not found. Install it (AUR: rife-ncnn-vulkan-bin, or the release zip \
+         from github.com/nihui/rife-ncnn-vulkan), put it on PATH, or set NNFRACTALS_RIFE_BIN to \
+         the binary. It needs Vulkan, which this machine already has."
+            .to_string(),
+    )
+}
+
+/// How many frames a clip should have after interpolating to `target_fps`.
+///
+/// Duration is preserved — interpolation makes a clip smoother, not longer — so
+/// this scales the frame count by the fps ratio rather than the clip length.
+pub fn rife_target_frames(src_frames: u32, src_fps: u32, target_fps: u32) -> u32 {
+    if src_fps == 0 || src_frames == 0 {
+        return 0;
+    }
+    let n = (src_frames as f64 * target_fps as f64 / src_fps as f64).round() as u32;
+    n.max(src_frames)
+}
+
+/// Interpolate `src` up to `target_fps` with RIFE, writing a NEW file beside it.
+///
+/// The source is deliberately left in place. Frame interpolation is a guess:
+/// on fractal content especially, self-similar structure is the aperture
+/// problem's worst case and a formula morph has no motion to estimate at all.
+/// Keeping both files means the result can actually be compared against the
+/// real render rather than taken on trust.
+///
+/// Returns the interpolated path, or an error naming what went wrong.
+pub fn interpolate_with_rife(
+    src: &Path, src_frames: u32, src_fps: u32, target_fps: u32,
+    on_progress: &(dyn Fn(&str) + Sync),
+) -> Result<PathBuf, String> {
+    use std::process::Command;
+    if target_fps <= src_fps {
+        return Err(format!(
+            "target {target_fps} fps is not above the clip's own {src_fps} fps — nothing to interpolate"
+        ));
+    }
+    let rife = locate_rife()?;
+    let want = rife_target_frames(src_frames, src_fps, target_fps);
+    if want <= src_frames {
+        return Err("nothing to interpolate".to_string());
+    }
+
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let base = std::env::temp_dir().join(format!("nnfractals_rife_{}_{stamp}", std::process::id()));
+    let in_dir = base.join("in");
+    let out_dir = base.join("out");
+    let cleanup = || { let _ = std::fs::remove_dir_all(&base); };
+    std::fs::create_dir_all(&in_dir).map_err(|e| format!("temp dir: {e}"))?;
+    std::fs::create_dir_all(&out_dir).map_err(|e| format!("temp dir: {e}"))?;
+
+    // 1. Explode to PNG. RIFE works on frame folders, not video.
+    on_progress("extracting frames");
+    let ex = Command::new("ffmpeg")
+        .args(["-hide_banner", "-loglevel", "error", "-y", "-i"])
+        .arg(src)
+        .arg(in_dir.join("%08d.png"))
+        .output()
+        .map_err(|e| { cleanup(); format!("could not run ffmpeg: {e}") })?;
+    if !ex.status.success() {
+        let tail = String::from_utf8_lossy(&ex.stderr).lines().rev().take(3)
+            .collect::<Vec<_>>().join(" | ");
+        cleanup();
+        return Err(format!("frame extraction failed: {tail}"));
+    }
+
+    // 2. Interpolate to the target COUNT. `-n` is what preserves duration; a
+    //    plain 2x pass would only hit the target when the ratio is a power of 2.
+    on_progress(&format!("interpolating {src_frames} → {want} frames"));
+    let ri = Command::new(&rife)
+        .arg("-i").arg(&in_dir)
+        .arg("-o").arg(&out_dir)
+        .arg("-n").arg(want.to_string())
+        .output()
+        .map_err(|e| { cleanup(); format!("could not run {}: {e}", rife.display()) })?;
+    if !ri.status.success() {
+        let tail = String::from_utf8_lossy(&ri.stderr).lines().rev().take(4)
+            .collect::<Vec<_>>().join(" | ");
+        cleanup();
+        return Err(format!(
+            "rife failed: {tail}  (if it does not recognise -n, the build is too old — \
+             it is needed to hit an arbitrary frame rate rather than only doubling)"
+        ));
+    }
+
+    // 3. Re-encode. Same absence of -crf/-b:v/-qp as everywhere else in this
+    //    module, so a compression measurement on the result stays comparable.
+    on_progress("encoding");
+    let stem = src.file_stem().and_then(|s| s.to_str()).unwrap_or("video");
+    let out = src.with_file_name(format!("{stem}_rife{target_fps}.mp4"));
+    let en = Command::new("ffmpeg")
+        .args(["-hide_banner", "-loglevel", "error", "-y", "-framerate", &target_fps.to_string(), "-i"])
+        .arg(out_dir.join("%08d.png"))
+        .args(["-c:v", "libx264", "-pix_fmt", "yuv420p"])
+        .arg(&out)
+        .output()
+        .map_err(|e| { cleanup(); format!("could not run ffmpeg: {e}") })?;
+    cleanup();
+    if !en.status.success() {
+        let tail = String::from_utf8_lossy(&en.stderr).lines().rev().take(3)
+            .collect::<Vec<_>>().join(" | ");
+        return Err(format!("re-encode failed: {tail}"));
+    }
+    Ok(out)
+}
+
 /// Encode an ALREADY-RENDERED set of RGB24 frames and return the same
 /// normalized compressed/raw ratio the camera-path probes use, so time scores
 /// and zoom scores are directly comparable.
@@ -1823,6 +1966,11 @@ pub struct QueueItem {
     /// How far toward the partner formula to travel, in [0,1].
     #[serde(default)]
     pub blend_amp: f32,
+    /// Target frame rate for a RIFE interpolation pass after rendering.
+    /// 0 = off. The rendered clip is kept; the interpolated one is written
+    /// beside it as `<name>_rife<fps>.mp4`.
+    #[serde(default)]
+    pub rife_fps: u32,
     /// Render only every Nth frame and warp the rest out of the two
     /// bracketing keyframes (see `export_video_chain_interpolated`). 0 or 1
     /// means every frame is rendered exactly, which is the behaviour of
@@ -2425,6 +2573,7 @@ mod tests {
             waypoints: Vec::new(), chain_label: None, keyframe_stride: 0,
             time_mod: Vec::new(), time_frames: 0,
             blend_nn_filename: None, blend_shape: String::new(), blend_amp: 0.0,
+            rife_fps: 0,
         }
     }
 
@@ -2508,6 +2657,53 @@ mod tests {
         assert!(msgs.iter().any(|m| matches!(m, VideoMsg::Failed(s) if s.contains("just a zoom"))),
             "{msgs:?}");
         assert!(!out.exists());
+    }
+
+    #[test]
+    fn interpolating_preserves_duration_not_length() {
+        // 24 fps -> 30 fps on a 2-second clip must stay 2 seconds: 48 frames
+        // becomes 60, not 48 played slower or 96 played longer.
+        assert_eq!(rife_target_frames(48, 24, 30), 60);
+        assert_eq!(rife_target_frames(48, 24, 48), 96);
+        assert_eq!(rife_target_frames(100, 30, 60), 200);
+    }
+
+    #[test]
+    fn interpolating_never_returns_fewer_frames_than_it_was_given() {
+        // A target below the source rate is a no-op, not a decimation — the
+        // caller refuses it, and this is the backstop.
+        assert_eq!(rife_target_frames(48, 30, 24), 48);
+        assert_eq!(rife_target_frames(48, 30, 30), 48);
+    }
+
+    #[test]
+    fn a_degenerate_clip_asks_for_no_frames() {
+        assert_eq!(rife_target_frames(0, 24, 30), 0);
+        assert_eq!(rife_target_frames(48, 0, 30), 0);
+    }
+
+    #[test]
+    fn a_target_at_or_below_the_source_rate_is_refused_with_a_reason() {
+        let src = std::env::temp_dir().join("nnf_rife_noop.mp4");
+        let err = interpolate_with_rife(&src, 48, 30, 24, &|_| {}).unwrap_err();
+        assert!(err.contains("nothing to interpolate"), "{err}");
+        // Refused before touching the filesystem or looking for the binary.
+        assert!(!src.exists());
+    }
+
+    #[test]
+    fn a_missing_rife_binary_explains_how_to_get_one() {
+        // The failure people will actually hit. It must name the package and
+        // the override rather than just saying "not found".
+        unsafe { std::env::set_var("NNFRACTALS_RIFE_BIN", "/nonexistent/rife") };
+        let err = locate_rife().unwrap_err();
+        unsafe { std::env::remove_var("NNFRACTALS_RIFE_BIN") };
+        assert!(err.contains("/nonexistent/rife"), "{err}");
+
+        if let Err(err) = locate_rife() {
+            assert!(err.contains("rife-ncnn-vulkan"), "{err}");
+            assert!(err.contains("NNFRACTALS_RIFE_BIN"), "must name the override: {err}");
+        }
     }
 
     #[test]

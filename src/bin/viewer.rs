@@ -3182,6 +3182,8 @@ impl App {
             blend_nn_filename: blend_file,
             blend_shape: self.blend_shape.label().to_string(),
             blend_amp: self.blend_amp,
+            // Set per item in the queue window, not here.
+            rife_fps: 0,
         };
         let mut items = nnfractals::video_export::load_queue();
         items.push(item);
@@ -3276,6 +3278,8 @@ impl App {
             keyframe_stride,
             time_mod: Vec::new(), time_frames: 0,
             blend_nn_filename: None, blend_shape: String::new(), blend_amp: 0.0,
+            // Set per item in the queue window, not here.
+            rife_fps: 0,
         };
             let mut items = nnfractals::video_export::load_queue();
             items.push(item);
@@ -3813,6 +3817,8 @@ impl App {
             blend_nn_filename: blend_file,
             blend_shape: self.blend_shape.label().to_string(),
             blend_amp: self.blend_amp,
+            // Set per item in the queue window, not here.
+            rife_fps: 0,
         };
         let mut items = nnfractals::video_export::load_queue();
         items.push(item);
@@ -4970,6 +4976,8 @@ impl App {
             keyframe_stride,
             time_mod: Vec::new(), time_frames: 0,
             blend_nn_filename: None, blend_shape: String::new(), blend_amp: 0.0,
+            // Set per item in the queue window, not here.
+            rife_fps: 0,
         };
         let mut items = nnfractals::video_export::load_queue();
         items.push(item);
