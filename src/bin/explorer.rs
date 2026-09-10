@@ -2243,7 +2243,7 @@ fn main() {
                 min_change: get_flag_or(&args, "--min-change",
                     time_explore::MIN_TEMPORAL_CHANGE),
                 max_noise: get_flag_or(&args, "--max-noise", time_explore::MAX_CLIP_NOISE),
-                min_stall_ratio: get_flag_or(&args, "--min-stall-ratio", time_explore::MIN_STALL_RATIO),
+                max_still_run: get_flag_or(&args, "--max-still-run", time_explore::MAX_STILL_RUN),
                 max_level_jump: get_flag_or(&args, "--max-level-jump", time_explore::MAX_LEVEL_JUMP),
             };
             let keep_clips = args.iter().any(|a| a == "--keep-clips");
@@ -2406,7 +2406,7 @@ fn main() {
             eprintln!("  nnfractals-explorer vae-explore [formula] [cx] [cy] [zoom] [out_dir] [--iterations N] [--n-seeds N] [--recursion-depth N] [--top-k N] [--canvas-res N] [--method name|mixed] [--select-by max-error|min-error|random] [--max-intricacy F] [--min-edge-density F] [--arch conv|resnet|inception] [--latent-dim N] [--kl-weight F] [--tuned-config path.json] [--epochs N] [--target-recon-mse F] [--min-improvement F] [--patience N] [--saliency-model path.pt (default: explorer_out/saliency_model.pt if it exists)]");
             eprintln!("  nnfractals-explorer vae-curate [pool_dir] [top_n] [out_dir] [res] [--select-by max-error|min-error|random]");
             eprintln!("  nnfractals-explorer video-zoom-explore [formula|genome.nn] [cx] [cy] [zoom] [out_dir] [--depth N] [--finalists N] [--lookahead-plies N] [--method name|mixed] [--final-width N] [--final-height N] [--canvas-res N] [--top-winners N] [--n-seeds N] [--min-score F (0.15)] [--min-file-size-ratio F (0.45)] [--min-file-size-step-ratio F (0.80)] [--min-step-zoom F (2.0)] [--max-intricacy F (0.30)] [--min-edge-density F (0.05)] [--angle-coloring] [--lookahead-probe-w/h/steps/fps N] [--final-probe-w/h/steps/fps N] [--dd-margin-ulps F (1.0 = zoom until f64 pixelates; 4.0 = stop while still smooth)]");
-            eprintln!("  nnfractals-explorer time-explore <formula|genome.nn> [cx] [cy] [zoom] [out_dir | --out DIR] [--frames N (48)] [--fps N (24)] [--probe-w N (192)] [--probe-h N (144)] [--amps 0.02,0.08,0.25] [--shapes sine,cosine,triangle,sawtooth,pulse,ramp,orbit] [--top-k N (8)] [--min-coherence F (0.55)] [--min-change F (1.0)] [--max-noise F (0.15)] [--min-stall-ratio F (0.15)] [--max-level-jump F (12)] [--angle-coloring] [--keep-clips]");
+            eprintln!("  nnfractals-explorer time-explore <formula|genome.nn> [cx] [cy] [zoom] [out_dir | --out DIR] [--frames N (48)] [--fps N (24)] [--probe-w N (192)] [--probe-h N (144)] [--amps 0.02,0.08,0.25] [--shapes sine,cosine,triangle,sawtooth,pulse,ramp,orbit] [--top-k N (8)] [--min-coherence F (0.55)] [--min-change F (1.0)] [--max-noise F (0.15)] [--max-still-run F (0.15)] [--max-level-jump F (12)] [--angle-coloring] [--keep-clips]");
             eprintln!("      searches the TIME axis: animates one scalar inside the formula (julia c / phoenix / bailout / a program or warp constant / an inserted scale node) and ranks by how well the clip resists video compression.");
             eprintln!("      three gates, all reported per candidate: 'noise' (spatially dithered frames), 'static' (amplitude too small to see — raise --amps), 'incoherent' (amplitude so large consecutive frames are unrelated: cuts, not a morph — lower --amps).");
             eprintln!("  nnfractals-explorer complex-export <zone.nn|zone_dir> [out_dir] [--res 512] [--limit 20]");

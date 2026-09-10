@@ -73,32 +73,42 @@ pub const MIN_TEMPORAL_CHANGE: f32 = 1.0;
 /// 0.96 vs 0.90, change 15.0 vs 13.1, noise 0.000 vs 0.250).
 pub const MAX_CLIP_NOISE: f32 = 0.15;
 
-/// A consecutive pair must move at least this fraction of the clip's mean
-/// motion, or the animation stalls partway through and reads as a hang.
+/// A frame pair counts as "still" when it moves less than this fraction of the
+/// clip's mean motion — i.e. is all but identical.
+pub const STILL_FRACTION: f32 = 0.02;
+
+/// Longest tolerated run of still pairs, as a fraction of the clip. A sinusoid
+/// turning point is a single pair; the freeze this catches was four in a row out
+/// of fifteen (27%).
 ///
 /// # Calibration
 ///
-/// Both this and [`MAX_LEVEL_JUMP`] were set from a real sweep with every gate
-/// disabled (genome 0b3199d357fc16e0, 42 candidates), after the contact sheets
-/// of the top scorers showed them to be visibly bad. The two groups separate
-/// cleanly, with no candidate in between:
+/// Measured on a real sweep with every gate disabled, after contact sheets of
+/// the top scorers showed them to be visibly bad.
+///
+/// The FIRST version of this gate compared `min_change` to `mean_change` and
+/// was badly wrong — it rejected every sine and triangle candidate on genome
+/// 4f53bc40f64a86c9, including clips averaging 13.4 luminance units of motion,
+/// because a sinusoid's velocity is zero at its turning points. Carl reported it
+/// as "find time axis does not work anymore even if there is plenty good
+/// candidates", and he was right.
+///
+/// The run-length form separates the two cases with nothing in between. On that
+/// same genome, 16 frames (15 pairs):
 ///
 /// ```text
-///   score  noise  minCoh   chg  stall   jump   candidate
-///  0.0351  0.250   0.634  13.1   0.16   32.3   phoenix orbit 0.08   <- flashes + stalls
-///  0.0252  0.250   0.746  13.9   0.19   46.1   phoenix triangle 0.08
-///  0.0250  0.250   0.673  12.9   0.08   33.0   phoenix sine 0.08
-///  0.0203  0.000   0.895  15.0   0.00   54.6   phoenix triangle 0.25  <- 5 frozen frames
-///  ---------------------------------------------------------------- clean below
-///  0.0159  0.000   0.919   5.7   0.59    3.4   prog scale #8 orbit 0.25
-///  0.0149  0.000   0.951   4.3   0.44    2.9   prog scale #8 orbit 0.08
-///  0.0141  0.000   0.971   3.3   0.55    2.6   phoenix orbit 0.02
+///   longest_still_run   verdict
+///        0.000          every passing candidate
+///   ---------------------------------- gap
+///        0.200          3 consecutive near-identical frames
+///        0.267          4
+///        0.400          6   (min_change 0.006 against a mean of 11-18)
 /// ```
 ///
-/// So the stall gap is 0.19..0.36 and the flash gap is 4.4..32.3; these sit in
-/// the middle of each. Calibrated on one genome — worth re-checking against a
-/// second before trusting them far.
-pub const MIN_STALL_RATIO: f32 = 0.25;
+/// A turning point is one slow pair; a freeze is several identical ones. Note
+/// `min_change` is near zero in BOTH cases, which is exactly why it was the
+/// wrong thing to test.
+pub const MAX_STILL_RUN: f32 = 0.15;
 
 /// Largest tolerated jump in frame-mean luminance (0-255) between consecutive
 /// frames. See [`MIN_STALL_RATIO`] for the calibration data.
@@ -124,9 +134,9 @@ pub struct TimeExploreOpts {
     pub min_coherence: f32,
     pub min_change: f32,
     pub max_noise: f32,
-    /// Reject if any consecutive pair moves less than this fraction of the
-    /// clip's mean motion — i.e. the animation stalls partway through.
-    pub min_stall_ratio: f32,
+    /// Reject when the longest run of near-identical frames exceeds this
+    /// fraction of the clip.
+    pub max_still_run: f32,
     /// Reject if frame-mean luminance jumps by more than this (0-255) between
     /// consecutive frames — a global flash.
     pub max_level_jump: f32,
@@ -146,7 +156,7 @@ impl Default for TimeExploreOpts {
             min_coherence: MIN_TEMPORAL_COHERENCE,
             min_change: MIN_TEMPORAL_CHANGE,
             max_noise: MAX_CLIP_NOISE,
-            min_stall_ratio: MIN_STALL_RATIO,
+            max_still_run: MAX_STILL_RUN,
             max_level_jump: MAX_LEVEL_JUMP,
         }
     }
@@ -174,9 +184,24 @@ pub struct ClipStats {
     /// Mean absolute luminance change between consecutive frames, 0-255.
     /// Answers "does the clip move at all".
     pub mean_change: f32,
-    /// Smallest consecutive-frame change. Answers "does it ever STOP moving" —
-    /// a clip that stalls mid-loop reads as a hang, not an animation.
+    /// Smallest consecutive-frame change. Reported for reference; NOT gated on
+    /// — see `longest_still_run` for why the minimum alone is the wrong test.
     pub min_change: f32,
+    /// Longest RUN of consecutive frame pairs that barely changed, as a
+    /// fraction of the clip's pairs.
+    ///
+    /// This replaced a gate on `min_change / mean_change`, which was wrong in a
+    /// way worth recording. A sinusoid's velocity is zero at its turning
+    /// points — that is what makes it smooth and loop cleanly — so ONE small
+    /// pair per half-cycle is the signature of well-behaved periodic motion,
+    /// not of a defect. The old ratio gate rejected every sine and triangle
+    /// candidate on a real genome, including clips averaging 13.4 luminance
+    /// units of motion per frame, purely because their minimum was near zero.
+    ///
+    /// The actual defect being caught was a PLATEAU: five genuinely identical
+    /// frames in the middle of a clip. A run separates the two cleanly — a
+    /// turning point is one pair, a freeze is several.
+    pub longest_still_run: f32,
     /// Largest jump in FRAME-MEAN luminance between consecutive frames, 0-255.
     /// Catches global flashes, which correlation structurally cannot see:
     /// Pearson is invariant to offset and scale, so a frame of identical
@@ -349,6 +374,7 @@ pub fn clip_stats(frames: &[Vec<u8>], w: u32, h: u32) -> ClipStats {
     let mut min_coh = f32::INFINITY;
     let mut min_chg = f32::INFINITY;
     let mut max_jump = 0.0f32;
+    let mut changes: Vec<f32> = Vec::with_capacity(lums.len().saturating_sub(1));
     for (i, pair) in lums.windows(2).enumerate() {
         let coh = pearson(&pair[0], &pair[1]);
         coh_sum += coh;
@@ -358,16 +384,34 @@ pub fn clip_stats(frames: &[Vec<u8>], w: u32, h: u32) -> ClipStats {
         let chg = d / pair[0].len() as f32;
         chg_sum += chg;
         min_chg = min_chg.min(chg);
+        changes.push(chg);
 
         max_jump = max_jump.max((means[i + 1] - means[i]).abs());
     }
     let pairs = (lums.len() - 1) as f32;
+    let mean_change = chg_sum / pairs;
+
+    // "Still" means all but identical, not merely slow: a turning point is
+    // slow, a freeze is still. STILL_FRACTION is deliberately tiny so the two
+    // cannot be confused.
+    let still_floor = mean_change * STILL_FRACTION;
+    let (mut run, mut longest) = (0u32, 0u32);
+    for c in &changes {
+        if *c <= still_floor {
+            run += 1;
+            longest = longest.max(run);
+        } else {
+            run = 0;
+        }
+    }
+
     ClipStats {
         max_noise,
         min_coherence: min_coh,
         mean_coherence: coh_sum / pairs,
-        mean_change: chg_sum / pairs,
+        mean_change,
         min_change: min_chg,
+        longest_still_run: longest as f32 / pairs,
         max_level_jump: max_jump,
     }
 }
@@ -380,9 +424,9 @@ fn gate(stats: &ClipStats, opts: &TimeExploreOpts) -> Option<&'static str> {
     if stats.mean_change < opts.min_change {
         return Some("static");
     }
-    // Scale-free: a pair that moves less than this fraction of the clip's own
-    // typical motion is a stall, whatever the clip's overall amplitude.
-    if stats.min_change < stats.mean_change * opts.min_stall_ratio {
+    // A RUN of near-identical frames, not a single slow pair — see
+    // ClipStats::longest_still_run.
+    if stats.longest_still_run > opts.max_still_run {
         return Some("stalls");
     }
     if stats.max_level_jump > opts.max_level_jump {
@@ -508,6 +552,7 @@ pub fn write_manifest(
             "mean_coherence": c.stats.mean_coherence,
             "mean_change": c.stats.mean_change,
             "min_change": c.stats.min_change,
+            "longest_still_run": c.stats.longest_still_run,
             "max_level_jump": c.stats.max_level_jump,
             "max_noise": c.stats.max_noise,
             "rejected": c.rejected,
@@ -784,8 +829,90 @@ mod tests {
         // this clip while it visibly hung.
         let st = ClipStats {
             max_noise: 0.0, min_coherence: 0.895, mean_coherence: 0.955,
-            mean_change: 15.0, min_change: 0.0, max_level_jump: 5.0,
+            mean_change: 15.0, min_change: 0.0,
+            // 4 still pairs out of 15 — the measured freeze.
+            longest_still_run: 4.0 / 15.0, max_level_jump: 5.0,
         };
+        assert_eq!(gate(&st, &TimeExploreOpts::default()), Some("stalls"));
+    }
+
+    #[test]
+    fn a_sinusoid_is_not_punished_for_turning_around() {
+        // Carl, 2026-09-10: "find time axis does not work anymore even if there
+        // is plenty good candidates". The old gate compared min_change to
+        // mean_change, and a sinusoid's velocity is ZERO at its turning points
+        // by definition — so every sine and triangle candidate was rejected,
+        // including these real measured numbers: a clip averaging 13.4
+        // luminance units of motion per frame, thrown out because its minimum
+        // pair was 0.688 (ratio 0.05).
+        let st = ClipStats {
+            max_noise: 0.0, min_coherence: 0.93, mean_coherence: 0.97,
+            mean_change: 13.398, min_change: 0.688,
+            // One slow pair per half-cycle is not a run.
+            longest_still_run: 0.0, max_level_jump: 4.0,
+        };
+        assert_eq!(gate(&st, &TimeExploreOpts::default()), None,
+            "smooth periodic motion must not be rejected for being smooth");
+    }
+
+    #[test]
+    fn one_still_pair_passes_but_a_run_of_them_does_not() {
+        // 16-frame clip = 15 pairs. A single still pair is 6.7% of the clip; a
+        // freeze of three is 20%.
+        let one = ClipStats {
+            mean_change: 10.0, min_coherence: 1.0, longest_still_run: 1.0 / 15.0,
+            ..Default::default()
+        };
+        assert_eq!(gate(&one, &TimeExploreOpts::default()), None);
+        let three = ClipStats {
+            mean_change: 10.0, min_coherence: 1.0, longest_still_run: 3.0 / 15.0,
+            ..Default::default()
+        };
+        assert_eq!(gate(&three, &TimeExploreOpts::default()), Some("stalls"));
+    }
+
+    #[test]
+    fn a_synthetic_sine_clip_measures_no_still_run() {
+        // End to end through clip_stats rather than hand-built stats: a real
+        // sinusoidal sweep of pixel values must report longest_still_run 0.
+        let (w, h) = (32u32, 32u32);
+        let n = 24;
+        let frames: Vec<Vec<u8>> = (0..n).map(|i| {
+            let t = i as f32 / n as f32;
+            // No wrap-around: rem_euclid would snap the level from 255 to 0 and
+            // register as a flash, which is a defect in the fixture, not the clip.
+            let off = 20.0 * (std::f32::consts::TAU * t).sin();
+            frame(w, h, move |x, y| {
+                (((x * 3 + y * 5) % 120) as f32 + 70.0 + off).clamp(0.0, 255.0) as u8
+            })
+        }).collect();
+        let st = clip_stats(&frames, w, h);
+        // Not necessarily zero: this fixture is a uniform ramp, so near the
+        // turning point the whole frame quantizes to the same u8 values and a
+        // pair or two really is identical. That is a short run, not a freeze,
+        // and the gate is what has to get it right.
+        assert!(st.longest_still_run <= MAX_STILL_RUN,
+            "a sine sweep must not read as a freeze, got {}", st.longest_still_run);
+        assert_eq!(gate(&st, &TimeExploreOpts::default()), None,
+            "smooth periodic motion must pass end to end");
+    }
+
+    #[test]
+    fn a_synthetic_frozen_stretch_is_caught_end_to_end() {
+        // The control: same clip, but frames 8..13 held.
+        let (w, h) = (32u32, 32u32);
+        let n = 24;
+        let frames: Vec<Vec<u8>> = (0..n).map(|i| {
+            let held = if (8..14).contains(&i) { 8 } else { i };
+            let t = held as f32 / n as f32;
+            let off = 20.0 * (std::f32::consts::TAU * t).sin();
+            frame(w, h, move |x, y| {
+                (((x * 3 + y * 5) % 120) as f32 + 70.0 + off).clamp(0.0, 255.0) as u8
+            })
+        }).collect();
+        let st = clip_stats(&frames, w, h);
+        assert!(st.longest_still_run > MAX_STILL_RUN,
+            "a five-frame freeze must be caught, got {}", st.longest_still_run);
         assert_eq!(gate(&st, &TimeExploreOpts::default()), Some("stalls"));
     }
 
@@ -800,7 +927,8 @@ mod tests {
 
         let st = ClipStats {
             max_noise: 0.0, min_coherence: 1.0, mean_coherence: 1.0,
-            mean_change: 10.0, min_change: 8.0, max_level_jump: 54.6,
+            mean_change: 10.0, min_change: 8.0,
+            longest_still_run: 0.0, max_level_jump: 54.6,
         };
         assert_eq!(gate(&st, &TimeExploreOpts::default()), Some("flash"));
     }
@@ -811,12 +939,14 @@ mod tests {
         // worst clean candidate must pass and the best bad one must not.
         let clean = ClipStats {
             max_noise: 0.0, min_coherence: 0.919, mean_coherence: 0.963,
-            mean_change: 5.7, min_change: 3.35, max_level_jump: 3.4,
+            mean_change: 5.7, min_change: 3.35,
+            longest_still_run: 0.0, max_level_jump: 3.4,
         };
         assert_eq!(gate(&clean, &TimeExploreOpts::default()), None);
         let bad = ClipStats {
             max_noise: 0.0, min_coherence: 0.895, mean_coherence: 0.965,
-            mean_change: 15.0, min_change: 0.0, max_level_jump: 54.6,
+            mean_change: 15.0, min_change: 0.0,
+            longest_still_run: 4.0 / 15.0, max_level_jump: 54.6,
         };
         assert!(gate(&bad, &TimeExploreOpts::default()).is_some());
     }

@@ -3796,7 +3796,34 @@ impl App {
                     { do_queue = true; }
                 });
 
-                if !self.time_message.is_empty() {
+                // Live progress. The sweep takes ~90s at the default probe size,
+                // and without this the window shows "searching…" and nothing
+                // else for a minute and a half — which reads as a hang. The
+                // subprocess's stdout already streams into eo_log; surface the
+                // tail of it here rather than only in the Explore window.
+                let searching = self.eo_busy && self.eo_stage == "Time exploring";
+                if searching {
+                    ui.separator();
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label(egui::RichText::new("searching the time axis…").color(Color32::YELLOW));
+                        if ui.small_button("Cancel").clicked() {
+                            self.cancel_explore_stage();
+                        }
+                    });
+                    egui::ScrollArea::vertical()
+                        .max_height(90.0)
+                        .stick_to_bottom(true)
+                        .id_salt("time_log")
+                        .show(ui, |ui| {
+                            for line in self.eo_log.iter().rev().take(60).collect::<Vec<_>>().into_iter().rev() {
+                                ui.label(egui::RichText::new(line).small().monospace());
+                            }
+                        });
+                    ctx.request_repaint_after(std::time::Duration::from_millis(250));
+                }
+
+                if !self.time_message.is_empty() && !searching {
                     ui.label(egui::RichText::new(&self.time_message).color(Color32::LIGHT_GREEN).small());
                 }
                 ui.separator();
