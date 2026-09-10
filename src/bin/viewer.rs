@@ -3425,6 +3425,16 @@ impl App {
     /// progress is visible without leaving the viewer.
     // ── Time axis ─────────────────────────────────────────────────────────
 
+    /// Where a rendered time video lands.
+    ///
+    /// NOT `save_out_dir()`: that falls back to the loaded `.nn`'s own folder,
+    /// so a queued video was dropped straight into the fractal archive
+    /// (`fractals_1/`) alongside thousands of genomes. Videos belong under
+    /// `viewer_output/`, next to everything else this window produces.
+    fn time_video_out_dir(&self) -> PathBuf {
+        nnfractals::project_root().join("viewer_output/time_videos")
+    }
+
     /// Directory this genome's time sweep reads and writes.
     fn time_out_dir(&self) -> PathBuf {
         let stem = self.nn_path.file_stem().and_then(|s| s.to_str()).unwrap_or("genome");
@@ -3551,6 +3561,10 @@ impl App {
             self.time_message = format!("queue FAILED: {e}");
             return;
         }
+        if let Err(e) = std::fs::create_dir_all(self.time_video_out_dir()) {
+            self.time_message = format!("queue FAILED: {e}");
+            return;
+        }
         let nn_filename = format!("{id}.nn");
         if let Err(e) = std::fs::copy(&self.nn_path, qdir.join(&nn_filename)) {
             self.time_message = format!("queue FAILED: {e}");
@@ -3575,7 +3589,7 @@ impl App {
             invert_range: false,
             colormap: self.config.rendering.colormap.clone(),
             angle_coloring: self.angle_coloring,
-            output_dir: self.save_out_dir().to_string_lossy().into_owned(),
+            output_dir: self.time_video_out_dir().to_string_lossy().into_owned(),
             status: nnfractals::video_export::QueueStatus::Pending,
             output_path: None,
             error: None,
@@ -3775,8 +3789,9 @@ impl App {
                                         the Video panel.");
                     if ui.add_enabled(!self.time_mod.is_empty(), egui::Button::new("＋ Queue time video"))
                         .on_hover_text("Adds a queue item that holds THIS view still and sweeps the \
-                                        modulation. Keyframe warping is forced off for these — it \
-                                        assumes only the camera moved.")
+                                        modulation, at the Video panel's resolution and fps. Output \
+                                        goes to viewer_output/time_videos. Keyframe warping is \
+                                        forced off for these — it assumes only the camera moved.")
                         .clicked()
                     { do_queue = true; }
                 });

@@ -258,6 +258,23 @@ fn discover_pools(root: &Path) -> Vec<String> {
     dirs
 }
 
+/// Classify a process as one this launcher manages, or not at all.
+///
+/// Stop kills exactly what this matches, so it is worth being able to test:
+/// the evolution binary is matched on its process NAME (comm), which is stable
+/// no matter what arguments it was launched with — notably `--profile`, added
+/// when fitness profiles landed. Matching on the command line instead would
+/// have quietly stopped finding profile-launched runs.
+fn classify_proc(name: &str, cmd: &[String]) -> Option<&'static str> {
+    if name == "nnfractals" {
+        return Some("evolution");
+    }
+    if cmd.iter().any(|a| a.contains("aesthetic_scorer.py")) {
+        return Some("scorer");
+    }
+    None
+}
+
 /// Every `config*.toml` at the project root, sorted. Mirrors `discover_pools`:
 /// scan rather than hardcode, so a fifth instance config shows up on its own.
 fn discover_configs(root: &Path) -> Vec<String> {
@@ -700,16 +717,13 @@ impl App {
         let mut rows: Vec<ProcRow> = Vec::new();
         for (pid, p) in self.sys.processes() {
             let name = p.name().to_string_lossy();
-            let is_evo = name == "nnfractals";
-            let is_scorer = !is_evo
-                && p.cmd().iter().any(|a| a.to_string_lossy().contains("aesthetic_scorer.py"));
-            if !(is_evo || is_scorer) {
-                continue;
-            }
+            let cmd: Vec<String> = p.cmd().iter().map(|a| a.to_string_lossy().into_owned()).collect();
+            let Some(kind) = classify_proc(&name, &cmd) else { continue };
+
             let id = pid.as_u32();
             rows.push(ProcRow {
                 pid: id,
-                kind: if is_evo { "evolution" } else { "scorer" },
+                kind,
                 cpu: p.cpu_usage(),
                 ram_mb: p.memory() / 1024 / 1024,
                 vram_mb: vram.get(&id).copied().unwrap_or(0),
@@ -880,27 +894,35 @@ impl App {
     /// shape: a bool on `App`, an early return, deferred action flags so `&mut self`
     /// is only touched after the closure's borrow ends, and hover text on
     /// everything.
-    fn show_fitness_window(&mut self, ctx: &egui::Context) {
+    fn show_fitness_window(&mut self, ctx: &egui::Context, avail_h: f32) {
         if !self.show_fitness { return; }
 
         let mut do_load = false;
         let mut do_save = false;
         let mut do_delete = false;
         let mut do_start = false;
+        let mut do_stop = false;
         let mut do_close = false;
         let mut reload_base = false;
 
         // Cloned up front: the combo boxes below need to read these while the
         // closure already holds `&mut self`.
         let profile_names: Vec<String> = self.fp_profiles.iter().map(|(n, _)| n.clone()).collect();
+        let running = self.procs.iter().filter(|p| p.kind == "evolution").count();
         let config_files = self.fp_config_files.clone();
         let working = self.fp_current();
         let bad = self.fp_bad_fields();
 
+        // Bounded by the actual app window: this used to be able to grow taller
+        // than the launcher itself, putting its own Close button off-screen and
+        // covering the main panel's controls with no way back.
+        let screen_h = avail_h.max(320.0);
+        let grid_h = (screen_h - 340.0).clamp(120.0, 420.0);
         egui::Window::new("Fitness Profiles")
             .collapsible(false)
             .resizable(true)
-            .default_width(660.0)
+            .default_width(600.0)
+            .max_height(screen_h - 20.0)
             .show(ctx, |ui| {
                 // ── Profile picker ────────────────────────────────────────
                 ui.horizontal(|ui| {
@@ -987,7 +1009,7 @@ impl App {
 
                 let shares = working.selection_shares(&base);
 
-                egui::ScrollArea::vertical().max_height(420.0).show(ui, |ui| {
+                egui::ScrollArea::vertical().max_height(grid_h).show(ui, |ui| {
                     for (group, title, blurb) in [
                         (Group::Selection, "1. Selection fitness",
                          "Summed every generation to rank the population. The percentages are each \
@@ -1063,6 +1085,18 @@ impl App {
                                         process reads the profile FILE, so save your edits first.")
                         .clicked()
                     { do_start = true; }
+                    // Deliberately here and not only on the main panel: this
+                    // window floats over it, so without a Stop of its own the
+                    // only way to end a run you just started is to close this
+                    // window first — or kill the process by hand.
+                    if ui.add_enabled(running > 0, egui::Button::new("■  Stop"))
+                        .on_hover_text("Stop every evolution + scorer process, the same as the \
+                                        Stop on the main panel.")
+                        .clicked()
+                    { do_stop = true; }
+                    if running > 0 {
+                        ui.colored_label(Color32::LIGHT_GREEN, format!("{running} running"));
+                    }
                 });
 
                 if self.fp_dirty {
@@ -1085,6 +1119,7 @@ impl App {
         if do_save   { self.fp_save(); }
         if do_delete { self.fp_delete_selected(); }
         if do_start  { self.fp_start(); }
+        if do_stop   { self.stop_evolution(); }
         if do_close  { self.show_fitness = false; }
     }
 }
@@ -1159,9 +1194,12 @@ impl eframe::App for App {
         if stale {
             self.refresh_procs();
         }
-        // Secondary windows need a Context, not the panel's Ui.
+        // Secondary windows need a Context, not the panel's Ui — but this
+        // eframe's App::ui hands us a Ui, and its Context exposes no screen
+        // rect, so the height the window must fit inside comes from here.
+        let avail_h = ui.available_height();
         let ctx = ui.ctx().clone();
-        self.show_fitness_window(&ctx);
+        self.show_fitness_window(&ctx, avail_h);
 
         // While a job runs, repaint frequently for smooth progress; otherwise
         // just keep the resource monitor ticking.
@@ -1171,7 +1209,12 @@ impl eframe::App for App {
             ui.ctx().request_repaint_after(Duration::from_secs(60));
         }
 
+        // Scrollable: the panel's content (Explore / Evolve / Dedup /
+        // Processes / System) is taller than the default window, and without
+        // this everything below the fold is unreachable — which is how the
+        // Stop button became impossible to press.
         egui::CentralPanel::default().show(ui, |ui| {
+            egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
             ui.add_space(6.0);
             ui.heading("NNFractals");
             ui.label(
@@ -1451,6 +1494,7 @@ impl eframe::App for App {
                 ui.separator();
                 ui.label(egui::RichText::new(&self.status).color(Color32::LIGHT_GREEN).monospace());
             }
+            });
         });
     }
 }
@@ -1471,7 +1515,7 @@ fn main() -> anyhow::Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("NNFractals Launcher")
-            .with_inner_size([560.0, 440.0]),
+            .with_inner_size([620.0, 620.0]),
         ..Default::default()
     };
     eframe::run_native(
@@ -1548,5 +1592,55 @@ mod fitness_ui_tests {
         let found = discover_configs(root);
         assert!(found.contains(&"config.toml".to_string()), "got {found:?}");
         assert!(found.windows(2).all(|w| w[0] <= w[1]), "must be sorted: {found:?}");
+    }
+}
+
+#[cfg(test)]
+mod proc_matching_tests {
+    use super::classify_proc;
+
+    fn cmd(parts: &[&str]) -> Vec<String> {
+        parts.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn a_profile_launched_run_is_still_recognised() {
+        // Carl, 2026-09-10: an evolution run had to be killed by hand. The
+        // matching itself is fine — it keys on comm, so the --profile argument
+        // added by the fitness feature cannot break it. Pinned so a future
+        // change to cmdline-based matching fails here instead of in the field.
+        assert_eq!(
+            classify_proc("nnfractals", &cmd(&[
+                "./target/release/nnfractals", "--config", "config.toml",
+                "--profile", "Entropy only",
+            ])),
+            Some("evolution")
+        );
+    }
+
+    #[test]
+    fn a_plain_run_is_recognised() {
+        assert_eq!(
+            classify_proc("nnfractals", &cmd(&["./target/release/nnfractals"])),
+            Some("evolution")
+        );
+    }
+
+    #[test]
+    fn the_scorer_sidecar_is_recognised_by_its_script() {
+        assert_eq!(
+            classify_proc("python3", &cmd(&["python3", "aesthetic_scorer.py"])),
+            Some("scorer")
+        );
+    }
+
+    #[test]
+    fn the_gui_binaries_are_not_stopped() {
+        // Stop must never take out the launcher, viewer, queue or browser —
+        // their names all start with "nnfractals-".
+        for n in ["nnfractals-launcher", "nnfractals-viewer", "nnfractals-queue", "nnfractals-browser"] {
+            assert_eq!(classify_proc(n, &cmd(&[n])), None, "{n} must be left alone");
+        }
+        assert_eq!(classify_proc("explorer", &cmd(&["./target/release/explorer"])), None);
     }
 }

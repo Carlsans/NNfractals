@@ -1378,6 +1378,14 @@ pub fn time_frames<'a>(
     view: &'a View, frames: u32, w: u32, h: u32,
 ) -> impl Iterator<Item = Vec<u8>> + 'a {
     let n = frames.max(1);
+    // The requested OUTPUT resolution's aspect wins, not the aspect the view
+    // happened to be captured at — exactly as `chain_frame_views` does for the
+    // camera path, and for the same reason. `render_save` letterboxes to
+    // preserve the VIEW's coordinate aspect, so a square captured view rendered
+    // into a 1920x1080 canvas comes out as a square image with black bars, and
+    // changing the export resolution appears to do nothing at all.
+    let mut view = view.clone();
+    view.aspect = if h > 0 { w as f64 / h as f64 } else { 1.0 };
     (0..n).map(move |i| {
         let t = i as f32 / n as f32;
         let g = genome.at_time(t);
@@ -1389,7 +1397,7 @@ pub fn time_frames<'a>(
         // because it has not been checked on this path specifically; a deep
         // time video is the thing to test before flipping it.
         save_pool().install(|| {
-            render_save(&g, config, view, w, h, angle_coloring, VIDEO_FRAME_ALLOW_DD)
+            render_save(&g, config, &view, w, h, angle_coloring, VIDEO_FRAME_ALLOW_DD)
         })
     })
 }
@@ -2118,6 +2126,52 @@ mod tests {
         // t never reaches 1.0, so the last frame must not be a copy of the
         // first — otherwise a loop would stutter on one duplicated frame.
         assert_ne!(frames[0], frames[7], "last frame duplicates the first");
+    }
+
+    #[test]
+    fn a_wide_time_frame_fills_the_canvas_instead_of_letterboxing() {
+        // Carl, 2026-09-10: "the scale does not apply, using a square resolution
+        // does the same as a rectangular one". render_save letterboxes to
+        // preserve the VIEW's aspect, and a viewer-captured view is square, so a
+        // 2:1 export was a square image with black bars — changing the export
+        // resolution looked like it did nothing.
+        let g = julia_animated();
+        let config = chain_test_config();
+        let view = View::new_square(0.0, 0.0, 1.0);
+        assert_eq!(view.aspect, 1.0, "fixture must start square");
+
+        let (w, h) = (128u32, 64u32);
+        let frame = time_frames(&g, &config, false, &view, 1, w, h).next().unwrap();
+        assert_eq!(frame.len(), (w * h * 3) as usize);
+
+        // A letterboxed 2:1 render of square content leaves whole columns black
+        // down both edges. Check the outermost column on each side.
+        for x in [0u32, w - 1] {
+            let lit = (0..h).any(|y| {
+                let o = ((y * w + x) * 3) as usize;
+                frame[o] != 0 || frame[o + 1] != 0 || frame[o + 2] != 0
+            });
+            assert!(lit, "column {x} is entirely black — still letterboxing");
+        }
+    }
+
+    #[test]
+    fn changing_the_export_aspect_changes_the_pixels() {
+        // The direct form of the complaint: a rectangular export must not be
+        // the same picture as a square one.
+        let g = julia_animated();
+        let config = chain_test_config();
+        let view = View::new_square(0.0, 0.0, 1.0);
+        let square = time_frames(&g, &config, false, &view, 1, 64, 64).next().unwrap();
+        let wide = time_frames(&g, &config, false, &view, 1, 128, 64).next().unwrap();
+        // Compare the shared left half row-by-row; if the wide render were just
+        // the square one letterboxed, the centre would be identical content.
+        let same_centre = (0..64u32).all(|y| {
+            let a = ((y * 64 + 32) * 3) as usize;
+            let b = ((y * 128 + 64) * 3) as usize;
+            square[a..a + 3] == wide[b..b + 3]
+        });
+        assert!(!same_centre, "wide export is just the square one re-centred");
     }
 
     #[test]

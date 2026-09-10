@@ -538,24 +538,42 @@ pub fn summary(cands: &[TimeCandidate]) -> String {
             best.tmod.amp, best.score, best.stats.min_coherence, best.stats.mean_change,
         );
     }
-    let mut noise = 0;
-    let mut static_ = 0;
-    let mut incoherent = 0;
+    // Counted from the gate names themselves so a new gate can never be
+    // silently omitted — the first version of this hard-coded three of the five
+    // and reported "1 static, 0 incoherent, 1 noisy" for four candidates.
+    let mut counts: std::collections::BTreeMap<&'static str, usize> = std::collections::BTreeMap::new();
     for c in cands {
-        match c.rejected {
-            Some("noise") => noise += 1,
-            Some("static") => static_ += 1,
-            Some("incoherent") => incoherent += 1,
-            _ => {}
+        if let Some(why) = c.rejected {
+            *counts.entry(why).or_insert(0) += 1;
         }
     }
+    let breakdown: Vec<String> = counts.iter().map(|(k, n)| format!("{n} {k}")).collect();
+    let total: usize = counts.values().sum();
+    debug_assert_eq!(total, cands.len(), "every rejected candidate must be counted");
+
+    // Advice only for the gates that actually fired, so it stays short and
+    // points at the knob that matters for THIS run.
+    let mut advice: Vec<&str> = Vec::new();
+    if counts.contains_key("static") {
+        advice.push("'static' = amplitudes below this genome's sensitivity: raise --amps");
+    }
+    if counts.contains_key("incoherent") {
+        advice.push("'incoherent' = amplitudes above it, cuts rather than a morph: lower --amps");
+    }
+    if counts.contains_key("stalls") {
+        advice.push("'stalls' = the clip freezes partway; try a different shape or amplitude");
+    }
+    if counts.contains_key("flash") {
+        advice.push("'flash' = a sudden global brightness jump: lower --amps");
+    }
+    if counts.contains_key("noise") {
+        advice.push("'noise' = this genome dithers at the amplitudes tried; --max-noise relaxes the floor");
+    }
     format!(
-        "0 of {} candidates passed — {static_} moved too little, {incoherent} moved incoherently \
-         (cuts, not a morph), {noise} were spatially noisy. \
-         Too many 'static' means the amplitudes are below this genome's sensitivity: raise --amps. \
-         Too many 'incoherent' means they are above it: lower --amps. \
-         Too many 'noise' means this genome dithers at every amplitude tried; --max-noise relaxes the floor.",
-        cands.len()
+        "0 of {} candidates passed ({}). {}",
+        cands.len(),
+        breakdown.join(", "),
+        advice.join(". ")
     )
 }
 
@@ -853,6 +871,28 @@ mod tests {
         }).collect();
         let s = summary(&cands);
         assert!(s.contains("0 of 3"), "{s}");
+        assert!(s.contains("2 static"), "counts must appear: {s}");
+        assert!(s.contains("1 incoherent"), "counts must appear: {s}");
         assert!(s.contains("raise --amps"), "must say what to do next: {s}");
+    }
+
+    #[test]
+    fn the_summary_counts_every_gate_including_the_newer_ones() {
+        // The first version hard-coded three of the five reasons and silently
+        // dropped 'stalls' and 'flash', so the breakdown did not add up to the
+        // number of candidates.
+        let cands: Vec<TimeCandidate> = ["noise", "static", "stalls", "flash", "incoherent"]
+            .iter()
+            .map(|r| TimeCandidate {
+                tmod: TimeMod::new(ModTarget::Bailout, ModShape::Sine, 0.1),
+                score: 0.0,
+                stats: ClipStats::default(),
+                rejected: Some(r),
+            })
+            .collect();
+        let s = summary(&cands);
+        for reason in ["noise", "static", "stalls", "flash", "incoherent"] {
+            assert!(s.contains(&format!("1 {reason}")), "{reason} missing from: {s}");
+        }
     }
 }

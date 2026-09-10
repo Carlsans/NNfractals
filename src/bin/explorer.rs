@@ -2187,6 +2187,19 @@ fn main() {
             // trailing path lands in the cx slot, fails to parse as a number and
             // is silently discarded — the same positional/flag trap this CLI has
             // been bitten by before. The flag makes the intent unambiguous.
+            // A path that ENDS in .nn but did not load is a missing or corrupt
+            // file, not a formula name. Falling through to build_genome reports
+            // it as `unknown formula "fractals_1/....nn"` alongside a list of
+            // built-in formulas, which sends you looking in entirely the wrong
+            // place — and genomes really do vanish from a pool while you work,
+            // since dedup prunes it every two hours.
+            if genome_override.is_none()
+                && formula_path.extension().and_then(|e| e.to_str()) == Some("nn")
+            {
+                eprintln!("cannot load genome {}: no such file, or it failed to parse",
+                          formula_path.display());
+                std::process::exit(2);
+            }
             let out_dir = get_flag(&args, "--out").map(PathBuf::from)
                 .or_else(|| pos.get(5).map(PathBuf::from))
                 .unwrap_or_else(|| PathBuf::from(format!("explorer_out/{default_out_name}_time")));
