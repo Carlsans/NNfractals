@@ -606,15 +606,40 @@ mod tests {
         PathBuf::from(env!("CARGO_MANIFEST_DIR"))
     }
 
+    /// The profiles shipped with the repo. Anything else in `profiles/` is a
+    /// user's own — created in the launcher or by hand — and must not be held
+    /// to the documentation rules below.
+    const SHIPPED: &[&str] = &[
+        "classic-2026-06", "current", "current-no-imgnovelty", "current-relaxed",
+        "explore-wide", "pure-entropy", "taste-led",
+    ];
+
+    /// Every profile in the directory must LOAD — including ones the user
+    /// created. A profile that fails to parse silently disappears from the
+    /// launcher's dropdown, which is a bad way to find out about a typo.
     #[test]
-    fn every_shipped_profile_parses() {
+    fn every_profile_in_the_directory_loads() {
         let found = list_profiles(&repo());
         assert!(!found.is_empty(), "no profiles/*.toml found — did they get deleted?");
         for (name, path) in found {
-            let p = FitnessProfile::load(&path)
+            FitnessProfile::load(&path)
                 .unwrap_or_else(|e| panic!("profiles/{name}.toml failed to load: {e}"));
+        }
+    }
+
+    /// The shipped profiles specifically must explain themselves and be named
+    /// consistently. User profiles are deliberately exempt — an empty `notes`
+    /// is a perfectly reasonable thing to save from the launcher.
+    #[test]
+    fn shipped_profiles_document_themselves() {
+        let found = list_profiles(&repo());
+        for want in SHIPPED {
+            let (name, path) = found.iter()
+                .find(|(n, _)| n == want)
+                .unwrap_or_else(|| panic!("shipped profile {want}.toml is missing"));
+            let p = FitnessProfile::load(path).unwrap();
             assert!(!p.notes.trim().is_empty(), "profiles/{name}.toml has no notes");
-            assert_eq!(p.name, name, "profiles/{name}.toml declares a mismatched name");
+            assert_eq!(&p.name, name, "profiles/{name}.toml declares a mismatched name");
         }
     }
 
