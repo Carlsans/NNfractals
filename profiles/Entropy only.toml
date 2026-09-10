@@ -1,0 +1,9 @@
+name = "Entropy only"
+notes = ""
+novelty_weight = 0.0
+formula_diversity_weight = 0.0
+ood_weight = 0.0
+angle_structure_weight = 0.0
+recursion_pred_weight = 0.0
+complexity_penalty = 0.0
+duplicate_penalty_weight = 1.0

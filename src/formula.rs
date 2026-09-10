@@ -70,13 +70,210 @@ pub mod op {
 
 /// One node of an expression-DAG program. `a`/`b` index strictly-earlier nodes
 /// (ignored for ops whose arity is below 2). `kre`/`kim` used only by CONST.
-#[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct OpNode {
     pub op: u8,
     pub a:  u8,
     pub b:  u8,
     #[serde(default)] pub kre: f32,
     #[serde(default)] pub kim: f32,
+}
+
+// ── Time modulation ─────────────────────────────────────────────────────────
+//
+// A fractal is normally a function of two variables (the pixel coordinate). A
+// `TimeMod` adds a third: it names one scalar inside the genome and varies it
+// over t ∈ [0,1), so a clip becomes a continuous walk through a one-parameter
+// family of fractals rather than a camera move over a fixed one.
+//
+// Every target below is a value the renderer already re-reads per render — the
+// DAG program's own `kre`/`kim`, the Julia constant, phoenix, bailout — and all
+// of them are re-uploaded to the GPU on every dispatch (`render_gpu::dag_item`
+// packs them fresh each time). So modulation is applied by building a modified
+// `Genome` per frame (`Genome::at_time`) and rendering it normally: no change to
+// the CPU kernel, the f64/DD kernels, or `fractal.wgsl`.
+
+/// Which scalar inside a genome a `TimeMod` drives.
+///
+/// Variants are serialized by NAME into the `.nn` file, so they may be added
+/// but must not be renamed — same append-only rule as the opcodes above.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum ModTarget {
+    /// The Julia constant `c`. Two-channel. Present on ~98% of the archive, and
+    /// the most reliably beautiful axis: the set morphs continuously while the
+    /// camera stays put. Inert unless `julia_mode` is set.
+    JuliaC,
+    /// The phoenix memory coefficient `p` in `z' = f(z,c) + p·z_prev`.
+    /// Two-channel. Changes the order of the recurrence itself.
+    Phoenix,
+    /// The escape radius. Single-channel, and the weakest of the set: it does
+    /// not change the set's topology, only where the smooth escape-time bands
+    /// fall, so it reads as a pulsing rather than a morph.
+    Bailout,
+    /// The `kre`/`kim` of an existing CONST node in the main program.
+    /// Two-channel. The most direct "scale one term of the formula", but only
+    /// ~25% of archived genomes have a CONST node at all — see `ProgScale`.
+    ProgConst { node: u8 },
+    /// The `kre`/`kim` of an existing CONST node in the coordinate-warp program.
+    /// Two-channel. Bends the input plane over time.
+    WarpConst { node: u8 },
+    /// For the three-quarters of genomes with no CONST node: splice
+    /// `MUL(CONST(k), program[node])` in at render time and drive `k`, so any
+    /// subtree can be scaled even when the evolved program never allocated a
+    /// constant. Costs 2 of the 24 register slots and is skipped when the
+    /// program has no room.
+    ProgScale { node: u8 },
+}
+
+impl ModTarget {
+    /// Whether this target drives a complex pair rather than a lone scalar.
+    /// `Bailout` is the only single-channel target.
+    pub fn is_two_channel(self) -> bool {
+        !matches!(self, ModTarget::Bailout)
+    }
+
+    /// Short label for logs, manifests and the viewer's list.
+    pub fn label(self) -> String {
+        match self {
+            ModTarget::JuliaC => "julia c".to_string(),
+            ModTarget::Phoenix => "phoenix p".to_string(),
+            ModTarget::Bailout => "bailout".to_string(),
+            ModTarget::ProgConst { node } => format!("prog const #{node}"),
+            ModTarget::WarpConst { node } => format!("warp const #{node}"),
+            ModTarget::ProgScale { node } => format!("prog scale #{node}"),
+        }
+    }
+}
+
+/// The shape of the modulation over one clip.
+///
+/// `Sine`, `Cosine` and `Triangle` are continuous AND periodic, so at an integer
+/// `freq` the clip loops seamlessly — the last frame flows back into the first.
+/// `Sawtooth` is periodic but NOT continuous: it snaps back once per cycle, so
+/// expect a visible cut there. `Pulse` and `Ramp` are one-shot and do not loop.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum ModShape {
+    Sine,
+    Cosine,
+    Triangle,
+    Sawtooth,
+    /// A single Gaussian bump centred at `phase`; `freq` narrows it.
+    Pulse,
+    /// A straight line from 0, reaching `amp` at t = 1/`freq`.
+    Ramp,
+    /// Two-channel only: walks a circle of radius `amp` in the complex plane.
+    /// The natural shape for `JuliaC` and `Phoenix` — a circular orbit of the
+    /// Julia constant is the classic animated-Julia move. On a single-channel
+    /// target it degenerates to its real part, i.e. a cosine.
+    Orbit,
+}
+
+impl ModShape {
+    pub fn label(self) -> &'static str {
+        match self {
+            ModShape::Sine => "sine",
+            ModShape::Cosine => "cosine",
+            ModShape::Triangle => "triangle",
+            ModShape::Sawtooth => "sawtooth",
+            ModShape::Pulse => "pulse",
+            ModShape::Ramp => "ramp",
+            ModShape::Orbit => "orbit",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<ModShape> {
+        Some(match s.trim().to_ascii_lowercase().as_str() {
+            "sine" | "sin" => ModShape::Sine,
+            "cosine" | "cos" => ModShape::Cosine,
+            "triangle" | "tri" => ModShape::Triangle,
+            "sawtooth" | "saw" => ModShape::Sawtooth,
+            "pulse" => ModShape::Pulse,
+            "ramp" => ModShape::Ramp,
+            "orbit" => ModShape::Orbit,
+            _ => return None,
+        })
+    }
+
+    /// Whether the clip returns to its starting value, so an integer number of
+    /// cycles plays as a seamless loop.
+    pub fn loops(self) -> bool {
+        matches!(self, ModShape::Sine | ModShape::Cosine | ModShape::Triangle | ModShape::Orbit)
+    }
+
+    pub const ALL: &'static [ModShape] = &[
+        ModShape::Sine, ModShape::Cosine, ModShape::Triangle,
+        ModShape::Sawtooth, ModShape::Pulse, ModShape::Ramp, ModShape::Orbit,
+    ];
+}
+
+/// One time-modulation channel: what to drive, how, and by how much.
+///
+/// The value is an OFFSET added to the genome's own stored value, never a
+/// replacement — so `amp = 0` is always exactly the original fractal, and a
+/// modulation can be dialled continuously from "off" to "wild" without the
+/// genome's identity jumping.
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct TimeMod {
+    pub target: ModTarget,
+    pub shape: ModShape,
+    /// Peak offset applied to the target. Interpreted in the target's own
+    /// units (the complex plane for julia/phoenix/consts, radius for bailout).
+    #[serde(default)]
+    pub amp: f32,
+    /// Cycles over the full clip. 1.0 = exactly one loop.
+    #[serde(default = "default_mod_freq")]
+    pub freq: f32,
+    /// Where in the cycle the clip starts, in turns (0..1).
+    #[serde(default)]
+    pub phase: f32,
+}
+
+fn default_mod_freq() -> f32 { 1.0 }
+
+impl TimeMod {
+    pub fn new(target: ModTarget, shape: ModShape, amp: f32) -> Self {
+        TimeMod { target, shape, amp, freq: 1.0, phase: 0.0 }
+    }
+}
+
+/// The scalar offset for `m` at time `t ∈ [0,1)`.
+///
+/// This is the real channel; for two-channel targets see [`mod_offset`].
+pub fn mod_value(m: &TimeMod, t: f32) -> f32 {
+    mod_offset(m, t).0
+}
+
+/// The complex offset `(re, im)` for `m` at time `t ∈ [0,1)`.
+///
+/// Every shape except `Orbit` drives the real channel only, leaving the
+/// imaginary part of the target untouched — so switching a modulation from
+/// `Sine` to `Orbit` is the difference between sliding along a line and walking
+/// a circle, which is exactly the distinction worth having.
+pub fn mod_offset(m: &TimeMod, t: f32) -> (f32, f32) {
+    use std::f32::consts::TAU;
+    let theta = TAU * (m.freq * t + m.phase);
+    match m.shape {
+        ModShape::Sine => (m.amp * theta.sin(), 0.0),
+        ModShape::Cosine => (m.amp * theta.cos(), 0.0),
+        ModShape::Triangle => {
+            // 4|x - round(x)| - 1 over one period: a continuous -1..1 ramp pair.
+            let x = m.freq * t + m.phase;
+            let tri = 4.0 * (x - (x + 0.5).floor()).abs() - 1.0;
+            (m.amp * tri, 0.0)
+        }
+        ModShape::Sawtooth => {
+            let x = m.freq * t + m.phase;
+            (m.amp * (2.0 * (x - x.floor()) - 1.0), 0.0)
+        }
+        ModShape::Pulse => {
+            // Gaussian bump centred at `phase`; `freq` narrows it. The factor 6
+            // makes freq = 1 span roughly a third of the clip.
+            let d = (t - m.phase) * m.freq.max(1e-3) * 6.0;
+            (m.amp * (-d * d).exp(), 0.0)
+        }
+        ModShape::Ramp => (m.amp * (m.freq * t + m.phase), 0.0),
+        ModShape::Orbit => (m.amp * theta.cos(), m.amp * theta.sin()),
+    }
 }
 
 // The formula evaluator is generated for both f32 (fast, GPU-matched, used by the
@@ -403,5 +600,132 @@ pub fn basis_name(i: usize) -> &'static str {
         54=>"1/(z²+c)",55=>"z²c/(z+c)",
         56=>"1",      57=>"i",
         _  =>"?",
+    }
+}
+
+#[cfg(test)]
+mod time_mod_tests {
+    use super::*;
+
+    fn m(shape: ModShape, amp: f32, freq: f32) -> TimeMod {
+        TimeMod { target: ModTarget::JuliaC, shape, amp, freq, phase: 0.0 }
+    }
+
+    #[test]
+    fn looping_shapes_return_to_their_start_at_integer_freq() {
+        // This is what makes a clip loop seamlessly: the frame after the last
+        // one would be the first one again.
+        for shape in [ModShape::Sine, ModShape::Cosine, ModShape::Triangle, ModShape::Orbit] {
+            for freq in [1.0f32, 2.0, 3.0] {
+                let tm = m(shape, 0.4, freq);
+                let (a_re, a_im) = mod_offset(&tm, 0.0);
+                let (b_re, b_im) = mod_offset(&tm, 1.0);
+                assert!((a_re - b_re).abs() < 1e-5 && (a_im - b_im).abs() < 1e-5,
+                    "{shape:?} at freq {freq} does not loop: {a_re},{a_im} vs {b_re},{b_im}");
+                assert!(shape.loops(), "{shape:?} should report loops() = true");
+            }
+        }
+    }
+
+    #[test]
+    fn sawtooth_is_periodic_but_reports_that_it_does_not_loop() {
+        // It returns to the same value, but by snapping rather than flowing —
+        // so `loops()` must say false or the UI would promise a seamless clip
+        // it cannot deliver.
+        let tm = m(ModShape::Sawtooth, 1.0, 1.0);
+        assert!(!ModShape::Sawtooth.loops());
+        // Just before the wrap it is near +amp; just after, near -amp.
+        assert!(mod_value(&tm, 0.99) > 0.9, "got {}", mod_value(&tm, 0.99));
+        assert!(mod_value(&tm, 0.01) < -0.9, "got {}", mod_value(&tm, 0.01));
+    }
+
+    #[test]
+    fn continuous_shapes_have_no_jumps_across_the_clip() {
+        for shape in [ModShape::Sine, ModShape::Cosine, ModShape::Triangle, ModShape::Orbit] {
+            let tm = m(shape, 1.0, 2.0);
+            let steps = 400;
+            let mut prev = mod_offset(&tm, 0.0);
+            for i in 1..=steps {
+                let t = i as f32 / steps as f32;
+                let cur = mod_offset(&tm, t);
+                let jump = ((cur.0 - prev.0).powi(2) + (cur.1 - prev.1).powi(2)).sqrt();
+                assert!(jump < 0.1, "{shape:?} jumps {jump} at t={t}");
+                prev = cur;
+            }
+        }
+    }
+
+    #[test]
+    fn zero_amplitude_is_always_the_identity() {
+        // The invariant the whole design rests on: dialling a modulation to 0
+        // must give back exactly the original fractal, for every shape.
+        for shape in ModShape::ALL {
+            let tm = m(*shape, 0.0, 1.7);
+            for i in 0..20 {
+                let t = i as f32 / 20.0;
+                assert_eq!(mod_offset(&tm, t), (0.0, 0.0), "{shape:?} at t={t}");
+            }
+        }
+    }
+
+    #[test]
+    fn orbit_walks_a_circle_of_radius_amp() {
+        let tm = m(ModShape::Orbit, 0.3, 1.0);
+        for i in 0..32 {
+            let t = i as f32 / 32.0;
+            let (re, im) = mod_offset(&tm, t);
+            let r = (re * re + im * im).sqrt();
+            assert!((r - 0.3).abs() < 1e-5, "radius {r} at t={t}");
+        }
+    }
+
+    #[test]
+    fn only_orbit_drives_the_imaginary_channel() {
+        for shape in ModShape::ALL {
+            let tm = m(*shape, 0.5, 1.0);
+            let (_, im) = mod_offset(&tm, 0.37);
+            if *shape == ModShape::Orbit {
+                assert!(im.abs() > 1e-6, "orbit must move in im");
+            } else {
+                assert_eq!(im, 0.0, "{shape:?} must leave im alone");
+            }
+        }
+    }
+
+    #[test]
+    fn pulse_peaks_at_its_phase_and_decays_away() {
+        let tm = TimeMod { target: ModTarget::Bailout, shape: ModShape::Pulse,
+                           amp: 1.0, freq: 1.0, phase: 0.5 };
+        let peak = mod_value(&tm, 0.5);
+        assert!((peak - 1.0).abs() < 1e-5, "peak {peak}");
+        assert!(mod_value(&tm, 0.0) < 0.02, "should be ~0 far from the peak");
+        assert!(mod_value(&tm, 1.0) < 0.02);
+    }
+
+    #[test]
+    fn shape_names_round_trip() {
+        for shape in ModShape::ALL {
+            assert_eq!(ModShape::parse(shape.label()), Some(*shape));
+        }
+        assert_eq!(ModShape::parse("SIN"), Some(ModShape::Sine));
+        assert_eq!(ModShape::parse("nonsense"), None);
+    }
+
+    #[test]
+    fn bailout_is_the_only_single_channel_target() {
+        assert!(!ModTarget::Bailout.is_two_channel());
+        for t in [ModTarget::JuliaC, ModTarget::Phoenix,
+                  ModTarget::ProgConst { node: 0 }, ModTarget::WarpConst { node: 0 },
+                  ModTarget::ProgScale { node: 0 }] {
+            assert!(t.is_two_channel(), "{t:?}");
+        }
+    }
+
+    #[test]
+    fn time_mod_survives_a_json_round_trip() {
+        let tm = TimeMod { target: ModTarget::ProgScale { node: 7 }, shape: ModShape::Orbit,
+                           amp: 0.25, freq: 2.0, phase: 0.125 };
+        let json = serde_json::to_string(&tm).unwrap();
+        assert_eq!(serde_json::from_str::<TimeMod>(&json).unwrap(), tm);
     }
 }

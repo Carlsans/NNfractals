@@ -1886,7 +1886,25 @@ mod tests {
         assert!(needs_dd(&view, 1280), "should already need DD at a realistic export width");
     }
 
-    fn mandelbrot_genome() -> Genome {
+    /// The guarantee that adding a time axis changed nothing about existing
+    /// rendering: for a genome with no `time_mod`, going through `at_time`
+    /// produces byte-identical pixels to not going through it at all.
+    #[test]
+    fn at_time_is_byte_identical_for_a_static_genome() {
+        let g = mandelbrot_genome();
+        assert!(g.time_mod.is_empty());
+        let config = chain_test_config();
+        let view = View::new_square(-0.5, 0.0, 1.0);
+        let plain = render_save(&g, &config, &view, 64, 64, false, false);
+        assert!(plain.iter().any(|&b| b != plain[0]), "reference frame is uniform — bad fixture");
+        for i in 0..5 {
+            let t = i as f32 / 5.0;
+            let via = render_save(&g.at_time(t), &config, &view, 64, 64, false, false);
+            assert_eq!(via, plain, "at_time({t}) changed the pixels of a static genome");
+        }
+    }
+
+    pub(super) fn mandelbrot_genome() -> Genome {
         use crate::formula::{op, OpNode};
         use crate::genome::ProgramBuilder;
         let mut b = ProgramBuilder::new();
@@ -1897,7 +1915,7 @@ mod tests {
         Genome { program: b.into_nodes(), bailout_radius: 4.0, view_zoom: 1.0, ..Default::default() }
     }
 
-    fn chain_test_config() -> Config {
+    pub(super) fn chain_test_config() -> Config {
         use crate::config::{DedupConfig, MassExtinctionConfig, OptimizationConfig, OutputConfig, RenderingConfig};
         Config {
             dedup: DedupConfig::default(), mass_extinction: MassExtinctionConfig::default(),
@@ -1922,5 +1940,31 @@ mod tests {
         for w in chain.windows(2) {
             assert!(w[1].zoom > w[0].zoom, "each waypoint must be a DEEPER zoom than the last");
         }
+    }
+}
+
+/// Scratch harness used to prove the `encode_rgb_frames` extraction is
+/// byte-identical on the shipping video path. Writes a short clip to a fixed
+/// path so the caller can hash it before and after the refactor.
+#[cfg(test)]
+mod refactor_parity_harness {
+    use super::*;
+
+    #[test]
+    #[ignore = "writes a file for manual MD5 comparison; run explicitly"]
+    fn export_reference_clip() {
+        let out = std::path::PathBuf::from(
+            std::env::var("NNF_PARITY_OUT").expect("set NNF_PARITY_OUT"),
+        );
+        let genome = super::tests::mandelbrot_genome();
+        let config = super::tests::chain_test_config();
+        let a = CapturedView { cx: -0.5,   cx_lo: 0.0, cy: 0.0,   cy_lo: 0.0, zoom: 1.0,  aspect: 1.0 };
+        let b = CapturedView { cx: -0.743, cx_lo: 0.0, cy: 0.126, cy_lo: 0.0, zoom: 40.0, aspect: 1.0 };
+        let (tx, rx) = std::sync::mpsc::channel();
+        export_video_chain(&genome, &config, false, &[a, b], 12, 24, 96, 96,
+                           false, false, &out, &tx, &|| {});
+        let done = rx.try_iter().any(|m| matches!(m, VideoMsg::Done(_)));
+        assert!(done, "reference export failed");
+        assert!(out.exists(), "no file written");
     }
 }

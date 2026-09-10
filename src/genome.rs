@@ -1,7 +1,7 @@
 use rand::Rng;
 use serde::{Deserialize, Serialize};
 use crate::config::Config;
-use crate::formula::{N_BASIS, basis_name, op, OpNode, N_SLOTS};
+use crate::formula::{N_BASIS, basis_name, op, OpNode, N_SLOTS, TimeMod, ModTarget, mod_offset};
 
 /// Bounds on the number of active terms in a genome's formula.
 pub const MIN_TERMS: usize = 2;
@@ -154,6 +154,12 @@ pub struct Genome {
     /// Optional warp program applied once to the pixel coordinate before iterating
     /// (c ← warp(pixel)). Empty = identity. Bends the plane (spirals/folds).
     #[serde(default)] pub warp: Vec<crate::formula::OpNode>,
+    /// Optional time modulation — the third dimension. Empty means a static
+    /// fractal, which is every `.nn` file written before this existed, so old
+    /// archives load and render bit-identically. Never consumed by the renderer
+    /// directly: `at_time` bakes it into a per-frame `Genome` clone instead, so
+    /// the CPU/f64/DD kernels and the WGSL shader are all untouched.
+    #[serde(default)] pub time_mod: Vec<TimeMod>,
     pub id: u64,
     #[serde(default)]
     pub view_cx: f32,
@@ -235,6 +241,12 @@ impl Genome {
                 s.push_str(&format!("   [julia c={}, z0=pixel]", fmt_c(self.julia_cre, self.julia_cim)));
             }
             s.push_str(&format!("   [bailout r={:.1}]", self.bailout_radius));
+            for m in &self.time_mod {
+                s.push_str(&format!(
+                    "   [anim: {} {} amp={:.3} freq={:.2}]",
+                    m.target.label(), m.shape.label(), m.amp, m.freq
+                ));
+            }
             s
         } else {
             let parts: Vec<String> = self.terms.iter()
@@ -243,6 +255,61 @@ impl Genome {
             let body = if parts.is_empty() { "0".into() } else { parts.join(" + ") };
             format!("z_next = {body}")
         }
+    }
+
+    /// A clone of this genome with every [`TimeMod`] evaluated at `t ∈ [0,1)`.
+    ///
+    /// This is the entire rendering change for the time axis. Because every
+    /// modulated scalar is a plain genome field that the renderer re-reads on
+    /// each call — and `render_gpu::dag_item` repacks all of them into the
+    /// per-genome upload block on every dispatch — the returned `Genome` renders
+    /// correctly through the f32 GPU path, the f64 CPU path and the DD path with
+    /// no change to any of them, and none to `fractal.wgsl`.
+    ///
+    /// Modulations are OFFSETS from the genome's own values, so `amp = 0` is
+    /// always exactly the original fractal. Two modulations aimed at the same
+    /// scalar sum, which is the useful behaviour (a slow drift plus a fast
+    /// wobble). An empty `time_mod` returns a plain clone, so a static genome is
+    /// bit-identical to not calling this at all.
+    pub fn at_time(&self, t: f32) -> Genome {
+        if self.time_mod.is_empty() {
+            return self.clone();
+        }
+        let mut g = self.clone();
+        for m in &self.time_mod {
+            let (dre, dim) = mod_offset(m, t);
+            match m.target {
+                ModTarget::JuliaC => {
+                    g.julia_cre += dre;
+                    g.julia_cim += dim;
+                }
+                ModTarget::Phoenix => {
+                    g.phoenix_re += dre;
+                    g.phoenix_im += dim;
+                }
+                ModTarget::Bailout => {
+                    // A non-positive escape radius makes every orbit escape on
+                    // iteration 0 and the frame goes flat, so floor it rather
+                    // than let a large amplitude destroy the clip.
+                    g.bailout_radius = (g.bailout_radius + dre).max(MIN_BAILOUT_RADIUS);
+                }
+                ModTarget::ProgConst { node } => {
+                    offset_const(&mut g.program, node, dre, dim);
+                }
+                ModTarget::WarpConst { node } => {
+                    offset_const(&mut g.warp, node, dre, dim);
+                }
+                ModTarget::ProgScale { node } => {
+                    // k = 1 + offset, NOT the offset itself: a multiplier of 0
+                    // would annihilate the subtree, and `amp = 0` has to stay
+                    // the identity like every other target.
+                    if let Some(next) = splice_scale(&g.program, node, 1.0 + dre, dim) {
+                        g.program = next;
+                    }
+                }
+            }
+        }
+        g
     }
 
     /// Representation-aware formula descriptor for k-NN formula-diversity scoring:
@@ -334,6 +401,7 @@ impl Genome {
             phoenix_im: 0.0,
             bailout_radius: default_bailout_radius(),
             warp: Vec::new(),
+            time_mod: Vec::new(),
             id: rng.random(),
             view_cx: view.0,
             view_cy: view.1,
@@ -647,6 +715,62 @@ mod gp_op_tests {
             }
         }
     }
+}
+
+
+/// Smallest escape radius a `Bailout` modulation may drive to. Below roughly
+/// this every orbit escapes immediately and the frame goes uniformly flat.
+pub const MIN_BAILOUT_RADIUS: f32 = 0.25;
+
+/// Add `(dre, dim)` to node `idx`'s constant, if that node exists and is
+/// actually a CONST. Silently does nothing otherwise — a stale node index in a
+/// hand-edited `.nn` should render a static fractal, not panic.
+fn offset_const(prog: &mut [OpNode], idx: u8, dre: f32, dim: f32) {
+    if let Some(n) = prog.get_mut(idx as usize) {
+        if n.op == op::CONST {
+            n.kre += dre;
+            n.kim += dim;
+        }
+    }
+}
+
+/// Splice `MUL(CONST(kre,kim), prog[node])` into `prog` so the subtree rooted at
+/// `node` is scaled by a complex constant.
+///
+/// The two new nodes go directly AFTER `node` rather than at the end, and every
+/// later operand index is remapped (+2, and any reference to `node` itself
+/// repointed at the new MUL). Appending at the end instead would make the MUL
+/// the program's root, which silently replaces the whole formula with a scaled
+/// copy of one subtree — right only when `node` happens to be the root already.
+///
+/// Returns `None` if there is no room within [`N_SLOTS`], leaving the caller to
+/// render the genome unmodulated rather than produce an invalid program.
+fn splice_scale(prog: &[OpNode], node: u8, kre: f32, kim: f32) -> Option<Vec<OpNode>> {
+    let n = node as usize;
+    if n >= prog.len() || prog.len() + 2 > N_SLOTS {
+        return None;
+    }
+    let k_idx = (n + 1) as u8;
+    let mul_idx = (n + 2) as u8;
+
+    let mut out: Vec<OpNode> = Vec::with_capacity(prog.len() + 2);
+    out.extend_from_slice(&prog[..=n]);
+    out.push(OpNode { op: op::CONST, a: 0, b: 0, kre, kim });
+    out.push(OpNode { op: op::MUL, a: k_idx, b: node, kre: 0.0, kim: 0.0 });
+
+    // Everything after the splice point shifts by 2; references to `node` now
+    // mean "the scaled version of node".
+    let remap = |i: u8| -> u8 {
+        if i as usize == n { mul_idx } else if (i as usize) > n { i + 2 } else { i }
+    };
+    for src in &prog[n + 1..] {
+        let mut nd = *src;
+        let arity = op::arity(nd.op);
+        if arity >= 1 { nd.a = remap(nd.a); }
+        if arity >= 2 { nd.b = remap(nd.b); }
+        out.push(nd);
+    }
+    Some(out)
 }
 
 #[cfg(test)]
@@ -975,5 +1099,206 @@ fn build_basis(b: &mut ProgramBuilder, i: u8, z: u8, c: u8) -> Option<u8> {
         57 => b.push(CONST, 0, 0, 0.0, 1.0),                              // i
         // 31 sinh, 32 cosh, 49 z·|z| — no exact single-op equivalent → bail.
         _  => None,
+    }
+}
+
+#[cfg(test)]
+mod at_time_tests {
+    use super::*;
+    use crate::formula::{ModShape, ModTarget, TimeMod, eval_program};
+
+    /// Same validity rule the GP operators are held to: every operand must name
+    /// a strictly-earlier node, and the program must fit the register file.
+    fn is_valid_dag(prog: &[OpNode]) -> bool {
+        prog.len() <= N_SLOTS
+            && prog.iter().enumerate().all(|(i, n)| {
+                let arity = op::arity(n.op);
+                (arity < 1 || (n.a as usize) < i) && (arity < 2 || (n.b as usize) < i)
+            })
+    }
+
+    fn mandelbrot() -> Genome {
+        let mut g = Genome::default();
+        g.program = vec![
+            OpNode { op: op::Z,   a: 0, b: 0, kre: 0.0, kim: 0.0 },
+            OpNode { op: op::C,   a: 0, b: 0, kre: 0.0, kim: 0.0 },
+            OpNode { op: op::SQR, a: 0, b: 0, kre: 0.0, kim: 0.0 },
+            OpNode { op: op::ADD, a: 2, b: 1, kre: 0.0, kim: 0.0 },
+        ];
+        g.bailout_radius = 4.0;
+        g
+    }
+
+    #[test]
+    fn an_empty_time_mod_is_a_plain_clone_at_every_t() {
+        // The guarantee that nothing about existing rendering changed.
+        let g = mandelbrot();
+        let base = serde_json::to_string(&g).unwrap();
+        for i in 0..25 {
+            let t = i as f32 / 25.0;
+            assert_eq!(serde_json::to_string(&g.at_time(t)).unwrap(), base, "t={t}");
+        }
+    }
+
+    #[test]
+    fn zero_amplitude_leaves_the_genome_untouched() {
+        let mut g = mandelbrot();
+        g.julia_mode = true;
+        g.julia_cre = -0.4;
+        g.julia_cim = 0.6;
+        let base = serde_json::to_string(&g).unwrap();
+        g.time_mod = vec![TimeMod::new(ModTarget::JuliaC, ModShape::Orbit, 0.0)];
+
+        let mut expected: Genome = serde_json::from_str(&base).unwrap();
+        expected.time_mod = g.time_mod.clone();
+        let want = serde_json::to_string(&expected).unwrap();
+        for i in 0..10 {
+            assert_eq!(serde_json::to_string(&g.at_time(i as f32 / 10.0)).unwrap(), want);
+        }
+    }
+
+    #[test]
+    fn julia_orbit_moves_c_on_a_circle_around_its_stored_value() {
+        let mut g = mandelbrot();
+        g.julia_mode = true;
+        g.julia_cre = -0.4;
+        g.julia_cim = 0.6;
+        g.time_mod = vec![TimeMod::new(ModTarget::JuliaC, ModShape::Orbit, 0.1)];
+        for i in 0..16 {
+            let t = i as f32 / 16.0;
+            let a = g.at_time(t);
+            let r = ((a.julia_cre + 0.4).powi(2) + (a.julia_cim - 0.6).powi(2)).sqrt();
+            assert!((r - 0.1).abs() < 1e-5, "radius {r} at t={t}");
+        }
+    }
+
+    #[test]
+    fn bailout_never_drops_to_a_degenerate_radius() {
+        // A huge amplitude must clamp, not produce a radius that makes every
+        // orbit escape on iteration 0 and the frame go flat.
+        let mut g = mandelbrot();
+        g.time_mod = vec![TimeMod::new(ModTarget::Bailout, ModShape::Sine, 50.0)];
+        for i in 0..40 {
+            let a = g.at_time(i as f32 / 40.0);
+            assert!(a.bailout_radius >= MIN_BAILOUT_RADIUS,
+                "radius {} below floor", a.bailout_radius);
+        }
+    }
+
+    #[test]
+    fn prog_scale_produces_a_valid_dag_and_actually_scales() {
+        let mut g = mandelbrot();
+        // Scale node 2 (the SQR), which is NOT the root — the case where naive
+        // append-at-the-end would silently replace the whole formula.
+        g.time_mod = vec![TimeMod::new(ModTarget::ProgScale { node: 2 }, ModShape::Cosine, 0.5)];
+        let a = g.at_time(0.0); // cos(0) = 1 → k = 1.5
+        assert_eq!(a.program.len(), 6, "two nodes spliced in");
+        assert!(is_valid_dag(&a.program), "invalid DAG: {:?}", a.program);
+
+        // The root must still be the ADD, with its SQR operand repointed at the
+        // new MUL — i.e. z' = 1.5·z² + c, not 1.5·z².
+        let root = a.program.last().unwrap();
+        assert_eq!(root.op, op::ADD, "root should still be the ADD");
+
+        let (zx, zy, cx, cy) = (0.3f32, 0.2f32, -0.1f32, 0.4f32);
+        let (got_x, got_y) = eval_program(&a.program, zx, zy, cx, cy);
+        // 1.5·(z²) + c, computed independently.
+        let (sx, sy) = (zx * zx - zy * zy, 2.0 * zx * zy);
+        let (want_x, want_y) = (1.5 * sx + cx, 1.5 * sy + cy);
+        assert!((got_x - want_x).abs() < 1e-5 && (got_y - want_y).abs() < 1e-5,
+            "got ({got_x},{got_y}) want ({want_x},{want_y})");
+    }
+
+    #[test]
+    fn prog_scale_at_zero_amplitude_evaluates_identically() {
+        // The spliced program has two extra nodes, so it is not byte-identical —
+        // but multiplying by k = 1 must leave the VALUE untouched.
+        let mut g = mandelbrot();
+        g.time_mod = vec![TimeMod::new(ModTarget::ProgScale { node: 2 }, ModShape::Sine, 0.0)];
+        let a = g.at_time(0.25);
+        for (zx, zy, cx, cy) in [(0.3f32, 0.2f32, -0.1f32, 0.4f32), (-1.2, 0.7, 0.05, -0.3)] {
+            let plain = eval_program(&g.program, zx, zy, cx, cy);
+            let scaled = eval_program(&a.program, zx, zy, cx, cy);
+            assert!((plain.0 - scaled.0).abs() < 1e-6 && (plain.1 - scaled.1).abs() < 1e-6,
+                "k=1 changed the value: {plain:?} vs {scaled:?}");
+        }
+    }
+
+    #[test]
+    fn prog_scale_is_refused_when_the_register_file_is_full() {
+        let mut g = mandelbrot();
+        // Pad to N_SLOTS-1 so a +2 splice cannot fit.
+        while g.program.len() < N_SLOTS - 1 {
+            let i = g.program.len() as u8;
+            g.program.push(OpNode { op: op::ADD, a: i - 1, b: i - 2, kre: 0.0, kim: 0.0 });
+        }
+        let before = g.program.clone();
+        g.time_mod = vec![TimeMod::new(ModTarget::ProgScale { node: 2 }, ModShape::Sine, 0.5)];
+        let a = g.at_time(0.3);
+        assert_eq!(a.program, before, "must render unmodulated rather than overflow");
+        assert!(is_valid_dag(&a.program));
+    }
+
+    #[test]
+    fn prog_scale_at_the_root_scales_the_whole_formula() {
+        let mut g = mandelbrot();
+        let root = (g.program.len() - 1) as u8;
+        g.time_mod = vec![TimeMod::new(ModTarget::ProgScale { node: root }, ModShape::Cosine, 1.0)];
+        let a = g.at_time(0.0); // k = 2
+        assert!(is_valid_dag(&a.program));
+        let (zx, zy, cx, cy) = (0.3f32, 0.2f32, -0.1f32, 0.4f32);
+        let plain = eval_program(&g.program, zx, zy, cx, cy);
+        let scaled = eval_program(&a.program, zx, zy, cx, cy);
+        assert!((scaled.0 - 2.0 * plain.0).abs() < 1e-5
+             && (scaled.1 - 2.0 * plain.1).abs() < 1e-5,
+            "root scale should double: {plain:?} -> {scaled:?}");
+    }
+
+    #[test]
+    fn a_stale_node_index_is_ignored_rather_than_panicking() {
+        let mut g = mandelbrot();
+        g.time_mod = vec![
+            TimeMod::new(ModTarget::ProgConst { node: 99 }, ModShape::Sine, 0.5),
+            TimeMod::new(ModTarget::ProgScale { node: 99 }, ModShape::Sine, 0.5),
+            TimeMod::new(ModTarget::WarpConst { node: 3 }, ModShape::Sine, 0.5),
+        ];
+        let a = g.at_time(0.4);
+        assert_eq!(a.program, g.program);
+        assert!(a.warp.is_empty());
+    }
+
+    #[test]
+    fn two_modulations_on_one_scalar_sum() {
+        let mut g = mandelbrot();
+        g.julia_mode = true;
+        g.time_mod = vec![
+            TimeMod { target: ModTarget::JuliaC, shape: ModShape::Cosine, amp: 0.1, freq: 1.0, phase: 0.0 },
+            TimeMod { target: ModTarget::JuliaC, shape: ModShape::Cosine, amp: 0.2, freq: 1.0, phase: 0.0 },
+        ];
+        // cos(0) = 1 for both → +0.3 total.
+        assert!((g.at_time(0.0).julia_cre - 0.3).abs() < 1e-6);
+    }
+
+    #[test]
+    fn time_mod_survives_a_genome_round_trip_and_old_files_default_to_empty() {
+        let mut g = mandelbrot();
+        g.time_mod = vec![TimeMod::new(ModTarget::JuliaC, ModShape::Orbit, 0.2)];
+        let json = serde_json::to_string(&g).unwrap();
+        let back: Genome = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.time_mod, g.time_mod);
+
+        // A real archive file, written long before this field existed.
+        let archive = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("fractals_1");
+        if let Ok(entries) = std::fs::read_dir(&archive) {
+            if let Some(nn) = entries.flatten()
+                .map(|e| e.path())
+                .find(|p| p.extension().and_then(|s| s.to_str()) == Some("nn"))
+            {
+                let old: Genome = serde_json::from_str(&std::fs::read_to_string(&nn).unwrap())
+                    .unwrap_or_else(|e| panic!("{} failed to load: {e}", nn.display()));
+                assert!(old.time_mod.is_empty(),
+                    "an archived genome must load as static");
+            }
+        }
     }
 }
