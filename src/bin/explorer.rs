@@ -31,6 +31,8 @@ use nnfractals::vae_explore::{self, RecursionOpts, SelectBy, ZoneGate};
 use nnfractals::vae_score::VaeScorer;
 use nnfractals::video_export::{needs_f64, render_complex_field, render_escape_times, View};
 use nnfractals::video_zoom_explore;
+use nnfractals::time_explore;
+use nnfractals::formula::ModShape;
 use rand::seq::{IndexedRandom, SliceRandom};
 use rand::{Rng, SeedableRng};
 use std::process::Command;
@@ -1607,6 +1609,48 @@ fn cmd_vae_explore(
 /// `video_zoom_explore::run`, writes the winners manifest, prints a
 /// one-line summary.
 #[allow(clippy::too_many_arguments)]
+fn cmd_time_explore(
+    formula: &str, genome_override: Option<Genome>, cx: f64, cy: f64, zoom: f64, out_dir: &Path,
+    opts: time_explore::TimeExploreOpts, keep_clips: bool,
+) {
+    std::fs::create_dir_all(out_dir).unwrap_or_else(|e| panic!("create {}: {e}", out_dir.display()));
+    let genome = genome_override.unwrap_or_else(|| build_genome(formula));
+    let config = load_config();
+    let view = View::new_square(cx, cy, zoom);
+
+    let targets = time_explore::enumerate_targets(&genome);
+    let n_cands = time_explore::candidate_mods(&genome, &opts).len();
+    println!(
+        "time-explore: {} animatable target(s) on {:016x} -> {n_cands} candidates \
+         ({}x{} x {} frames each)",
+        targets.len(), genome.id, opts.probe_w, opts.probe_h, opts.frames
+    );
+    for t in &targets {
+        println!("  target: {}", t.label());
+    }
+
+    let started = std::time::Instant::now();
+    let cands = time_explore::run(&genome, &config, &view, &opts, &|i, total, tmod, cand| {
+        let verdict = match cand.rejected {
+            Some(why) => format!("rejected: {why}"),
+            None => format!("score {:.4}", cand.score),
+        };
+        println!(
+            "  [{i}/{total}] {} {} amp {:.3} -> {verdict}  (worst-coh {:.2}, change {:.1}, noise {:.2}, jump {:.1})",
+            tmod.target.label(), tmod.shape.label(), tmod.amp,
+            cand.stats.min_coherence, cand.stats.mean_change, cand.stats.max_noise, cand.stats.max_level_jump
+        );
+    });
+
+    time_explore::write_manifest(out_dir, &cands, &genome, &config, &view, &opts, keep_clips)
+        .unwrap_or_else(|e| panic!("write {}/time_winners.jsonl: {e}", out_dir.display()));
+
+    println!(
+        "time-explore: {} in {:.1}s -> {}",
+        time_explore::summary(&cands), started.elapsed().as_secs_f32(), out_dir.display()
+    );
+}
+
 fn cmd_video_zoom_explore(
     formula: &str, genome_override: Option<Genome>, cx: f64, cy: f64, zoom: f64, out_dir: &Path,
     depth: usize, finalists: usize, lookahead_plies: usize, method_arg: &str,
@@ -2118,6 +2162,80 @@ fn main() {
                 dd_margin_ulps,
             );
         }
+        Some("time-explore") => {
+            // Same genome-path-vs-formula-name convention as the other explore
+            // subcommands. A .nn path is the normal case here: the sweep needs a
+            // real genome's dynamics (julia mode, phoenix, warp, CONST nodes) to
+            // have anything to animate.
+            let formula = pos.get(1).cloned().unwrap_or_else(|| "Mandelbrot".to_string());
+            let formula_path = Path::new(&formula);
+            let genome_override: Option<Genome> = (formula_path.extension().and_then(|e| e.to_str()) == Some("nn"))
+                .then(|| io::load_genome(formula_path).ok())
+                .flatten();
+            let (default_cx, default_cy, default_zoom) = match &genome_override {
+                Some(g) => (g.view_cx as f64, g.view_cy as f64, g.view_zoom as f64),
+                None => (-0.5, 0.0, 1.0),
+            };
+            let cx: f64 = pos.get(2).and_then(|s| s.parse().ok()).unwrap_or(default_cx);
+            let cy: f64 = pos.get(3).and_then(|s| s.parse().ok()).unwrap_or(default_cy);
+            let zoom: f64 = pos.get(4).and_then(|s| s.parse().ok()).unwrap_or(default_zoom);
+            let default_out_name = match &genome_override {
+                Some(_) => formula_path.file_stem().and_then(|s| s.to_str()).unwrap_or("genome").to_string(),
+                None => formula.to_lowercase().replace(' ', "_"),
+            };
+            // `--out` as well as the 5th positional: with cx/cy/zoom omitted a
+            // trailing path lands in the cx slot, fails to parse as a number and
+            // is silently discarded — the same positional/flag trap this CLI has
+            // been bitten by before. The flag makes the intent unambiguous.
+            let out_dir = get_flag(&args, "--out").map(PathBuf::from)
+                .or_else(|| pos.get(5).map(PathBuf::from))
+                .unwrap_or_else(|| PathBuf::from(format!("explorer_out/{default_out_name}_time")));
+            // A positional that should be a number but looks like a path is
+            // almost certainly a misplaced out_dir; say so rather than silently
+            // using the default.
+            for (slot, name) in [(2usize, "cx"), (3, "cy"), (4, "zoom")] {
+                if let Some(v) = pos.get(slot) {
+                    if v.parse::<f64>().is_err() {
+                        eprintln!(
+                            "warning: positional #{slot} ({name}) is \"{v}\", which is not a number \
+                             — it was ignored. Did you mean --out {v}?"
+                        );
+                    }
+                }
+            }
+
+            let amps: Vec<f32> = get_flag(&args, "--amps")
+                .map(|s| s.split(',').filter_map(|v| v.trim().parse().ok()).collect())
+                .filter(|v: &Vec<f32>| !v.is_empty())
+                .unwrap_or_else(|| vec![0.02, 0.08, 0.25]);
+            let shapes: Vec<ModShape> = get_flag(&args, "--shapes")
+                .map(|s| s.split(',').filter_map(ModShape::parse).collect())
+                .filter(|v: &Vec<ModShape>| !v.is_empty())
+                .unwrap_or_else(|| vec![ModShape::Sine, ModShape::Triangle, ModShape::Orbit]);
+
+            let opts = time_explore::TimeExploreOpts {
+                probe_w: get_flag_or(&args, "--probe-w", 192),
+                probe_h: get_flag_or(&args, "--probe-h", 144),
+                frames: get_flag_or(&args, "--frames", 48),
+                fps: get_flag_or(&args, "--fps", 24),
+                amps,
+                shapes,
+                top_k: get_flag_or(&args, "--top-k", 8),
+                angle_coloring: args.iter().any(|a| a == "--angle-coloring"),
+                // Raise if winners still read as cuts rather than morphs; lower
+                // if a genome that visibly animates well keeps getting rejected
+                // as "incoherent".
+                min_coherence: get_flag_or(&args, "--min-coherence",
+                    time_explore::MIN_TEMPORAL_COHERENCE),
+                min_change: get_flag_or(&args, "--min-change",
+                    time_explore::MIN_TEMPORAL_CHANGE),
+                max_noise: get_flag_or(&args, "--max-noise", time_explore::MAX_CLIP_NOISE),
+                min_stall_ratio: get_flag_or(&args, "--min-stall-ratio", time_explore::MIN_STALL_RATIO),
+                max_level_jump: get_flag_or(&args, "--max-level-jump", time_explore::MAX_LEVEL_JUMP),
+            };
+            let keep_clips = args.iter().any(|a| a == "--keep-clips");
+            cmd_time_explore(&formula, genome_override, cx, cy, zoom, &out_dir, opts, keep_clips);
+        }
         Some("shot") => {
             // Ad-hoc visual inspection utility: render one genome+view
             // straight to a PNG, no pool/manifest/out_dir bookkeeping.
@@ -2275,6 +2393,9 @@ fn main() {
             eprintln!("  nnfractals-explorer vae-explore [formula] [cx] [cy] [zoom] [out_dir] [--iterations N] [--n-seeds N] [--recursion-depth N] [--top-k N] [--canvas-res N] [--method name|mixed] [--select-by max-error|min-error|random] [--max-intricacy F] [--min-edge-density F] [--arch conv|resnet|inception] [--latent-dim N] [--kl-weight F] [--tuned-config path.json] [--epochs N] [--target-recon-mse F] [--min-improvement F] [--patience N] [--saliency-model path.pt (default: explorer_out/saliency_model.pt if it exists)]");
             eprintln!("  nnfractals-explorer vae-curate [pool_dir] [top_n] [out_dir] [res] [--select-by max-error|min-error|random]");
             eprintln!("  nnfractals-explorer video-zoom-explore [formula|genome.nn] [cx] [cy] [zoom] [out_dir] [--depth N] [--finalists N] [--lookahead-plies N] [--method name|mixed] [--final-width N] [--final-height N] [--canvas-res N] [--top-winners N] [--n-seeds N] [--min-score F (0.15)] [--min-file-size-ratio F (0.45)] [--min-file-size-step-ratio F (0.80)] [--min-step-zoom F (2.0)] [--max-intricacy F (0.30)] [--min-edge-density F (0.05)] [--angle-coloring] [--lookahead-probe-w/h/steps/fps N] [--final-probe-w/h/steps/fps N] [--dd-margin-ulps F (1.0 = zoom until f64 pixelates; 4.0 = stop while still smooth)]");
+            eprintln!("  nnfractals-explorer time-explore <formula|genome.nn> [cx] [cy] [zoom] [out_dir | --out DIR] [--frames N (48)] [--fps N (24)] [--probe-w N (192)] [--probe-h N (144)] [--amps 0.02,0.08,0.25] [--shapes sine,cosine,triangle,sawtooth,pulse,ramp,orbit] [--top-k N (8)] [--min-coherence F (0.55)] [--min-change F (1.0)] [--max-noise F (0.15)] [--min-stall-ratio F (0.15)] [--max-level-jump F (12)] [--angle-coloring] [--keep-clips]");
+            eprintln!("      searches the TIME axis: animates one scalar inside the formula (julia c / phoenix / bailout / a program or warp constant / an inserted scale node) and ranks by how well the clip resists video compression.");
+            eprintln!("      three gates, all reported per candidate: 'noise' (spatially dithered frames), 'static' (amplitude too small to see — raise --amps), 'incoherent' (amplitude so large consecutive frames are unrelated: cuts, not a morph — lower --amps).");
             eprintln!("  nnfractals-explorer complex-export <zone.nn|zone_dir> [out_dir] [--res 512] [--limit 20]");
             eprintln!("  nnfractals-explorer verify-chain [--queue-id ID (default: newest chain item)] [--stride N] [--max-iter N] [--dump-frames DIR]");
             eprintln!("      replays a queued chain's EXACT export frames offline: per-frame png size + 'flood' (fraction of the frame that is one colour).");

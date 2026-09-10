@@ -24,6 +24,8 @@ pub mod explore;
 pub mod vae_explore;
 #[cfg(feature = "wgpu-backend")]
 pub mod video_zoom_explore;
+#[cfg(feature = "wgpu-backend")]
+pub mod time_explore;
 #[cfg(any(feature = "viewer", feature = "browser", feature = "launcher", feature = "queue"))]
 pub mod gui_font;
 #[cfg(feature = "wgpu-backend")]

@@ -79,6 +79,44 @@ pub struct OpNode {
     #[serde(default)] pub kim: f32,
 }
 
+/// Which nodes of `prog` actually contribute to its result.
+///
+/// A program's value is its LAST node, and evolved DAGs routinely accumulate
+/// unreachable subtrees — introns, in GP terms. On a real archived genome
+/// measured while building the time sweep, 5 of 9 nodes were dead. Anything
+/// that reasons about "changing this node" has to know that, or it will spend
+/// its budget perturbing values nothing reads and then report the result as a
+/// mysterious no-op.
+///
+/// Returns an empty vec for an empty program.
+pub fn reachable_from_root(prog: &[OpNode]) -> Vec<bool> {
+    let mut live = vec![false; prog.len()];
+    if prog.is_empty() {
+        return live;
+    }
+    let root = prog.len() - 1;
+    live[root] = true;
+    // Operands always index strictly-earlier nodes, so one backward sweep
+    // suffices — no work list needed.
+    for i in (0..prog.len()).rev() {
+        if !live[i] {
+            continue;
+        }
+        let arity = op::arity(prog[i].op);
+        if arity >= 1 {
+            if let Some(slot) = live.get_mut(prog[i].a as usize) {
+                *slot = true;
+            }
+        }
+        if arity >= 2 {
+            if let Some(slot) = live.get_mut(prog[i].b as usize) {
+                *slot = true;
+            }
+        }
+    }
+    live
+}
+
 // ── Time modulation ─────────────────────────────────────────────────────────
 //
 // A fractal is normally a function of two variables (the pixel coordinate). A
@@ -600,6 +638,58 @@ pub fn basis_name(i: usize) -> &'static str {
         54=>"1/(z²+c)",55=>"z²c/(z+c)",
         56=>"1",      57=>"i",
         _  =>"?",
+    }
+}
+
+#[cfg(test)]
+mod reachability_tests {
+    use super::*;
+
+    fn n(o: u8, a: u8, b: u8) -> OpNode { OpNode { op: o, a, b, kre: 0.0, kim: 0.0 } }
+
+    #[test]
+    fn an_empty_program_has_no_live_nodes() {
+        assert!(reachable_from_root(&[]).is_empty());
+    }
+
+    #[test]
+    fn a_fully_used_program_is_all_live() {
+        // z² + c: every node feeds the root.
+        let prog = [n(op::Z, 0, 0), n(op::C, 0, 0), n(op::SQR, 0, 0), n(op::ADD, 2, 1)];
+        assert_eq!(reachable_from_root(&prog), vec![true; 4]);
+    }
+
+    #[test]
+    fn introns_are_reported_dead() {
+        // Shape taken from a real archived genome (0b3199d357fc16e0), where
+        // five of nine nodes never reach the root.
+        let prog = [
+            n(op::Z, 0, 0),        // 0
+            n(op::NORMZ, 0, 0),    // 1
+            n(op::ABSRE, 1, 0),    // 2
+            n(op::SQR, 1, 0),      // 3  dead
+            n(op::CUBE, 0, 0),     // 4  dead
+            n(op::SIN, 1, 0),      // 5  dead
+            n(op::CONST, 0, 0),    // 6  dead
+            n(op::DIV, 4, 1),      // 7  dead
+            n(op::ABSIM, 2, 0),    // 8  root
+        ];
+        assert_eq!(
+            reachable_from_root(&prog),
+            vec![true, true, true, false, false, false, false, false, true]
+        );
+    }
+
+    #[test]
+    fn the_root_is_always_live_even_as_a_lone_leaf() {
+        assert_eq!(reachable_from_root(&[n(op::Z, 0, 0)]), vec![true]);
+    }
+
+    #[test]
+    fn a_leafs_stale_operand_bytes_do_not_revive_nodes() {
+        // Leaves ignore a/b, so garbage there must not mark anything live.
+        let prog = [n(op::Z, 0, 0), n(op::CONST, 0, 0), n(op::C, 7, 7)];
+        assert_eq!(reachable_from_root(&prog), vec![false, false, true]);
     }
 }
 
