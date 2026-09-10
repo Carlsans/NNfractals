@@ -621,7 +621,7 @@ enum WormholeState {
 
 // ── Preferences ───────────────────────────────────────────────────────────────
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, PartialEq)]
 struct ViewerPrefs {
     last_save_width:  u32,
     last_save_height: u32,
@@ -646,6 +646,9 @@ struct ViewerPrefs {
     /// off (every frame rendered exactly). Persisted like the other video
     /// settings so a chosen speed/accuracy trade survives a restart.
     #[serde(default = "default_video_keyframe_stride")] video_keyframe_stride: u32,
+    /// Frames in an exported time video (the ⏱ Time window). Persisted like
+    /// the other video knobs.
+    #[serde(default = "default_time_frames")] time_frames: u32,
     #[serde(default)] video_invert_coords: bool,
     #[serde(default)] video_invert_range:  bool,
 }
@@ -662,6 +665,7 @@ fn default_video_height() -> u32 { 720 }
 // frames. Every video in the 2026-08 batch from f05 on used this and all
 // verified clean. Set the KF field to 1 in the video row to disable.
 fn default_video_keyframe_stride() -> u32 { 16 }
+fn default_time_frames() -> u32 { 96 }
 
 impl Default for ViewerPrefs {
     fn default() -> Self {
@@ -678,6 +682,7 @@ impl Default for ViewerPrefs {
             video_width:  default_video_width(),
             video_height: default_video_height(),
             video_keyframe_stride: default_video_keyframe_stride(),
+            time_frames: default_time_frames(),
             video_invert_coords: false,
             video_invert_range:  false,
         }
@@ -1109,9 +1114,8 @@ impl App {
             genome.view_zoom.max(0.1) as f64,
         );
 
-        let prefs_path = nn_path.parent().unwrap_or(Path::new("."))
-            .join("viewer_prefs.toml");
-        let prefs = ViewerPrefs::load(&prefs_path);
+        let prefs_path = viewer_prefs_path();
+        let prefs = load_viewer_prefs(&nn_path);
         let save_dir_str = if prefs.save_dir.is_empty() {
             nn_path.parent().unwrap_or(Path::new(".")).to_string_lossy().into_owned()
         } else {
@@ -1274,7 +1278,7 @@ impl App {
             time_playing: false,
             time_period: 6.0,
             time_mod: Vec::new(),
-            time_frames_str: "96".to_string(),
+            time_frames_str: prefs.time_frames.to_string(),
             time_winners: Vec::new(),
             time_winners_genome: String::new(),
             time_message: String::new(),
@@ -2271,11 +2275,36 @@ impl App {
                 ui.label("Steps:");
                 ui.add(egui::TextEdit::singleline(&mut self.video_steps_str).desired_width(45.0));
                 ui.label("FPS:");
-                ui.add(egui::TextEdit::singleline(&mut self.video_fps_str).desired_width(35.0));
+                if ui.add(egui::TextEdit::singleline(&mut self.video_fps_str).desired_width(35.0))
+                    .on_hover_text("Frames per second. Remembered as the default for next time.")
+                    .lost_focus()
+                {
+                    if let Ok(v) = self.video_fps_str.trim().parse::<u32>() {
+                        if v >= 1 { self.prefs.video_fps = v; self.prefs.save(&self.prefs_path); }
+                    }
+                }
+                // Committed on lost-focus, not only when a queue button is
+                // pressed: a resolution typed and then not immediately used was
+                // being lost at exit, which is the opposite of "the last knobs
+                // you used are the new defaults".
+                let mut res_edited = false;
                 ui.label("Res:");
-                ui.add(egui::TextEdit::singleline(&mut self.video_w_str).desired_width(55.0));
+                res_edited |= ui.add(egui::TextEdit::singleline(&mut self.video_w_str).desired_width(55.0))
+                    .on_hover_text("Export width. Remembered as the default for next time.")
+                    .lost_focus();
                 ui.label("×");
-                ui.add(egui::TextEdit::singleline(&mut self.video_h_str).desired_width(55.0));
+                res_edited |= ui.add(egui::TextEdit::singleline(&mut self.video_h_str).desired_width(55.0))
+                    .on_hover_text("Export height. Remembered as the default for next time.")
+                    .lost_focus();
+                if res_edited {
+                    if let Ok(v) = self.video_w_str.trim().parse::<u32>() {
+                        if v >= 16 { self.prefs.video_width = v; }
+                    }
+                    if let Ok(v) = self.video_h_str.trim().parse::<u32>() {
+                        if v >= 16 { self.prefs.video_height = v; }
+                    }
+                    self.prefs.save(&self.prefs_path);
+                }
                 ui.label("KF:");
                 ui.add(egui::TextEdit::singleline(&mut self.video_kf_str).desired_width(35.0))
                     .on_hover_text("Keyframe stride: render only every Nth frame and warp the \
@@ -3543,6 +3572,14 @@ impl App {
             self.video_h_str.trim().parse::<u32>().unwrap_or(720).max(16),
         );
         let fps: u32 = self.video_fps_str.trim().parse().unwrap_or(24).max(1);
+        // Same as "Add to Queue" and "Wormhole Video": the knobs you last used
+        // become the defaults next launch. This path used to read them without
+        // saving, so a resolution typed for a time video was lost.
+        self.prefs.video_fps    = fps;
+        self.prefs.video_width  = w;
+        self.prefs.video_height = h;
+        self.prefs.time_frames  = frames;
+        self.prefs.save(&self.prefs_path);
         let captured = CapturedView::from_view(&self.view);
 
         let id = std::time::SystemTime::now()
@@ -3616,6 +3653,7 @@ impl App {
         let mut do_queue = false;
         let mut remove: Option<usize> = None;
         let mut apply_winner: Option<usize> = None;
+        let mut add_winner: Option<usize> = None;
         let mut open_clip: Option<PathBuf> = None;
         let mut changed = false;
         let winners = self.time_winners.clone();
@@ -3713,12 +3751,20 @@ impl App {
                 }
                 ui.horizontal(|ui| {
                     if ui.add_enabled(!targets.is_empty(), egui::Button::new("+ Add modulation"))
-                        .on_hover_text("Stack another channel. Two aimed at the same scalar sum, \
-                                        which is how you get a slow drift plus a fast wobble.")
+                        .on_hover_text("Stack another channel on top of the ones above. Picks a \
+                                        scalar that is not already being driven, so pressing this \
+                                        twice gives a genuinely new layer — two modulations aimed \
+                                        at the SAME scalar just sum, which only changes its \
+                                        amplitude. Pick any target you like afterwards; aiming two \
+                                        at one scalar on purpose is how you get a slow drift plus \
+                                        a fast wobble.")
                         .clicked()
                     {
-                        self.time_mod.push(TimeMod::new(targets[0], ModShape::Orbit, 0.08));
-                        changed = true;
+                        let used: Vec<ModTarget> = self.time_mod.iter().map(|m| m.target).collect();
+                        if let Some(m) = next_layer(&targets, &used) {
+                            self.time_mod.push(m);
+                            changed = true;
+                        }
                     }
                     if ui.add_enabled(!self.time_mod.is_empty(), egui::Button::new("Clear"))
                         .clicked()
@@ -3767,9 +3813,14 @@ impl App {
                                             if w.loops { " · loops" } else { "" })
                                 ).small().color(Color32::GRAY));
                                 if ui.add_enabled(winners_match, egui::Button::new("Apply"))
-                                    .on_hover_text("Load this into the scrubber above.")
+                                    .on_hover_text("Replace the modulations above with this one.")
                                     .clicked()
                                 { apply_winner = Some(i); }
+                                if ui.add_enabled(winners_match, egui::Button::new("+"))
+                                    .on_hover_text("Add this one ON TOP of what is already there, \
+                                                    instead of replacing it.")
+                                    .clicked()
+                                { add_winner = Some(i); }
                                 if let Some(c) = &w.clip {
                                     if c.exists() && ui.button("▶ clip").clicked() {
                                         open_clip = Some(c.clone());
@@ -3784,9 +3835,15 @@ impl App {
                 ui.separator();
                 ui.horizontal(|ui| {
                     ui.label("Frames:");
-                    ui.add(egui::TextEdit::singleline(&mut self.time_frames_str).desired_width(60.0))
+                    if ui.add(egui::TextEdit::singleline(&mut self.time_frames_str).desired_width(60.0))
                         .on_hover_text("Frames in the exported loop. Resolution and fps come from \
-                                        the Video panel.");
+                                        the Video panel. Remembered as the default for next time.")
+                        .lost_focus()
+                    {
+                        if let Ok(v) = self.time_frames_str.trim().parse::<u32>() {
+                            if v >= 2 { self.prefs.time_frames = v; self.prefs.save(&self.prefs_path); }
+                        }
+                    }
                     if ui.add_enabled(!self.time_mod.is_empty(), egui::Button::new("＋ Queue time video"))
                         .on_hover_text("Adds a queue item that holds THIS view still and sweeps the \
                                         modulation, at the Video panel's resolution and fps. Output \
@@ -3838,6 +3895,13 @@ impl App {
             if let Some(w) = self.time_winners.get(i) {
                 self.time_mod = vec![w.tmod];
                 self.time_t = 0.0;
+                changed = true;
+            }
+        }
+        if let Some(i) = add_winner {
+            if let Some(w) = self.time_winners.get(i) {
+                let tmod = w.tmod;
+                self.time_mod.push(tmod);
                 changed = true;
             }
         }
@@ -5519,6 +5583,92 @@ fn queue_socket_path() -> PathBuf {
 /// comment for the real incident this fixes): target/release/<name> is
 /// checked BEFORE this exe's own dir, so a debug build never silently
 /// prefers a debug sibling just because it happens to sit next to one.
+/// Which modulation "+ Add modulation" should append, given the targets this
+/// genome offers and the ones already being driven.
+///
+/// Prefers a scalar that is not already modulated. Two modulations aimed at the
+/// SAME scalar simply sum, so defaulting to the first target every time made the
+/// button look broken — pressing it twice only doubled the first layer's
+/// amplitude instead of adding a second, independent one. Aiming two at one
+/// scalar deliberately is still useful (a slow drift plus a fast wobble); this
+/// just stops it being the accidental default.
+///
+/// `Orbit` is the nicest default where it means something, but it degenerates to
+/// a plain cosine on a single-channel target, so those get `Sine` instead.
+fn next_layer(targets: &[ModTarget], used: &[ModTarget]) -> Option<TimeMod> {
+    let next = targets.iter().copied()
+        .find(|t| !used.contains(t))
+        .or_else(|| targets.first().copied())?;
+    let shape = if next.is_two_channel() { ModShape::Orbit } else { ModShape::Sine };
+    Some(TimeMod::new(next, shape, 0.08))
+}
+
+/// The viewer's preferences file: ONE file at the project root, like
+/// `launcher_prefs.toml` and `browser_prefs.toml` already are.
+///
+/// It used to live next to whichever `.nn` was open, which made every setting
+/// silently per-folder. Carl hit the consequence: a 1080x1980 export resolution
+/// he had set was stranded in `fractals_1_old/viewer_prefs.toml` when that pool
+/// was renamed, so opening a genome from the new `fractals_1/` fell back to the
+/// 1280x720 defaults and his resolution "was not preserved". There were five
+/// such files scattered across pool directories, none of them in the active
+/// pool.
+fn viewer_prefs_path() -> PathBuf {
+    nnfractals::project_root().join("viewer_prefs.toml")
+}
+
+/// Every legacy per-folder prefs file, newest first: the `.nn`'s own folder if
+/// it has one, then any directly under the project root.
+fn legacy_prefs_candidates(nn_path: &Path, root: &Path) -> Vec<PathBuf> {
+    let mut out: Vec<PathBuf> = Vec::new();
+    let own = nn_path.parent().unwrap_or(Path::new(".")).join("viewer_prefs.toml");
+    if own.exists() {
+        out.push(own.clone());
+    }
+    let mut others: Vec<(std::time::SystemTime, PathBuf)> = std::fs::read_dir(root)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|e| e.path().join("viewer_prefs.toml"))
+        .filter(|p| p.exists() && Some(p.as_path()) != Some(own.as_path()))
+        .filter_map(|p| {
+            let t = std::fs::metadata(&p).and_then(|m| m.modified()).ok()?;
+            Some((t, p))
+        })
+        .collect();
+    others.sort_by(|a, b| b.0.cmp(&a.0));
+    out.extend(others.into_iter().map(|(_, p)| p));
+    out
+}
+
+/// Load preferences, adopting a legacy per-folder file the first time.
+///
+/// Prefers the folder the genome came from, then the most recently touched of
+/// whatever else is lying around. That second step is what actually rescues
+/// settings: Carl's export resolution was in `fractals_1_old/`, a folder no
+/// genome is ever opened from any more, so looking only beside the `.nn` would
+/// have found nothing and silently reverted to defaults again.
+///
+/// The stale copies are left in place rather than deleted — the next save goes
+/// to the root and they simply stop being consulted.
+fn load_viewer_prefs(nn_path: &Path) -> ViewerPrefs {
+    let root_file = viewer_prefs_path();
+    if root_file.exists() {
+        return ViewerPrefs::load(&root_file);
+    }
+    let root = nnfractals::project_root();
+    for legacy in legacy_prefs_candidates(nn_path, &root) {
+        let p = ViewerPrefs::load(&legacy);
+        // `load` falls back to Default on a parse failure, so check the file
+        // really carried something rather than trusting its mere existence.
+        if p != ViewerPrefs::default() {
+            eprintln!("adopted viewer preferences from {}", legacy.display());
+            return p;
+        }
+    }
+    ViewerPrefs::load(&root_file)
+}
+
 fn locate_sibling_bin(name: &str) -> PathBuf {
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
@@ -5739,9 +5889,7 @@ fn main() -> anyhow::Result<()> {
         );
     }
 
-    let prefs_path = Path::new(&nn_path).parent().unwrap_or(Path::new("."))
-        .join("viewer_prefs.toml");
-    let prefs = ViewerPrefs::load(&prefs_path);
+    let prefs = load_viewer_prefs(Path::new(&nn_path));
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -6174,5 +6322,112 @@ mod bottom_bar_tests {
 
         assert!(crossed_dd_threshold, "test didn't actually reach DD-precision territory — not a valid regression check");
         assert!(view.zoom.log2() > 60.0, "expected drilling to reach at least zoom 2^60, got 2^{:.1}", view.zoom.log2());
+    }
+}
+
+#[cfg(test)]
+mod time_ui_tests {
+    use super::next_layer;
+    use nnfractals::formula::{ModShape, ModTarget};
+
+    #[test]
+    fn add_modulation_picks_a_scalar_that_is_not_already_driven() {
+        // Carl, 2026-09-10: wanted to stack modulations using the Add button.
+        // It always appended targets[0], so a second press just doubled the
+        // first layer's amplitude rather than adding a new one.
+        let targets = [ModTarget::JuliaC, ModTarget::Phoenix, ModTarget::Bailout];
+        let first = next_layer(&targets, &[]).unwrap();
+        assert_eq!(first.target, ModTarget::JuliaC);
+        let second = next_layer(&targets, &[first.target]).unwrap();
+        assert_eq!(second.target, ModTarget::Phoenix, "must not repeat the first");
+        let third = next_layer(&targets, &[first.target, second.target]).unwrap();
+        assert_eq!(third.target, ModTarget::Bailout);
+    }
+
+    #[test]
+    fn once_every_target_is_used_it_falls_back_rather_than_refusing() {
+        // Stacking two on one scalar is legitimate — it is just not the default.
+        let targets = [ModTarget::JuliaC, ModTarget::Phoenix];
+        let all = [ModTarget::JuliaC, ModTarget::Phoenix];
+        assert_eq!(next_layer(&targets, &all).unwrap().target, ModTarget::JuliaC);
+    }
+
+    #[test]
+    fn a_single_channel_target_does_not_get_orbit() {
+        // Orbit on a scalar target is just a cosine, so offering it would look
+        // like a distinct choice that behaves identically.
+        assert_eq!(next_layer(&[ModTarget::Bailout], &[]).unwrap().shape, ModShape::Sine);
+        assert_eq!(next_layer(&[ModTarget::JuliaC], &[]).unwrap().shape, ModShape::Orbit);
+    }
+
+    #[test]
+    fn a_genome_with_nothing_animatable_adds_nothing() {
+        assert!(next_layer(&[], &[]).is_none());
+    }
+}
+
+#[cfg(test)]
+mod prefs_migration_tests {
+    use super::legacy_prefs_candidates;
+    use std::path::{Path, PathBuf};
+
+    fn scratch(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("nnf_prefs_{}_{}", tag, std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    fn touch(dir: &Path, name: &str) -> PathBuf {
+        let d = dir.join(name);
+        std::fs::create_dir_all(&d).unwrap();
+        let f = d.join("viewer_prefs.toml");
+        std::fs::write(&f, "window_width = 900\n").unwrap();
+        f
+    }
+
+    #[test]
+    fn the_genomes_own_folder_is_preferred() {
+        let root = scratch("own");
+        let mine = touch(&root, "fractals_1");
+        touch(&root, "fractals_old");
+        let nn = root.join("fractals_1/a.nn");
+        assert_eq!(legacy_prefs_candidates(&nn, &root).first(), Some(&mine));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_stranded_file_in_another_folder_is_still_found() {
+        // Carl's actual case: the resolution he wanted lived in fractals_1_old,
+        // a folder no genome is opened from any more. Looking only beside the
+        // .nn would find nothing and revert to defaults.
+        let root = scratch("stranded");
+        let stranded = touch(&root, "fractals_1_old");
+        std::fs::create_dir_all(root.join("fractals_1")).unwrap();
+        let nn = root.join("fractals_1/a.nn");
+        let found = legacy_prefs_candidates(&nn, &root);
+        assert_eq!(found, vec![stranded], "must reach outside the genome's own folder");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn the_most_recently_touched_stray_wins() {
+        let root = scratch("newest");
+        let older = touch(&root, "a_old");
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        let newer = touch(&root, "b_new");
+        let nn = root.join("fractals_1/a.nn");
+        let found = legacy_prefs_candidates(&nn, &root);
+        assert_eq!(found.first(), Some(&newer), "got {found:?}");
+        assert!(found.contains(&older));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn no_legacy_files_is_not_an_error() {
+        let root = scratch("empty");
+        let nn = root.join("fractals_1/a.nn");
+        assert!(legacy_prefs_candidates(&nn, &root).is_empty());
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

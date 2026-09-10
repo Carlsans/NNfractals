@@ -1233,7 +1233,6 @@ pub fn export_video_chain_limited(
     out_path: &Path, tx: &mpsc::Sender<VideoMsg>, on_progress: &(dyn Fn() + Sync),
     max_frames: Option<u32>,
 ) {
-    use std::process::{Command, Stdio};
     if waypoints.len() < 2 {
         let _ = tx.send(VideoMsg::Failed("need at least 2 waypoints to export a video".into()));
         on_progress();
