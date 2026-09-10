@@ -23,8 +23,9 @@ use nnfractals::config::Config;
 use nnfractals::io::load_genome;
 use nnfractals::formula::ModShape;
 use nnfractals::video_export::{
-    export_blend_video, export_time_video, export_video_chain_interpolated, load_queue, queue_dir,
-    save_queue, QueueItem, QueueStatus, VideoMsg, DEFAULT_TIME_FRAMES,
+    export_blend_video, export_chain_time_video, export_time_video,
+    export_video_chain_interpolated, load_queue, queue_dir, save_queue,
+    QueueItem, QueueStatus, VideoMsg, DEFAULT_TIME_FRAMES,
 };
 
 // ── Small utilities (moved from viewer.rs — this window owns the "job
@@ -151,6 +152,8 @@ fn process_item(
         .and_then(|f| nnfractals::io::load_genome(&queue_dir().join(f)).ok());
     let blend_shape = ModShape::parse(&item.blend_shape).unwrap_or(ModShape::Sine);
     let blend_amp = if item.blend_amp > 0.0 { item.blend_amp } else { 0.15 };
+    let camera_moves = item.camera_moves();
+    let animates_formula = item.animates_formula();
     let time_frames = if item.time_frames >= 2 { item.time_frames } else { DEFAULT_TIME_FRAMES };
     let out_path2 = out_path.clone();
     let ctx2 = ctx.clone();
@@ -159,17 +162,27 @@ fn process_item(
         // must not go anywhere near the camera-path exporters — and in
         // particular not near the interpolated one, which warps intermediate
         // frames on the assumption that only the camera moved.
-        if !time_mod.is_empty() || blend_partner.is_some() {
+        if animates_formula {
             let mut g_anim = g2.clone();
             g_anim.time_mod = time_mod;
-            let view = start.to_view();
-            match blend_partner {
-                Some(partner) => export_blend_video(
-                    &g_anim, &partner, &c2, ang, &view, time_frames, fps, w, h,
-                    blend_shape, 1.0, 0.0, blend_amp,
-                    &out_path2, &tx, &|| ctx2.request_repaint()),
-                None => export_time_video(&g_anim, &c2, ang, &view, time_frames, fps, w, h,
-                                          &out_path2, &tx, &|| ctx2.request_repaint()),
+            if camera_moves {
+                // Both axes at once: the camera travels the chain exactly as a
+                // normal zoom does while the formula animates across the clip.
+                let wp = if waypoints.len() >= 2 { waypoints.clone() } else { vec![start, end] };
+                export_chain_time_video(
+                    &g_anim, blend_partner.as_ref(), &c2, ang, &wp, steps, fps, w, h,
+                    invc, invr, blend_shape, 1.0, 0.0, blend_amp,
+                    &out_path2, &tx, &|| ctx2.request_repaint());
+            } else {
+                let view = start.to_view();
+                match blend_partner {
+                    Some(partner) => export_blend_video(
+                        &g_anim, &partner, &c2, ang, &view, time_frames, fps, w, h,
+                        blend_shape, 1.0, 0.0, blend_amp,
+                        &out_path2, &tx, &|| ctx2.request_repaint()),
+                    None => export_time_video(&g_anim, &c2, ang, &view, time_frames, fps, w, h,
+                                              &out_path2, &tx, &|| ctx2.request_repaint()),
+                }
             }
             return;
         }
@@ -602,10 +615,17 @@ impl eframe::App for App {
                                     format!("⏱ {} {}", m.target.label(), m.shape.label()),
                                 )
                                 .on_hover_text(
-                                    "Time video: the CAMERA holds still and the FORMULA animates. \
-                                     Rendered frame by frame — keyframe warping assumes only the \
-                                     camera moved, so it is forced off for these.",
+                                    "The FORMULA animates. Rendered frame by frame — keyframe \
+                                     warping assumes only the camera moved, so it is forced off \
+                                     for these.",
                                 );
+                            }
+                            if it.animates_formula() && it.camera_moves() {
+                                ui.colored_label(Color32::from_rgb(120, 255, 180), "＋zoom")
+                                    .on_hover_text(
+                                        "Both axes: the camera travels start→end while the formula \
+                                         animates across the whole clip.",
+                                    );
                             }
                             if it.time_mod.is_empty() && it.blend_nn_filename.is_none()
                                 && it.keyframe_stride > 1 {

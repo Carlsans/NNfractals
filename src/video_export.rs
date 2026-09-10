@@ -689,6 +689,25 @@ pub struct CapturedView {
     pub aspect: f64,
 }
 
+impl QueueItem {
+    /// Whether this item's camera actually travels. A time or morph item made
+    /// in the ⏱ Time window sets `start == end` (the camera holds still); one
+    /// made from Set Start / Set End does not.
+    pub fn camera_moves(&self) -> bool {
+        if self.waypoints.len() >= 2 {
+            return true;
+        }
+        let (a, b) = (&self.start, &self.end);
+        a.cx != b.cx || a.cy != b.cy || a.zoom != b.zoom
+            || a.cx_lo != b.cx_lo || a.cy_lo != b.cy_lo
+    }
+
+    /// Whether the formula animates — a scalar modulation, a morph, or both.
+    pub fn animates_formula(&self) -> bool {
+        !self.time_mod.is_empty() || self.blend_nn_filename.is_some()
+    }
+}
+
 impl CapturedView {
     pub fn from_view(v: &View) -> Self {
         CapturedView { cx: v.cx, cx_lo: v.cx_lo, cy: v.cy, cy_lo: v.cy_lo, zoom: v.zoom, aspect: v.aspect }
@@ -1473,6 +1492,78 @@ pub fn export_time_video(
         time_frames(genome, config, angle_coloring, view, n, w, h),
         n, fps, w, h, out_path, tx, on_progress,
     );
+}
+
+/// Export a video where the camera travels a waypoint chain AND the formula
+/// animates at the same time.
+///
+/// The two axes were previously exclusive: `export_video_chain_*` moves the
+/// camera over a fixed genome, `export_time_video` animates the genome over a
+/// fixed camera. This is simply both frame sources at once — the camera path
+/// comes from `chain_frame_views` exactly as a normal zoom does, and frame `i`
+/// renders the genome at `t = i / total` rather than the genome as stored.
+///
+/// `t` spans the WHOLE clip, so a looping shape at `freq = 1` completes one
+/// cycle over the entire zoom rather than per leg.
+///
+/// Never routes through `export_video_chain_interpolated`. That exporter warps
+/// intermediate frames out of keyframes on the assumption that consecutive
+/// frames differ only by a scale-and-shift of the same fractal — true for a
+/// zoom, false the moment the formula moves too.
+#[allow(clippy::too_many_arguments)]
+pub fn export_chain_time_video(
+    genome: &Genome, partner: Option<&Genome>, config: &Config, angle_coloring: bool,
+    waypoints: &[CapturedView], steps: u32, fps: u32, w: u32, h: u32,
+    invert_coords: bool, invert_range: bool,
+    shape: crate::formula::ModShape, freq: f32, phase: f32, blend_amp: f32,
+    out_path: &Path, tx: &mpsc::Sender<VideoMsg>, on_progress: &(dyn Fn() + Sync),
+) {
+    if waypoints.len() < 2 {
+        let _ = tx.send(VideoMsg::Failed("need at least 2 waypoints to move the camera".into()));
+        on_progress();
+        return;
+    }
+    if genome.time_mod.is_empty() && partner.is_none() {
+        let _ = tx.send(VideoMsg::Failed(
+            "no time modulation and no morph partner — this is just a zoom".into()));
+        on_progress();
+        return;
+    }
+    if let Some(p) = partner {
+        if let Err(why) = genome.blend_compatibility(p) {
+            let _ = tx.send(VideoMsg::Failed(format!("cannot blend these two fractals: {why}")));
+            on_progress();
+            return;
+        }
+    }
+
+    let legs = waypoints.len() - 1;
+    let (_, total_frames) = chain_frame_budget(steps, legs);
+    if total_frames == 0 {
+        let _ = tx.send(VideoMsg::Failed("no frames to render".into()));
+        on_progress();
+        return;
+    }
+
+    let views = chain_frame_views(waypoints, steps, w, h, invert_coords, invert_range);
+    let n = views.len().min(total_frames as usize);
+    let frames = views.into_iter().take(n).enumerate().map(move |(i, view)| {
+        // t spans the whole clip, not one leg.
+        let t = i as f32 / n as f32;
+        let g = genome.at_time(t);
+        let g = match partner {
+            Some(p) => {
+                let s = crate::formula::blend_fraction(shape, freq, phase, blend_amp, t);
+                g.blend_with(p, s).unwrap_or(g)
+            }
+            None => g,
+        };
+        save_pool().install(|| {
+            render_save(&g, config, &view, w, h, angle_coloring, VIDEO_FRAME_ALLOW_DD)
+        })
+    });
+
+    encode_rgb_frames(frames, n as u32, fps, w, h, out_path, tx, on_progress);
 }
 
 /// Encode an ALREADY-RENDERED set of RGB24 frames and return the same
@@ -2322,6 +2413,101 @@ mod tests {
     fn probe_frames_score_needs_at_least_two_frames() {
         assert_eq!(probe_frames_score(&[], 24, 32, 32, None), None);
         assert_eq!(probe_frames_score(&[vec![0u8; 32 * 32 * 3]], 24, 32, 32, None), None);
+    }
+
+    fn qitem(start: CapturedView, end: CapturedView) -> QueueItem {
+        QueueItem {
+            id: "x".into(), nn_filename: "x.nn".into(), genome_label: "x".into(),
+            start, end, steps: 100, fps: 24, width: 640, height: 480,
+            invert_coords: false, invert_range: false, colormap: "turbo".into(),
+            angle_coloring: false, output_dir: ".".into(),
+            status: QueueStatus::Pending, output_path: None, error: None, created_at: 0,
+            waypoints: Vec::new(), chain_label: None, keyframe_stride: 0,
+            time_mod: Vec::new(), time_frames: 0,
+            blend_nn_filename: None, blend_shape: String::new(), blend_amp: 0.0,
+        }
+    }
+
+    #[test]
+    fn a_time_item_holds_the_camera_still_and_a_zoom_does_not() {
+        // Routing between the three exporters turns on this: same endpoints
+        // means the ⏱ Time window made it, different means Set Start/Set End did.
+        assert!(!qitem(cv(0.0, 0.0, 1.0), cv(0.0, 0.0, 1.0)).camera_moves());
+        assert!(qitem(cv(0.0, 0.0, 1.0), cv(0.0, 0.0, 40.0)).camera_moves(), "zoom differs");
+        assert!(qitem(cv(0.0, 0.0, 1.0), cv(-0.7, 0.0, 1.0)).camera_moves(), "position differs");
+        let mut chained = qitem(cv(0.0, 0.0, 1.0), cv(0.0, 0.0, 1.0));
+        chained.waypoints = vec![cv(0.0, 0.0, 1.0), cv(0.0, 0.0, 8.0)];
+        assert!(chained.camera_moves(), "a chain always moves");
+    }
+
+    #[test]
+    fn a_deep_endpoint_difference_is_not_lost_to_the_low_word() {
+        // Past ~1e11 the centre lives in the lo halves; comparing only hi would
+        // call a real deep pan a still camera.
+        let a = CapturedView { cx: -0.5, cx_lo: 0.0, cy: 0.0, cy_lo: 0.0, zoom: 1e12, aspect: 1.0 };
+        let b = CapturedView { cx_lo: 1e-15, ..a };
+        assert!(qitem(a, b).camera_moves());
+    }
+
+    #[test]
+    fn animates_formula_covers_both_axes() {
+        use crate::formula::{ModShape, ModTarget, TimeMod};
+        let mut it = qitem(cv(0.0, 0.0, 1.0), cv(0.0, 0.0, 1.0));
+        assert!(!it.animates_formula());
+        it.time_mod = vec![TimeMod::new(ModTarget::Phoenix, ModShape::Orbit, 0.1)];
+        assert!(it.animates_formula());
+        let mut m = qitem(cv(0.0, 0.0, 1.0), cv(0.0, 0.0, 1.0));
+        m.blend_nn_filename = Some("p.nn".into());
+        assert!(m.animates_formula(), "a morph counts even with no scalar modulation");
+    }
+
+    #[test]
+    fn a_combined_item_still_loses_its_keyframe_stride() {
+        // The zoom path is where stride 16 comes from, so the invariant matters
+        // most here.
+        use crate::formula::{ModShape, ModTarget, TimeMod};
+        let mut it = qitem(cv(0.0, 0.0, 1.0), cv(0.0, 0.0, 40.0));
+        it.keyframe_stride = 16;
+        it.time_mod = vec![TimeMod::new(ModTarget::Phoenix, ModShape::Orbit, 0.1)];
+        let mut items = vec![it];
+        enforce_time_invariants(&mut items);
+        assert_eq!(items[0].keyframe_stride, 1);
+        assert!(items[0].camera_moves() && items[0].animates_formula());
+    }
+
+    #[test]
+    fn a_combined_export_moves_the_camera_and_the_formula() {
+        let g = julia_animated();
+        let config = chain_test_config();
+        let a = cv(-0.5, 0.0, 1.0);
+        let b = cv(-0.5, 0.0, 6.0);
+        let out = std::env::temp_dir().join(format!("nnf_combined_{}.mp4", std::process::id()));
+        let (tx, rx) = mpsc::channel();
+        export_chain_time_video(&g, None, &config, false, &[a, b], 8, 24, 48, 48,
+                                false, false, crate::formula::ModShape::Orbit, 1.0, 0.0, 0.0,
+                                &out, &tx, &|| {});
+        let msgs: Vec<_> = rx.try_iter().collect();
+        assert!(msgs.iter().any(|m| matches!(m, VideoMsg::Done(_))), "{msgs:?}");
+        assert!(std::fs::metadata(&out).map(|m| m.len() > 0).unwrap_or(false));
+        let _ = std::fs::remove_file(&out);
+    }
+
+    #[test]
+    fn a_combined_export_refuses_when_there_is_nothing_to_animate() {
+        // Otherwise it would silently be an ordinary zoom rendered the slow way,
+        // with the keyframe speedup given up for nothing.
+        let g = mandelbrot_genome();
+        let config = chain_test_config();
+        let out = std::env::temp_dir().join(format!("nnf_nocombine_{}.mp4", std::process::id()));
+        let (tx, rx) = mpsc::channel();
+        export_chain_time_video(&g, None, &config, false, &[cv(-0.5, 0.0, 1.0), cv(-0.5, 0.0, 6.0)],
+                                8, 24, 32, 32, false, false,
+                                crate::formula::ModShape::Sine, 1.0, 0.0, 0.0,
+                                &out, &tx, &|| {});
+        let msgs: Vec<_> = rx.try_iter().collect();
+        assert!(msgs.iter().any(|m| matches!(m, VideoMsg::Failed(s) if s.contains("just a zoom"))),
+            "{msgs:?}");
+        assert!(!out.exists());
     }
 
     #[test]

@@ -664,6 +664,8 @@ struct ViewerPrefs {
     #[serde(default = "yes")] gate_stalls_on: bool,
     #[serde(default = "yes")] gate_flash_on: bool,
     #[serde(default = "yes")] gate_coherence_on: bool,
+    /// Whether "Add to Queue" folds the ⏱ Time modulation into the zoom.
+    #[serde(default)] video_include_time: bool,
     #[serde(default = "default_probe_samples")]       probe_samples: u32,
     #[serde(default)] video_invert_coords: bool,
     #[serde(default)] video_invert_range:  bool,
@@ -731,6 +733,7 @@ impl Default for ViewerPrefs {
             gate_stalls_on: true,
             gate_flash_on: true,
             gate_coherence_on: true,
+            video_include_time: false,
             probe_samples: default_probe_samples(),
             video_invert_coords: false,
             video_invert_range:  false,
@@ -2420,6 +2423,29 @@ impl App {
                                     chain, and slightly CLEANER — resampling softens the \
                                     aliasing speckle that point-sampling produces.");
 
+                // Sits with the zoom controls rather than in the ⏱ Time window:
+                // this is the zoom export gaining a second axis, and Set Start /
+                // Set End live here.
+                {
+                    let active = self.time_axis_active();
+                    let r = ui.add_enabled(active,
+                        egui::Checkbox::new(&mut self.prefs.video_include_time, "⏱ + time"));
+                    let r = if active {
+                        r.on_hover_text(
+                            "Animate the FORMULA as well as the camera: the zoom runs start→end \
+                             while the ⏱ Time modulation plays across the whole clip. Forces every \
+                             frame to be rendered — keyframe warping assumes only the camera moved.")
+                    } else {
+                        r.on_disabled_hover_text(
+                            "Set up a modulation or a morph partner in the ⏱ Time window first — \
+                             there is nothing to animate yet.")
+                    };
+                    if r.changed() { self.prefs.save(&self.prefs_path); }
+                    if self.prefs.video_include_time && active {
+                        ui.colored_label(Color32::from_rgb(120, 255, 180), "every frame");
+                    }
+                }
+
                 if ui.checkbox(&mut self.prefs.video_invert_coords, "inv.coords")
                     .on_hover_text("Swap which captured point's position feeds the start vs. end")
                     .changed()
@@ -3088,7 +3114,11 @@ impl App {
     /// Actual rendering happens entirely in `nnfractals-queue` — this is
     /// just a fast file-copy + JSON append, no thread needed.
     fn add_to_queue(&mut self, steps: u32, fps: u32, w: u32, h: u32) {
-        let keyframe_stride = self.prefs.video_keyframe_stride.max(1);
+        // Folding the time axis in forces every frame to be rendered: keyframe
+        // warping reconstructs frames on the assumption that only the camera
+        // moved, which stops being true the moment the formula animates too.
+        let include_time = self.prefs.video_include_time && self.time_axis_active();
+        let keyframe_stride = if include_time { 1 } else { self.prefs.video_keyframe_stride.max(1) };
         let (Some(start), Some(end)) = (self.video_start, self.video_end) else { return };
 
         let id = std::time::SystemTime::now()
@@ -3112,8 +3142,19 @@ impl App {
             self.video_status = format!("Add to queue FAILED: {e}");
             return;
         }
+        let blend_file = match (include_time, &self.blend_partner) {
+            (true, Some(p)) => {
+                let name = format!("{id}_partner.nn");
+                if let Err(e) = nnfractals::io::save_genome(p, &qdir.join(&name)) {
+                    self.video_status = format!("Add to queue FAILED: {e}");
+                    return;
+                }
+                Some(name)
+            }
+            _ => None,
+        };
 
-        // Camera-path export: no time modulation (see QueueItem::time_mod).
+        // Zoom export; carries the ⏱ Time modulation too when asked.
         let item = nnfractals::video_export::QueueItem {
             id,
             nn_filename,
@@ -3136,15 +3177,22 @@ impl App {
             waypoints: Vec::new(),
             chain_label: None,
             keyframe_stride,
-            time_mod: Vec::new(), time_frames: 0,
-            blend_nn_filename: None, blend_shape: String::new(), blend_amp: 0.0,
+            time_mod: if include_time { self.time_mod.clone() } else { Vec::new() },
+            time_frames: 0,
+            blend_nn_filename: blend_file,
+            blend_shape: self.blend_shape.label().to_string(),
+            blend_amp: self.blend_amp,
         };
         let mut items = nnfractals::video_export::load_queue();
         items.push(item);
         nnfractals::video_export::save_queue(&items);
 
         wake_or_launch_queue_window();
-        self.video_status = "Added to queue ✓".to_string();
+        self.video_status = if include_time {
+            "Added to queue ✓ (zoom + time)".to_string()
+        } else {
+            "Added to queue ✓".to_string()
+        };
     }
 
     /// Builds a wormhole chain from the CURRENT view in a background thread
