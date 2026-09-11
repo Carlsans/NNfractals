@@ -441,6 +441,49 @@ pub fn best_shippable(pop: &[Individual], full_depths: usize) -> Option<&Individ
     pop.iter().find(|i| i.passed() && i.tier_depths >= full_depths)
 }
 
+/// A rough "closeness to acceptable" ordering for an individual that FAILED
+/// the gates, built from the same `ClipStats` the gates already computed —
+/// so choosing a fallback costs no extra rendering.
+///
+/// Not comparable to `Individual::score` (a compression ratio, and zero for
+/// every reject): this exists only to rank rejects against each other. The
+/// weights are unballasted by calibration on purpose — the only claim made is
+/// an ordering, not a threshold, so there is nothing to calibrate against.
+fn reject_quality(stats: &ClipStats) -> f64 {
+    stats.min_coherence as f64
+        + (stats.mean_change as f64 / 255.0).min(1.0)
+        - stats.max_noise as f64
+        - stats.longest_still_run as f64
+        - (stats.max_level_jump as f64 / 255.0)
+}
+
+/// The individual to ship when nothing passed every gate at full depth.
+///
+/// A reel with NO time formula is worse than one with an imperfect one: the
+/// review GUI is a human looking at every clip anyway, and "re-roll" exists
+/// precisely for a shot the search didn't nail on the first try. So this
+/// only returns `None` when `pop` has nothing to offer at all — every
+/// individual `run` produces carries at least one channel, so in practice
+/// that means an empty population.
+///
+/// Prefers individuals judged at full depth (their stats describe the actual
+/// shot, not a cheap proxy for it) and falls back to the best cheap-tier
+/// attempt only if nothing ever reached full depth — a small population or
+/// generation budget can leave it that way.
+pub fn best_effort(pop: &[Individual], full_depths: usize) -> Option<&Individual> {
+    if let Some(win) = best_shippable(pop, full_depths) {
+        return Some(win);
+    }
+    let by_quality = |a: &&Individual, b: &&Individual| {
+        reject_quality(&a.stats).partial_cmp(&reject_quality(&b.stats))
+            .unwrap_or(std::cmp::Ordering::Equal)
+    };
+    pop.iter()
+        .filter(|i| !i.progs.is_empty() && i.tier_depths >= full_depths)
+        .max_by(by_quality)
+        .or_else(|| pop.iter().filter(|i| !i.progs.is_empty()).max_by(by_quality))
+}
+
 /// Evolve a time formula for `g` along the shot `start → end`.
 ///
 /// Returns the population ranked best-first. Rejected individuals are kept (with
@@ -915,6 +958,64 @@ mod tests {
         let pop = [mk(0.9, 3), mk(0.8, 1)];
         assert_eq!(best_shippable(&pop, 3).map(|i| i.score), Some(0.9));
         assert!(best_shippable(&[], 3).is_none());
+    }
+
+    #[test]
+    fn best_effort_prefers_a_real_winner_when_one_exists() {
+        let mut winner = ind(vec![phasor(ModTarget::JuliaC, 0.1)]);
+        winner.score = 0.7;
+        winner.tier_depths = 3;
+        let mut reject = ind(vec![phasor(ModTarget::Phoenix, 0.1)]);
+        reject.rejected = Some("flash");
+        reject.tier_depths = 3;
+        let pop = [reject, winner];
+        assert_eq!(best_effort(&pop, 3).map(|i| i.score), Some(0.7));
+    }
+
+    #[test]
+    fn best_effort_never_returns_none_when_the_population_is_nonempty() {
+        // Nothing passed anywhere — every reel this batch touches must still
+        // carry SOME time formula rather than falling back to a plain zoom.
+        let mk = |why, depths| {
+            let mut i = ind(vec![phasor(ModTarget::JuliaC, 0.1)]);
+            i.rejected = Some(why);
+            i.tier_depths = depths;
+            i
+        };
+        let pop = [mk("noise", 3), mk("flash", 3), mk("incoherent", 1)];
+        assert!(best_effort(&pop, 3).is_some());
+        assert!(best_effort(&[], 3).is_none(), "an empty population has nothing to offer");
+    }
+
+    #[test]
+    fn best_effort_prefers_full_depth_rejects_over_cheap_only_ones() {
+        let mut cheap = ind(vec![phasor(ModTarget::JuliaC, 0.1)]);
+        cheap.rejected = Some("noise");
+        cheap.tier_depths = 1;
+        cheap.stats.min_coherence = 0.99; // would win on raw quality alone
+        let mut full = ind(vec![phasor(ModTarget::Phoenix, 0.1)]);
+        full.rejected = Some("flash");
+        full.tier_depths = 3;
+        full.stats.min_coherence = 0.2;
+        let pop = [cheap, full];
+        assert_eq!(best_effort(&pop, 3).map(|i| i.stats.min_coherence), Some(0.2),
+                   "a full-depth reject describes the real shot; a cheap one does not");
+    }
+
+    #[test]
+    fn best_effort_picks_the_least_bad_reject_by_clip_stats() {
+        let mut noisy = ind(vec![phasor(ModTarget::JuliaC, 0.1)]);
+        noisy.rejected = Some("noise");
+        noisy.tier_depths = 3;
+        noisy.stats = ClipStats { max_noise: 0.9, min_coherence: 0.5, mean_change: 20.0,
+                                   ..ClipStats::default() };
+        let mut mild = ind(vec![phasor(ModTarget::Phoenix, 0.1)]);
+        mild.rejected = Some("incoherent");
+        mild.tier_depths = 3;
+        mild.stats = ClipStats { max_noise: 0.05, min_coherence: 0.4, mean_change: 15.0,
+                                  ..ClipStats::default() };
+        let pop = [noisy, mild];
+        assert_eq!(best_effort(&pop, 3).map(|i| i.progs[0].target), Some(ModTarget::Phoenix));
     }
 
     #[test]

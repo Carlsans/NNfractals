@@ -1649,15 +1649,22 @@ fn cmd_auto_reel_redo(record_path: &Path, args: &[String]) {
     });
     rec.time_summary = nnfractals::time_ga::summary(&pop);
     println!("{}", rec.time_summary);
-    match nnfractals::time_ga::best_shippable(&pop, ga_opts.full.depths) {
-        Some(best) => {
+    match nnfractals::time_ga::best_effort(&pop, ga_opts.full.depths) {
+        Some(best) if best.passed() => {
             println!("  {}", best.label());
             rec.time_prog = best.progs.clone();
             rec.time_score = best.score;
             rec.time_loops = best.loops();
         }
+        Some(best) => {
+            println!("  no formula passed every gate — shipping the closest one for review \
+                      ({}): {}", best.rejected.unwrap_or("?"), best.label());
+            rec.time_prog = best.progs.clone();
+            rec.time_score = best.score;
+            rec.time_loops = best.loops();
+        }
         None => {
-            println!("  no time formula survived — the reel stays a plain zoom");
+            println!("  no time formula could be evolved at all — the reel stays a plain zoom");
             rec.time_prog.clear();
             rec.time_score = 0.0;
             rec.time_loops = false;
@@ -1840,16 +1847,22 @@ fn cmd_auto_reel(pool: &Path, args: &[String]) {
                          r.generation, r.best, r.passed, r.evaluated);
             });
             let sum = time_ga::summary(&pop);
-            match time_ga::best_shippable(&pop, ga_opts.full.depths) {
-                Some(best) => {
+            // `best_effort` only returns `None` for a genuinely empty
+            // population — every reel gets SOME time formula, even an
+            // imperfect one, because Stage 2 is a human reviewing every clip
+            // anyway and re-roll exists for exactly this case.
+            match time_ga::best_effort(&pop, ga_opts.full.depths) {
+                Some(best) if best.passed() => {
                     println!("  {}", best.label());
                     (best.progs.clone(), best.score, best.loops(), sum)
                 }
-                // A shot with no time formula is still a shot. Rendering it as
-                // a plain zoom is far better than throwing away the framing and
-                // aiming work because the third axis found nothing.
+                Some(best) => {
+                    println!("  no formula passed every gate — shipping the closest one for \
+                              review ({}): {}", best.rejected.unwrap_or("?"), best.label());
+                    (best.progs.clone(), best.score, best.loops(), sum)
+                }
                 None => {
-                    println!("  no time formula survived — rendering as a plain zoom");
+                    println!("  no time formula could be evolved at all — rendering as a plain zoom");
                     (Vec::new(), 0.0, false, sum)
                 }
             }

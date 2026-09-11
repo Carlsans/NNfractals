@@ -149,6 +149,57 @@ pub fn clamp_offset(re: f32, im: f32, cap: f32) -> (f32, f32) {
     }
 }
 
+/// The genome's own natural half-extent: `2.0 / zoom` at `zoom = 1.0`, the
+/// scale every archived fractal is framed at before any camera move. `amp` is
+/// calibrated against this — a `JuliaC` amp of 0.1 means "move the constant by
+/// 0.1 against a view that shows about [-2,2]".
+pub const REFERENCE_HALF_EXTENT: f32 = 2.0;
+
+/// Scale a raw, amp-applied offset so it is a FIXED FRACTION of the current
+/// view once the view is narrower than [`REFERENCE_HALF_EXTENT`], instead of
+/// holding the establishing shot's absolute magnitude until it is forced flat
+/// by [`MAX_OFFSET_FRACTION`].
+///
+/// # Why the old clamp alone was not enough
+///
+/// `amp` is calibrated in the target's own units against the genome's natural
+/// framing (see [`REFERENCE_HALF_EXTENT`]). Left unscaled, that same absolute
+/// offset is applied at every depth — so as the camera zooms in and
+/// `half_extent` shrinks, the offset stays fixed while the FRAME shrinks
+/// around it, and its apparent speed relative to what's on screen grows
+/// without bound. `Genome::at_time_in_view`'s old hard clamp caught this only
+/// once the offset exceeded `MAX_OFFSET_FRACTION · half_extent` — and because
+/// that ceiling is itself proportional to `half_extent`, once triggered the
+/// offset was pinned at exactly half the frame's extent, constantly, all the
+/// way down. That is not a taper, it is a flat 50%-of-frame jump every frame,
+/// which is indistinguishable from noise to the five clip gates: on a real
+/// batch this was the dominant cause of "incoherent" and "flash" rejections at
+/// depth, and disabling the noise gate specifically changed nothing (2026-09).
+///
+/// # The fix
+///
+/// Below `REFERENCE_HALF_EXTENT` the offset is rescaled by
+/// `half_extent / REFERENCE_HALF_EXTENT`, so its size relative to the frame —
+/// not its absolute size — is what stays constant. A modulation that occupies
+/// 5% of the establishing shot occupies 5% of every frame after it, shrinking
+/// smoothly in lockstep with the camera instead of holding still and then
+/// snapping to a fixed fraction. [`MAX_OFFSET_FRACTION`] remains applied
+/// afterward as a hard safety net — it should rarely fire once amplitudes are
+/// drawn from a sane range, since `time_ga::TimeGaOpts::amp_range` tops out
+/// well under 1.0 — but a hand-set channel in the viewer is not bound by that
+/// range.
+///
+/// `half_extent = INFINITY` (no view context, e.g. bare [`Genome::at_time`])
+/// disables scaling entirely, matching [`clamp_offset`]'s "no cap" behaviour.
+pub fn scale_to_view(re: f32, im: f32, half_extent: f32) -> (f32, f32) {
+    if !half_extent.is_finite() {
+        return (re, im);
+    }
+    let k = (half_extent.abs() / REFERENCE_HALF_EXTENT).min(1.0);
+    let cap = MAX_OFFSET_FRACTION * half_extent.abs();
+    clamp_offset(re * k, im * k, cap)
+}
+
 /// One evolved time channel: a DAG, what it drives, and how hard.
 ///
 /// The scalars mean the same things they mean on [`crate::formula::TimeMod`],
@@ -692,6 +743,46 @@ mod tests {
         // Degenerate inputs must not produce NaN.
         assert_eq!(clamp_offset(0.0, 0.0, 0.5), (0.0, 0.0));
         assert_eq!(clamp_offset(1.0, 2.0, f32::INFINITY), (1.0, 2.0), "no cap = no clamp");
+    }
+
+    #[test]
+    fn scale_to_view_is_unscaled_above_the_reference_extent() {
+        // Wider than the genome's natural framing (an establishing shot):
+        // absolute amp, exactly as before.
+        assert_eq!(scale_to_view(0.1, 0.0, REFERENCE_HALF_EXTENT), (0.1, 0.0));
+        assert_eq!(scale_to_view(0.1, 0.0, 20.0), (0.1, 0.0));
+    }
+
+    #[test]
+    fn scale_to_view_shrinks_in_proportion_below_the_reference_extent() {
+        // Half the reference extent → half the offset, not a hold-then-clamp.
+        let (re, im) = scale_to_view(0.1, 0.0, REFERENCE_HALF_EXTENT / 2.0);
+        assert!((re - 0.05).abs() < 1e-6, "got {re}");
+        assert_eq!(im, 0.0);
+        // The relative fraction of the frame stays constant across depths,
+        // rather than growing until it hits the safety cap.
+        for half_extent in [1.0f32, 0.1, 1e-4, 1e-8] {
+            let (re, _) = scale_to_view(0.1, 0.0, half_extent);
+            let frac = re / half_extent;
+            let want = 0.1 / REFERENCE_HALF_EXTENT;
+            assert!((frac - want).abs() < 1e-4 * want.max(1.0),
+                    "half_extent={half_extent}: fraction {frac}, want {want}");
+        }
+    }
+
+    #[test]
+    fn scale_to_view_still_enforces_the_safety_cap_for_oversized_amplitudes() {
+        // A hand-set channel with amp well past what the GA would ever draw
+        // must still be capped — scaling down does not replace the ceiling.
+        let half_extent = 4.0f32;
+        let (re, im) = scale_to_view(3.0, 4.0, half_extent);
+        let mag = (re * re + im * im).sqrt();
+        assert!(mag <= MAX_OFFSET_FRACTION * half_extent + 1e-6, "mag={mag}");
+    }
+
+    #[test]
+    fn scale_to_view_disabled_with_no_view_context() {
+        assert_eq!(scale_to_view(1.0, 2.0, f32::INFINITY), (1.0, 2.0));
     }
 
     #[test]
