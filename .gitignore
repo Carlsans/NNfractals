@@ -43,6 +43,8 @@ novelty_head.pt
 novelty_model.npz
 viewer_output/
 explorer_out/
+# auto-reel batches: previews, their genomes and their records
+reels/
 gen_metrics_*.jsonl
 auto_select_log.jsonl
 nav_log.jsonl

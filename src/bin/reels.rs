@@ -13,7 +13,8 @@
 //! happens on a worker thread so selecting a reel never blocks the UI.
 
 use std::path::{Path, PathBuf};
-use std::sync::mpsc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{mpsc, Arc, Mutex};
 
 use eframe::egui::{self, Color32};
 
@@ -31,7 +32,36 @@ enum Msg {
     Failed(String, String),
     /// A re-roll subprocess finished: reel id, and what to say about it.
     Redone(String, Result<(), String>),
+    /// The batch subprocess finished.
+    BatchDone(Result<(), String>),
 }
+
+/// Directories a batch can draw from: every top-level `fractals*` pool plus the
+/// curated `Starred` folder, the same set the browser offers.
+fn discover_pools() -> Vec<String> {
+    let root = nnfractals::project_root();
+    let mut out: Vec<String> = std::fs::read_dir(&root)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.is_dir())
+        .filter_map(|p| p.file_name().and_then(|n| n.to_str()).map(str::to_owned))
+        .filter(|n| n.starts_with("fractals"))
+        .collect();
+    out.sort();
+    // First when it exists — it is the curated folder the browser stars into,
+    // and the obvious place to point a first batch. Not offered when absent:
+    // a pool with no .nn files just makes the run exit with an error.
+    if root.join("Starred").is_dir() {
+        out.insert(0, "Starred".into());
+    }
+    out
+}
+
+/// Lines kept from a running batch. Enough to see what the last few reels did
+/// without holding an unbounded log in memory for a run that lasts hours.
+const LOG_LINES: usize = 400;
 
 /// Frames held in memory for one preview.
 ///
@@ -101,6 +131,24 @@ struct App {
     out_seconds: String,
     out_rife: String,
     show_rejected: bool,
+
+    // ── Starting a batch ──────────────────────────────────────────────────
+    pools: Vec<String>,
+    pool: usize,
+    batch_count: String,
+    batch_seconds: String,
+    batch_pop: String,
+    batch_gens: String,
+    batch_fit_time: bool,
+    /// PID of the running batch, so it can be stopped. `None` = not running.
+    batch_pid: Arc<Mutex<Option<u32>>>,
+    /// Set when the user asks to stop, so the finish message can say so rather
+    /// than reporting the kill as a failure.
+    batch_stopping: Arc<AtomicBool>,
+    batch_running: bool,
+    batch_log: Arc<Mutex<Vec<String>>>,
+    show_log: bool,
+    last_batch_poll: std::time::Instant,
 }
 
 impl App {
@@ -116,6 +164,19 @@ impl App {
             out_w: "1920".into(), out_h: "1080".into(), out_fps: "30".into(),
             out_seconds: "45".into(), out_rife: String::new(),
             show_rejected: false,
+            pools: discover_pools(),
+            pool: 0,
+            batch_count: "5".into(),
+            batch_seconds: "12".into(),
+            batch_pop: "24".into(),
+            batch_gens: "8".into(),
+            batch_fit_time: false,
+            batch_pid: Arc::new(Mutex::new(None)),
+            batch_stopping: Arc::new(AtomicBool::new(false)),
+            batch_running: false,
+            batch_log: Arc::new(Mutex::new(Vec::new())),
+            show_log: true,
+            last_batch_poll: std::time::Instant::now(),
         };
         app.reload();
         app
@@ -125,16 +186,25 @@ impl App {
         self.batches.get(self.batch)
     }
 
+    /// Re-read the batch list and the current batch from disk.
+    ///
+    /// Keeps the selection AND the decoded clip when the selected reel is still
+    /// there. A batch writes reels one at a time, so this runs every few seconds
+    /// while one is going — dropping the clip each time would make a preview
+    /// unwatchable exactly while you are trying to watch it.
     fn reload(&mut self) {
+        let was = self.selected.and_then(|i| self.reels.get(i).map(|r| r.id.clone()));
         self.batches = auto_reel::list_batches();
         self.batch = self.batch.min(self.batches.len().saturating_sub(1));
         self.reels = match self.batch_dir() {
             Some(d) => auto_reel::load_batch(d),
             None => Vec::new(),
         };
-        self.selected = None;
-        self.clip = None;
-        self.tex = None;
+        self.selected = was.and_then(|id| self.reels.iter().position(|r| r.id == id));
+        if self.selected.is_none() {
+            self.clip = None;
+            self.tex = None;
+        }
     }
 
     fn visible(&self) -> Vec<usize> {
@@ -173,6 +243,105 @@ impl App {
                 self.message = format!("cannot save decision: {e}");
             }
         }
+    }
+
+    /// Start an `explorer auto-reel` batch in a subprocess.
+    ///
+    /// A subprocess for the same reason the re-roll is one: a batch renders for
+    /// hours, and this window has to stay responsive enough to watch the reels
+    /// it is producing as they land. Both pipes are drained on their own
+    /// threads — a child that fills one and blocks would stall the whole run.
+    fn start_batch(&mut self) {
+        use std::io::{BufRead, BufReader};
+        use std::process::{Command, Stdio};
+
+        if self.batch_running {
+            self.message = "a batch is already running".into();
+            return;
+        }
+        let pool = self.pools.get(self.pool).cloned().unwrap_or_else(|| "fractals_1".into());
+        let mut args: Vec<String> = vec![
+            "auto-reel".into(),
+            "--pool".into(), pool.clone(),
+            "--count".into(), self.batch_count.trim().to_string(),
+            "--seconds".into(), self.batch_seconds.trim().to_string(),
+            "--pop".into(), self.batch_pop.trim().to_string(),
+            "--gens".into(), self.batch_gens.trim().to_string(),
+        ];
+        if self.batch_fit_time {
+            args.push("--fit-time".into());
+        }
+
+        let child = Command::new(nnfractals::locate_bin("explorer"))
+            .current_dir(nnfractals::project_root())
+            .args(&args)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn();
+        let mut child = match child {
+            Ok(c) => c,
+            Err(e) => {
+                self.message = format!("cannot run explorer: {e}");
+                return;
+            }
+        };
+
+        self.batch_log.lock().unwrap().clear();
+        *self.batch_pid.lock().unwrap() = Some(child.id());
+        self.batch_stopping.store(false, Ordering::SeqCst);
+        self.batch_running = true;
+        self.show_log = true;
+        self.message = format!("batch started on {pool}");
+
+        let log = self.batch_log.clone();
+        let pid = self.batch_pid.clone();
+        let stopping = self.batch_stopping.clone();
+        let tx = self.tx.clone();
+
+        // stderr carries the `[gpu]` banner and any panic; keep it in the same
+        // log so a failure is visible here rather than only in a terminal
+        // nobody is watching.
+        if let Some(err) = child.stderr.take() {
+            let log = log.clone();
+            std::thread::spawn(move || {
+                for line in BufReader::new(err).lines().map_while(Result::ok) {
+                    let mut l = log.lock().unwrap();
+                    l.push(line);
+                    let n = l.len();
+                    if n > LOG_LINES { l.drain(..n - LOG_LINES); }
+                }
+            });
+        }
+        std::thread::spawn(move || {
+            if let Some(out) = child.stdout.take() {
+                for line in BufReader::new(out).lines().map_while(Result::ok) {
+                    let mut l = log.lock().unwrap();
+                    l.push(line);
+                    let n = l.len();
+                    if n > LOG_LINES { l.drain(..n - LOG_LINES); }
+                }
+            }
+            let status = child.wait();
+            *pid.lock().unwrap() = None;
+            let result = match status {
+                _ if stopping.load(Ordering::SeqCst) => Err("stopped".to_string()),
+                Ok(s) if s.success() => Ok(()),
+                Ok(s) => Err(format!("explorer exited with {s}")),
+                Err(e) => Err(e.to_string()),
+            };
+            let _ = tx.send(Msg::BatchDone(result));
+        });
+    }
+
+    /// Ask the running batch to stop.
+    ///
+    /// SIGTERM rather than SIGKILL: a reel's record and clip are written before
+    /// the next one starts, so a clean exit keeps everything already finished.
+    fn stop_batch(&mut self) {
+        let Some(pid) = *self.batch_pid.lock().unwrap() else { return };
+        self.batch_stopping.store(true, Ordering::SeqCst);
+        let _ = std::process::Command::new("kill").arg(pid.to_string()).status();
+        self.message = "stopping after the current reel…".into();
     }
 
     /// Re-run only the time-formula search for one reel, in a subprocess.
@@ -272,6 +441,15 @@ impl eframe::App for App {
                         self.message = format!("cannot play preview: {why}");
                     }
                 }
+                Msg::BatchDone(result) => {
+                    self.batch_running = false;
+                    self.reload();
+                    self.message = match result {
+                        Ok(()) => "batch finished ✓".into(),
+                        Err(why) if why == "stopped" => "batch stopped — finished reels kept".into(),
+                        Err(why) => format!("cannot finish batch: {why}"),
+                    };
+                }
                 Msg::Redone(id, result) => {
                     self.redoing = None;
                     match result {
@@ -299,6 +477,8 @@ impl eframe::App for App {
         let mut do_reset: Option<usize> = None;
         let mut do_redo: Option<usize> = None;
         let mut do_reload = false;
+        let mut do_start_batch = false;
+        let mut do_stop_batch = false;
 
         egui::Panel::top("bar").show(ui, |ui| {
             ui.horizontal_wrapped(|ui| {
@@ -314,6 +494,11 @@ impl eframe::App for App {
                             let name = b.file_name().and_then(|s| s.to_str()).unwrap_or("?");
                             if ui.selectable_label(self.batch == i, name).clicked() {
                                 self.batch = i;
+                                // A different batch has different reels, so the
+                                // current selection and clip are meaningless.
+                                self.selected = None;
+                                self.clip = None;
+                                self.tex = None;
                                 do_reload = true;
                             }
                         }
@@ -339,6 +524,72 @@ impl eframe::App for App {
                 ui.add(egui::TextEdit::singleline(&mut self.out_rife).desired_width(35.0))
                     .on_hover_text("Optional RIFE interpolation target frame rate. Blank = off.");
             });
+
+            // ── Start a batch ─────────────────────────────────────────────
+            ui.horizontal_wrapped(|ui| {
+                ui.label("New batch:");
+                egui::ComboBox::from_id_salt("pool")
+                    .selected_text(self.pools.get(self.pool).cloned().unwrap_or_default())
+                    .width(130.0)
+                    .show_ui(ui, |ui| {
+                        for (i, p) in self.pools.clone().iter().enumerate() {
+                            if ui.selectable_label(self.pool == i, p).clicked() {
+                                self.pool = i;
+                            }
+                        }
+                    });
+                ui.label("count");
+                ui.add(egui::TextEdit::singleline(&mut self.batch_count).desired_width(35.0))
+                    .on_hover_text("How many fractals to plan. They are taken from the top of the \
+                                    pool by aesthetic/pref/novelty, skipping anything an earlier \
+                                    batch already used.");
+                ui.label("secs");
+                ui.add(egui::TextEdit::singleline(&mut self.batch_seconds).desired_width(30.0))
+                    .on_hover_text("Length of each PREVIEW clip, at 512x512 and 5fps. Short keeps \
+                                    a batch cheap; the approved render can be any length.");
+                ui.label("pop");
+                ui.add(egui::TextEdit::singleline(&mut self.batch_pop).desired_width(30.0))
+                    .on_hover_text("Time-formula search population. Smaller is much faster and \
+                                    finds less.");
+                ui.label("gens");
+                ui.add(egui::TextEdit::singleline(&mut self.batch_gens).desired_width(30.0));
+                ui.checkbox(&mut self.batch_fit_time, "⏱ fit time")
+                    .on_hover_text("Pull the end zoom back so the formula animates across the \
+                                    WHOLE shot. Past zoom ~2e5 a genome scalar is an f32 with no \
+                                    step small enough to move smoothly, so without this a deep \
+                                    reel animates for its first stretch and is a plain zoom after. \
+                                    Costs depth: a 41-doubling shot becomes about 20.");
+
+                if !self.batch_running {
+                    if ui.button("▶  Start batch")
+                        .on_hover_text("Runs `explorer auto-reel` in the background. Reels appear \
+                                        in the list as they finish, so you can start watching \
+                                        before the batch is done. Budget about a minute each.")
+                        .clicked()
+                    { do_start_batch = true; }
+                } else {
+                    if ui.button("■  Stop").on_hover_text(
+                        "Stops after the reel in progress. Everything already finished is kept.")
+                        .clicked()
+                    { do_stop_batch = true; }
+                    ui.spinner();
+                    let last = self.batch_log.lock().unwrap().last().cloned().unwrap_or_default();
+                    ui.label(egui::RichText::new(last).monospace().small());
+                }
+                ui.checkbox(&mut self.show_log, "log");
+            });
+
+            if self.show_log && (self.batch_running || !self.batch_log.lock().unwrap().is_empty()) {
+                let lines = self.batch_log.lock().unwrap().clone();
+                egui::ScrollArea::vertical()
+                    .max_height(110.0)
+                    .stick_to_bottom(true)
+                    .show(ui, |ui| {
+                        for l in &lines {
+                            ui.label(egui::RichText::new(l).monospace().small());
+                        }
+                    });
+            }
         });
 
         // This build's eframe hands `ui`, not a `Context`, and exposes only
@@ -546,7 +797,18 @@ impl eframe::App for App {
             self.set_status(i, ReelStatus::Pending);
             self.message.clear();
         }
+        if do_start_batch { self.start_batch(); }
+        if do_stop_batch { self.stop_batch(); }
         if let Some(i) = do_redo { self.redo(i); }
+        if self.batch_running {
+            // Reels are written one at a time, so re-read periodically and the
+            // list fills in while the batch is still going.
+            if self.last_batch_poll.elapsed() >= std::time::Duration::from_secs(5) {
+                self.last_batch_poll = std::time::Instant::now();
+                self.reload();
+            }
+            ctx.request_repaint_after(std::time::Duration::from_millis(400));
+        }
         if self.redoing.is_some() {
             ctx.request_repaint_after(std::time::Duration::from_millis(500));
         }
@@ -567,4 +829,39 @@ fn main() -> anyhow::Result<()> {
         }),
     ).map_err(|e| anyhow::anyhow!("{e}"))?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_log_stays_bounded_however_long_a_batch_runs() {
+        // A batch runs for hours and prints per generation; an unbounded log
+        // would grow without limit in a window meant to be left open.
+        let log: Vec<String> = Vec::new();
+        let log = std::sync::Mutex::new(log);
+        for i in 0..LOG_LINES * 3 {
+            let mut l = log.lock().unwrap();
+            l.push(format!("line {i}"));
+            let n = l.len();
+            if n > LOG_LINES {
+                l.drain(..n - LOG_LINES);
+            }
+        }
+        let l = log.lock().unwrap();
+        assert_eq!(l.len(), LOG_LINES);
+        // And it keeps the NEWEST lines, which are the ones worth seeing.
+        assert_eq!(l.last().unwrap(), &format!("line {}", LOG_LINES * 3 - 1));
+    }
+
+    #[test]
+    fn discovered_pools_are_real_directories() {
+        // The combo must never offer a pool that would make the run exit with
+        // "no .nn files" — `Starred` in particular is only there when it is.
+        let root = nnfractals::project_root();
+        for p in discover_pools() {
+            assert!(root.join(&p).is_dir(), "offered {p}, which is not a directory");
+        }
+    }
 }
