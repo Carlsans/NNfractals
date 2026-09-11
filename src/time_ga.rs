@@ -843,6 +843,85 @@ mod tests {
         CapturedView { cx, cx_lo: 0.0, cy, cy_lo: 0.0, zoom, aspect: 1.0 }
     }
 
+    /// Print a coherence/noise/change table for one `(genome, target)` at
+    /// increasing depth, at several amplitudes — the "is a given frame-relative
+    /// offset getting more dangerous with zoom" question, answered with real
+    /// renders instead of theory.
+    ///
+    /// Not a pass/fail check: this is the calibration tool itself, kept as a
+    /// test so it is discoverable and rerunnable (`cargo test -- --ignored
+    /// probe_zoom_sensitivity --nocapture`) rather than a one-off script that
+    /// gets thrown away. Every amp is `TimeProgram::new(target, [C], amp)` —
+    /// the raw phasor, so after normalisation this is exactly a circular orbit
+    /// of radius `amp` (after `scale_to_view`) around the target's stored
+    /// value, with no GA randomness in the way.
+    fn probe_zoom_sensitivity(nn_path: &str, target: ModTarget, doublings: &[f64], amps: &[f32]) {
+        let path = std::path::Path::new(nn_path);
+        let Ok(genome) = crate::io::load_genome(path) else {
+            eprintln!("skipping: {nn_path} not present (Starred/ is local archive data, gitignored)");
+            return;
+        };
+        let config = test_config();
+        let start = match crate::auto_reel::auto_frame(&genome, &config) {
+            Ok(f) => f.view.to_view(),
+            Err(why) => { eprintln!("skipping {nn_path}: cannot auto-frame ({why})"); return; }
+        };
+        let orbit = |amp: f32| TimeProgram::new(target, vec![OpNode {
+            op: crate::formula::op::C, a: 0, b: 0, kre: 0.0, kim: 0.0 }], amp);
+
+        eprintln!("\n== {nn_path} / {target:?} == start zoom={:.3e}", start.zoom);
+        for &d in doublings {
+            let view = View { zoom: start.zoom * 2f64.powf(d), ..start };
+            eprintln!("-- {d:.1} doublings past start  (zoom={:.3e}) --", view.zoom);
+            for &amp in amps {
+                let mut probe = genome.clone();
+                probe.time_prog = vec![orbit(amp)];
+                let frames: Vec<Vec<u8>> = time_frames(&probe, &config, false, &view, 8, 96, 72).collect();
+                let stats = crate::time_explore::clip_stats(&frames, 96, 72);
+                eprintln!("  amp={amp:<6.3}  noise={:.3}  coherence={:.3}  change={:6.2}  jump={:.2}",
+                          stats.max_noise, stats.min_coherence, stats.mean_change, stats.max_level_jump);
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "needs local Starred/ archive data and a GPU; run explicitly with --ignored"]
+    fn probe_zoom_sensitivity_structural_target() {
+        // Phoenix (changes the RECURRENCE ORDER, not a smooth deformation).
+        // This straight-zoom-from-the-auto-framed-start path is simpler to set
+        // up than a real reel's drilled descent and already shows the target
+        // running visibly noisier / less coherent at larger amplitudes than
+        // `probe_zoom_sensitivity_a_scale_target` below. The MUCH sharper
+        // finding — coherence collapsing to near-zero regardless of amplitude,
+        // all the way down to a ~1e-6 absolute offset — was measured
+        // 2026-09-10/11 along the actual drilled path of a real 41-doubling
+        // reel, not this simpler straight zoom; see
+        // [[formula-animation-f32-depth-limit]] for those exact numbers. Use
+        // this test to re-probe the general target-dependent contrast; use a
+        // saved `reels/<batch>/*.json` record's own start/end (as
+        // `auto-reel --redo` does) to reproduce a specific reel's exact path.
+        probe_zoom_sensitivity("Starred/0a3fbd3fc7ecb9e0.nn", ModTarget::Phoenix,
+            &[3.4, 6.8, 10.2, 13.6, 17.1], &[0.02, 0.1, 0.35]);
+    }
+
+    #[test]
+    #[ignore = "needs local Starred/ archive data and a GPU; run explicitly with --ignored"]
+    fn probe_zoom_sensitivity_a_scale_target() {
+        // ProgScale (splices a scale into an existing subtree — a smooth
+        // deformation, not a structural change). The contrast with the Phoenix
+        // probe above is the point: a single global zoom-only damping factor
+        // cannot tell a target like this apart from one prone to chaos, and an
+        // A/B test (2026-09-11, see [[formula-animation-f32-depth-limit]])
+        // found that adding one on top of `scale_to_view`'s existing
+        // frame-relative term regressed exactly this well-behaved case — a
+        // real GA run on this genome that found 5/6 full-tier winners without
+        // the extra factor found 0 with it — without rescuing the Phoenix case
+        // at all. That factor was reverted; this test is the tool to re-check
+        // any future proposal against both cases before it ships.
+        probe_zoom_sensitivity("Starred/af773ce92439b867.nn", ModTarget::ProgScale { node: 2 },
+            &[2.2, 4.3, 6.5, 8.6, 10.8, 13.0], &[0.02, 0.1, 0.35]);
+    }
+
     fn phasor(target: ModTarget, amp: f32) -> TimeProgram {
         TimeProgram::new(target, vec![OpNode { op: op::C, a: 0, b: 0, kre: 0.0, kim: 0.0 }], amp)
     }
