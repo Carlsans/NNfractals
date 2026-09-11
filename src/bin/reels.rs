@@ -59,6 +59,43 @@ fn discover_pools() -> Vec<String> {
     out
 }
 
+/// Width of the reel list down the left side.
+const LIST_WIDTH: f32 = 240.0;
+
+/// Fraction of the window width the player aims to fill.
+pub const PLAYER_WIDTH_FRACTION: f32 = 0.66;
+
+/// Height kept below the player for the transport row and the first line of the
+/// recipe.
+///
+/// Deliberately small — the detail pane scrolls, so the Approve/Reject buttons
+/// stay reachable either way, and reserving room for the whole recipe would cap
+/// a square 512x512 preview at well under half the window. This is the "you can
+/// always see that there IS more below" allowance, not room for all of it.
+const DETAIL_HEIGHT: f32 = 132.0;
+
+/// How large to draw the preview, given the whole panel and the clip's aspect.
+///
+/// Sized from the PANEL rather than from `available_size()` at the point of
+/// drawing: inside the nested horizontal/vertical the latter reports what is
+/// left of the current row, which made the player a fraction of the window.
+///
+/// Aims for [`PLAYER_WIDTH_FRACTION`] of the window width and shrinks only when
+/// the height cannot take it — so the clip is as large as the window allows
+/// without pushing the recipe and the Approve/Reject buttons out of reach.
+pub fn player_size(panel: egui::Vec2, aspect: f32) -> (f32, f32) {
+    let aspect = if aspect.is_finite() && aspect > 0.0 { aspect } else { 1.0 };
+    let right = (panel.x - LIST_WIDTH - 16.0).max(120.0);
+    let mut w = (panel.x * PLAYER_WIDTH_FRACTION).min(right).max(120.0);
+    let mut h = w / aspect;
+    let max_h = (panel.y - DETAIL_HEIGHT).max(120.0);
+    if h > max_h {
+        h = max_h;
+        w = h * aspect;
+    }
+    (w, h)
+}
+
 /// Lines kept from a running batch. Enough to see what the last few reels did
 /// without holding an unbounded log in memory for a run that lasts hours.
 const LOG_LINES: usize = 400;
@@ -175,7 +212,9 @@ impl App {
             batch_stopping: Arc::new(AtomicBool::new(false)),
             batch_running: false,
             batch_log: Arc::new(Mutex::new(Vec::new())),
-            show_log: true,
+            // Off until a batch starts (`start_batch` turns it on): the log
+            // panel costs ~110px of height, which is height the player wants.
+            show_log: false,
             last_batch_poll: std::time::Instant::now(),
         };
         app.reload();
@@ -596,10 +635,14 @@ impl eframe::App for App {
         // `Panel::top` / `CentralPanel` — no `SidePanel`. A two-column split
         // inside the central panel gives the same layout.
         egui::CentralPanel::default().show(ui, |ui| {
-        let avail = ui.available_size();
+        // Measured ONCE, on the panel, before any nesting. `available_size()`
+        // inside the horizontal/vertical below reports what is left of the
+        // current row, not the window — which is what made the player come out
+        // a fraction of its intended size.
+        let panel = ui.available_size();
         ui.horizontal(|ui| {
         ui.allocate_ui_with_layout(
-            egui::Vec2::new(240.0, avail.y),
+            egui::Vec2::new(LIST_WIDTH, panel.y),
             egui::Layout::top_down(egui::Align::Min),
             |ui| {
             let visible = self.visible();
@@ -625,7 +668,11 @@ impl eframe::App for App {
             });
         });
         ui.separator();
-        ui.vertical(|ui| {
+        // Scrollable: at a large player the recipe and the Approve/Reject
+        // buttons sit below the fold, and content taller than the window with
+        // no way to reach it is exactly the bug that hid the launcher's Stop
+        // button.
+        egui::ScrollArea::vertical().id_salt("detail").show(ui, |ui| {
             let Some(i) = self.selected else {
                 ui.centered_and_justified(|ui| {
                     ui.label(egui::RichText::new(
@@ -652,10 +699,8 @@ impl eframe::App for App {
                     self.tex = Some(ctx.load_texture("reel", img, egui::TextureOptions::LINEAR));
                 }
                 if let Some(tex) = &self.tex {
-                    let avail = ui.available_size();
-                    let side = avail.x.min(avail.y - 150.0).max(64.0);
-                    let asp = rec.preview_w as f32 / rec.preview_h.max(1) as f32;
-                    let (w, h) = if asp >= 1.0 { (side, side / asp) } else { (side * asp, side) };
+                    let (w, h) = player_size(
+                        panel, rec.preview_w as f32 / rec.preview_h.max(1) as f32);
                     ui.vertical_centered(|ui| {
                         ui.add(egui::Image::new(egui::load::SizedTexture::new(
                             tex.id(), egui::Vec2::new(w, h))));
@@ -676,13 +721,23 @@ impl eframe::App for App {
                     }
                 });
                 ctx.request_repaint_after(std::time::Duration::from_millis(40));
-            } else if self.loading.is_some() {
-                ui.centered_and_justified(|ui| { ui.spinner(); });
-                ctx.request_repaint_after(std::time::Duration::from_millis(100));
             } else {
-                ui.centered_and_justified(|ui| {
-                    ui.label(egui::RichText::new("no preview loaded").color(Color32::GRAY));
+                // A fixed box: inside a scroll area `centered_and_justified`
+                // has no height to centre within and would stretch.
+                let (w, h) = player_size(panel, 1.0);
+                let _ = w;
+                ui.allocate_ui(egui::Vec2::new(ui.available_width(), h), |ui| {
+                    ui.centered_and_justified(|ui| {
+                        if self.loading.is_some() {
+                            ui.spinner();
+                        } else {
+                            ui.label(egui::RichText::new("no preview loaded").color(Color32::GRAY));
+                        }
+                    });
                 });
+                if self.loading.is_some() {
+                    ctx.request_repaint_after(std::time::Duration::from_millis(100));
+                }
             }
 
             ui.separator();
@@ -817,7 +872,7 @@ impl eframe::App for App {
 
 fn main() -> anyhow::Result<()> {
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default().with_inner_size([1040.0, 760.0]),
+        viewport: egui::ViewportBuilder::default().with_inner_size([1200.0, 860.0]),
         ..Default::default()
     };
     eframe::run_native(
@@ -834,6 +889,57 @@ fn main() -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_player_fills_two_thirds_of_the_window_when_it_can() {
+        // Carl's report: the preview came out "very small". It was being sized
+        // from `available_size()` inside a nested layout, which reports what is
+        // left of the current row rather than the window.
+        //
+        // A tall enough window: width is what binds, and it is two thirds.
+        let panel = egui::Vec2::new(1400.0, 1200.0);
+        let (w, h) = player_size(panel, 1.0);
+        assert!((w / panel.x - PLAYER_WIDTH_FRACTION).abs() < 0.01,
+                "{w} of {} is not two thirds", panel.x);
+        assert!((w - h).abs() < 0.01, "a square clip must stay square");
+    }
+
+    #[test]
+    fn a_square_preview_gets_most_of_a_realistic_window() {
+        // The shape that actually ships: 512x512 previews in the default
+        // window, minus the two toolbar rows. Whatever binds, the result has to
+        // be a clip worth looking at rather than a thumbnail.
+        let panel = egui::Vec2::new(1200.0 - 16.0, 860.0 - 90.0);
+        let (w, h) = player_size(panel, 1.0);
+        assert!(w >= 500.0, "a 512px preview drawn at {w}px is still small");
+        assert!((w - h).abs() < 0.01);
+    }
+
+    #[test]
+    fn the_player_gives_way_before_the_buttons_go_out_of_reach() {
+        // A short window must shrink the clip rather than push Approve/Reject
+        // off the bottom.
+        let panel = egui::Vec2::new(1400.0, 480.0);
+        let (w, h) = player_size(panel, 1.0);
+        assert!(h <= panel.y - DETAIL_HEIGHT + 0.01, "player {h} leaves no room in {}", panel.y);
+        assert!(w < panel.x * PLAYER_WIDTH_FRACTION, "it should have shrunk, got {w}");
+    }
+
+    #[test]
+    fn the_player_never_overlaps_the_list_or_inverts() {
+        for (pw, ph, asp) in [(1400.0, 900.0, 1.0), (600.0, 400.0, 1.0),
+                              (900.0, 900.0, 16.0 / 9.0), (900.0, 900.0, 9.0 / 16.0),
+                              (300.0, 200.0, 1.0)] {
+            let (w, h) = player_size(egui::Vec2::new(pw, ph), asp);
+            assert!(w > 0.0 && h > 0.0, "{pw}x{ph} @{asp} gave {w}x{h}");
+            assert!(w <= (pw - LIST_WIDTH).max(120.0) + 0.01,
+                    "{w} overlaps the {LIST_WIDTH}px list in a {pw}px panel");
+            assert!((w / h - asp).abs() < 0.01, "aspect drifted: {w}x{h} vs {asp}");
+        }
+        // A degenerate aspect must not produce NaN.
+        let (w, h) = player_size(egui::Vec2::new(1400.0, 900.0), 0.0);
+        assert!(w.is_finite() && h.is_finite() && w > 0.0 && h > 0.0);
+    }
 
     #[test]
     fn the_log_stays_bounded_however_long_a_batch_runs() {
