@@ -1724,6 +1724,15 @@ fn ga_opts_from(args: &[String]) -> nnfractals::time_ga::TimeGaOpts {
     o.full.depths = get_flag_or(args, "--depths", o.full.depths);
     o.full.frames = get_flag_or(args, "--frames", o.full.frames);
     o.cheap.frames = get_flag_or(args, "--cheap-frames", o.cheap.frames);
+    // The five clip gates, same flag names `time-explore` takes — which is what
+    // the viewer's ⏱ "Rejection criteria" controls already send. Without these
+    // the GA silently ignored every one of them, so turning a gate off in the
+    // GUI changed the sweep and not the search.
+    o.clip.min_coherence = get_flag_or(args, "--min-coherence", o.clip.min_coherence);
+    o.clip.min_change = get_flag_or(args, "--min-change", o.clip.min_change);
+    o.clip.max_noise = get_flag_or(args, "--max-noise", o.clip.max_noise);
+    o.clip.max_still_run = get_flag_or(args, "--max-still-run", o.clip.max_still_run);
+    o.clip.max_level_jump = get_flag_or(args, "--max-level-jump", o.clip.max_level_jump);
     o
 }
 
