@@ -416,26 +416,48 @@ pub fn clip_stats(frames: &[Vec<u8>], w: u32, h: u32) -> ClipStats {
     }
 }
 
-/// Apply the three gates in cost-of-being-wrong order.
+/// One gate's verdict against one clip: the raw measurement, the threshold it
+/// was judged against, which direction a pass means, and whether it passed.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct GateCheck {
+    pub name: &'static str,
+    /// "at most" or "at least" `threshold` — which side of it is a pass.
+    pub direction: &'static str,
+    pub value: f64,
+    pub threshold: f64,
+    pub passed: bool,
+}
+
+/// Every gate `gate()` applies, checked independently rather than
+/// short-circuited on the first failure — so a caller can see how far a clip
+/// stood from EVERY threshold, not only the one that stopped it. Order matches
+/// `gate()`'s cost-of-being-wrong order, and `gate()` is defined in terms of
+/// this so the two can never silently disagree.
+pub fn gate_checks(stats: &ClipStats, opts: &TimeExploreOpts) -> Vec<GateCheck> {
+    vec![
+        GateCheck { name: "noise", direction: "at most",
+                    value: stats.max_noise as f64, threshold: opts.max_noise as f64,
+                    passed: stats.max_noise <= opts.max_noise },
+        GateCheck { name: "static", direction: "at least",
+                    value: stats.mean_change as f64, threshold: opts.min_change as f64,
+                    passed: stats.mean_change >= opts.min_change },
+        // A RUN of near-identical frames, not a single slow pair — see
+        // ClipStats::longest_still_run.
+        GateCheck { name: "stalls", direction: "at most",
+                    value: stats.longest_still_run as f64, threshold: opts.max_still_run as f64,
+                    passed: stats.longest_still_run <= opts.max_still_run },
+        GateCheck { name: "flash", direction: "at most",
+                    value: stats.max_level_jump as f64, threshold: opts.max_level_jump as f64,
+                    passed: stats.max_level_jump <= opts.max_level_jump },
+        GateCheck { name: "incoherent", direction: "at least",
+                    value: stats.min_coherence as f64, threshold: opts.min_coherence as f64,
+                    passed: stats.min_coherence >= opts.min_coherence },
+    ]
+}
+
+/// Apply the gates in cost-of-being-wrong order, stopping at the first failure.
 fn gate(stats: &ClipStats, opts: &TimeExploreOpts) -> Option<&'static str> {
-    if stats.max_noise > opts.max_noise {
-        return Some("noise");
-    }
-    if stats.mean_change < opts.min_change {
-        return Some("static");
-    }
-    // A RUN of near-identical frames, not a single slow pair — see
-    // ClipStats::longest_still_run.
-    if stats.longest_still_run > opts.max_still_run {
-        return Some("stalls");
-    }
-    if stats.max_level_jump > opts.max_level_jump {
-        return Some("flash");
-    }
-    if stats.min_coherence < opts.min_coherence {
-        return Some("incoherent");
-    }
-    None
+    gate_checks(stats, opts).into_iter().find(|c| !c.passed).map(|c| c.name)
 }
 
 /// Gate and score an already-rendered clip. The one place the two searches —
@@ -1006,6 +1028,44 @@ mod tests {
         // is the more actionable diagnosis.
         let st = ClipStats { max_noise: 1.0, min_coherence: 0.0, mean_change: 0.0, ..Default::default() };
         assert_eq!(gate(&st, &TimeExploreOpts::default()), Some("noise"));
+    }
+
+    #[test]
+    fn gate_checks_reports_every_gate_not_just_the_first_failure() {
+        // Fails noise AND incoherent at once; `gate()` would only ever say
+        // "noise" (checked first). `gate_checks` must show both.
+        let st = ClipStats {
+            max_noise: 1.0, min_coherence: 0.0, mean_change: 100.0,
+            longest_still_run: 0.0, max_level_jump: 0.0, mean_coherence: 0.0, min_change: 0.0,
+        };
+        let checks = gate_checks(&st, &TimeExploreOpts::default());
+        assert_eq!(checks.len(), 5, "one entry per gate, always");
+        let failed: Vec<&str> = checks.iter().filter(|c| !c.passed).map(|c| c.name).collect();
+        assert_eq!(failed, vec!["noise", "incoherent"]);
+        // The passing gates must still be reported, not omitted.
+        assert!(checks.iter().any(|c| c.name == "static" && c.passed));
+        assert!(checks.iter().any(|c| c.name == "stalls" && c.passed));
+        assert!(checks.iter().any(|c| c.name == "flash" && c.passed));
+    }
+
+    #[test]
+    fn gate_checks_agrees_with_gate_on_the_first_failure() {
+        // `gate()` is now defined in terms of `gate_checks` — this pins that
+        // relationship so the two representations can never drift apart.
+        let cases = [
+            ClipStats { max_noise: 1.0, ..Default::default() },
+            ClipStats { mean_change: 0.0, ..Default::default() },
+            ClipStats { longest_still_run: 1.0, mean_change: 100.0, ..Default::default() },
+            ClipStats { max_level_jump: 1000.0, mean_change: 100.0, ..Default::default() },
+            ClipStats { min_coherence: 0.0, mean_change: 100.0, ..Default::default() },
+            ClipStats { mean_change: 100.0, min_coherence: 1.0, ..Default::default() },
+        ];
+        for st in cases {
+            let opts = TimeExploreOpts::default();
+            let via_gate = gate(&st, &opts);
+            let via_checks = gate_checks(&st, &opts).into_iter().find(|c| !c.passed).map(|c| c.name);
+            assert_eq!(via_gate, via_checks, "{st:?}");
+        }
     }
 
     #[test]

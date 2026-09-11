@@ -1668,6 +1668,13 @@ fn cmd_auto_reel_redo(record_path: &Path, args: &[String]) {
             rec.time_loops = false;
         }
     }
+    if let Some(best) = nnfractals::time_ga::best_effort(&pop, ga_opts.full.depths) {
+        let views = nnfractals::time_ga::depth_views(&rec.start, &rec.end, ga_opts.full.depths,
+                                                       ga_opts.clip_frames);
+        let explains = nnfractals::time_ga::explain_individual(
+            &genome, &config, best, &views, &ga_opts, &ga_opts.full);
+        print_explain(best, rec.start.zoom, &explains);
+    }
     rec.secs_evolve = t.elapsed().as_secs_f32();
 
     // The genome on disk carries the formula, so rewrite it too.
@@ -1745,6 +1752,41 @@ fn print_gen_report(r: &nnfractals::time_ga::GenReport) {
     println!("        {flag} {}", r.best_label);
 }
 
+/// The full decomposition of one individual's fitness, depth by depth, with
+/// every gate's margin and nothing short-circuited — what backs a single
+/// number ("score 0.42" or "rejected: noise") when that number alone isn't
+/// enough to say why the search landed where it did.
+fn print_explain(
+    ind: &nnfractals::time_ga::Individual, start_zoom: f64,
+    explains: &[nnfractals::time_ga::DepthExplain],
+) {
+    println!("\n── decomposition: {} ──", ind.label());
+    for (i, tp) in ind.progs.iter().enumerate() {
+        let p = tp.profile();
+        println!("  [{i}] {}  amp={:.6}  freq={:.2}  phase={:.3}  {}",
+                 tp.target.label(), tp.amp, tp.freq, tp.phase, tp.expr());
+        println!("       free-gate profile: finite={} travel_rel={:.3} max_step={:.3} loops={}",
+                 p.finite, p.travel_rel, p.max_step, p.loops);
+    }
+    for d in explains {
+        let doublings = (d.zoom / start_zoom).max(1e-300).log2().max(0.0);
+        println!("\n  d{}  zoom={:.3e}  ({doublings:.1} doublings)  cx={:.4e}  cy={:.4e}",
+                 d.depth, d.zoom, d.cx, d.cy);
+        for g in &d.gates {
+            let mark = if g.passed { "✓" } else { "✗" };
+            let cmp = if g.direction == "at most" { "≤" } else { "≥" };
+            println!("        {:<11} {:>10.4}  {cmp} {:<8.4}  {mark}", g.name, g.value, g.threshold);
+        }
+        println!("        (reference, not gated) mean_coherence={:.3}  min_change={:.3}",
+                 d.stats.mean_coherence, d.stats.min_change);
+        match d.rejected {
+            Some(why) => println!("        → REJECTED: {why}   score(would-be)={:.4}", d.score),
+            None => println!("        → PASS   score={:.4}", d.score),
+        }
+    }
+    println!();
+}
+
 /// The GA settings both the batch and a re-roll read from the same flags.
 fn ga_opts_from(args: &[String]) -> nnfractals::time_ga::TimeGaOpts {
     let mut o = nnfractals::time_ga::TimeGaOpts {
@@ -1791,6 +1833,11 @@ fn cmd_auto_reel(pool: &Path, args: &[String]) {
     let frames = ((seconds * pfps as f32).round() as u32).max(2);
     let skip_ga = args.iter().any(|a| a == "--no-time");
     let fit_time = args.iter().any(|a| a == "--fit-time");
+    // Off by default: a batch runs unattended over many reels for hours, and
+    // the full depth-by-depth breakdown is verbose by design (see
+    // `print_explain`). `auto-reel --redo` and `time-ga` — the single-shot
+    // debugging entry points — print it unconditionally instead.
+    let explain = args.iter().any(|a| a == "--explain");
 
     let batch = get_flag(args, "--out").map(PathBuf::from)
         .unwrap_or_else(|| auto_reel::reels_dir().join(format!("{}", timestamp())));
@@ -1875,7 +1922,7 @@ fn cmd_auto_reel(pool: &Path, args: &[String]) {
             // population — every reel gets SOME time formula, even an
             // imperfect one, because Stage 2 is a human reviewing every clip
             // anyway and re-roll exists for exactly this case.
-            match time_ga::best_effort(&pop, ga_opts.full.depths) {
+            let result = match time_ga::best_effort(&pop, ga_opts.full.depths) {
                 Some(best) if best.passed() => {
                     println!("  {}", best.label());
                     (best.progs.clone(), best.score, best.loops(), sum)
@@ -1889,7 +1936,17 @@ fn cmd_auto_reel(pool: &Path, args: &[String]) {
                     println!("  no time formula could be evolved at all — rendering as a plain zoom");
                     (Vec::new(), 0.0, false, sum)
                 }
+            };
+            if explain {
+                if let Some(best) = time_ga::best_effort(&pop, ga_opts.full.depths) {
+                    let views = time_ga::depth_views(&fit.view, &dest.end, ga_opts.full.depths,
+                                                      ga_opts.clip_frames);
+                    let explains = time_ga::explain_individual(
+                        genome, &config, best, &views, &ga_opts, &ga_opts.full);
+                    print_explain(best, fit.view.zoom, &explains);
+                }
             }
+            result
         };
         let secs_evolve = t.elapsed().as_secs_f32();
 
@@ -2032,6 +2089,12 @@ fn cmd_time_ga(genome: &Genome, label: &str, out_dir: &Path, args: &[String]) {
         std::process::exit(3);
     }
     println!("{}  in {:.1}s", time_ga::summary(&pop), t0.elapsed().as_secs_f32());
+
+    if let Some(best) = time_ga::best_effort(&pop, opts.full.depths) {
+        let views = time_ga::depth_views(&start, &end, opts.full.depths, opts.clip_frames);
+        let explains = time_ga::explain_individual(genome, &config, best, &views, &opts, &opts.full);
+        print_explain(best, start.zoom, &explains);
+    }
 
     let keep: usize = get_flag_or(args, "--top-k", 6);
     match time_ga::write_manifest(out_dir, &pop, genome, &start, &end, &opts, keep) {

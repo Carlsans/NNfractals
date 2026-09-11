@@ -45,9 +45,9 @@ use rand::Rng;
 
 use crate::config::Config;
 use crate::genome::Genome;
-use crate::time_explore::{score_clip, ClipStats, TimeExploreOpts};
+use crate::time_explore::{clip_stats, gate_checks, score_clip, ClipStats, GateCheck, TimeExploreOpts};
 use crate::time_program::TimeProgram;
-use crate::video_export::{lerp_view, time_frames, CapturedView, View};
+use crate::video_export::{lerp_view, probe_frames_score, time_frames, CapturedView, View};
 
 /// Probe geometry for one evaluation tier.
 #[derive(Clone, Copy, Debug)]
@@ -276,6 +276,69 @@ pub fn evaluate(
     }
     ind.rejected = None;
     ind.score = if worst == f64::MAX { 0.0 } else { worst };
+}
+
+/// Everything measured about one individual at one sampled depth: not just the
+/// verdict, but every gate's margin and a score even where a gate failed.
+#[derive(Clone, Debug)]
+pub struct DepthExplain {
+    /// Index into the `views` slice `explain_individual` was called with.
+    pub depth: usize,
+    pub cx: f64,
+    pub cy: f64,
+    pub zoom: f64,
+    pub stats: ClipStats,
+    /// Every gate, independently — see `time_explore::gate_checks`.
+    pub gates: Vec<GateCheck>,
+    /// The first failing gate, if any — matches what `evaluate` would report
+    /// for this depth alone.
+    pub rejected: Option<&'static str>,
+    /// Compression score, computed regardless of gate outcome. `evaluate`
+    /// only ever computes this for a depth that passed; this is for a caller
+    /// who wants to know what the score WOULD have been anyway.
+    pub score: f64,
+}
+
+/// Explain one individual's fitness at EVERY view in `views`, with nothing
+/// short-circuited and nothing discarded.
+///
+/// `evaluate` is deliberately the opposite of this: it stops at the first
+/// rejecting depth and keeps only that depth's stats, because during a GA run
+/// with a large population that is the right tradeoff (a rejection at depth 0
+/// is a complete answer, and the deeper renders are the expensive ones). But
+/// `Individual::stats`/`rejected`/`worst_depth` can then only ever describe
+/// ONE depth — for the single individual a run actually ships, that is not
+/// enough to answer "why isn't it better", so this re-renders every sampled
+/// depth and reports all of it.
+///
+/// Not part of the search's hot path — call this once, after the fact, on
+/// whichever individual `best_shippable`/`best_effort` returned.
+pub fn explain_individual(
+    g: &Genome, config: &Config, ind: &Individual, views: &[View],
+    opts: &TimeGaOpts, tier: &Tier,
+) -> Vec<DepthExplain> {
+    let mut clip_opts = opts.clip.clone();
+    clip_opts.probe_w = tier.w;
+    clip_opts.probe_h = tier.h;
+    clip_opts.frames = tier.frames;
+    clip_opts.fps = opts.fps;
+    if !tier.apply_noise_gate {
+        clip_opts.max_noise = 1.0;
+    }
+
+    let mut probe = g.clone();
+    probe.time_prog = ind.progs.clone();
+
+    views.iter().enumerate().map(|(depth, view)| {
+        let frames: Vec<Vec<u8>> = time_frames(
+            &probe, config, opts.angle_coloring, view, tier.frames, tier.w, tier.h,
+        ).collect();
+        let stats = clip_stats(&frames, tier.w, tier.h);
+        let gates = gate_checks(&stats, &clip_opts);
+        let rejected = gates.iter().find(|c| !c.passed).map(|c| c.name);
+        let score = probe_frames_score(&frames, clip_opts.fps, tier.w, tier.h, None).unwrap_or(0.0);
+        DepthExplain { depth, cx: view.cx, cy: view.cy, zoom: view.zoom, stats, gates, rejected, score }
+    }).collect()
 }
 
 /// Draw an amplitude log-uniformly from `range`.
@@ -1211,6 +1274,29 @@ mod tests {
             // Every full-tier rejection is attributed to some sampled depth.
             let by_depth_total: usize = r.full_rejected_by_depth.iter().map(|(_, n)| n).sum();
             assert_eq!(by_depth_total, full_reject_total);
+        }
+    }
+
+    #[test]
+    fn explain_individual_reports_every_gate_at_every_depth_unconditionally() {
+        let g = mandelbrot();
+        let ind = ind(vec![phasor(ModTarget::JuliaC, 0.15)]);
+        let opts = TimeGaOpts { seed: 7, ..Default::default() };
+        let tier = Tier { w: 32, h: 24, frames: 4, depths: 2, apply_noise_gate: true };
+        let views = depth_views(&cv(-0.5, 0.0, 1.0), &cv(-0.5, 0.0, 1.0e6), 2, opts.clip_frames);
+        let out = explain_individual(&g, &test_config(), &ind, &views, &opts, &tier);
+        assert_eq!(out.len(), views.len());
+        for (i, d) in out.iter().enumerate() {
+            assert_eq!(d.depth, i);
+            assert_eq!(d.gates.len(), 5, "no gate may be skipped, pass or fail");
+            // The reported verdict must be the first failing gate, exactly as
+            // `evaluate`'s own short-circuiting `gate()` would find — this is
+            // a richer view of the SAME rule, not a different one.
+            let want = d.gates.iter().find(|c| !c.passed).map(|c| c.name);
+            assert_eq!(d.rejected, want);
+            // A score is always computed, even when a gate failed — that's
+            // the entire point of this over `evaluate`.
+            assert!(d.score.is_finite());
         }
     }
 
