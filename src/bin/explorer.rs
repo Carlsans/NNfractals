@@ -1643,10 +1643,8 @@ fn cmd_auto_reel_redo(record_path: &Path, args: &[String]) {
         ..ga_opts_from(args)
     };
     let t = std::time::Instant::now();
-    let pop = nnfractals::time_ga::run(&genome, &config, &rec.start, &rec.end, &ga_opts, &|r| {
-        println!("  gen {:>2}  best {:.4}  {} passing  ({} evaluated)",
-                 r.generation, r.best, r.passed, r.evaluated);
-    });
+    let pop = nnfractals::time_ga::run(&genome, &config, &rec.start, &rec.end, &ga_opts,
+                                        &print_gen_report);
     rec.time_summary = nnfractals::time_ga::summary(&pop);
     println!("{}", rec.time_summary);
     match nnfractals::time_ga::best_effort(&pop, ga_opts.full.depths) {
@@ -1716,6 +1714,35 @@ fn render_preview(
         Some(why) => Err(why),
         None => Ok(()),
     }
+}
+
+/// One generation of `time_ga::run`, printed with enough detail to diagnose a
+/// search that isn't converging without re-running it.
+///
+/// The one-line summary answers "is it working"; everything after answers
+/// "why not". `full_rejected_by_depth` is the single most useful line here —
+/// a rejection concentrated at the same (deepest) sample index generation
+/// after generation is a real depth limit the search cannot search around; one
+/// spread across shallow and deep alike means the population itself is the
+/// problem (not exploring, or amplitudes landing in a bad range) and more
+/// generations or population are likely to help.
+fn print_gen_report(r: &nnfractals::time_ga::GenReport) {
+    let flag = if r.best_passed { "✓" } else { "·" };
+    println!("  gen {:>2}  best {:.4}  {}/{} full-tier  {} passing  ({} evaluated, {} targets)",
+             r.generation, r.best, r.full_passed, r.full_evaluated, r.passed, r.evaluated,
+             r.unique_targets);
+    if !r.cheap_rejected.is_empty() {
+        let parts: Vec<String> = r.cheap_rejected.iter().map(|(why, n)| format!("{n} {why}")).collect();
+        println!("        cheap rejects: {}", parts.join(", "));
+    }
+    if r.full_evaluated > 0 && !r.full_rejected.is_empty() {
+        let by_reason: Vec<String> = r.full_rejected.iter().map(|(why, n)| format!("{n} {why}")).collect();
+        let by_depth: Vec<String> = r.full_rejected_by_depth.iter()
+            .map(|(d, n)| format!("d{d}:{n}")).collect();
+        println!("        full  rejects: {}  (at depth {})",
+                 by_reason.join(", "), by_depth.join(" "));
+    }
+    println!("        {flag} {}", r.best_label);
 }
 
 /// The GA settings both the batch and a re-roll read from the same flags.
@@ -1842,10 +1869,7 @@ fn cmd_auto_reel(pool: &Path, args: &[String]) {
         let (time_prog, time_score, time_loops, time_summary) = if skip_ga {
             (Vec::new(), 0.0, false, "skipped".to_string())
         } else {
-            let pop = time_ga::run(genome, &config, &fit.view, &dest.end, &ga_opts, &|r| {
-                println!("  gen {:>2}  best {:.4}  {} passing  ({} evaluated)",
-                         r.generation, r.best, r.passed, r.evaluated);
-            });
+            let pop = time_ga::run(genome, &config, &fit.view, &dest.end, &ga_opts, &print_gen_report);
             let sum = time_ga::summary(&pop);
             // `best_effort` only returns `None` for a genuinely empty
             // population — every reel gets SOME time formula, even an
@@ -2002,10 +2026,7 @@ fn cmd_time_ga(genome: &Genome, label: &str, out_dir: &Path, args: &[String]) {
              (end.zoom / start.zoom).log2().max(0.0));
 
     let t0 = std::time::Instant::now();
-    let pop = time_ga::run(genome, &config, &start, &end, &opts, &|r| {
-        println!("  gen {:>2}  best {:.4}  {} passing  ({} evaluated)  {}",
-                 r.generation, r.best, r.passed, r.evaluated, r.best_label);
-    });
+    let pop = time_ga::run(genome, &config, &start, &end, &opts, &print_gen_report);
     if pop.is_empty() {
         eprintln!("{label} has nothing animatable — every candidate scalar is absent or unread");
         std::process::exit(3);

@@ -419,13 +419,53 @@ fn tournament<'a>(rng: &mut impl Rng, pop: &'a [Individual]) -> &'a Individual {
 }
 
 /// What one generation did, for the caller's progress display.
+///
+/// Beyond the one-line summary (`best`/`passed`/`evaluated`), this exists to
+/// answer "why isn't it converging" without re-running anything: the funnel has
+/// two tiers and a population-wide pass count conflates them, so a search that
+/// clears the cheap gates every generation and dies at the SAME full-tier gate
+/// every time looks identical, from `passed` alone, to one that is making real
+/// progress and losing it to bad luck. The breakdowns below are read from
+/// individuals that were actually (re-)evaluated THIS generation, not the whole
+/// population — carried-over elites already explain themselves via `best_label`.
 #[derive(Clone, Debug)]
 pub struct GenReport {
     pub generation: usize,
+    /// Score of the population's true full-tier winner, or 0.0 if none exists
+    /// yet. Distinct from `best_label`, which always names SOMETHING.
     pub best: f64,
+    /// Whole-population count of `Individual::passed()`, cheap or full tier —
+    /// the same number the original one-line log reported.
     pub passed: usize,
     pub evaluated: usize,
+    /// Label of the population's current leader: a true winner if one exists,
+    /// otherwise `time_ga::best_effort`'s pick — so this is never empty once
+    /// the population holds anything at all.
     pub best_label: String,
+    /// Whether `best_label` is a real winner (`Individual::passed()`) or just
+    /// the closest-to-passing reject.
+    pub best_passed: bool,
+    /// Why `best_label`'s individual was rejected, if it was.
+    pub best_rejected: Option<&'static str>,
+    /// New cheap-tier evaluations this generation, by rejection reason
+    /// (omits gate names that rejected nobody).
+    pub cheap_rejected: Vec<(&'static str, usize)>,
+    /// New full-tier evaluations this generation (i.e. this generation's
+    /// finalists) and how many of them passed.
+    pub full_evaluated: usize,
+    pub full_passed: usize,
+    /// Full-tier rejections this generation, by reason.
+    pub full_rejected: Vec<(&'static str, usize)>,
+    /// Full-tier rejections this generation, by WHICH sampled depth caused
+    /// them (index into the depth samples, shallow to deep) — the single most
+    /// useful field for "why": a bottleneck concentrated at the deepest index
+    /// every generation is a real depth limit, one spread evenly is a noisier,
+    /// more tractable amplitude problem.
+    pub full_rejected_by_depth: Vec<(usize, usize)>,
+    /// Distinct `ModTarget`s present anywhere in the current population — a
+    /// search stuck on one or two targets generation after generation is
+    /// failing to explore, not failing to find an answer.
+    pub unique_targets: usize,
 }
 
 /// The best individual actually fit to ship: one that passed AND was judged at
@@ -518,6 +558,7 @@ pub fn run(
 
     for generation in 0..opts.generations.max(1) {
         let mut evaluated = 0usize;
+        let mut cheap_rejected: std::collections::BTreeMap<&'static str, usize> = Default::default();
         for ind in pop.iter_mut() {
             // An elite carried over already holds a full-tier score; re-scoring
             // it cheaply would throw that away and make it look worse than a
@@ -527,6 +568,9 @@ pub fn run(
             }
             evaluate(g, config, &cheap_views, ind, opts, &opts.cheap);
             evaluated += 1;
+            if let Some(why) = ind.rejected {
+                *cheap_rejected.entry(why).or_insert(0) += 1;
+            }
         }
         // Choosing finalists is the ONE thing the cheap scores are used for.
         pop.sort_by(|a, b| {
@@ -536,19 +580,52 @@ pub fn run(
 
         // The funnel: only what already looks good cheaply earns the deep
         // renders, and its full score then replaces the cheap one.
+        let mut full_evaluated = 0usize;
+        let mut full_passed = 0usize;
+        let mut full_rejected: std::collections::BTreeMap<&'static str, usize> = Default::default();
+        let mut full_rejected_by_depth: std::collections::BTreeMap<usize, usize> = Default::default();
         for ind in pop.iter_mut().take(opts.finalists).filter(|i| i.tier_depths < opts.full.depths) {
             evaluate(g, config, &full_views, ind, opts, &opts.full);
             evaluated += 1;
+            full_evaluated += 1;
+            if ind.passed() {
+                full_passed += 1;
+            } else if let Some(why) = ind.rejected {
+                *full_rejected.entry(why).or_insert(0) += 1;
+                *full_rejected_by_depth.entry(ind.worst_depth).or_insert(0) += 1;
+            }
         }
         rank(&mut pop, opts.full.depths);
 
+        let unique_targets = {
+            let mut seen = std::collections::BTreeSet::new();
+            for ind in &pop {
+                for p in &ind.progs {
+                    seen.insert(format!("{:?}", p.target));
+                }
+            }
+            seen.len()
+        };
+
         let leader = pop.iter().find(|i| i.passed() && i.tier_depths >= opts.full.depths);
+        // `best_effort` always names something once the population holds
+        // anything at all, so `best_label` is never empty even in a
+        // generation where nothing has ever passed.
+        let effort = best_effort(&pop, opts.full.depths);
         on_generation(&GenReport {
             generation,
             best: leader.map(|i| i.score).unwrap_or(0.0),
             passed: pop.iter().filter(|i| i.passed()).count(),
             evaluated,
-            best_label: leader.map(|i| i.label()).unwrap_or_default(),
+            best_label: effort.map(|i| i.label()).unwrap_or_default(),
+            best_passed: leader.is_some(),
+            best_rejected: effort.and_then(|i| i.rejected),
+            cheap_rejected: cheap_rejected.into_iter().collect(),
+            full_evaluated,
+            full_passed,
+            full_rejected: full_rejected.into_iter().collect(),
+            full_rejected_by_depth: full_rejected_by_depth.into_iter().collect(),
+            unique_targets,
         });
 
         if generation + 1 == opts.generations.max(1) {
@@ -697,6 +774,7 @@ mod tests {
     fn opts() -> TimeGaOpts {
         TimeGaOpts { seed: 7, ..Default::default() }
     }
+
 
     fn cv(cx: f64, cy: f64, zoom: f64) -> CapturedView {
         CapturedView { cx, cx_lo: 0.0, cy, cy_lo: 0.0, zoom, aspect: 1.0 }
@@ -1102,6 +1180,37 @@ mod tests {
         // reason, never neither.
         for ind in &pop {
             assert!(ind.passed() || ind.rejected.is_some() || ind.score == 0.0);
+        }
+    }
+
+    #[test]
+    fn gen_report_always_names_a_best_label_and_accounts_for_every_evaluation() {
+        let tiny = TimeGaOpts {
+            population: 4, generations: 2, elites: 1, finalists: 2, seed: 42,
+            cheap: Tier { w: 32, h: 24, frames: 4, depths: 1, apply_noise_gate: false },
+            full: Tier { w: 32, h: 24, frames: 4, depths: 2, apply_noise_gate: true },
+            ..Default::default()
+        };
+        let reports = std::cell::RefCell::new(Vec::new());
+        run(&mandelbrot(), &test_config(), &cv(-0.5, 0.0, 1.0), &cv(-0.75, 0.1, 64.0),
+            &tiny, &|r| reports.borrow_mut().push(r.clone()));
+        let reports = reports.into_inner();
+        assert_eq!(reports.len(), 2);
+        for r in &reports {
+            // The whole point of `best_effort` feeding this field: there is
+            // always something to look at, winner or not.
+            assert!(!r.best_label.is_empty(), "gen {}: best_label must never be empty", r.generation);
+            assert!(r.unique_targets >= 1);
+            // A passing best has no rejection reason and vice versa.
+            assert_eq!(r.best_passed, r.best_rejected.is_none());
+            // Every full-tier evaluation is either counted as passed or shows
+            // up in the rejection breakdown — nothing falls through the crack
+            // between them.
+            let full_reject_total: usize = r.full_rejected.iter().map(|(_, n)| n).sum();
+            assert_eq!(r.full_passed + full_reject_total, r.full_evaluated);
+            // Every full-tier rejection is attributed to some sampled depth.
+            let by_depth_total: usize = r.full_rejected_by_depth.iter().map(|(_, n)| n).sum();
+            assert_eq!(by_depth_total, full_reject_total);
         }
     }
 
