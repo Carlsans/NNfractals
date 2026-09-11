@@ -668,11 +668,19 @@ impl eframe::App for App {
             });
         });
         ui.separator();
+        // Explicit height, mirroring the list column. Inside a horizontal
+        // layout a child otherwise gets whatever height the row happens to
+        // have, which is what starved the player.
+        let detail_w = (panel.x - LIST_WIDTH - 16.0).max(160.0);
+        ui.allocate_ui_with_layout(
+            egui::Vec2::new(detail_w, panel.y),
+            egui::Layout::top_down(egui::Align::Min),
+            |ui| {
         // Scrollable: at a large player the recipe and the Approve/Reject
         // buttons sit below the fold, and content taller than the window with
         // no way to reach it is exactly the bug that hid the launcher's Stop
         // button.
-        egui::ScrollArea::vertical().id_salt("detail").show(ui, |ui| {
+        egui::ScrollArea::vertical().id_salt("detail").auto_shrink([false, false]).show(ui, |ui| {
             let Some(i) = self.selected else {
                 ui.centered_and_justified(|ui| {
                     ui.label(egui::RichText::new(
@@ -702,8 +710,17 @@ impl eframe::App for App {
                     let (w, h) = player_size(
                         panel, rec.preview_w as f32 / rec.preview_h.max(1) as f32);
                     ui.vertical_centered(|ui| {
-                        ui.add(egui::Image::new(egui::load::SizedTexture::new(
-                            tex.id(), egui::Vec2::new(w, h))));
+                        // `fit_to_exact_size`, NOT the SizedTexture size alone.
+                        // `Image::new` treats the texture's size as an aspect
+                        // hint and then scales to the space available where it
+                        // is drawn — so inside the scroll area it came out
+                        // whatever height that had, regardless of what was
+                        // computed here.
+                        let size = egui::Vec2::new(w, h);
+                        ui.add(
+                            egui::Image::new(egui::load::SizedTexture::new(tex.id(), size))
+                                .fit_to_exact_size(size),
+                        );
                     });
                 }
                 ui.horizontal(|ui| {
@@ -837,9 +854,10 @@ impl eframe::App for App {
                 };
                 ui.colored_label(col, &self.message);
             }
-        });
-        });
-        });
+        });   // detail scroll area
+        });   // detail column
+        });   // horizontal split
+        });   // central panel
 
         if do_reload { self.reload(); }
         if let Some(i) = do_select { self.select(i); }
@@ -902,6 +920,20 @@ mod tests {
         assert!((w / panel.x - PLAYER_WIDTH_FRACTION).abs() < 0.01,
                 "{w} of {} is not two thirds", panel.x);
         assert!((w - h).abs() < 0.01, "a square clip must stay square");
+    }
+
+    #[test]
+    fn a_square_preview_is_drawn_square() {
+        // Carl's second report: "occupies part of the width but is very thin on
+        // the height". `Image::new(SizedTexture)` treats the texture size as an
+        // ASPECT HINT and then scales to whatever space it is drawn in, so the
+        // computed height was being ignored. Whatever binds, the returned pair
+        // must carry the clip's own aspect — the draw call pins it with
+        // `fit_to_exact_size`.
+        for (pw, ph) in [(1200.0, 860.0), (1200.0, 400.0), (600.0, 900.0), (2560.0, 1440.0)] {
+            let (w, h) = player_size(egui::Vec2::new(pw, ph), 1.0);
+            assert!((w - h).abs() < 0.01, "{pw}x{ph} drew a 512x512 clip as {w}x{h}");
+        }
     }
 
     #[test]
