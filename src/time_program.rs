@@ -92,6 +92,63 @@ pub const MAX_STEP_FRACTION: f64 = 0.25;
 /// How close `freq` must be to a whole number for the clip to close the loop.
 pub const LOOP_FREQ_TOLERANCE: f32 = 1e-3;
 
+/// Largest offset a channel may apply, as a fraction of the rendered view's
+/// half-extent.
+///
+/// A modulation is only an animation while it moves the picture by less than a
+/// frame. Half a half-extent per clip is a generous ceiling for a morph and a
+/// hard stop against a cut.
+pub const MAX_OFFSET_FRACTION: f32 = 0.5;
+
+/// The deepest zoom at which a `frames`-frame clip can still animate SMOOTHLY.
+///
+/// # Why there is a limit, and why it is not a tuning problem
+///
+/// Every animatable scalar on a `Genome` is an `f32`. The smallest change
+/// representable in an `f32` of magnitude ~1 is one ULP, about 1.2e-7. A view at
+/// zoom `z` spans `2/z` in each direction, and [`MAX_OFFSET_FRACTION`] of that
+/// is all a modulation may travel. So the number of DISTINCT values a
+/// modulation can take within a frame is `MAX_OFFSET_FRACTION · 2 / (z · ULP)`,
+/// and a clip of `frames` frames needs at least that many to move a little each
+/// frame instead of jumping.
+///
+/// The answer is far shallower than it first looks. "One ULP still fits inside
+/// the frame" gives z ≈ 1.7e7 — but that is one single step for the whole clip,
+/// which is a cut, not an animation. For 40 frames it is z ≈ 2.1e5.
+///
+/// # Measured
+///
+/// On a real shot (2026-09-10) from zoom 0.147 to 3.14e11 — 41 doublings — the
+/// time search returned `0 winners · 5 flash · 4 static` at every generation.
+/// That split is the signature: large amplitudes cut the frame, small ones round
+/// to nothing, and no amplitude between them survives because there is no
+/// representable value between them. Capping the search at the one-ULP depth was
+/// not enough and produced the same result; the smooth limit is what made the
+/// search viable. At that shot's end zoom one ULP is 18,716 screen-widths.
+///
+/// So this is not an amplitude-range problem. Past this depth the camera can
+/// keep going but the formula must hold still, which is what the offset clamp in
+/// `Genome::at_time_in_view` makes happen gracefully, and what
+/// `time_ga::depth_views` refuses to search past.
+pub fn animatable_zoom_limit(frames: u32) -> f64 {
+    let steps = frames.max(1) as f64;
+    2.0 * MAX_OFFSET_FRACTION as f64 / (steps * f32::EPSILON as f64)
+}
+
+/// Scale `(re, im)` down so its magnitude is at most `cap`. Never scales up.
+pub fn clamp_offset(re: f32, im: f32, cap: f32) -> (f32, f32) {
+    if !cap.is_finite() {
+        return (re, im);
+    }
+    let mag = (re * re + im * im).sqrt();
+    if mag <= cap || mag == 0.0 || !mag.is_finite() {
+        (re, im)
+    } else {
+        let k = cap / mag;
+        (re * k, im * k)
+    }
+}
+
 /// One evolved time channel: a DAG, what it drives, and how hard.
 ///
 /// The scalars mean the same things they mean on [`crate::formula::TimeMod`],
@@ -603,6 +660,38 @@ mod tests {
         }
         assert!(made > 150, "only {made}/200 attempts produced a usable program — the \
                              generator is fighting the gates");
+    }
+
+    #[test]
+    fn the_animatable_depth_limit_gives_one_representable_step_per_frame() {
+        for frames in [12u32, 40, 48] {
+            let z = animatable_zoom_limit(frames);
+            // At the limit the offset cap is exactly `frames` ULPs wide, so the
+            // clip has one distinct representable value per frame.
+            let cap = MAX_OFFSET_FRACTION as f64 * 2.0 / z;
+            let steps = cap / f32::EPSILON as f64;
+            assert!((steps - frames as f64).abs() < 1e-6, "{frames} frames gave {steps} steps");
+        }
+        // More frames demand a shallower zoom, never a deeper one.
+        assert!(animatable_zoom_limit(40) < animatable_zoom_limit(12));
+        // And the measured 41-doubling shot is far past it either way.
+        assert!(animatable_zoom_limit(40) < 3.14e11);
+        // "one step for the whole clip" is the loosest it can be — and is a cut.
+        assert!((animatable_zoom_limit(1) - 2.0 * MAX_OFFSET_FRACTION as f64
+                 / f32::EPSILON as f64).abs() < 1.0);
+    }
+
+    #[test]
+    fn clamping_only_ever_shrinks_an_offset() {
+        // Inside the cap: untouched, exactly.
+        assert_eq!(clamp_offset(0.1, 0.0, 0.5), (0.1, 0.0));
+        // Outside: scaled to the cap, direction preserved.
+        let (re, im) = clamp_offset(3.0, 4.0, 1.0);
+        assert!(((re * re + im * im).sqrt() - 1.0).abs() < 1e-6);
+        assert!((re / im - 3.0 / 4.0).abs() < 1e-6, "direction must be preserved");
+        // Degenerate inputs must not produce NaN.
+        assert_eq!(clamp_offset(0.0, 0.0, 0.5), (0.0, 0.0));
+        assert_eq!(clamp_offset(1.0, 2.0, f32::INFINITY), (1.0, 2.0), "no cap = no clamp");
     }
 
     #[test]

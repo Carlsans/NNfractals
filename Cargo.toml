@@ -27,6 +27,11 @@ name = "nnfractals-queue"
 path = "src/bin/queue.rs"
 required-features = ["queue", "wgpu-backend"]
 
+[[bin]]
+name = "nnfractals-reels"
+path = "src/bin/reels.rs"
+required-features = ["queue", "wgpu-backend"]
+
 [features]
 default = ["wgpu-backend"]
 wgpu-backend = ["dep:wgpu", "dep:pollster"]

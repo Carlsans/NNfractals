@@ -67,7 +67,7 @@ pub const CANVAS_SCAN_SCALES: &[f64] = &[0.5, 0.25, 0.125];
 /// scan scale dominate runtime).
 pub const COARSE_SAMPLE_RES: usize = 128;
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub struct ZoneGate {
     pub max_intricacy: f32,
     pub min_edge_density: f32,

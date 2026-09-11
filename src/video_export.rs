@@ -1404,9 +1404,13 @@ pub fn time_frames<'a>(
     // changing the export resolution appears to do nothing at all.
     let mut view = view.clone();
     view.aspect = if h > 0 { w as f64 / h as f64 } else { 1.0 };
+    // Capped against THIS view, which never moves here — so the cap is the
+    // same every frame and simply limits how far the formula may travel
+    // relative to what is on screen.
+    let half_extent = (2.0 / view.zoom) as f32;
     (0..n).map(move |i| {
         let t = i as f32 / n as f32;
-        let g = genome.at_time(t);
+        let g = genome.at_time_in_view(t, half_extent);
         // VIDEO_FRAME_ALLOW_DD (false), same as the chain exporter. Worth
         // knowing that the reason DD is disabled there — a shift artifact when
         // DD-tier rendering is combined with a MOVING camera — does not apply
@@ -1550,7 +1554,11 @@ pub fn export_chain_time_video(
     let frames = views.into_iter().take(n).enumerate().map(move |(i, view)| {
         // t spans the whole clip, not one leg.
         let t = i as f32 / n as f32;
-        let g = genome.at_time(t);
+        // Capped against the CURRENT frame's extent, which shrinks as the
+        // camera descends — so a modulation sized for the establishing shot
+        // tapers on its own rather than tearing the deep frames apart. See
+        // `Genome::at_time_in_view`.
+        let g = genome.at_time_in_view(t, (2.0 / view.zoom) as f32);
         let g = match partner {
             Some(p) => {
                 let s = crate::formula::blend_fraction(shape, freq, phase, blend_amp, t);

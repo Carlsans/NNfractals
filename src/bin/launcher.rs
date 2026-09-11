@@ -1234,6 +1234,15 @@ impl eframe::App for App {
                 {
                     self.spawn(sibling("nnfractals-browser"), &[], "gallery browser");
                 }
+                if ui
+                    .button("🎬  Review reels")
+                    .on_hover_text("Watch the previews `explorer auto-reel` produced and approve \
+                                    the ones worth rendering properly. Approving queues a \
+                                    full-resolution render in the video queue.")
+                    .clicked()
+                {
+                    self.spawn(sibling("nnfractals-reels"), &[], "reel review");
+                }
             });
             ui.horizontal(|ui| {
                 ui.label("Viewer:");
@@ -1638,7 +1647,8 @@ mod proc_matching_tests {
     fn the_gui_binaries_are_not_stopped() {
         // Stop must never take out the launcher, viewer, queue or browser —
         // their names all start with "nnfractals-".
-        for n in ["nnfractals-launcher", "nnfractals-viewer", "nnfractals-queue", "nnfractals-browser"] {
+        for n in ["nnfractals-launcher", "nnfractals-viewer", "nnfractals-queue", "nnfractals-browser",
+                  "nnfractals-reels"] {
             assert_eq!(classify_proc(n, &cmd(&[n])), None, "{n} must be left alone");
         }
         assert_eq!(classify_proc("explorer", &cmd(&["./target/release/explorer"])), None);

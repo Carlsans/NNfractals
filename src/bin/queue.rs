@@ -287,6 +287,51 @@ fn recover_stale_processing() {
     if changed { save_queue(&items); }
 }
 
+/// Wall-clock window during which the queue is allowed to start a new item.
+///
+/// Stored as minutes past midnight so it survives a restart as two plain
+/// numbers. `None` means no restriction, which is what every existing
+/// installation gets.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HoldWindow {
+    pub start_min: u32,
+    pub end_min: u32,
+}
+
+impl HoldWindow {
+    /// Whether `minute_of_day` falls inside the window.
+    ///
+    /// Handles a window that wraps midnight, which is the normal case here —
+    /// "render overnight" means something like 23:00 to 07:00, and a naive
+    /// `start <= t && t < end` would make that window empty.
+    pub fn contains(&self, minute_of_day: u32) -> bool {
+        if self.start_min <= self.end_min {
+            minute_of_day >= self.start_min && minute_of_day < self.end_min
+        } else {
+            minute_of_day >= self.start_min || minute_of_day < self.end_min
+        }
+    }
+}
+
+/// Parse "HH:MM" into minutes past midnight.
+pub fn parse_hhmm(s: &str) -> Option<u32> {
+    let (h, m) = s.trim().split_once(':')?;
+    let h: u32 = h.trim().parse().ok()?;
+    let m: u32 = m.trim().parse().ok()?;
+    (h < 24 && m < 60).then_some(h * 60 + m)
+}
+
+/// Local minute of day, from the system clock.
+fn now_minute_of_day() -> u32 {
+    // `date +%H:%M` rather than a timezone crate: this project has no chrono
+    // dependency, and `SystemTime` is UTC — which for a "render overnight"
+    // setting would silently be wrong by the local offset.
+    let out = std::process::Command::new("date").arg("+%H:%M").output().ok();
+    out.and_then(|o| String::from_utf8(o.stdout).ok())
+        .and_then(|s| parse_hhmm(&s))
+        .unwrap_or(0)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn spawn_processing_thread(
     running: Arc<AtomicBool>,
@@ -295,12 +340,22 @@ fn spawn_processing_thread(
     current_pid: Arc<Mutex<Option<u32>>>,
     rife_status: Arc<Mutex<Option<String>>>,
     cancelling: Arc<AtomicBool>,
+    hold: Arc<Mutex<Option<HoldWindow>>>,
     ctx: egui::Context,
 ) {
     thread::spawn(move || loop {
         if !running.load(Ordering::SeqCst) {
             thread::sleep(std::time::Duration::from_millis(300));
             continue;
+        }
+        // Checked only before STARTING an item, never during one: a render
+        // that runs past the window finishes rather than being abandoned
+        // half-encoded.
+        if let Some(w) = *hold.lock().unwrap() {
+            if !w.contains(now_minute_of_day()) {
+                thread::sleep(std::time::Duration::from_secs(20));
+                continue;
+            }
         }
         let mut items = load_queue();
         let next_idx = items.iter()
@@ -415,6 +470,14 @@ struct App {
     rife_status: Arc<Mutex<Option<String>>>,
     cancelling: Arc<AtomicBool>,
 
+    /// When set, the processing thread will not START a new item outside this
+    /// wall-clock window. Shared with the thread rather than re-read from disk:
+    /// it is a session setting, not a property of the queue.
+    hold: Arc<Mutex<Option<HoldWindow>>>,
+    hold_on: bool,
+    hold_from: String,
+    hold_to: String,
+
     wake_rx: mpsc::Receiver<()>,
 
     /// This executable's path and mtime, both captured AT STARTUP — see
@@ -470,9 +533,11 @@ impl App {
         let current_pid = Arc::new(Mutex::new(None));
         let rife_status = Arc::new(Mutex::new(None));
         let cancelling = Arc::new(AtomicBool::new(false));
+        let hold = Arc::new(Mutex::new(None));
         spawn_processing_thread(
             running.clone(), progress.clone(), current_id.clone(),
-            current_pid.clone(), rife_status.clone(), cancelling.clone(), cc.egui_ctx.clone(),
+            current_pid.clone(), rife_status.clone(), cancelling.clone(), hold.clone(),
+            cc.egui_ctx.clone(),
         );
 
         App {
@@ -487,6 +552,10 @@ impl App {
             current_pid,
             rife_status,
             cancelling,
+            hold,
+            hold_on: false,
+            hold_from: "23:00".into(),
+            hold_to: "07:00".into(),
             wake_rx,
             // Captured now, while `/proc/self/exe` still resolves to a file
             // that exists — see `binary_is_stale`.
@@ -601,6 +670,42 @@ impl eframe::App for App {
                 };
                 if ui.add_enabled(running, egui::Button::new(label)).on_hover_text(hover).clicked() {
                     nnfractals::video_export::RENDER_CONTROL.set_paused(!paused);
+                }
+
+                // Overnight rendering: hold new items until a wall-clock
+                // window. Only START is gated — an item already rendering runs
+                // to completion, because abandoning a half-encoded video at
+                // 07:00 would be worse than finishing it.
+                ui.separator();
+                let mut hold_changed = ui.checkbox(&mut self.hold_on, "🌙 hold until")
+                    .on_hover_text("Only start new renders inside this window. Anything already \
+                                    rendering finishes regardless. A window that crosses midnight \
+                                    (23:00 → 07:00) works as written.")
+                    .changed();
+                hold_changed |= ui.add_enabled(self.hold_on,
+                        egui::TextEdit::singleline(&mut self.hold_from).desired_width(45.0))
+                    .changed();
+                ui.label("→");
+                hold_changed |= ui.add_enabled(self.hold_on,
+                        egui::TextEdit::singleline(&mut self.hold_to).desired_width(45.0))
+                    .changed();
+                if hold_changed {
+                    let w = match (parse_hhmm(&self.hold_from), parse_hhmm(&self.hold_to)) {
+                        (Some(a), Some(b)) if a != b => Some(HoldWindow { start_min: a, end_min: b }),
+                        _ => None,
+                    };
+                    *self.hold.lock().unwrap() = if self.hold_on { w } else { None };
+                }
+                if self.hold_on {
+                    match *self.hold.lock().unwrap() {
+                        Some(w) if w.contains(now_minute_of_day()) => {
+                            ui.colored_label(Color32::from_rgb(120, 255, 180), "open");
+                        }
+                        Some(_) => { ui.colored_label(Color32::from_rgb(150, 170, 255), "waiting"); }
+                        None => {
+                            ui.colored_label(Color32::LIGHT_RED, "need HH:MM → HH:MM");
+                        }
+                    }
                 }
 
                 ui.separator();
@@ -883,4 +988,38 @@ fn main() -> anyhow::Result<()> {
     ).map_err(|e| anyhow::anyhow!("{e}"))?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_window_that_crosses_midnight_is_the_normal_case() {
+        // "Render overnight" is 23:00 → 07:00, and a naive start<=t<end would
+        // make exactly that window empty.
+        let w = HoldWindow { start_min: 23 * 60, end_min: 7 * 60 };
+        assert!(w.contains(23 * 60), "23:00 opens it");
+        assert!(w.contains(2 * 60), "02:00 is inside");
+        assert!(w.contains(6 * 60 + 59));
+        assert!(!w.contains(7 * 60), "07:00 closes it");
+        assert!(!w.contains(12 * 60), "midday is outside");
+    }
+
+    #[test]
+    fn a_same_day_window_behaves_normally() {
+        let w = HoldWindow { start_min: 9 * 60, end_min: 17 * 60 };
+        assert!(w.contains(9 * 60) && w.contains(16 * 60 + 59));
+        assert!(!w.contains(8 * 60 + 59) && !w.contains(17 * 60));
+    }
+
+    #[test]
+    fn hhmm_parses_only_real_times() {
+        assert_eq!(parse_hhmm("23:00"), Some(1380));
+        assert_eq!(parse_hhmm(" 7:05 "), Some(425));
+        assert_eq!(parse_hhmm("00:00"), Some(0));
+        for bad in ["24:00", "12:60", "12", "", "ab:cd", "-1:00"] {
+            assert_eq!(parse_hhmm(bad), None, "{bad:?} must not parse");
+        }
+    }
 }

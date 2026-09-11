@@ -28,6 +28,8 @@ pub mod video_zoom_explore;
 #[cfg(feature = "wgpu-backend")]
 pub mod time_explore;
 #[cfg(feature = "wgpu-backend")]
+pub mod time_ga;
+#[cfg(feature = "wgpu-backend")]
 pub mod auto_reel;
 #[cfg(any(feature = "viewer", feature = "browser", feature = "launcher", feature = "queue"))]
 pub mod gui_font;
@@ -51,6 +53,50 @@ pub mod render_gpu;
 /// copy — this project has already been bitten once by exactly that
 /// (three duplicated `locate_bin` functions, see
 /// `[[viewer-angle-coloring-and-binary-resolution]]`).
+/// Locate a sibling project binary: `target/release/<name>` first — even when
+/// the caller is itself a debug build — then next to this executable, then
+/// `target/debug/<name>`, then `~/.local/bin`, then the bare name on PATH.
+///
+/// Release-first is load-bearing and was a real bug: a desktop entry hardcoding
+/// `target/debug/nnfractals-launcher` cascaded into debug siblings
+/// indefinitely, because a check-my-own-directory-first order never got as far
+/// as preferring release.
+///
+/// `viewer.rs`, `browser.rs` and `launcher.rs` each carry their own copy of
+/// this, independently written and independently bitten by that same bug. This
+/// is the one to use from here on; migrating those three is a separate,
+/// mechanical change.
+pub fn locate_bin(name: &str) -> std::path::PathBuf {
+    use std::path::{Path, PathBuf};
+    let dir = std::env::current_exe()
+        .ok()
+        .and_then(|e| e.parent().map(Path::to_path_buf))
+        .unwrap_or_else(|| PathBuf::from("."));
+    if let Some(target) = dir.parent() {
+        let c = target.join("release").join(name);
+        if c.exists() {
+            return c;
+        }
+    }
+    let c = dir.join(name);
+    if c.exists() {
+        return c;
+    }
+    if let Some(target) = dir.parent() {
+        let c = target.join("debug").join(name);
+        if c.exists() {
+            return c;
+        }
+    }
+    if let Ok(home) = std::env::var("HOME") {
+        let c = PathBuf::from(home).join(".local/bin").join(name);
+        if c.exists() {
+            return c;
+        }
+    }
+    PathBuf::from(name)
+}
+
 pub fn project_root() -> std::path::PathBuf {
     std::env::current_exe()
         .ok()

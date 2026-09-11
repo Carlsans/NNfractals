@@ -771,6 +771,18 @@ struct BlendWinnerUi {
     clip: Option<PathBuf>,
 }
 
+/// One evolved time formula from `explorer time-ga`, as the gallery shows it.
+#[derive(Clone)]
+struct TimeGaWinnerUi {
+    progs: Vec<TimeProgram>,
+    score: f64,
+    loops: bool,
+    /// How many depths along the shot it was scored at — a cheap score and a
+    /// full one are not comparable, so the gallery says which this is.
+    depths: usize,
+    label: String,
+}
+
 #[derive(Clone, Debug)]
 struct TimeWinnerUi {
     tmod: TimeMod,
@@ -808,6 +820,10 @@ struct App {
     /// Genome the winners were found for — queuing or applying a winner
     /// against a different fractal is meaningless, so it is refused.
     time_winners_genome: String,
+    /// Results of the last `explorer time-ga` run, best-first.
+    time_ga_winners: Vec<TimeGaWinnerUi>,
+    /// Genome those winners were evolved for.
+    time_ga_genome: String,
     time_message: String,
     /// "12 noise · 5 stalls · 3 flash" — what the last run threw out and why.
     /// The point of exposing the gates is seeing this move when you change one.
@@ -1368,6 +1384,8 @@ impl App {
             time_frames_str: prefs.time_frames.to_string(),
             time_winners: Vec::new(),
             time_winners_genome: String::new(),
+            time_ga_winners: Vec::new(),
+            time_ga_genome: String::new(),
             time_message: String::new(),
             time_rejects: String::new(),
             blend_partner: None,
@@ -3610,6 +3628,94 @@ impl App {
         self.spawn_explore_stage("Time exploring", program, args, cwd);
     }
 
+    /// Directory this genome's time-formula search reads and writes.
+    fn time_ga_dir(&self) -> PathBuf {
+        let stem = self.nn_path.file_stem().and_then(|s| s.to_str()).unwrap_or("genome");
+        nnfractals::project_root().join(format!("viewer_output/time_ga/{stem}"))
+    }
+
+    /// Evolve a time FORMULA for this genome over the shot it will travel.
+    ///
+    /// Uses Set Start / Set End when both are captured, so the search optimises
+    /// the zoom being built rather than an arbitrary view; otherwise the
+    /// subprocess frames and aims the shot itself, exactly as the automated
+    /// pipeline would.
+    fn start_time_ga(&mut self) {
+        if self.eo_busy {
+            self.time_message = "a pipeline stage is already running".to_string();
+            return;
+        }
+        let out_dir = self.time_ga_dir();
+        if let Err(e) = std::fs::create_dir_all(&out_dir) {
+            self.time_message = format!("cannot create {}: {e}", out_dir.display());
+            return;
+        }
+        let seed = out_dir.join("_seed_genome.nn");
+        if let Err(e) = nnfractals::io::save_genome(&self.genome, &seed) {
+            self.time_message = format!("cannot save seed genome: {e}");
+            return;
+        }
+        let mut args: Vec<String> = vec![
+            "time-ga".into(),
+            seed.to_string_lossy().into_owned(),
+            "--out".into(),
+            out_dir.to_string_lossy().into_owned(),
+        ];
+        if let (Some(a), Some(b)) = (self.video_start, self.video_end) {
+            args.extend([
+                "--cx".into(), format!("{}", a.cx),
+                "--cy".into(), format!("{}", a.cy),
+                "--start-zoom".into(), format!("{}", a.zoom),
+                "--end-zoom".into(), format!("{}", b.zoom),
+            ]);
+        }
+        args.extend(self.gate_args());
+        if self.angle_coloring {
+            args.push("--angle-coloring".into());
+        }
+        self.time_ga_winners.clear();
+        self.time_ga_genome = format!("{:016x}", self.genome.id);
+        self.time_message = "evolving a time formula… (this renders at several depths)".to_string();
+        let program = locate_sibling_bin("explorer");
+        let cwd = nnfractals::project_root();
+        self.spawn_explore_stage("Time GA", program, args, cwd);
+    }
+
+    /// Read `time_ga_winners.jsonl` back into the gallery.
+    fn load_time_ga_winners(&mut self) {
+        let path = self.time_ga_dir().join("time_ga_winners.jsonl");
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            self.time_message = format!("no results at {}", path.display());
+            return;
+        };
+        let mut out = Vec::new();
+        let mut rejected = 0usize;
+        for line in text.lines() {
+            let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else { continue };
+            if !v["rejected"].is_null() {
+                rejected += 1;
+                continue;
+            }
+            let Ok(progs) = serde_json::from_value::<Vec<TimeProgram>>(v["time_prog"].clone())
+            else { continue };
+            if progs.is_empty() { continue; }
+            out.push(TimeGaWinnerUi {
+                progs,
+                score: v["score"].as_f64().unwrap_or(0.0),
+                loops: v["loops"].as_bool().unwrap_or(false),
+                depths: v["depths_scored"].as_u64().unwrap_or(0) as usize,
+                label: v["label"].as_str().unwrap_or("").to_string(),
+            });
+        }
+        out.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+        self.time_message = if out.is_empty() {
+            format!("no time formula survived ({rejected} rejected) — see {}", path.display())
+        } else {
+            format!("{} time formulas evolved ({rejected} rejected)", out.len())
+        };
+        self.time_ga_winners = out;
+    }
+
     /// Read `time_winners.jsonl` back into the gallery. Best-effort and
     /// tolerant: a malformed line is skipped rather than losing the whole run.
     fn load_time_winners(&mut self) {
@@ -3879,6 +3985,9 @@ impl App {
         let mut remove_prog: Option<usize> = None;
         let mut add_random_prog = false;
         let mut clear_progs = false;
+        let mut do_time_ga = false;
+        let mut load_ga_results = false;
+        let mut apply_ga: Option<usize> = None;
         let mut apply_winner: Option<usize> = None;
         let mut add_winner: Option<usize> = None;
         let mut load_partner = false;
@@ -3891,6 +4000,7 @@ impl App {
         let mut open_clip: Option<PathBuf> = None;
         let mut changed = false;
         let winners = self.time_winners.clone();
+        let ga_winners = self.time_ga_winners.clone();
         let blend_winners = self.blend_winners.clone();
         let winners_match = self.time_winners_genome == format!("{:016x}", self.genome.id);
 
@@ -4073,6 +4183,22 @@ impl App {
                     });
                 }
                 ui.horizontal(|ui| {
+                    if ui.add_enabled(!targets.is_empty() && !self.eo_busy,
+                                      egui::Button::new("🧬 Evolve time function"))
+                        .on_hover_text("Runs `explorer time-ga`: a genetic search over time \
+                                        formulas, scored at several depths along the zoom by its \
+                                        WORST depth. A modulation that transforms the whole set at \
+                                        zoom 1 can be invisible at 1e9, so judging it at one view \
+                                        is judging the wrong thing.\n\nUses Set Start / Set End if \
+                                        both are captured; otherwise it frames and aims the shot \
+                                        itself. Renders deep frames, so expect minutes, not seconds.")
+                        .clicked()
+                    { do_time_ga = true; }
+                    if ui.button("↻ Load GA results")
+                        .on_hover_text("Re-read the last run's winners from disk — useful after \
+                                        running `explorer time-ga` yourself.")
+                        .clicked()
+                    { load_ga_results = true; }
                     if ui.add_enabled(!targets.is_empty(), egui::Button::new("🎲 Random formula"))
                         .on_hover_text("Grow a random DAG on an un-driven scalar and keep it only \
                                         if it is finite, actually moves, and has no pole. Cheap — \
@@ -4084,6 +4210,41 @@ impl App {
                         .clicked()
                     { clear_progs = true; }
                 });
+
+                if !ga_winners.is_empty() {
+                    let matches = self.time_ga_genome == format!("{:016x}", self.genome.id);
+                    if !matches {
+                        ui.colored_label(Color32::from_rgb(240, 160, 80),
+                            "these formulas were evolved for a different fractal");
+                    }
+                    egui::CollapsingHeader::new(format!("Evolved formulas ({})", ga_winners.len()))
+                        .default_open(true)
+                        .show(ui, |ui| {
+                            egui::ScrollArea::vertical().max_height(190.0).show(ui, |ui| {
+                                for (i, w) in ga_winners.iter().enumerate() {
+                                    ui.horizontal(|ui| {
+                                        ui.monospace(format!("#{i}  {:.4}", w.score));
+                                        if w.loops {
+                                            ui.colored_label(Color32::from_rgb(120, 255, 180), "loops");
+                                        } else {
+                                            ui.colored_label(Color32::from_rgb(230, 200, 120), "one-shot");
+                                        }
+                                        // A cheap score and a full one are not comparable, so say
+                                        // which this is rather than let the ranking imply it.
+                                        ui.label(egui::RichText::new(format!("{}d", w.depths))
+                                            .color(Color32::GRAY).small())
+                                          .on_hover_text("How many depths along the shot this was \
+                                                          scored at. More depths is a stricter test, \
+                                                          not a better result.");
+                                        if ui.add_enabled(matches, egui::Button::new("Apply")).clicked() {
+                                            apply_ga = Some(i);
+                                        }
+                                    });
+                                    ui.label(egui::RichText::new(&w.label).monospace().small());
+                                }
+                            });
+                        });
+                }
 
                 // ── Gates ─────────────────────────────────────────────────
                 ui.separator();
@@ -4384,6 +4545,22 @@ impl App {
         if clear_progs {
             self.time_prog.clear();
             changed = true;
+        }
+        if do_time_ga {
+            self.start_time_ga();
+        }
+        if load_ga_results {
+            self.load_time_ga_winners();
+        }
+        if let Some(i) = apply_ga {
+            if let Some(w) = self.time_ga_winners.get(i) {
+                // Replaces rather than stacks: an evolved individual IS the whole
+                // channel stack, so appending it to whatever is already loaded
+                // would render something the search never scored.
+                self.time_prog = w.progs.clone();
+                self.time_t = 0.0;
+                changed = true;
+            }
         }
         if add_random_prog {
             let targets = time_explore::enumerate_targets(&self.genome);

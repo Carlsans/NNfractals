@@ -288,16 +288,43 @@ impl Genome {
     /// wobble). An empty `time_mod` returns a plain clone, so a static genome is
     /// bit-identical to not calling this at all.
     pub fn at_time(&self, t: f32) -> Genome {
+        self.at_time_in_view(t, f32::INFINITY)
+    }
+
+    /// [`Genome::at_time`], with every offset capped at
+    /// [`crate::time_program::MAX_OFFSET_FRACTION`] of the rendered view's
+    /// half-extent.
+    ///
+    /// This is what the exporters call, and it is what keeps a zoom-plus-time
+    /// video watchable all the way down. A modulation sized to morph the whole
+    /// set at the establishing shot is, at zoom 1e9, a jump of tens of thousands
+    /// of screen-widths — the same offset, an entirely different picture. Past
+    /// `time_program::animatable_zoom_limit()` no representable offset is small
+    /// enough to be an animation at all, so the cap drives the modulation below
+    /// the f32 resolution of the scalar it drives and the formula simply holds
+    /// still while the camera keeps going. The alternative is a second half that
+    /// flashes.
+    ///
+    /// `half_extent = INFINITY` disables the cap, which is what bare `at_time`
+    /// uses: a caller with no view has no frame to be measured against.
+    pub fn at_time_in_view(&self, t: f32, half_extent: f32) -> Genome {
         if self.time_mod.is_empty() && self.time_prog.is_empty() {
             return self.clone();
         }
+        let cap = if half_extent.is_finite() {
+            crate::time_program::MAX_OFFSET_FRACTION * half_extent.abs()
+        } else {
+            f32::INFINITY
+        };
         let mut g = self.clone();
         for m in &self.time_mod {
             let (dre, dim) = mod_offset(m, t);
+            let (dre, dim) = crate::time_program::clamp_offset(dre, dim, cap);
             apply_offset(&mut g, m.target, dre, dim);
         }
         for tp in &self.time_prog {
             let (dre, dim) = tp.eval(t);
+            let (dre, dim) = crate::time_program::clamp_offset(dre, dim, cap);
             apply_offset(&mut g, tp.target, dre, dim);
         }
         g

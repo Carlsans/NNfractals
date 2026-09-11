@@ -1609,6 +1609,495 @@ fn cmd_vae_explore(
 /// `video_zoom_explore::run`, writes the winners manifest, prints a
 /// one-line summary.
 #[allow(clippy::too_many_arguments)]
+/// Re-run only the time-formula search for one already-planned reel, then
+/// re-render its preview.
+///
+/// The framing and the aim are kept: they are the expensive, deterministic half
+/// of planning a shot, and re-deriving them would give the same answer. Only the
+/// search is re-rolled, which is what "I like the shot but not the animation"
+/// asks for. Runs as a subprocess so the review GUI never renders in its own
+/// process.
+fn cmd_auto_reel_redo(record_path: &Path, args: &[String]) {
+    use nnfractals::auto_reel;
+    let Ok(text) = std::fs::read_to_string(record_path) else {
+        eprintln!("cannot read {}", record_path.display());
+        std::process::exit(2);
+    };
+    let Ok(mut rec) = serde_json::from_str::<auto_reel::ReelRecord>(&text) else {
+        eprintln!("{} is not a reel record", record_path.display());
+        std::process::exit(2);
+    };
+    let Some(batch) = record_path.parent() else {
+        eprintln!("no batch directory");
+        std::process::exit(2);
+    };
+    let config = Config::load(Path::new("config.toml")).expect("config.toml");
+    let Ok(genome) = io::load_genome(&batch.join(&rec.nn_file)) else {
+        eprintln!("cannot load {}", batch.join(&rec.nn_file).display());
+        std::process::exit(2);
+    };
+
+    println!("re-rolling the time formula for {} ({:.1} doublings)", rec.label, rec.doublings());
+    let ga_opts = nnfractals::time_ga::TimeGaOpts {
+        clip_frames: rec.preview_frames,
+        ..ga_opts_from(args)
+    };
+    let t = std::time::Instant::now();
+    let pop = nnfractals::time_ga::run(&genome, &config, &rec.start, &rec.end, &ga_opts, &|r| {
+        println!("  gen {:>2}  best {:.4}  {} passing  ({} evaluated)",
+                 r.generation, r.best, r.passed, r.evaluated);
+    });
+    rec.time_summary = nnfractals::time_ga::summary(&pop);
+    println!("{}", rec.time_summary);
+    match nnfractals::time_ga::best_shippable(&pop, ga_opts.full.depths) {
+        Some(best) => {
+            println!("  {}", best.label());
+            rec.time_prog = best.progs.clone();
+            rec.time_score = best.score;
+            rec.time_loops = best.loops();
+        }
+        None => {
+            println!("  no time formula survived — the reel stays a plain zoom");
+            rec.time_prog.clear();
+            rec.time_score = 0.0;
+            rec.time_loops = false;
+        }
+    }
+    rec.secs_evolve = t.elapsed().as_secs_f32();
+
+    // The genome on disk carries the formula, so rewrite it too.
+    let mut reel_genome = genome.clone();
+    reel_genome.time_prog = rec.time_prog.clone();
+    if let Err(e) = save_genome(&reel_genome, &batch.join(&rec.nn_file)) {
+        eprintln!("cannot save genome: {e}");
+        std::process::exit(3);
+    }
+    let t = std::time::Instant::now();
+    if let Err(e) = render_preview(&reel_genome, &config, &rec, &batch.join(&rec.preview_file)) {
+        eprintln!("render failed: {e}");
+        std::process::exit(3);
+    }
+    rec.secs_render = t.elapsed().as_secs_f32();
+    // Back to undecided: it is a different clip now.
+    rec.status = auto_reel::ReelStatus::Pending;
+    if let Err(e) = auto_reel::save_record(batch, &rec) {
+        eprintln!("cannot write record: {e}");
+        std::process::exit(3);
+    }
+    println!("re-rolled {} in {:.0}s", rec.label, rec.secs_evolve + rec.secs_render);
+}
+
+/// Render one reel's preview clip.
+fn render_preview(
+    genome: &Genome, config: &Config, rec: &nnfractals::auto_reel::ReelRecord, out_path: &Path,
+) -> Result<(), String> {
+    use nnfractals::video_export::{self, VideoMsg};
+    let (tx, rx) = std::sync::mpsc::channel::<VideoMsg>();
+    let waypoints = [rec.start, rec.end];
+    if rec.time_prog.is_empty() {
+        video_export::export_video_chain(
+            genome, config, false, &waypoints, rec.preview_frames, rec.preview_fps,
+            rec.preview_w, rec.preview_h, false, false, out_path, &tx, &|| {});
+    } else {
+        video_export::export_chain_time_video(
+            genome, None, config, false, &waypoints, rec.preview_frames, rec.preview_fps,
+            rec.preview_w, rec.preview_h, false, false,
+            nnfractals::formula::ModShape::Sine, 1.0, 0.0, 0.0, out_path, &tx, &|| {});
+    }
+    drop(tx);
+    match rx.iter().find_map(|m| match m { VideoMsg::Failed(w) => Some(w), _ => None }) {
+        Some(why) => Err(why),
+        None => Ok(()),
+    }
+}
+
+/// The GA settings both the batch and a re-roll read from the same flags.
+fn ga_opts_from(args: &[String]) -> nnfractals::time_ga::TimeGaOpts {
+    let mut o = nnfractals::time_ga::TimeGaOpts {
+        population: get_flag_or(args, "--pop", 24),
+        generations: get_flag_or(args, "--gens", 8),
+        finalists: get_flag_or(args, "--finalists", 6),
+        max_channels: get_flag_or(args, "--channels", 2),
+        seed: get_flag_or(args, "--seed", 0u64),
+        ..Default::default()
+    };
+    o.full.depths = get_flag_or(args, "--depths", o.full.depths);
+    o.full.frames = get_flag_or(args, "--frames", o.full.frames);
+    o.cheap.frames = get_flag_or(args, "--cheap-frames", o.cheap.frames);
+    o
+}
+
+/// Stage 1 of the automated pipeline, end to end.
+///
+/// Deliberately incremental: each reel's record and preview are written the
+/// moment they exist, so a batch that runs for hours and is then killed keeps
+/// everything it finished. Every stage is timed and every refusal is printed
+/// with its reason, because the expected way to use this is to start it, walk
+/// away, and read the log afterwards.
+fn cmd_auto_reel(pool: &Path, args: &[String]) {
+    use nnfractals::video_export::VideoMsg;
+    use nnfractals::{auto_reel, time_ga, video_export};
+
+    let config = Config::load(Path::new("config.toml")).expect("config.toml");
+    let count: usize = get_flag_or(args, "--count", 10);
+    let final_width: u32 = get_flag_or(args, "--final-width", 1920);
+    let pw: u32 = get_flag_or(args, "--preview-w", 512);
+    let ph: u32 = get_flag_or(args, "--preview-h", 512);
+    let pfps: u32 = get_flag_or(args, "--preview-fps", 5);
+    let seconds: f32 = get_flag_or(args, "--seconds", 12.0);
+    let frames = ((seconds * pfps as f32).round() as u32).max(2);
+    let skip_ga = args.iter().any(|a| a == "--no-time");
+    let fit_time = args.iter().any(|a| a == "--fit-time");
+
+    let batch = get_flag(args, "--out").map(PathBuf::from)
+        .unwrap_or_else(|| auto_reel::reels_dir().join(format!("{}", timestamp())));
+    std::fs::create_dir_all(&batch).expect("create batch dir");
+
+    // Don't re-plan fractals earlier batches already used: a ranked pool hands
+    // back the same top entries every time.
+    let seen = auto_reel::already_reeled(&auto_reel::list_batches());
+    println!("batch {}  ({} fractals already reeled)", batch.display(), seen.len());
+
+    let rows: Vec<_> = rank_pool(pool, count + seen.len())
+        .into_iter()
+        .filter(|(p, _, _)| !seen.contains(&p.to_string_lossy().into_owned()))
+        .take(count)
+        .collect();
+    if rows.is_empty() {
+        eprintln!("nothing left to reel in {}", pool.display());
+        std::process::exit(2);
+    }
+
+    let dest_opts = auto_reel::DestinationOpts { final_width, ..Default::default() };
+    // The GA is a proxy for the clip that actually ships, so it must know how
+    // many frames that clip has — that is what sets the depth past which no
+    // representable offset is small enough to animate smoothly.
+    let ga_opts = time_ga::TimeGaOpts { clip_frames: frames, ..ga_opts_from(args) };
+
+    println!("planning {} reels from {}: preview {pw}x{ph} @{pfps}fps, {frames} frames",
+             rows.len(), pool.display());
+    let batch_t0 = std::time::Instant::now();
+    let (mut made, mut skipped) = (0usize, 0usize);
+
+    for (path, genome, rank) in &rows {
+        let label = path.file_stem().and_then(|s| s.to_str()).unwrap_or("?").to_string();
+        println!("\n── {label}  (rank {rank:.3}) ──");
+
+        let t = std::time::Instant::now();
+        let fit = match auto_reel::auto_frame(genome, &config) {
+            Ok(f) => f,
+            Err(why) => { println!("[skip]  {label}  {why}"); skipped += 1; continue; }
+        };
+        let secs_frame = t.elapsed().as_secs_f32();
+        println!("{}  ({secs_frame:.1}s)", auto_reel::frame_report(&label, &fit));
+
+        let t = std::time::Instant::now();
+        let dest = match auto_reel::find_destination(genome, &config, &fit.view, &dest_opts) {
+            Ok(d) => d,
+            Err(why) => { println!("[noaim] {label}  {why}"); skipped += 1; continue; }
+        };
+        let secs_aim = t.elapsed().as_secs_f32();
+        println!("{}  ({secs_aim:.1}s)", auto_reel::destination_report(&label, fit.view.zoom, &dest));
+
+        // "Animate throughout" trades depth for a live third axis across the
+        // whole shot, which is the right call when the time axis IS the point.
+        // Off by default: most of the value of a reel is the descent.
+        //
+        // MUST happen before the search: the GA optimises against `dest.end`,
+        // and pulling the end back afterwards would hand the renderer a shot the
+        // formula was never judged on.
+        let mut dest = dest;
+        if fit_time {
+            let (_, reachable) = time_ga::animatable_span(&fit.view, &dest.end, frames);
+            if reachable < dest.end.zoom {
+                let span = (dest.end.zoom / fit.view.zoom).log2();
+                let t = if span > 0.0 { (reachable / fit.view.zoom).log2() / span } else { 1.0 };
+                let before = dest.doublings_travelled(fit.view.zoom);
+                dest.end = video_export::CapturedView::from_view(
+                    &video_export::lerp_view(&fit.view, &dest.end, t.clamp(0.0, 1.0)));
+                println!("  ⏱ --fit-time: end pulled back to {:.2e}x so the formula animates for \
+                          the whole shot — {:.1} doublings instead of {:.1}",
+                         dest.end.zoom, dest.doublings_travelled(fit.view.zoom), before);
+            }
+        }
+
+        // Evolve the time formula over the shot that was just chosen.
+        let t = std::time::Instant::now();
+        let (time_prog, time_score, time_loops, time_summary) = if skip_ga {
+            (Vec::new(), 0.0, false, "skipped".to_string())
+        } else {
+            let pop = time_ga::run(genome, &config, &fit.view, &dest.end, &ga_opts, &|r| {
+                println!("  gen {:>2}  best {:.4}  {} passing  ({} evaluated)",
+                         r.generation, r.best, r.passed, r.evaluated);
+            });
+            let sum = time_ga::summary(&pop);
+            match time_ga::best_shippable(&pop, ga_opts.full.depths) {
+                Some(best) => {
+                    println!("  {}", best.label());
+                    (best.progs.clone(), best.score, best.loops(), sum)
+                }
+                // A shot with no time formula is still a shot. Rendering it as
+                // a plain zoom is far better than throwing away the framing and
+                // aiming work because the third axis found nothing.
+                None => {
+                    println!("  no time formula survived — rendering as a plain zoom");
+                    (Vec::new(), 0.0, false, sum)
+                }
+            }
+        };
+        let secs_evolve = t.elapsed().as_secs_f32();
+
+        let id = format!("{:x}", std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0));
+        let nn_file = format!("{id}.nn");
+        let mut reel_genome = genome.clone();
+        reel_genome.time_prog = time_prog.clone();
+        if let Err(e) = save_genome(&reel_genome, &batch.join(&nn_file)) {
+            println!("[fail]  {label}  cannot save genome: {e}");
+            skipped += 1;
+            continue;
+        }
+
+        let preview_file = format!("{id}.mp4");
+        let out_path = batch.join(&preview_file);
+        let t = std::time::Instant::now();
+        let (tx, rx) = std::sync::mpsc::channel::<VideoMsg>();
+        if time_prog.is_empty() {
+            video_export::export_video_chain(
+                &reel_genome, &config, false, &[fit.view, dest.end], frames, pfps, pw, ph,
+                false, false, &out_path, &tx, &|| {});
+        } else {
+            video_export::export_chain_time_video(
+                &reel_genome, None, &config, false, &[fit.view, dest.end], frames, pfps, pw, ph,
+                false, false, nnfractals::formula::ModShape::Sine, 1.0, 0.0, 0.0,
+                &out_path, &tx, &|| {});
+        }
+        drop(tx);
+        let failure = rx.iter().find_map(|m| match m {
+            VideoMsg::Failed(why) => Some(why),
+            _ => None,
+        });
+        let secs_render = t.elapsed().as_secs_f32();
+        if let Some(why) = failure {
+            println!("[fail]  {label}  render failed: {why}");
+            skipped += 1;
+            continue;
+        }
+
+        let (animated_fraction, animatable_to) =
+            time_ga::animatable_span(&fit.view, &dest.end, frames);
+        if animated_fraction < 0.999 {
+            println!("  ⏱ animatable over the first {:.0}% of the shot (to {animatable_to:.2e}x) — \
+                      past that a {frames}-frame clip has no representable step small enough \
+                      to move smoothly",
+                     animated_fraction * 100.0);
+        }
+        let rec = auto_reel::ReelRecord {
+            id,
+            source: path.to_string_lossy().into_owned(),
+            label: label.clone(),
+            nn_file,
+            preview_file,
+            start: fit.view,
+            end: dest.end,
+            time_prog,
+            frame: fit,
+            destination: dest,
+            time_score,
+            time_loops,
+            time_summary,
+            animated_fraction,
+            animatable_to,
+            preview_w: pw, preview_h: ph, preview_fps: pfps, preview_frames: frames,
+            secs_frame, secs_aim, secs_evolve, secs_render,
+            created_at: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0),
+            status: auto_reel::ReelStatus::Pending,
+        };
+        if let Err(e) = auto_reel::save_record(&batch, &rec) {
+            println!("[fail]  {label}  cannot write record: {e}");
+            skipped += 1;
+            continue;
+        }
+        made += 1;
+        println!("[reel]  {label}  {:.1} doublings, {:.0}s total → {}",
+                 rec.doublings(), rec.total_secs(), out_path.display());
+    }
+
+    println!("\n{made} reels, {skipped} skipped, {:.1} min total",
+             batch_t0.elapsed().as_secs_f32() / 60.0);
+    println!("review them with `nnfractals-reels` (batch {})", batch.display());
+}
+
+/// Evolve a time formula for one genome, over the shot the pipeline would give
+/// it unless start/end are named explicitly.
+fn cmd_time_ga(genome: &Genome, label: &str, out_dir: &Path, args: &[String]) {
+    use nnfractals::{auto_reel, time_ga};
+    let config = Config::load(Path::new("config.toml")).expect("config.toml");
+    let final_width: u32 = get_flag_or(args, "--final-width", 1920);
+
+    // Explicit endpoints win; otherwise frame and aim exactly as a reel would.
+    let start = match (get_flag(args, "--start-zoom"), get_flag(args, "--cx"), get_flag(args, "--cy")) {
+        (Some(z), Some(cx), Some(cy)) => nnfractals::video_export::CapturedView {
+            cx: cx.parse().unwrap_or(0.0), cx_lo: 0.0,
+            cy: cy.parse().unwrap_or(0.0), cy_lo: 0.0,
+            zoom: z.parse().unwrap_or(1.0), aspect: 1.0,
+        },
+        _ => match auto_reel::auto_frame(genome, &config) {
+            Ok(f) => { println!("{}", auto_reel::frame_report(label, &f)); f.view }
+            Err(why) => { eprintln!("cannot frame {label}: {why}"); std::process::exit(3); }
+        },
+    };
+    let end = match get_flag(args, "--end-zoom").and_then(|z| z.parse::<f64>().ok()) {
+        Some(z) => nnfractals::video_export::CapturedView { zoom: z, ..start },
+        None => {
+            let opts = auto_reel::DestinationOpts { final_width, ..Default::default() };
+            match auto_reel::find_destination(genome, &config, &start, &opts) {
+                Ok(d) => { println!("{}", auto_reel::destination_report(label, start.zoom, &d)); d.end }
+                Err(why) => { eprintln!("cannot aim {label}: {why}"); std::process::exit(3); }
+            }
+        }
+    };
+
+    let mut opts = time_ga::TimeGaOpts {
+        population: get_flag_or(args, "--pop", 24),
+        generations: get_flag_or(args, "--gens", 8),
+        elites: get_flag_or(args, "--elites", 4),
+        max_channels: get_flag_or(args, "--channels", 2),
+        finalists: get_flag_or(args, "--finalists", 6),
+        fps: get_flag_or(args, "--fps", 24),
+        angle_coloring: args.iter().any(|a| a == "--angle-coloring"),
+        seed: get_flag_or(args, "--seed", 0u64),
+        ..Default::default()
+    };
+    opts.full.depths = get_flag_or(args, "--depths", opts.full.depths);
+    opts.full.frames = get_flag_or(args, "--frames", opts.full.frames);
+    opts.cheap.frames = get_flag_or(args, "--cheap-frames", opts.cheap.frames);
+
+    println!("evolving a time formula for {label}: pop {} x {} gens, {} channels, \\
+              {} depths over {:.1} doublings",
+             opts.population, opts.generations, opts.max_channels, opts.full.depths,
+             (end.zoom / start.zoom).log2().max(0.0));
+
+    let t0 = std::time::Instant::now();
+    let pop = time_ga::run(genome, &config, &start, &end, &opts, &|r| {
+        println!("  gen {:>2}  best {:.4}  {} passing  ({} evaluated)  {}",
+                 r.generation, r.best, r.passed, r.evaluated, r.best_label);
+    });
+    if pop.is_empty() {
+        eprintln!("{label} has nothing animatable — every candidate scalar is absent or unread");
+        std::process::exit(3);
+    }
+    println!("{}  in {:.1}s", time_ga::summary(&pop), t0.elapsed().as_secs_f32());
+
+    let keep: usize = get_flag_or(args, "--top-k", 6);
+    match time_ga::write_manifest(out_dir, &pop, genome, &start, &end, &opts, keep) {
+        Ok(files) => println!("wrote {} winners to {}", files.len(), out_dir.display()),
+        Err(e) => eprintln!("cannot write manifest: {e}"),
+    }
+}
+
+/// Rank a pool by the scores the browser already sorts on.
+///
+/// Deliberately the same signals the taste model and the GA already produce
+/// rather than a new one: `aesthetic_ensemble` is what the save gate selects on,
+/// `pref_score` is Carl's own trained preference, and `novelty_score` keeps a
+/// batch from being ten variations of one family. A genome missing a score
+/// contributes 0 for it rather than being dropped — the archive was scored in
+/// waves and older entries genuinely lack some fields.
+fn rank_pool(pool: &Path, count: usize) -> Vec<(PathBuf, Genome, f32)> {
+    let mut rows: Vec<(PathBuf, Genome, f32)> = std::fs::read_dir(pool)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("nn"))
+        .filter_map(|p| io::load_genome(&p).ok().map(|g| (p, g)))
+        .map(|(p, g)| {
+            let score = g.aesthetic_ensemble / 10.0 + 0.5 * g.pref_score + 0.25 * g.novelty_score;
+            (p, g, score)
+        })
+        .collect();
+    rows.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
+    rows.truncate(count);
+    rows
+}
+
+/// Plan (but do not render) automated reels, writing the opening and closing
+/// frame of each so the framing and aiming rules can be judged by eye.
+fn cmd_auto_reel_plan(
+    pool: &Path, count: usize, out_dir: &Path, final_width: u32, shot_res: u32, aim: bool,
+    fo: nnfractals::auto_reel::FrameOpts,
+) {
+    use nnfractals::auto_reel;
+    let config = Config::load(Path::new("config.toml")).expect("config.toml");
+    std::fs::create_dir_all(out_dir).expect("create out dir");
+
+    let rows = rank_pool(pool, count);
+    if rows.is_empty() {
+        eprintln!("no .nn files in {}", pool.display());
+        std::process::exit(2);
+    }
+    println!("planning {} reels from {} (final width {final_width}px)", rows.len(), pool.display());
+
+    let mut report = String::new();
+    let (mut framed, mut aimed) = (0usize, 0usize);
+    let dest_opts = auto_reel::DestinationOpts { final_width, ..Default::default() };
+
+    for (path, g, rank) in &rows {
+        let label = path.file_stem().and_then(|s| s.to_str()).unwrap_or("?").to_string();
+        let t0 = std::time::Instant::now();
+        let fit = match auto_reel::auto_frame_with(g, &config, &fo) {
+            Ok(f) => f,
+            Err(why) => {
+                let line = format!("[skip]  {label}  rank {rank:.3}  {why}");
+                println!("{line}");
+                report.push_str(&line);
+                report.push('\n');
+                continue;
+            }
+        };
+        framed += 1;
+        let line = format!("{}  rank {rank:.3}  ({:.1}s)",
+                           auto_reel::frame_report(&label, &fit), t0.elapsed().as_secs_f32());
+        println!("{line}");
+        report.push_str(&line);
+        report.push('\n');
+        save_shot(g, &config, &fit.view.to_view(), shot_res, &out_dir.join(format!("{label}_a_start.png")));
+
+        if !aim { continue; }
+        let t1 = std::time::Instant::now();
+        match auto_reel::find_destination(g, &config, &fit.view, &dest_opts) {
+            Ok(d) => {
+                aimed += 1;
+                let line = format!("{}  ({:.1}s)",
+                                   auto_reel::destination_report(&label, fit.view.zoom, &d), t1.elapsed().as_secs_f32());
+                println!("{line}");
+                report.push_str(&line);
+                report.push('\n');
+                save_shot(g, &config, &d.end.to_view(), shot_res,
+                          &out_dir.join(format!("{label}_b_end.png")));
+                // The midpoint is where a straight line most often dies, so it
+                // is the frame worth looking at beyond the two endpoints.
+                let mid = nnfractals::video_export::lerp_view(&fit.view, &d.end, 0.5);
+                save_shot(g, &config, &mid, shot_res, &out_dir.join(format!("{label}_m_mid.png")));
+            }
+            Err(why) => {
+                let line = format!("[noaim] {label}  {why}");
+                println!("{line}");
+                report.push_str(&line);
+                report.push('\n');
+            }
+        }
+    }
+
+    let summary = format!("\n{framed}/{} framed, {aimed}/{framed} aimed\n", rows.len());
+    println!("{summary}");
+    report.push_str(&summary);
+    let _ = std::fs::write(out_dir.join("plan.txt"), &report);
+    println!("wrote {}", out_dir.join("plan.txt").display());
+}
+
 fn cmd_time_explore(
     formula: &str, genome_override: Option<Genome>, cx: f64, cy: f64, zoom: f64, out_dir: &Path,
     opts: time_explore::TimeExploreOpts, keep_clips: bool,
@@ -2248,6 +2737,66 @@ fn main() {
             };
             let keep_clips = args.iter().any(|a| a == "--keep-clips");
             cmd_time_explore(&formula, genome_override, cx, cy, zoom, &out_dir, opts, keep_clips);
+        }
+        Some("time-ga") => {
+            // Evolve a time FORMULA (crate::time_program) for one genome along
+            // the shot it will actually travel. Start/end default to the
+            // pipeline's own choices, so the search optimises the same zoom the
+            // reel will use rather than an arbitrary view.
+            let formula = pos.get(1).cloned().unwrap_or_else(|| "Mandelbrot".to_string());
+            let formula_path = Path::new(&formula);
+            if formula_path.extension().and_then(|e| e.to_str()) != Some("nn") {
+                eprintln!("time-ga needs a .nn genome path — a time formula has nothing to \
+                           animate without one");
+                std::process::exit(2);
+            }
+            let Ok(genome) = io::load_genome(formula_path) else {
+                eprintln!("cannot load genome {}: no such file, or it failed to parse",
+                          formula_path.display());
+                std::process::exit(2);
+            };
+            let label = formula_path.file_stem().and_then(|s| s.to_str()).unwrap_or("genome").to_string();
+            let out_dir = get_flag(&args, "--out").map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from(format!("explorer_out/{label}_time_ga")));
+            cmd_time_ga(&genome, &label, &out_dir, &args);
+        }
+        Some("auto-reel") => {
+            // The whole of stage 1: pick, frame, aim, evolve a time formula,
+            // render a low-resolution preview. Unattended and incremental — a
+            // batch killed partway keeps every reel it finished.
+            if let Some(rec) = get_flag(&args, "--redo") {
+                cmd_auto_reel_redo(Path::new(rec), &args);
+                return;
+            }
+            let pool = get_flag(&args, "--pool").map(PathBuf::from)
+                .or_else(|| pos.get(1).map(PathBuf::from))
+                .unwrap_or_else(|| PathBuf::from("fractals_1"));
+            cmd_auto_reel(&pool, &args);
+        }
+        Some("auto-reel-plan") => {
+            // Stages 1-3 of the automated pipeline (pick, frame, aim) WITHOUT
+            // rendering a reel: writes the opening and closing frame of each
+            // shot as PNGs plus a report line, so the framing and zoom rules can
+            // be checked by looking at real output rather than by argument.
+            // This is how `auto_frame`'s thresholds get calibrated — the same
+            // contact-sheet method that caught all three time-gate
+            // miscalibrations.
+            let pool = get_flag(&args, "--pool").map(PathBuf::from)
+                .or_else(|| pos.get(1).map(PathBuf::from))
+                .unwrap_or_else(|| PathBuf::from("fractals_1"));
+            let count: usize = get_flag_or(&args, "--count", 10);
+            let out_dir = get_flag(&args, "--out").map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from(format!("explorer_out/auto_reel_{}", timestamp())));
+            let final_width: u32 = get_flag_or(&args, "--final-width", 1920);
+            let shot_res: u32 = get_flag_or(&args, "--shot-res", 384);
+            let aim = !args.iter().any(|a| a == "--frame-only");
+            let fo = nnfractals::auto_reel::FrameOpts {
+                body_escape_fraction: get_flag_or(&args, "--body-frac",
+                    nnfractals::auto_reel::BODY_ESCAPE_FRACTION),
+                fill: get_flag_or(&args, "--fill", nnfractals::auto_reel::FRAME_FILL),
+                res: get_flag_or(&args, "--frame-res", nnfractals::auto_reel::FRAME_RES),
+            };
+            cmd_auto_reel_plan(&pool, count, &out_dir, final_width, shot_res, aim, fo);
         }
         Some("blend-explore") => {
             // Search the pool for a fractal whose FORMULA morphs well into this

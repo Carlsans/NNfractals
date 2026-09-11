@@ -149,7 +149,7 @@ fn same_endpoint(a: &CapturedView, b: &CapturedView) -> bool {
 /// crops — reuses `vae_explore::COARSE_SAMPLE_RES`, the resolution
 /// `coarse_scan` already samples at internally for its own (pre-filter
 /// only) metrics, rather than inventing an unrelated number.
-const FILE_SIZE_PROBE_RES: u32 = COARSE_SAMPLE_RES as u32;
+pub const FILE_SIZE_PROBE_RES: u32 = COARSE_SAMPLE_RES as u32;
 
 #[derive(Clone, Copy, Debug)]
 pub struct ProbeSize {
@@ -446,7 +446,12 @@ pub struct Winner {
 /// one the GA optimizes against), which Carl asked to make the deciding
 /// signal here ("always use file size entropy since it is the most
 /// effective", 2026-08-13).
-fn file_size_entropy(genome: &Genome, config: &Config, view: &View, res: u32, export_w: u32) -> f32 {
+/// Frame richness on exactly the exporter's terms — public because the
+/// automated pipeline (`crate::auto_reel`) validates its straight-line path
+/// with the same measure. Re-deriving it there would mean a second
+/// calibration of a metric whose doc comments record three separate bugs
+/// already paid for.
+pub fn file_size_entropy(genome: &Genome, config: &Config, view: &View, res: u32, export_w: u32) -> f32 {
     // Render at the VIEW's aspect, not a forced square. `render_escape_times`
     // maps `view.bounds()` straight onto the w×h grid with no letterboxing,
     // so squashing a portrait view (aspect 0.5625) into res×res stretches it
