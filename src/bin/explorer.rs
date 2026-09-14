@@ -2204,6 +2204,146 @@ fn cmd_auto_reel_plan(
     println!("wrote {}", out_dir.join("plan.txt").display());
 }
 
+/// Headless queue processor — what `explorer queue-run` runs, and so what a
+/// nightly cron job runs. No GUI, no egui dependency: progress is printed,
+/// not routed to a repaint.
+///
+/// `--until HH:MM` makes this a long-lived loop rather than a single pass:
+/// process whatever's Pending, and when the queue runs dry, wait and check
+/// again (a fresh Approve from `nnfractals-reels` mid-run picks up without a
+/// second cron trigger) — until the deadline, at which point it stops
+/// STARTING new items (an item already rendering always finishes, the same
+/// rule the interactive window's hold window uses) and exits. Without
+/// `--until`, it drains once through whatever is Pending right now and exits
+/// — useful for testing, or for a cron line that fires every few minutes
+/// instead of once nightly.
+fn cmd_queue_run(args: &[String]) {
+    use nnfractals::queue_runner::{
+        now_minute_of_day, parse_hhmm, process_queue_item, ProcessorLock, QueueProgress,
+    };
+    use nnfractals::video_export::{load_queue, queue_dir, save_queue, QueueStatus};
+
+    let until_str = get_flag(args, "--until");
+    let until = until_str.and_then(|s| parse_hhmm(s));
+    // Always leave at least this many cores free even when the system is
+    // otherwise idle — never hand out literally every core to a background
+    // batch job, whatever else may want to start using the machine.
+    let min_free_cores: usize = get_flag_or(args, "--min-free-cores", 1);
+    let check_secs: u64 = get_flag_or(args, "--check-interval-secs", 20);
+
+    // A one-shot deadline computed now, not re-parsed as wall-clock HH:MM on
+    // every loop iteration: that would need its own midnight-wrap logic, and
+    // this project already has one wrap-aware primitive (`HoldWindow`) that
+    // the interactive window uses for the SAME setting — reusing it here
+    // instead of writing a second, subtly different version of the same rule.
+    let deadline = until.map(|until_min| {
+        let now_min = now_minute_of_day() as i64;
+        let mut delta = until_min as i64 - now_min;
+        if delta <= 0 { delta += 24 * 60; }
+        std::time::Instant::now() + std::time::Duration::from_secs(delta as u64 * 60)
+    });
+
+    match (until_str, until) {
+        (Some(s), Some(_)) => println!("queue-run: starting (until {s})"),
+        (Some(s), None) => {
+            eprintln!("queue-run: --until {s} is not HH:MM — ignoring, running a single pass");
+        }
+        (None, _) => println!("queue-run: starting (single pass)"),
+    }
+
+    // Load-monitor thread: runs for the whole session, not per item, so it
+    // keeps adjusting while a single long render is in flight rather than
+    // only ever sampling between items.
+    let monitor_stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let monitor_handle = {
+        let stop = monitor_stop.clone();
+        std::thread::spawn(move || {
+            let mut current: Option<usize> = None;
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                let want = nnfractals::queue_runner::recommend_thread_count(
+                    min_free_cores, std::time::Duration::from_millis(800));
+                if current != Some(want) {
+                    match current {
+                        Some(prev) if want < prev =>
+                            println!("queue-run: more other-process load detected — dropping to {want} core(s)"),
+                        Some(prev) if want > prev =>
+                            println!("queue-run: less other-process load detected — using {want} core(s)"),
+                        _ => println!("queue-run: using {want} core(s) for rendering"),
+                    }
+                    nnfractals::video_export::RENDER_CONTROL.set_threads(want);
+                    current = Some(want);
+                }
+                std::thread::sleep(std::time::Duration::from_secs(check_secs));
+            }
+        })
+    };
+
+    let mut processed = 0usize;
+    loop {
+        if let Some(d) = deadline {
+            if std::time::Instant::now() >= d {
+                println!("queue-run: reached the deadline — stopping (finished {processed} item(s))");
+                break;
+            }
+        }
+        let Some(_lock) = ProcessorLock::acquire() else {
+            // The interactive window (or another queue-run) is already
+            // processing something — wait for it rather than racing it.
+            std::thread::sleep(std::time::Duration::from_secs(5));
+            continue;
+        };
+        let mut items = load_queue();
+        let next_idx = items.iter().enumerate()
+            .filter(|(_, it)| it.status == QueueStatus::Pending)
+            .min_by_key(|(_, it)| it.created_at)
+            .map(|(i, _)| i);
+        let Some(idx) = next_idx else {
+            if until.is_none() {
+                println!("queue-run: nothing Pending — done (finished {processed} item(s))");
+                break;
+            }
+            // Keep polling until the deadline: a reel approved mid-run
+            // should still get picked up without a second cron trigger.
+            drop(_lock);
+            std::thread::sleep(std::time::Duration::from_secs(30));
+            continue;
+        };
+
+        items[idx].status = QueueStatus::Processing;
+        save_queue(&items);
+        let item = items[idx].clone();
+        println!("queue-run: {} ({})", item.genome_label, item.id);
+
+        let result = process_queue_item(&item, &|p| match p {
+            QueueProgress::Pid(pid) => println!("  pid {pid}"),
+            QueueProgress::Frame(done, total) => {
+                if total == 0 || done % 20 == 0 || done == total {
+                    println!("  frame {done}/{total}");
+                }
+            }
+            QueueProgress::Rife(s) => println!("  {s}"),
+        });
+
+        let mut items = load_queue();
+        if let Some(it) = items.iter_mut().find(|it| it.id == item.id) {
+            match &result {
+                Ok(out) => { it.status = QueueStatus::Done; it.output_path = Some(out.clone()); it.error = None; }
+                Err(e) => { it.status = QueueStatus::Failed; it.error = Some(e.clone()); }
+            }
+        }
+        save_queue(&items);
+        let _ = std::fs::remove_file(queue_dir().join(&item.nn_filename));
+        match &result {
+            Ok(out) => println!("  done -> {out}"),
+            Err(e) => println!("  FAILED: {e}"),
+        }
+        processed += 1;
+    }
+
+    monitor_stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    let _ = monitor_handle.join();
+}
+
 fn cmd_time_explore(
     formula: &str, genome_override: Option<Genome>, cx: f64, cy: f64, zoom: f64, out_dir: &Path,
     opts: time_explore::TimeExploreOpts, keep_clips: bool,
@@ -2903,6 +3043,16 @@ fn main() {
                 res: get_flag_or(&args, "--frame-res", nnfractals::auto_reel::FRAME_RES),
             };
             cmd_auto_reel_plan(&pool, count, &out_dir, final_width, shot_res, aim, fo);
+        }
+        Some("queue-run") => {
+            // Headless video-queue processor: same render path the
+            // interactive `nnfractals-queue` window uses
+            // (`queue_runner::process_queue_item`), with no GUI at all — what
+            // a cron job fires at night. `--until HH:MM` keeps it processing
+            // Pending items in a loop until that wall-clock time, so one cron
+            // trigger covers the whole night rather than needing one per
+            // item; omit it to drain whatever is Pending right now and exit.
+            cmd_queue_run(&args);
         }
         Some("blend-explore") => {
             // Search the pool for a fractal whose FORMULA morphs well into this

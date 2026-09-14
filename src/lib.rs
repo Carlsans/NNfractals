@@ -35,6 +35,8 @@ pub mod auto_reel;
 pub mod gui_font;
 #[cfg(feature = "wgpu-backend")]
 pub mod render_gpu;
+#[cfg(feature = "wgpu-backend")]
+pub mod queue_runner;
 
 /// Derives the project root from the running binary's own location —
 /// `target/release/<bin>` (or `target/debug/<bin>`) sits exactly 2

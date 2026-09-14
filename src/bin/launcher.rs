@@ -1243,6 +1243,16 @@ impl eframe::App for App {
                 {
                     self.spawn(sibling("nnfractals-reels"), &[], "reel review");
                 }
+                if ui
+                    .button("📼  Video queue")
+                    .on_hover_text("Open the video export queue: see what's Pending/Processing/\
+                                    Done, and (🌙) hold new renders to a wall-clock window. A \
+                                    cron job can drive the same queue headlessly overnight via \
+                                    `explorer queue-run --until HH:MM`.")
+                    .clicked()
+                {
+                    self.spawn(sibling("nnfractals-queue"), &[], "video queue");
+                }
             });
             ui.horizontal(|ui| {
                 ui.label("Viewer:");

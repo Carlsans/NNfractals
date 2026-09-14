@@ -19,14 +19,10 @@ use std::thread;
 
 use eframe::egui::{self, Color32};
 
-use nnfractals::config::Config;
-use nnfractals::io::load_genome;
-use nnfractals::formula::ModShape;
-use nnfractals::video_export::{
-    export_blend_video, export_chain_time_video, export_time_video,
-    export_video_chain_interpolated, load_queue, queue_dir, save_queue,
-    QueueItem, QueueStatus, VideoMsg, DEFAULT_TIME_FRAMES,
+use nnfractals::queue_runner::{
+    now_minute_of_day, parse_hhmm, process_queue_item, HoldWindow, ProcessorLock, QueueProgress,
 };
+use nnfractals::video_export::{load_queue, queue_dir, save_queue, QueueItem, QueueStatus};
 
 // ── Small utilities (moved from viewer.rs — this window owns the "job
 // finished" notifications now, the viewer no longer produces a video
@@ -104,11 +100,12 @@ fn try_delegate(sock: &Path) -> bool {
 
 // ── Processing ────────────────────────────────────────────────────────────
 
-/// Render one queued item, returning the output path or an error. Loads its
-/// own fresh `Config` (colormap overridden from the item) rather than
-/// sharing one with the viewer process — they're separate processes.
-/// `progress` is updated live so the UI can show "frame X/Y" for whichever
-/// item is currently rendering.
+/// Render one queued item, returning the output path or an error. Thin
+/// wrapper around `queue_runner::process_queue_item` — the actual render
+/// dispatch is shared with the headless `explorer queue-run` subcommand a
+/// cron job fires at night, so this window and that one can never drift onto
+/// different render paths. All this adds is routing progress into the
+/// `Mutex`-backed fields the UI reads, plus a repaint request per update.
 fn process_item(
     item: &QueueItem,
     progress: &Arc<Mutex<Option<(u32, u32)>>>,
@@ -116,159 +113,22 @@ fn process_item(
     rife_status: &Arc<Mutex<Option<String>>>,
     ctx: &egui::Context,
 ) -> Result<String, String> {
-    let rife_fps = item.rife_fps;
-    let nn_path = queue_dir().join(&item.nn_filename);
-    let genome = load_genome(&nn_path).map_err(|e| format!("failed to load {}: {e}", nn_path.display()))?;
-    // Project-root-relative, NOT CWD-relative — see
-    // `nnfractals::project_root`'s doc comment. This exact line was the
-    // reported crash (Carl, 2026-08-11): "No such file or directory" when
-    // this window was spawned by a viewer launched via the file manager,
-    // whose working directory wasn't the project root.
-    let config_path = nnfractals::project_root().join("config.toml");
-    let mut config = Config::load(&config_path)
-        .map_err(|e| format!("failed to load {}: {e}", config_path.display()))?;
-    config.rendering.colormap = item.colormap.clone();
-
-    let out_dir = PathBuf::from(&item.output_dir);
-    std::fs::create_dir_all(&out_dir).map_err(|e| format!("cannot create {}: {e}", out_dir.display()))?;
-    let base = format!("{}_zoom_{}s_{}fps", item.genome_label, item.steps, item.fps);
-    let mut out_path = out_dir.join(format!("{base}.mp4"));
-    let mut n = 2;
-    while out_path.exists() {
-        out_path = out_dir.join(format!("{base}_{n}.mp4"));
-        n += 1;
-    }
-
-    let (tx, rx) = mpsc::channel::<VideoMsg>();
-    let (g2, c2, start, end) = (genome, config, item.start, item.end);
-    let waypoints = item.waypoints.clone();
-    let (steps, fps, w, h, invc, invr, ang) = (
-        item.steps, item.fps, item.width, item.height,
-        item.invert_coords, item.invert_range, item.angle_coloring,
-    );
-    let kf_stride = item.keyframe_stride;
-    let time_mod = item.time_mod.clone();
-    let time_prog = item.time_prog.clone();
-    // The morph partner travels as its own .nn beside the item's, same as the
-    // main genome — a whole genome inside the queue JSON would be unreadable.
-    let blend_partner = item.blend_nn_filename.as_ref()
-        .and_then(|f| nnfractals::io::load_genome(&queue_dir().join(f)).ok());
-    let blend_shape = ModShape::parse(&item.blend_shape).unwrap_or(ModShape::Sine);
-    let blend_amp = if item.blend_amp > 0.0 { item.blend_amp } else { 0.15 };
-    let camera_moves = item.camera_moves();
-    let animates_formula = item.animates_formula();
-    let time_frames = if item.time_frames >= 2 { item.time_frames } else { DEFAULT_TIME_FRAMES };
-    let out_path2 = out_path.clone();
-    let ctx2 = ctx.clone();
-    let render_handle = thread::spawn(move || {
-        // A time item animates the FORMULA with the camera held still, so it
-        // must not go anywhere near the camera-path exporters — and in
-        // particular not near the interpolated one, which warps intermediate
-        // frames on the assumption that only the camera moved.
-        if animates_formula {
-            let mut g_anim = g2.clone();
-            g_anim.time_mod = time_mod;
-            g_anim.time_prog = time_prog;
-            if camera_moves {
-                // Both axes at once: the camera travels the chain exactly as a
-                // normal zoom does while the formula animates across the clip.
-                let wp = if waypoints.len() >= 2 { waypoints.clone() } else { vec![start, end] };
-                export_chain_time_video(
-                    &g_anim, blend_partner.as_ref(), &c2, ang, &wp, steps, fps, w, h,
-                    invc, invr, blend_shape, 1.0, 0.0, blend_amp,
-                    &out_path2, &tx, &|| ctx2.request_repaint());
-            } else {
-                let view = start.to_view();
-                match blend_partner {
-                    Some(partner) => export_blend_video(
-                        &g_anim, &partner, &c2, ang, &view, time_frames, fps, w, h,
-                        blend_shape, 1.0, 0.0, blend_amp,
-                        &out_path2, &tx, &|| ctx2.request_repaint()),
-                    None => export_time_video(&g_anim, &c2, ang, &view, time_frames, fps, w, h,
-                                              &out_path2, &tx, &|| ctx2.request_repaint()),
-                }
+    let out = process_queue_item(item, &|p| {
+        match p {
+            QueueProgress::Pid(pid) => *current_pid.lock().unwrap() = Some(pid),
+            QueueProgress::Frame(done, total) => *progress.lock().unwrap() = Some((done, total)),
+            // The render is over by the time RIFE starts — clear the "frame
+            // X/Y" readout rather than leaving it stuck at its last value
+            // for the whole interpolation pass.
+            QueueProgress::Rife(s) => {
+                *progress.lock().unwrap() = None;
+                *rife_status.lock().unwrap() = Some(s);
             }
-            return;
         }
-        // A wormhole-chain item carries its own waypoint sequence — render
-        // ALL of it as one continuous multi-leg video, not just start→end
-        // (which for a chain item are only the first/last waypoint, kept
-        // solely for older UI that expects those two fields to exist).
-        // A plain start→end item is just the 2-waypoint case of the same
-        // thing (`export_video` is literally `export_video_chain(&[start,
-        // end])`), so it goes through the SAME renderer rather than a
-        // parallel one — otherwise the item's keyframe stride is carried
-        // all the way here, badged "⚡kf/N" in the queue window, and then
-        // silently ignored for exactly the export people run most.
-        let waypoints = if waypoints.len() >= 2 { waypoints } else { vec![start, end] };
-        // Honours the item's keyframe stride: 0/1 renders every frame
-        // exactly (the pre-existing behaviour, and what older queue
-        // items deserialize to), higher values render every Nth and
-        // warp the rest.
-        export_video_chain_interpolated(&g2, &c2, ang, &waypoints, steps, fps, w, h, invc, invr,
-                            &out_path2, &tx, &|| ctx2.request_repaint(), None, kf_stride);
+        ctx.request_repaint();
     });
-
-    let mut result: Option<Result<String, String>> = None;
-    for msg in rx {
-        match msg {
-            VideoMsg::Started { pid } => {
-                *current_pid.lock().unwrap() = Some(pid);
-            }
-            VideoMsg::Progress { done, total } => {
-                *progress.lock().unwrap() = Some((done, total));
-                ctx.request_repaint();
-            }
-            VideoMsg::Done(p) => result = Some(Ok(p.to_string_lossy().into_owned())),
-            VideoMsg::Failed(e) => result = Some(Err(e)),
-        }
-    }
-    let _ = render_handle.join();
     *progress.lock().unwrap() = None;
-
-    // Optional RIFE pass. A failure here does NOT fail the item: the render
-    // succeeded and that file is real and kept. Interpolation is a bonus pass
-    // over it, so the worst case is a note saying why there is no smoothed
-    // version — losing a finished render because a post-process could not find
-    // its binary would be indefensible.
-    if let Some(Ok(path)) = &result {
-        if rife_fps > 0 {
-            let src = PathBuf::from(path);
-            let frames = rendered_frame_count(&src).unwrap_or(0);
-            *rife_status.lock().unwrap() = Some("interpolating…".to_string());
-            ctx.request_repaint();
-            match nnfractals::video_export::interpolate_with_rife(
-                &src, frames, fps, rife_fps,
-                &|stage| {
-                    *rife_status.lock().unwrap() = Some(format!("RIFE: {stage}"));
-                    ctx.request_repaint();
-                },
-            ) {
-                Ok(out) => {
-                    *rife_status.lock().unwrap() =
-                        Some(format!("interpolated → {}", out.file_name().unwrap_or_default().to_string_lossy()));
-                }
-                Err(e) => {
-                    *rife_status.lock().unwrap() = Some(format!("RIFE skipped: {e}"));
-                }
-            }
-            ctx.request_repaint();
-        }
-    }
-
-    result.unwrap_or_else(|| Err("export thread ended without a result".to_string()))
-}
-
-/// Frame count of a rendered clip, straight from the container.
-fn rendered_frame_count(path: &Path) -> Option<u32> {
-    let out = std::process::Command::new("ffprobe")
-        .args(["-v", "error", "-select_streams", "v:0",
-               "-count_frames", "-show_entries", "stream=nb_read_frames",
-               "-of", "csv=p=0"])
-        .arg(path)
-        .output()
-        .ok()?;
-    String::from_utf8_lossy(&out.stdout).trim().parse().ok()
+    out
 }
 
 /// One-time recovery for a previous ungraceful shutdown: an item still
@@ -287,50 +147,9 @@ fn recover_stale_processing() {
     if changed { save_queue(&items); }
 }
 
-/// Wall-clock window during which the queue is allowed to start a new item.
-///
-/// Stored as minutes past midnight so it survives a restart as two plain
-/// numbers. `None` means no restriction, which is what every existing
-/// installation gets.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct HoldWindow {
-    pub start_min: u32,
-    pub end_min: u32,
-}
-
-impl HoldWindow {
-    /// Whether `minute_of_day` falls inside the window.
-    ///
-    /// Handles a window that wraps midnight, which is the normal case here —
-    /// "render overnight" means something like 23:00 to 07:00, and a naive
-    /// `start <= t && t < end` would make that window empty.
-    pub fn contains(&self, minute_of_day: u32) -> bool {
-        if self.start_min <= self.end_min {
-            minute_of_day >= self.start_min && minute_of_day < self.end_min
-        } else {
-            minute_of_day >= self.start_min || minute_of_day < self.end_min
-        }
-    }
-}
-
-/// Parse "HH:MM" into minutes past midnight.
-pub fn parse_hhmm(s: &str) -> Option<u32> {
-    let (h, m) = s.trim().split_once(':')?;
-    let h: u32 = h.trim().parse().ok()?;
-    let m: u32 = m.trim().parse().ok()?;
-    (h < 24 && m < 60).then_some(h * 60 + m)
-}
-
-/// Local minute of day, from the system clock.
-fn now_minute_of_day() -> u32 {
-    // `date +%H:%M` rather than a timezone crate: this project has no chrono
-    // dependency, and `SystemTime` is UTC — which for a "render overnight"
-    // setting would silently be wrong by the local offset.
-    let out = std::process::Command::new("date").arg("+%H:%M").output().ok();
-    out.and_then(|o| String::from_utf8(o.stdout).ok())
-        .and_then(|s| parse_hhmm(&s))
-        .unwrap_or(0)
-}
+// `HoldWindow`, `parse_hhmm` and `now_minute_of_day` now live in
+// `nnfractals::queue_runner`, shared with the headless `explorer queue-run`
+// subcommand — imported above.
 
 #[allow(clippy::too_many_arguments)]
 fn spawn_processing_thread(
@@ -357,6 +176,15 @@ fn spawn_processing_thread(
                 continue;
             }
         }
+        // A headless `explorer queue-run` (what a cron job fires at night)
+        // picks "the oldest Pending item" the same independent way this loop
+        // does, so if both were active at once they could pick the SAME one.
+        // The lock makes that "wait a poll, try again" instead of a race.
+        let Some(_lock) = ProcessorLock::acquire() else {
+            thread::sleep(std::time::Duration::from_secs(2));
+            continue;
+        };
+
         let mut items = load_queue();
         let next_idx = items.iter()
             .enumerate()
