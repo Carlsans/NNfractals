@@ -32,6 +32,7 @@ launcher_prefs.toml
 # Per-user viewer state (window size, export resolution, search gates). Was
 # briefly committed by accident when it moved to the project root.
 viewer_prefs.toml
+quat_viewer_render_prefs.toml
 breeding/
 pref_model.npz
 ratings.jsonl
@@ -104,3 +105,16 @@ oldfractals/
 saliency_sidecar.log
 shot.png
 0.025/
+# Quaternion GA out-dirs, corpora, logs, models (mirrors the 2D patterns above)
+fractals_dag_quat*/
+train_corpus_quat/
+quat_evolve*.log
+quat_viewer_prefs.toml
+pref_model_quat.npz
+pref_model_quat.json
+taste_model_quat.npz
+taste_model_quat.json
+role_model_centroids.npz
+embed_cache/
+quat_taste_sidecar.log
+train_taste_quat.log

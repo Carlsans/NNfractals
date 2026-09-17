@@ -13,6 +13,31 @@ pub fn apply_colormap(escape_times: &[f32], max_iter: u32, colormap_name: &str) 
     pixels
 }
 
+/// Like `apply_colormap`, but histogram-equalizes `escape_times` against
+/// its OWN distribution (rank-based, via `escape_equalize`) rather than a
+/// fixed `t/max_iter` ratio. For a caller whose escape times don't relate
+/// to `max_iter` the way a standard 2D fractal render's do — e.g.
+/// `quat_raymarch`'s color-source probe (a point just outside a
+/// ray-marched surface), whose values cluster in a narrow low range
+/// (confirmed on a real Bulb render: every probe under ~5 out of
+/// `max_iter=60`) regardless of `max_iter` — the fixed-ratio version
+/// renders a uniform dark smear, exactly the problem `escape_equalize` was
+/// already built to solve for angle-coloring. Interior pixels (`t >=
+/// max_iter`) equalize to `1.0`, matching `apply_colormap`'s own
+/// convention that interior sits at the top of the range.
+pub fn apply_colormap_equalized(escape_times: &[f32], max_iter: u32, colormap_name: &str) -> Vec<u8> {
+    let equalize = escape_equalize(escape_times, max_iter);
+    let mut pixels = Vec::with_capacity(escape_times.len() * 3);
+    for &t in escape_times {
+        let norm = if (t as u32) >= max_iter { 1.0 } else { equalize(t) };
+        let (r, g, b) = color_at(colormap_name, norm as f64);
+        pixels.push(r);
+        pixels.push(g);
+        pixels.push(b);
+    }
+    pixels
+}
+
 /// Dimmest an escaped pixel may render. Rank alone would put the darkest
 /// escaped pixel at value 0 — indistinguishable from the interior, and it
 /// throws away the hue that is the whole point of this mode.
@@ -426,6 +451,33 @@ mod angle_colormap_tests {
         let lo = cdf(1.0);
         let hi = cdf(1.0 + 899.0 * 1e-6);
         assert!(hi - lo > 0.85, "cluster spread only {} of the range", hi - lo);
+    }
+
+    #[test]
+    fn apply_colormap_equalized_spreads_a_tightly_clustered_low_range_across_the_full_palette() {
+        // The exact real-world failure this exists to fix: every escape
+        // time clustered under 5 out of max_iter=60 (a Bulb ray-march
+        // color probe). The fixed-ratio apply_colormap would render this
+        // as a uniform dark smear near t/max_iter=0; equalized must not.
+        let escape_times: Vec<f32> = (0..200).map(|i| (i % 5) as f32).collect();
+        let pixels = apply_colormap_equalized(&escape_times, 60, "turbo");
+        let mut min_luma = 255u32;
+        let mut max_luma = 0u32;
+        for chunk in pixels.chunks(3) {
+            let luma = chunk[0] as u32 + chunk[1] as u32 + chunk[2] as u32;
+            min_luma = min_luma.min(luma);
+            max_luma = max_luma.max(luma);
+        }
+        assert!(max_luma - min_luma > 300, "expected a wide brightness spread, got min={min_luma} max={max_luma}");
+    }
+
+    #[test]
+    fn apply_colormap_equalized_puts_interior_at_the_top_of_the_range() {
+        let escape_times = vec![0.0, 1.0, 2.0, 60.0]; // last is interior at max_iter=60
+        let equalized = apply_colormap_equalized(&escape_times, 60, "turbo");
+        let plain_top = color_at("turbo", 1.0);
+        let interior_pixel = (equalized[9], equalized[10], equalized[11]);
+        assert_eq!(interior_pixel, plain_top, "interior should equalize to the same color as norm=1.0");
     }
 
     #[test]

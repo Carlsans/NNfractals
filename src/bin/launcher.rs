@@ -1267,7 +1267,17 @@ impl eframe::App for App {
                     .clicked()
                 {
                     let p = self.viewer_path.trim().to_string();
-                    self.spawn(sibling("nnfractals-viewer"), &[p.as_str()], "viewer");
+                    // Route to the quaternion viewer for a fractals_dag_quat*
+                    // path — this field never had any such check before
+                    // (browser.rs's own routing did, launcher.rs's didn't),
+                    // so typing/pasting a quat genome's path here always
+                    // opened it in the 2D viewer instead.
+                    let bin_name = if nnfractals::is_quat_genome_path(std::path::Path::new(&p)) {
+                        "nnfractals-quat-viewer"
+                    } else {
+                        "nnfractals-viewer"
+                    };
+                    self.spawn(sibling(bin_name), &[p.as_str()], "viewer");
                 }
             });
 

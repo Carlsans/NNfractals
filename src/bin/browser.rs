@@ -107,7 +107,31 @@ fn cmp_cells(a: Option<&Cell>, b: Option<&Cell>, desc: bool) -> Ordering {
 struct Row {
     nn_path: PathBuf,
     png_path: PathBuf,
+    /// Whether an animated-thumbnail frame sequence exists for this genome
+    /// (see `anim_frame_path`) — checked once at load time (a single cheap
+    /// `exists()` on frame 0) rather than on every repaint.
+    has_anim: bool,
     cells: BTreeMap<String, Cell>,
+}
+
+/// Number of frames in an animated thumbnail sequence, and how long each
+/// frame is shown. A short sequence of small PNGs, not a decoded video —
+/// no video-decode crate exists in this project (only `image = "0.25"`),
+/// and a handful of pre-rendered stills cycled on a timer reuses the
+/// EXACT SAME `load_thumb`/`TextureHandle` machinery the static thumbnail
+/// path already has, just called N times instead of once.
+const ANIM_THUMB_FRAMES: usize = 8;
+const ANIM_FRAME_MS: u64 = 180;
+
+/// `foo.png`'s animated companion frame `i`: `foo_thumb_00.png` etc., same
+/// directory and stem as the static thumbnail. Convention only — nothing
+/// in the browser generates these frames; a render pipeline (e.g.
+/// `explorer quat-raymarch-genome` run N times, or a future dedicated
+/// subcommand) writes them alongside a genome's `.nn`/`.png`.
+fn anim_frame_path(png_path: &Path, frame: usize) -> PathBuf {
+    let stem = png_path.file_stem().and_then(|s| s.to_str()).unwrap_or("thumb");
+    let ext = png_path.extension().and_then(|s| s.to_str()).unwrap_or("png");
+    png_path.with_file_name(format!("{stem}_thumb_{frame:02}.{ext}"))
 }
 
 enum LoadMsg {
@@ -197,7 +221,9 @@ fn parse_nn(path: &Path) -> Option<Row> {
     cells.insert("bytes".into(), Cell::Num(fsize as f64));
     cells.insert("modified".into(), Cell::Time(mtime));
 
-    Some(Row { nn_path: path.to_path_buf(), png_path: path.with_extension("png"), cells })
+    let png_path = path.with_extension("png");
+    let has_anim = anim_frame_path(&png_path, 0).exists();
+    Some(Row { nn_path: path.to_path_buf(), png_path, has_anim, cells })
 }
 
 /// Read `dir` for `*.nn`, parse each, stream `Row`s back.
@@ -373,11 +399,73 @@ fn viewer_path() -> PathBuf {
     locate_bin("nnfractals-viewer")
 }
 
+fn quat_viewer_path() -> PathBuf {
+    locate_bin("nnfractals-quat-viewer")
+}
+
+/// Quaternion genomes (`fractals_dag_quat/`) are saved through the same
+/// `Genome` struct/format as ordinary 2D DAG genomes (`fractals_dag/`).
+/// Genomes saved going forward carry an explicit `fractal_kind` field
+/// ("quat" vs. empty/2D), but this folder-path check is still the
+/// primary signal used throughout browser.rs (viewer routing, rating-
+/// corpus separation, and now column filtering below) — a browser
+/// session is always folder-scoped, and path-based detection covers
+/// every file including the many saved before `fractal_kind` existed.
+/// Canonical version now lives in `lib.rs` (`nnfractals::
+/// is_quat_genome_path`) — this used to be its own exact-match copy,
+/// which silently routed every genome from a differently-named quat
+/// out-dir (`fractals_dag_quat_night_subtree/` etc.) to the 2D viewer;
+/// `launcher.rs` never had an equivalent check at all. Re-exported here
+/// under the old name so every call site below stays unchanged.
+use nnfractals::is_quat_genome_path;
+
+/// Fields that only ever mean anything on a 2D escape-time genome —
+/// always 0.0/empty clutter on a quaternion one. No equivalent hardcoded
+/// list is needed in the other direction: every quaternion-only field
+/// shares the `quat_` prefix by construction, so that side is a simple
+/// `starts_with` check instead.
+const TWO_D_ONLY_FIELDS: &[&str] = &[
+    "beauty", "beauty_boundary", "beauty_edge", "beauty_entropy", "beauty_self_sim", "beauty_cool_zone",
+    "clip_score", "laion_score", "nima", "topiq_iaa", "ap25_score", "musiq", "aesthetic_ensemble",
+    "pref_score", "self_replication", "fractal_recursion", "pred_recursion", "pred_clip",
+    "formula_diversity", "angle_structure", "known_formula_match", "known_formula_score",
+    "novelty_score", "novelty_cluster", "wormhole_score", "wormhole_dx", "wormhole_dy", "wormhole_zoom",
+];
+
+/// Whether `key` is relevant to `folder`'s fractal type — hides the 2D-
+/// only fields in a quaternion folder and vice versa, so the gallery
+/// (both the Columns picker and the actual displayed/sortable columns)
+/// only ever shows fields that mean something for what's actually
+/// loaded, instead of a confusing mix where half the columns are always
+/// zero. Universal fields (file/bytes/modified/id/fitness/favorite/
+/// formula_readable/...) are never filtered — only the type-specific
+/// extras are.
+fn field_relevant_to_folder(folder: &Path, key: &str) -> bool {
+    if is_quat_genome_path(folder) {
+        !TWO_D_ONLY_FIELDS.contains(&key)
+    } else {
+        !key.starts_with("quat_")
+    }
+}
+
 fn load_thumb(ctx: &egui::Context, path: &Path, sz: u32) -> Option<TextureHandle> {
     let img = image::open(path).ok()?.thumbnail(sz, sz).to_rgb8();
     let (w, h) = (img.width() as usize, img.height() as usize);
     let color = ColorImage::from_rgb([w, h], img.as_raw());
     Some(ctx.load_texture(path.to_string_lossy(), color, TextureOptions::LINEAR))
+}
+
+/// Loads all `ANIM_THUMB_FRAMES` frames for one genome's animated
+/// thumbnail. `None` if frame 0 is missing (caller should already have
+/// checked `Row::has_anim` before calling this, but stay defensive);
+/// individual missing/corrupt LATER frames are skipped rather than
+/// failing the whole sequence, so a partially-written frame set still
+/// animates with whatever landed.
+fn load_anim_thumb(ctx: &egui::Context, png_path: &Path, sz: u32) -> Option<Vec<TextureHandle>> {
+    let frames: Vec<TextureHandle> = (0..ANIM_THUMB_FRAMES)
+        .filter_map(|i| load_thumb(ctx, &anim_frame_path(png_path, i), sz))
+        .collect();
+    if frames.is_empty() { None } else { Some(frames) }
 }
 
 // ── Destination dialog ─────────────────────────────────────────────────────────
@@ -409,6 +497,13 @@ struct App {
     load_count: usize,
 
     thumb_cache: HashMap<PathBuf, Option<TextureHandle>>,
+    /// Animated-thumbnail frames, keyed the same way as `thumb_cache`
+    /// (by `Row::png_path`) — kept as a separate map rather than widening
+    /// `thumb_cache`'s value type, so every existing static-thumbnail call
+    /// site (the rating view's `rating_cache` is already separate; this
+    /// grid's static path) keeps working unchanged for genomes with no
+    /// animated frames.
+    anim_cache: HashMap<PathBuf, Option<Vec<TextureHandle>>>,
     selection: HashSet<PathBuf>,
     anchor: Option<usize>,
     sort_dirty: bool,
@@ -447,6 +542,7 @@ impl App {
             loading: true,
             load_count: 0,
             thumb_cache: HashMap::new(),
+            anim_cache: HashMap::new(),
             selection: HashSet::new(),
             anchor: None,
             sort_dirty: false,
@@ -474,6 +570,7 @@ impl App {
         self.rows.clear();
         self.catalog.clear();
         self.thumb_cache.clear();
+        self.anim_cache.clear();
         self.selection.clear();
         self.anchor = None;
         self.load_count = 0;
@@ -569,7 +666,8 @@ impl App {
     }
 
     fn open_path(&mut self, path: &Path) {
-        match std::process::Command::new(viewer_path()).arg(path).spawn() {
+        let bin = if is_quat_genome_path(path) { quat_viewer_path() } else { viewer_path() };
+        match std::process::Command::new(bin).arg(path).spawn() {
             Ok(child) => {
                 // Reap it. The viewer is single-instance: when one is already
                 // running, the process spawned here hands the path over via
@@ -600,6 +698,10 @@ impl App {
             let png = p.with_extension("png");
             let _ = std::fs::remove_file(&png);
             self.thumb_cache.remove(&png);
+            for i in 0..ANIM_THUMB_FRAMES {
+                let _ = std::fs::remove_file(anim_frame_path(&png, i));
+            }
+            self.anim_cache.remove(&png);
         }
         self.rows.retain(|r| !self.selection.contains(&r.nn_path));
         let n = paths.len();
@@ -661,6 +763,7 @@ impl App {
         if sz != self.prefs.thumb_size {
             self.prefs.thumb_size = sz;
             self.thumb_cache.clear(); // re-decode at the new resolution so it stays crisp
+            self.anim_cache.clear();
             self.save_prefs();
         }
     }
@@ -931,10 +1034,19 @@ impl App {
         // Persist both compared images into a dedup-immune corpus and log the
         // comparison — referencing the corpus copies — to one central store, so
         // old ratings stay usable after the originals are deleted from the pool.
-        let corpus = PathBuf::from("train_corpus");
-        let _ = std::fs::create_dir_all(&corpus);
+        // Quaternion ratings go to a SEPARATE corpus/ratings file
+        // (train_corpus_quat/, same `is_quat_genome_path` check the
+        // viewer-routing fix uses) rather than the 2D pipeline's
+        // `train_corpus/ratings.jsonl` — the two domains have entirely
+        // different feature spaces (quat_* metrics vs. a 2D formula's own
+        // fields), so mixing them into one ratings file would train a
+        // meaningless model on whichever pipeline pairs happened to get
+        // compared against each other, since a rating pair is always
+        // drawn from ONE currently-loaded folder.
         let wsrc = self.rows[winner].nn_path.clone();
         let lsrc = self.rows[loser].nn_path.clone();
+        let corpus = PathBuf::from(if is_quat_genome_path(&wsrc) { "train_corpus_quat" } else { "train_corpus" });
+        let _ = std::fs::create_dir_all(&corpus);
         let wp = self.persist_to_corpus(&wsrc, &corpus);
         let lp = self.persist_to_corpus(&lsrc, &corpus);
         let line = format!("{{\"winner\": {:?}, \"loser\": {:?}}}\n", wp, lp);
@@ -1014,6 +1126,21 @@ impl App {
                 chosen = Some(false);
             }
         });
+        // Filename under each image — for a single-metric test run this
+        // is where the metric name actually lives (--fitness-metric
+        // bakes it into the filename, e.g. "convexity_3f8a91b2...") so a
+        // batch of short per-metric runs stays identifiable by eye while
+        // rating, not just discoverable after the fact.
+        let l_name = self.rows[li].nn_path.file_stem().and_then(|s| s.to_str()).unwrap_or("?").to_string();
+        let r_name = self.rows[ri].nn_path.file_stem().and_then(|s| s.to_str()).unwrap_or("?").to_string();
+        ui.columns(2, |cols| {
+            cols[0].vertical_centered(|ui| {
+                ui.label(egui::RichText::new(l_name).monospace().weak().size(11.0));
+            });
+            cols[1].vertical_centered(|ui| {
+                ui.label(egui::RichText::new(r_name).monospace().weak().size(11.0));
+            });
+        });
 
         // Star either/both of the compared fractals to keep them (→ Starred folder).
         let (l_starred, r_starred) =
@@ -1057,7 +1184,12 @@ impl App {
     }
 
     fn show_table(&mut self, ui: &mut egui::Ui) {
-        let columns = self.prefs.columns.clone();
+        // Filtered by fractal type even though prefs.columns is a single
+        // global list shared across every folder ever browsed — without
+        // this, switching from a 2D folder to a quaternion one (or back)
+        // would keep showing whatever columns were configured for the
+        // OTHER type, all reading as zero/empty.
+        let columns: Vec<String> = self.prefs.columns.iter().filter(|c| field_relevant_to_folder(&self.folder, c)).cloned().collect();
         let thumb = self.prefs.thumb_size as f32;
         let sort_col = self.prefs.sort_column.clone();
         let sort_desc = self.prefs.sort_desc;
@@ -1097,6 +1229,7 @@ impl App {
         let rows = &self.rows;
         let selection = &self.selection;
         let thumb_cache = &mut self.thumb_cache;
+        let anim_cache = &mut self.anim_cache;
 
         let mut builder = TableBuilder::new(ui)
             .striped(true)
@@ -1157,10 +1290,30 @@ impl App {
                         {
                             star_toggle = Some(idx);
                         }
-                        let tex = thumb_cache
-                            .entry(r.png_path.clone())
-                            .or_insert_with(|| load_thumb(ui.ctx(), &r.png_path, thumb as u32));
-                        if let Some(t) = tex {
+                        // Animated frame sequence takes priority when one exists
+                        // (`Row::has_anim`, checked once at load time); falls back
+                        // to the static thumbnail otherwise — genomes with no
+                        // animated frames are completely unaffected.
+                        let frame_tex: Option<&TextureHandle> = if r.has_anim {
+                            let frames = anim_cache
+                                .entry(r.png_path.clone())
+                                .or_insert_with(|| load_anim_thumb(ui.ctx(), &r.png_path, thumb as u32));
+                            match frames {
+                                Some(fr) if !fr.is_empty() => {
+                                    ui.ctx().request_repaint_after(std::time::Duration::from_millis(ANIM_FRAME_MS));
+                                    let now = ui.input(|i| i.time);
+                                    let idx = ((now * 1000.0 / ANIM_FRAME_MS as f64) as usize) % fr.len();
+                                    Some(&fr[idx])
+                                }
+                                _ => None,
+                            }
+                        } else {
+                            thumb_cache
+                                .entry(r.png_path.clone())
+                                .or_insert_with(|| load_thumb(ui.ctx(), &r.png_path, thumb as u32))
+                                .as_ref()
+                        };
+                        if let Some(t) = frame_tex {
                             let ts = t.size_vec2();
                             let scale = (thumb / ts.x).min(thumb / ts.y).min(1.0);
                             let size = ts * scale;
@@ -1256,6 +1409,7 @@ impl App {
         for c in &self.prefs.columns {
             keys.insert(c.clone());
         }
+        keys.retain(|k| field_relevant_to_folder(&self.folder, k));
         egui::Window::new("Columns")
             .open(&mut open)
             .resizable(true)

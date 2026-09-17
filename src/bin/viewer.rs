@@ -6559,16 +6559,25 @@ fn wake_or_launch_queue_window() {
     let _ = std::process::Command::new(locate_sibling_bin("nnfractals-queue")).spawn();
 }
 
-/// Try to connect to a running viewer and hand it the new path.
-/// Returns true if delegated successfully (caller should exit).
+/// Try to connect to a running viewer and hand it the new path. Returns
+/// true only once the listener acks having actually parsed the path off
+/// the wire — a socket file left behind by a process that died mid-
+/// shutdown (or a listener thread that's alive but wedged) still accepts
+/// `connect()`, and `write_all` even "succeeds" into the kernel buffer, so
+/// the old blind version could report success while no window ever
+/// appeared. Any failure here (connect, write, or a missing ack within the
+/// timeout) means "no live instance" — the caller falls through to
+/// binding its own listener and opening a real window instead of
+/// vanishing silently.
 fn try_delegate(sock: &Path, path: &Path) -> bool {
-    match UnixStream::connect(sock) {
-        Ok(mut s) => {
-            let _ = s.write_all(path.to_string_lossy().as_bytes());
-            true
-        }
-        Err(_) => false,
+    let Ok(mut s) = UnixStream::connect(sock) else { return false };
+    if s.write_all(path.to_string_lossy().as_bytes()).is_err() {
+        return false;
     }
+    let _ = s.shutdown(std::net::Shutdown::Write); // EOF so the listener's read_to_string returns
+    let _ = s.set_read_timeout(Some(std::time::Duration::from_millis(500)));
+    let mut ack = [0u8; 1];
+    s.read_exact(&mut ack).is_ok()
 }
 
 // ── Entry point ───────────────────────────────────────────────────────────────
@@ -6727,14 +6736,28 @@ fn main() -> anyhow::Result<()> {
                         let mut buf = String::new();
                         if s.read_to_string(&mut buf).is_ok() {
                             let p = PathBuf::from(buf.trim());
-                            if p.exists() { let _ = tx.send(p); }
+                            if p.exists() {
+                                let _ = tx.send(p);
+                                let _ = s.write_all(b"K"); // ack — see try_delegate's doc comment
+                            }
                         }
                     }
                 }
             });
             Some(SocketGuard(sock_path))
         }
-        Err(e) => { eprintln!("[viewer] IPC unavailable: {e}"); None }
+        Err(e) => {
+            // Lost a bind race against a near-simultaneous second launch —
+            // that other process now legitimately owns the socket. One more
+            // delegate attempt before falling back to a standalone window
+            // (never silently duplicate a window over a lost race).
+            if try_delegate(&sock_path, &nn_path) {
+                eprintln!("[viewer] Delegated to running instance (after bind race).");
+                return Ok(());
+            }
+            eprintln!("[viewer] IPC unavailable: {e}");
+            None
+        }
     };
 
     // ── GPU init ──────────────────────────────────────────────────────────────

@@ -229,6 +229,12 @@ fn rendered_frame_count(path: &Path) -> Option<u32> {
 pub fn process_queue_item(
     item: &QueueItem, on_progress: &(dyn Fn(QueueProgress) + Sync),
 ) -> Result<String, String> {
+    // Quaternion items carry none of the 2D fields below (start/end,
+    // time_mod, blend_partner, ...) — they're never populated for one, so
+    // dispatch away before any of that logic reads them.
+    if let Some(q) = &item.quat {
+        return process_quat_queue_item(item, q, on_progress);
+    }
     let rife_fps = item.rife_fps;
     let nn_path = queue_dir().join(&item.nn_filename);
     let genome = load_genome(&nn_path).map_err(|e| format!("failed to load {}: {e}", nn_path.display()))?;
@@ -346,9 +352,189 @@ pub fn process_queue_item(
     result.unwrap_or_else(|| Err("export thread ended without a result".to_string()))
 }
 
+/// Renders one quaternion ray-march queue item by shelling out to
+/// `explorer quat-raymarch-genome[-video]` — the exact CLI surface
+/// `quat_viewer.rs`'s "Render…" button already builds directly, just
+/// persisted through the queue instead of spawned immediately. A
+/// subprocess (not an in-process call like the 2D exporters above) is
+/// the deliberate choice here, not a shortcut: each render gets its own
+/// GPU device/queue that the OS fully reclaims the moment the process
+/// exits, so a long-lived queue runner never accumulates GPU state
+/// across jobs — see the module doc on `render_gpu_raymarch_dag_codegen`
+/// for why that module's own device/queue, once initialized, otherwise
+/// lives for its host process's entire lifetime.
+fn process_quat_queue_item(
+    item: &QueueItem, q: &crate::video_export::QuatRenderSpec, on_progress: &(dyn Fn(QueueProgress) + Sync),
+) -> Result<String, String> {
+    let nn_path = queue_dir().join(&item.nn_filename);
+    if !nn_path.exists() {
+        return Err(format!(
+            "queued genome file is missing: {} — it should have been copied into video_queue/ when this item was added; was it deleted since?",
+            nn_path.display()
+        ));
+    }
+    let out_dir = PathBuf::from(&item.output_dir);
+    std::fs::create_dir_all(&out_dir)
+        .map_err(|e| format!("cannot create output directory {}: {e}", out_dir.display()))?;
+    let ext = if q.mode == "orbit" { "mp4" } else { "png" };
+    let base = format!("{}_{}", item.genome_label, q.mode);
+    let mut out_path = out_dir.join(format!("{base}.{ext}"));
+    let mut n = 2;
+    while out_path.exists() {
+        out_path = out_dir.join(format!("{base}_{n}.{ext}"));
+        n += 1;
+    }
+
+    let bin = crate::locate_bin("explorer");
+    let genome_arg = nn_path.to_string_lossy().to_string();
+    let mut cmd = std::process::Command::new(&bin);
+    match q.mode.as_str() {
+        "static" => {
+            cmd.arg("quat-raymarch-genome")
+                .arg(&out_path)
+                .args(["--genome", &genome_arg])
+                .args(["--eye", &format!("{},{},{}", q.eye.0, q.eye.1, q.eye.2)])
+                .args(["--target", &format!("{},{},{}", q.target.0, q.target.1, q.target.2)])
+                .args(["--up", &format!("{},{},{}", q.up.0, q.up.1, q.up.2)])
+                .args(["--fov-deg", &q.fov_deg.to_string()])
+                .args(["--c", &q.c.to_string()])
+                .args(["--width", &q.width.to_string()])
+                .args(["--height", &q.height.to_string()])
+                .args(["--max-iter", &q.max_iter.to_string()])
+                .args(["--aa", &q.aa.max(2).to_string()])
+                .args(["--colormap", &q.colormap])
+                .arg("--gpu");
+        }
+        "orbit" => {
+            cmd.arg("quat-raymarch-genome-video")
+                .arg(&out_path)
+                .args(["--genome", &genome_arg])
+                .args(["--axis", &format!("{},{},{}", q.axis.0, q.axis.1, q.axis.2)])
+                .args(["--phase0", &q.phase0.to_string()])
+                .args(["--turns", &q.turns.to_string()])
+                .args(["--c0", &q.c0.to_string()])
+                .args(["--c1", &q.c1.to_string()])
+                .args(["--frames", &q.frames.to_string()])
+                .args(["--fps", &q.fps.to_string()])
+                .args(["--width", &q.width.to_string()])
+                .args(["--height", &q.height.to_string()])
+                .args(["--max-iter", &q.max_iter.to_string()])
+                .args(["--aa", &q.aa.max(2).to_string()])
+                .args(["--colormap", &q.colormap])
+                .arg("--gpu");
+        }
+        other => {
+            return Err(format!(
+                "unknown quaternion render mode {other:?} on queue item {} ({}) — expected \"static\" or \"orbit\"",
+                item.id, item.genome_label
+            ));
+        }
+    }
+
+    cmd.stdout(std::process::Stdio::null());
+    cmd.stderr(std::process::Stdio::piped());
+    let mut child = cmd.spawn().map_err(|e| {
+        format!(
+            "couldn't launch {} for queue item {} ({}): {e} — is the release binary built? (cargo build --release --bin explorer)",
+            bin.display(), item.id, item.genome_label
+        )
+    })?;
+    on_progress(QueueProgress::Pid(child.id()));
+
+    // `cmd_quat_raymarch_dag_video` prints "frame {done}/{total}   " to
+    // stderr as it goes (carriage-return-terminated, for an interactive
+    // terminal to overwrite in place — same source as the 2D exporters'
+    // `VideoMsg::Progress`, just not routed through a channel since this
+    // is a subprocess). Reading stderr incrementally and parsing those
+    // lines as they arrive is what actually fixes "no indication of
+    // progress at all" — the old code only ever reported a `Pid` once,
+    // then blocked on `wait_with_output()` until the whole render (which
+    // can be minutes for an orbit video) finished, so the queue window's
+    // "Processing…" label just sat there unchanging the entire time.
+    use std::io::Read as _;
+    let mut stderr_pipe = child.stderr.take().expect("stderr was piped");
+    let mut captured = String::new();
+    let mut line_buf = String::new();
+    let mut chunk = [0u8; 512];
+    loop {
+        let n = stderr_pipe.read(&mut chunk).unwrap_or(0);
+        if n == 0 {
+            break;
+        }
+        for &b in &chunk[..n] {
+            let c = b as char;
+            if c == '\n' || c == '\r' {
+                if let Some((done, total)) = parse_frame_progress(&line_buf) {
+                    on_progress(QueueProgress::Frame(done, total));
+                }
+                captured.push('\n');
+                captured.push_str(&line_buf);
+                line_buf.clear();
+            } else {
+                line_buf.push(c);
+            }
+        }
+    }
+    if !line_buf.is_empty() {
+        if let Some((done, total)) = parse_frame_progress(&line_buf) {
+            on_progress(QueueProgress::Frame(done, total));
+        }
+        captured.push('\n');
+        captured.push_str(&line_buf);
+    }
+
+    let status = child.wait().map_err(|e| {
+        format!("failed while waiting for {} on queue item {} ({}): {e}", bin.display(), item.id, item.genome_label)
+    })?;
+
+    if !status.success() {
+        let tail: Vec<&str> = captured.lines().rev().take(6).collect();
+        let tail: String = tail.into_iter().rev().collect::<Vec<_>>().join("\n");
+        let code = status.code().map(|c| c.to_string()).unwrap_or_else(|| "terminated by signal".to_string());
+        return Err(format!(
+            "quaternion render failed (exit {code}) for queue item {} ({}) — last lines of stderr:\n{}",
+            item.id, item.genome_label,
+            if tail.is_empty() { "(no output captured — the process produced no stderr before exiting)".to_string() } else { tail }
+        ));
+    }
+    if !out_path.exists() {
+        return Err(format!(
+            "{} exited successfully but no output file appeared at {} — this usually means the genome's DAG failed to compile on GPU; re-run `{} {} --genome {} ...` directly to see the full compiler output",
+            bin.display(), out_path.display(), bin.display(),
+            if q.mode == "orbit" { "quat-raymarch-genome-video" } else { "quat-raymarch-genome" },
+            nn_path.display()
+        ));
+    }
+    Ok(out_path.display().to_string())
+}
+
+/// Parses a `cmd_quat_raymarch_dag_video`-style progress line, e.g.
+/// `"frame 45/180   "` (trailing padding spaces, from the source
+/// overwriting a shorter previous line in a terminal — harmless here
+/// since parsing only cares about the two numbers). `None` for any other
+/// line (the startup banner, `ffmpeg started (pid ...)`, `done: ...`,
+/// etc.) — those aren't progress, just pass through unparsed into the
+/// captured tail used for error reporting.
+fn parse_frame_progress(line: &str) -> Option<(u32, u32)> {
+    let rest = line.trim().strip_prefix("frame ")?;
+    let (done, total) = rest.split_once('/')?;
+    let done: u32 = done.trim().parse().ok()?;
+    let total: u32 = total.trim().split_whitespace().next().unwrap_or("").parse().ok()?;
+    Some((done, total))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_frame_progress_reads_the_quat_video_exporter_format() {
+        assert_eq!(parse_frame_progress("frame 45/180   "), Some((45, 180)));
+        assert_eq!(parse_frame_progress("frame 0/1"), Some((0, 1)));
+        assert_eq!(parse_frame_progress("ffmpeg started (pid 1234)"), None);
+        assert_eq!(parse_frame_progress("done: /tmp/x.mp4"), None);
+        assert_eq!(parse_frame_progress(""), None);
+    }
 
     #[test]
     fn hold_window_handles_the_midnight_wrap() {

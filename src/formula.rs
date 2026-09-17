@@ -117,6 +117,32 @@ pub fn reachable_from_root(prog: &[OpNode]) -> Vec<bool> {
     live
 }
 
+/// Longest operand dependency chain ending at the program's root (0 for a
+/// leaf-only/empty program). No per-node depth is stored anywhere in
+/// `OpNode` — this is a fresh O(n) DP pass every time, same cost class as
+/// `reachable_from_root`. Shared by `quat_dag_fitness::structural_metrics`
+/// (a reporting metric) and `quat_genome_ops`'s depth-aware "grow" mutation
+/// guard (an actual GA constraint) — one implementation for both rather
+/// than two copies of the same DP that could quietly drift apart.
+pub fn program_depth(prog: &[OpNode]) -> usize {
+    if prog.is_empty() {
+        return 0;
+    }
+    let mut depth = vec![0usize; prog.len()];
+    for (i, node) in prog.iter().enumerate() {
+        let arity = op::arity(node.op);
+        let mut d = 0usize;
+        if arity >= 1 && (node.a as usize) < i {
+            d = d.max(depth[node.a as usize] + 1);
+        }
+        if arity >= 2 && (node.b as usize) < i {
+            d = d.max(depth[node.b as usize] + 1);
+        }
+        depth[i] = d;
+    }
+    depth[prog.len() - 1]
+}
+
 // ── Time modulation ─────────────────────────────────────────────────────────
 //
 // A fractal is normally a function of two variables (the pixel coordinate). A
@@ -307,6 +333,35 @@ pub fn blend_fraction(shape: ModShape, freq: f32, phase: f32, amp: f32, t: f32) 
     // watchable, where the full sweep is a cut. Exactly the role `amp` plays
     // for a scalar modulation.
     v.clamp(0.0, 1.0) * amp.clamp(0.0, 1.0)
+}
+
+/// A value that moves between `val0` and `val1` over `t ∈ [0,1)` using
+/// `shape`'s vocabulary. `Ramp` sweeps once from `val0` to `val1` (the
+/// plain linear formula, its own branch rather than routed through the
+/// general path below so it stays byte-identical for any caller that only
+/// ever wants a one-way sweep). Every other shape instead treats
+/// `[val0,val1]` as a symmetric range — center = midpoint, amplitude =
+/// half-width — and oscillates within it via `mod_value`, e.g. `Sine`
+/// breathes back and forth rather than sweeping one-way. `freq` is cycles
+/// over the full `t` range (so for a clip that's one full camera
+/// revolution, `freq=1.0` is "once per revolution").
+///
+/// f64-native (this project's quaternion/motion code is f64 throughout;
+/// `TimeMod`/`mod_value` are f32) so callers don't have to sprinkle casts
+/// — originally factored out of `quat_gravity`'s own time-value ramp
+/// (`time_value_at`, kept private/unchanged there) when `quat_raymarch`
+/// needed the identical shape for pulsing a ray-marched camera's C value
+/// during an orbit.
+pub fn ramp_or_pulse(val0: f64, val1: f64, shape: ModShape, freq: f64, phase: f64, t: f64) -> f64 {
+    match shape {
+        ModShape::Ramp => val0 + (val1 - val0) * t,
+        shape => {
+            let center = (val0 + val1) / 2.0;
+            let amp = (val1 - val0) / 2.0;
+            let m = TimeMod { target: ModTarget::Bailout, shape, amp: amp as f32, freq: freq as f32, phase: phase as f32 };
+            center + mod_value(&m, t as f32) as f64
+        }
+    }
 }
 
 /// The scalar offset for `m` at time `t ∈ [0,1)`.
@@ -852,5 +907,35 @@ mod time_mod_tests {
                            amp: 0.25, freq: 2.0, phase: 0.125 };
         let json = serde_json::to_string(&tm).unwrap();
         assert_eq!(serde_json::from_str::<TimeMod>(&json).unwrap(), tm);
+    }
+
+    #[test]
+    fn ramp_or_pulse_ramp_is_the_plain_linear_formula() {
+        for i in 0..10 {
+            let t = i as f64 / 10.0;
+            let expected = -2.0 + 8.0 * t; // val0=-2, val1=6
+            let got = ramp_or_pulse(-2.0, 6.0, ModShape::Ramp, 1.0, 0.0, t);
+            assert!((got - expected).abs() < 1e-9, "t={t}: got={got} expected={expected}");
+        }
+    }
+
+    #[test]
+    fn ramp_or_pulse_sine_oscillates_within_val0_val1_centered_at_the_midpoint() {
+        let (val0, val1) = (-0.8, 0.8); // center=0.0, amp=0.8
+        assert!((ramp_or_pulse(val0, val1, ModShape::Sine, 1.0, 0.0, 0.0) - 0.0).abs() < 1e-6, "t=0 should sit at the center");
+        assert!((ramp_or_pulse(val0, val1, ModShape::Sine, 1.0, 0.0, 0.25) - 0.8).abs() < 1e-5, "t=0.25 should reach the peak (val1)");
+        for i in 0..40 {
+            let t = i as f64 / 40.0;
+            let v = ramp_or_pulse(val0, val1, ModShape::Sine, 1.0, 0.0, t);
+            assert!(v >= val0 - 1e-6 && v <= val1 + 1e-6, "t={t} v={v} left [{val0},{val1}]");
+        }
+    }
+
+    #[test]
+    fn ramp_or_pulse_frequency_controls_cycles_per_unit_t() {
+        // freq=2 completes two full sine cycles over t in [0,1) — so it
+        // should be back near the center at t=0.5, not still rising.
+        let v_half = ramp_or_pulse(-1.0, 1.0, ModShape::Sine, 2.0, 0.0, 0.5);
+        assert!(v_half.abs() < 1e-4, "expected freq=2 to complete a full cycle by t=0.5, got {v_half}");
     }
 }

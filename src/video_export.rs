@@ -1991,6 +1991,47 @@ pub struct QueueItem {
     /// `#[serde(default)]`, which yields 0 and therefore "off".
     #[serde(default)]
     pub keyframe_stride: u32,
+    /// Present only for a quaternion ray-marched render (from
+    /// `quat-viewer`'s "Render…" button routing through the queue instead
+    /// of spawning its own subprocess directly). When set, `process_item`
+    /// dispatches to `process_quat_queue_item` and none of the 2D fields
+    /// above (`start`/`end`/`waypoints`/`time_mod`/...) are meaningful —
+    /// they stay at their zero defaults. `#[serde(default)]` so every
+    /// queue item written before quaternion support existed still
+    /// deserializes as a plain (2D) item.
+    #[serde(default)]
+    pub quat: Option<QuatRenderSpec>,
+}
+
+/// Everything one quaternion ray-march render (still or orbit video) needs —
+/// the queue's counterpart to `quat_viewer.rs`'s own `spawn_render_job`
+/// argument-building, just persisted instead of spawned immediately. Mirrors
+/// that function's exact CLI surface (`quat-raymarch-genome`/
+/// `quat-raymarch-genome-video`) so `process_quat_queue_item` can build the
+/// identical command line.
+#[derive(Clone, Serialize, Deserialize, Default)]
+pub struct QuatRenderSpec {
+    /// "static" (`quat-raymarch-genome`) or "orbit" (`quat-raymarch-genome-video`).
+    pub mode: String,
+    pub eye: (f64, f64, f64),
+    pub target: (f64, f64, f64),
+    pub up: (f64, f64, f64),
+    pub fov_deg: f64,
+    /// Static mode's fixed C value. Ignored in orbit mode (use c0/c1).
+    pub c: f64,
+    /// Orbit mode only.
+    pub axis: (f64, f64, f64),
+    pub phase0: f64,
+    pub turns: f64,
+    pub c0: f64,
+    pub c1: f64,
+    pub frames: u32,
+    pub fps: u32,
+    pub width: u32,
+    pub height: u32,
+    pub max_iter: u32,
+    pub aa: u32,
+    pub colormap: String,
 }
 
 /// Everything a caller must decide to queue one export.
@@ -2029,6 +2070,11 @@ pub struct QueueSpec {
     pub blend_shape: String,
     pub blend_amp: f32,
     pub rife_fps: u32,
+    /// Set for a quaternion render — see `QuatRenderSpec`'s docs. When
+    /// present, `enqueue` skips the 2D `waypoints.len() < 2` validation
+    /// (a quat item has no camera waypoints at all) and every 2D field on
+    /// the resulting `QueueItem` stays at its zero default.
+    pub quat_spec: Option<QuatRenderSpec>,
 }
 
 impl Default for QueueSpec {
@@ -2055,6 +2101,7 @@ impl Default for QueueSpec {
             blend_shape: String::new(),
             blend_amp: 0.0,
             rife_fps: 0,
+            quat_spec: None,
         }
     }
 }
@@ -2065,13 +2112,14 @@ impl Default for QueueSpec {
 /// Does NOT wake the queue window — that is a GUI concern and headless callers
 /// have no use for it.
 pub fn enqueue(spec: QueueSpec) -> Result<QueueItem, String> {
-    if spec.waypoints.len() < 2 {
+    let is_quat = spec.quat_spec.is_some();
+    if !is_quat && spec.waypoints.len() < 2 {
         return Err("need at least two camera waypoints (use the same view twice \
                     for a still camera)".into());
     }
     let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).ok();
     let id = now.map(|d| format!("{:x}", d.as_nanos()))
-        .unwrap_or_else(|| format!("{:016x}", spec.waypoints[0].zoom.to_bits()));
+        .unwrap_or_else(|| format!("{:016x}", spec.waypoints.first().map(|w| w.zoom).unwrap_or(0.0).to_bits()));
     let created_at = now.map(|d| d.as_secs()).unwrap_or(0);
 
     let qdir = queue_dir();
@@ -2090,8 +2138,12 @@ pub fn enqueue(spec: QueueSpec) -> Result<QueueItem, String> {
         None => None,
     };
 
-    let start = spec.waypoints[0];
-    let end = *spec.waypoints.last().expect("checked non-empty above");
+    // A quat item carries no 2D camera at all — the zero CapturedView is
+    // never read for it (`process_item` dispatches on `quat.is_some()`
+    // before touching `start`/`end`/`waypoints`).
+    let zero_view = CapturedView { cx: 0.0, cx_lo: 0.0, cy: 0.0, cy_lo: 0.0, zoom: 0.0, aspect: 0.0 };
+    let start = spec.waypoints.first().copied().unwrap_or(zero_view);
+    let end = spec.waypoints.last().copied().unwrap_or(zero_view);
     // A two-point path is stored as start/end with NO waypoints, which is what
     // every item written before chains existed looks like — `process_item`
     // reconstructs `[start, end]` for it, and `camera_moves()` reads a
@@ -2127,6 +2179,7 @@ pub fn enqueue(spec: QueueSpec) -> Result<QueueItem, String> {
         blend_shape: spec.blend_shape,
         blend_amp: spec.blend_amp,
         rife_fps: spec.rife_fps,
+        quat: spec.quat_spec,
     };
 
     let mut items = load_queue();
@@ -2732,7 +2785,7 @@ mod tests {
             waypoints: Vec::new(), chain_label: None, keyframe_stride: 0,
             time_mod: Vec::new(), time_prog: Vec::new(), time_frames: 0,
             blend_nn_filename: None, blend_shape: String::new(), blend_amp: 0.0,
-            rife_fps: 0,
+            rife_fps: 0, quat: None,
         }
     }
 
@@ -2822,6 +2875,23 @@ mod tests {
         let r = enqueue(QueueSpec { waypoints: vec![cv(0.0, 0.0, 1.0)], ..Default::default() });
         let err = r.err().expect("one waypoint is not a camera path");
         assert!(err.contains("two camera waypoints"), "{err}");
+    }
+
+    #[test]
+    fn enqueue_skips_waypoint_validation_for_a_quat_render() {
+        // A quat render has no camera waypoints at all — the 2D "need at
+        // least two waypoints" check must not apply to it. Uses a
+        // nonexistent nn_src so this fails at the file-copy step instead
+        // (the only I/O this test performs is `create_dir_all` on the
+        // already-existing `video_queue/` — it never writes a queue item).
+        let r = enqueue(QueueSpec {
+            nn_src: PathBuf::from("/nonexistent/does_not_exist.nn"),
+            quat_spec: Some(QuatRenderSpec { mode: "static".to_string(), ..Default::default() }),
+            ..Default::default()
+        });
+        let err = r.err().expect("a missing nn_src still fails, just not on waypoints");
+        assert!(!err.contains("camera waypoints"), "quat items must skip 2D waypoint validation: {err}");
+        assert!(err.contains("cannot copy"), "{err}");
     }
 
     #[test]

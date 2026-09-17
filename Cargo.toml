@@ -18,6 +18,11 @@ path = "src/bin/browser.rs"
 required-features = ["browser"]
 
 [[bin]]
+name = "nnfractals-quat-viewer"
+path = "src/bin/quat_viewer.rs"
+required-features = ["viewer", "wgpu-backend"]
+
+[[bin]]
 name = "nnfractals-launcher"
 path = "src/bin/launcher.rs"
 required-features = ["launcher"]
@@ -42,6 +47,10 @@ launcher = ["dep:eframe", "dep:sysinfo"]
 queue = ["dep:eframe"]
 
 [dependencies]
+flate2 = "1"
+fast-surface-nets = "0.2"
+meshopt-rs = { version = "0.1", features = ["experimental"] }
+stl_io     = "0.11"
 wgpu       = { version = "29", optional = true }
 pollster   = { version = "0.3", optional = true }
 eframe      = { version = "0.35", optional = true }

@@ -177,6 +177,97 @@ pub struct Genome {
     pub view_cy: f32,
     #[serde(default = "default_view_zoom")]
     pub view_zoom: f32,
+
+    /// Explicit, self-describing fractal-kind marker — `"quat"` for a
+    /// quaternion ray-marched genome (written by `apply_quat_full_metrics`
+    /// at every quaternion save site), empty/absent for a 2D escape-time
+    /// genome (every genome saved before this field existed, and every
+    /// 2D genome going forward — the 2D save path is deliberately left
+    /// untouched rather than risk that much more heavily-used code path
+    /// for a field browser.rs can infer just as reliably from folder
+    /// convention). Exists so a genome's type is readable from the file
+    /// ITSELF, not only from which folder it happens to sit in — Carl's
+    /// own ask, after noticing the two families were only ever kept
+    /// apart by folder-naming convention. `browser.rs`'s column
+    /// filtering still primarily keys off the folder path (`fractals_dag`
+    /// vs `fractals_dag_quat`) rather than this field, since a session is
+    /// always folder-scoped and path-based detection already covers the
+    /// vast majority of existing files that predate this field.
+    #[serde(default)] pub fractal_kind: String,
+
+    // ── Quaternion ray-marched fractal metrics (quat_dag_fitness.rs) ───────────
+    // Written only by `explorer.rs`'s `apply_quat_full_metrics` (at
+    // quat-dag-evolve save time and by the quat-dag-rescore backfill
+    // command) — 0.0 on every 2D genome and on any quat genome saved
+    // before this existed. All [0,1] except `quat_max_depth`/
+    // `quat_warp_node_count`, which are also [0,1] but normalized
+    // against the 24-node register-file cap, not a natural [0,1]
+    // quantity — see `quat_dag_fitness::structural_metrics`'s docs.
+    // Deliberately separate fields, NOT folded into `fitness` — these
+    // are for sorting/inspecting in the gallery, browser.rs picks up
+    // any new scalar field automatically with no code change (see
+    // browser.rs's module doc). `quat_` prefix keeps them visually
+    // grouped in that column list and collision-proof against the 2D
+    // fields above.
+    #[serde(default)] pub quat_anisotropy: f32,
+    #[serde(default)] pub quat_coverage: f32,
+    #[serde(default)] pub quat_solidity: f32,
+    #[serde(default)] pub quat_shading_richness: f32,
+    #[serde(default)] pub quat_color_entropy: f32,
+    #[serde(default)] pub quat_silhouette_irregularity: f32,
+    #[serde(default)] pub quat_box_dim: f32,
+    #[serde(default)] pub quat_lacunarity: f32,
+    #[serde(default)] pub quat_convexity: f32,
+    #[serde(default)] pub quat_isoperimetric: f32,
+    #[serde(default)] pub quat_bilateral_symmetry: f32,
+    #[serde(default)] pub quat_centroid_offset: f32,
+    #[serde(default)] pub quat_largest_component_frac: f32,
+    #[serde(default)] pub quat_shading_gradient: f32,
+    #[serde(default)] pub quat_shading_skewness: f32,
+    #[serde(default)] pub quat_specular_fraction: f32,
+    #[serde(default)] pub quat_crevice_fraction: f32,
+    #[serde(default)] pub quat_color_gradient: f32,
+    #[serde(default)] pub quat_color_shading_corr: f32,
+    #[serde(default)] pub quat_color_band_autocorr: f32,
+    #[serde(default)] pub quat_color_range_utilization: f32,
+    /// Cross-view silhouette IoU (2 probe cameras, same C) — empirical
+    /// companion to the purely analytic `quat_anisotropy`.
+    #[serde(default)] pub quat_cross_view_iou: f32,
+    #[serde(default)] pub quat_cross_view_coverage_delta: f32,
+    /// `1 - hitmask_iou` between the two probe C values already sampled
+    /// for `quat_coverage` etc. — "does the shape change much as C
+    /// varies," relevant to whether the C-pulse/animated thumbnails
+    /// will look dynamic for this genome.
+    #[serde(default)] pub quat_c_sensitivity: f32,
+    #[serde(default)] pub quat_c_coverage_range: f32,
+    #[serde(default)] pub quat_node_count: f32,
+    #[serde(default)] pub quat_opcode_diversity: f32,
+    #[serde(default)] pub quat_max_depth: f32,
+    #[serde(default)] pub quat_warp_node_count: f32,
+    #[serde(default)] pub quat_warp_opcode_diversity: f32,
+
+    // ── Whole-4D-object organization metrics (quat_organization.rs) ────────
+    // Written only by `explorer.rs`'s `apply_organization_metrics` (at
+    // quat-dag-evolve save time). Unlike every quat_* field above, these
+    // are NOT computed from a rendered image at all — no camera, no
+    // TimeAxis choice, every one of R/A/B/C sampled as an equal spatial
+    // coordinate via a direct Halton-sequence evaluation of the DAG
+    // program. See quat_organization.rs's module doc for the literature
+    // (statistical/ordinal-pattern complexity, multifractal spectrum
+    // width, compression-ratio complexity, finite-difference chaoticity)
+    // and the "Organized Complexity" research memo this implements.
+    #[serde(default)] pub quat_organization_statistical: f32,
+    #[serde(default)] pub quat_organization_ordinal: f32,
+    #[serde(default)] pub quat_organization_multifractal: f32,
+    #[serde(default)] pub quat_organization_compression: f32,
+    #[serde(default)] pub quat_organization_chaoticity: f32,
+    /// Sphericity of the genome's shape at C=0 — 1.0 = perfectly
+    /// spherical, 0.0 = highly direction-dependent. Carl's own
+    /// observation: "most uninteresting fractals have a spherical shape
+    /// even if they are colored... the Mandelbulb is not a sphere at
+    /// all." Meant as a PENALTY term (negative weight in a
+    /// --fitness-metric combo), not maximized on its own.
+    #[serde(default)] pub quat_sphericity: f32,
 }
 
 fn default_view_zoom() -> f32 { 1.0 }
@@ -516,13 +607,18 @@ impl Genome {
             view_cx: view.0,
             view_cy: view.1,
             view_zoom: view.2,
+            ..Default::default()
         }
     }
 
     /// Randomize Phase-3/4 iteration dynamics for a fresh DAG genome. Most
     /// genomes stay standard (Mandelbrot-style, no phoenix, no warp); a minority
     /// get Julia mode / phoenix memory / a coordinate warp to seed unusual families.
-    fn randomize_dynamics(&mut self, rng: &mut impl Rng) {
+    /// `pub` (not private) so `src/bin/explorer.rs` — a separate binary
+    /// crate, `pub(crate)` isn't visible there — can reuse it directly on
+    /// a throwaway `Genome` for `quat-dag-random` instead of re-deriving
+    /// the same probabilities by hand.
+    pub fn randomize_dynamics(&mut self, rng: &mut impl Rng) {
         if rng.random_bool(0.30) {
             self.julia_mode = true;
             self.julia_cre = re_k(rng) * 0.9;
@@ -1040,19 +1136,24 @@ pub(crate) fn render_node_with(
 
 // ── Genetic-programming operators on flat topological DAG arrays ────────────────
 
-const UNARY_OPS: [u8; 14] = [
+// pub(crate) rather than private: quat_genome_ops.rs (the quaternion-only
+// GP operator variants — see that module's docs for why they're kept
+// separate from the operators below rather than modifying these in
+// place) reuses these exact op tables/constant-generation helpers rather
+// than risk drift from a second hand-copied definition.
+pub(crate) const UNARY_OPS: [u8; 14] = [
     op::SQR, op::CUBE, op::QUART, op::RECIP, op::SIN, op::COS, op::EXP, op::LOG,
     op::TANH, op::CONJ, op::ABSFOLD, op::ABSRE, op::ABSIM, op::NORMZ,
 ];
-const BINARY_OPS: [u8; 4] = [op::ADD, op::SUB, op::MUL, op::DIV];
+pub(crate) const BINARY_OPS: [u8; 4] = [op::ADD, op::SUB, op::MUL, op::DIV];
 // Rare/transcendental ops that produce unusual fractals — biased in via "exotic".
 const EXOTIC_OPS: [u8; 6] = [op::SIN, op::EXP, op::RECIP, op::NORMZ, op::ABSFOLD, op::LOG];
 
-fn rand_const(rng: &mut impl Rng) -> OpNode {
+pub(crate) fn rand_const(rng: &mut impl Rng) -> OpNode {
     OpNode { op: op::CONST, a: 0, b: 0, kre: re_k(rng), kim: im_k(rng) }
 }
-fn re_k(rng: &mut impl Rng) -> f32 { rng.random::<f32>() * 2.0 - 1.0 }
-fn im_k(rng: &mut impl Rng) -> f32 { rng.random::<f32>() * 2.0 - 1.0 }
+pub(crate) fn re_k(rng: &mut impl Rng) -> f32 { rng.random::<f32>() * 2.0 - 1.0 }
+pub(crate) fn im_k(rng: &mut impl Rng) -> f32 { rng.random::<f32>() * 2.0 - 1.0 }
 
 /// Grow a random valid topological DAG: leaves first, then unary/binary nodes
 /// referencing earlier nodes, respecting depth/node caps. The root (last node)

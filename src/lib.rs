@@ -19,6 +19,19 @@ pub mod vae_score;
 pub mod saliency;
 pub mod video_export;
 pub mod formula_usage;
+pub mod quaternion;
+pub mod quat_fractal;
+pub mod quat_motion;
+pub mod quat_voxel;
+pub mod quat_gravity;
+pub mod quat_raymarch;
+pub mod quat_dag;
+pub mod quat_dag_fitness;
+pub mod quat_genome_ops;
+pub mod quat_organization;
+pub mod quat_predator;
+pub mod quat_pref;
+pub mod debug_overlay;
 #[cfg(feature = "wgpu-backend")]
 pub mod explore;
 #[cfg(feature = "wgpu-backend")]
@@ -35,6 +48,12 @@ pub mod auto_reel;
 pub mod gui_font;
 #[cfg(feature = "wgpu-backend")]
 pub mod render_gpu;
+#[cfg(feature = "wgpu-backend")]
+pub mod render_gpu_raymarch;
+#[cfg(feature = "wgpu-backend")]
+pub mod render_gpu_raymarch_dag;
+#[cfg(feature = "wgpu-backend")]
+pub mod render_gpu_raymarch_dag_codegen;
 #[cfg(feature = "wgpu-backend")]
 pub mod queue_runner;
 
@@ -99,6 +118,27 @@ pub fn locate_bin(name: &str) -> std::path::PathBuf {
     PathBuf::from(name)
 }
 
+/// Whether `path` is (or is inside) a quaternion-genome folder —
+/// `fractals_dag_quat/` and any `--out-dir` variant of it (a
+/// `quat-dag-evolve` run naturally lands in something like
+/// `fractals_dag_quat_night_subtree/` or
+/// `fractals_dag_quat_metric_boxdim/`, never pinned to the exact literal
+/// name). PREFIX match, not exact equality, on purpose: the original
+/// exact-match version (once duplicated between `browser.rs` and never
+/// added to `launcher.rs` at all) silently routed every genome from a
+/// differently-named quat out-dir to the 2D viewer instead of the
+/// quaternion one — found by Carl opening one and getting a 2D escape-
+/// time render instead of a ray-march. Canonical version — `browser.rs`
+/// and `launcher.rs` both call this now instead of carrying their own
+/// copy, the exact drift that caused the bug in the first place.
+pub fn is_quat_genome_path(path: &std::path::Path) -> bool {
+    path.components().any(|c| {
+        c.as_os_str()
+            .to_str()
+            .is_some_and(|s| s.starts_with("fractals_dag_quat"))
+    })
+}
+
 pub fn project_root() -> std::path::PathBuf {
     std::env::current_exe()
         .ok()
@@ -131,6 +171,34 @@ pub fn python_bin(root: &std::path::Path) -> std::path::PathBuf {
         }
     }
     std::path::PathBuf::from("python3")
+}
+
+#[cfg(test)]
+mod is_quat_genome_path_tests {
+    use super::is_quat_genome_path;
+    use std::path::Path;
+
+    #[test]
+    fn recognizes_the_literal_folder() {
+        assert!(is_quat_genome_path(Path::new("fractals_dag_quat/abc123.nn")));
+    }
+
+    #[test]
+    fn recognizes_out_dir_variants() {
+        // The actual bug Carl hit: quat-dag-evolve --out-dir isn't pinned to
+        // the literal "fractals_dag_quat" name, so every one of these is a
+        // real folder an overnight run/metric sanity-check produced.
+        assert!(is_quat_genome_path(Path::new("fractals_dag_quat_night_subtree/x.nn")));
+        assert!(is_quat_genome_path(Path::new("fractals_dag_quat_compare_legacy/x.nn")));
+        assert!(is_quat_genome_path(Path::new("fractals_dag_quat_metric_boxdim/x.nn")));
+        assert!(is_quat_genome_path(Path::new("/home/carl/rust_projects/NNfractals/fractals_dag_quat_metric_boxdim_autocorr_predprey/x.nn")));
+    }
+
+    #[test]
+    fn does_not_match_the_2d_folder() {
+        assert!(!is_quat_genome_path(Path::new("fractals_dag/abc123.nn")));
+        assert!(!is_quat_genome_path(Path::new("fractals_1/abc123.nn")));
+    }
 }
 
 #[cfg(test)]
