@@ -31,6 +31,8 @@ pub mod quat_genome_ops;
 pub mod quat_organization;
 pub mod quat_predator;
 pub mod quat_pref;
+pub mod quat_taste;
+pub mod quat_map_elites;
 pub mod debug_overlay;
 #[cfg(feature = "wgpu-backend")]
 pub mod explore;

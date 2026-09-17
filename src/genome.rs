@@ -268,6 +268,18 @@ pub struct Genome {
     /// all." Meant as a PENALTY term (negative weight in a
     /// --fitness-metric combo), not maximized on its own.
     #[serde(default)] pub quat_sphericity: f32,
+
+    // ── Taste model (scripts/train_taste_quat.py, quat_taste_scorer.py) ────
+    /// Bradley-Terry preference score fit on Carl's own pairwise ratings
+    /// over a SigLIP embedding of the genome's rendered views (see
+    /// `project-taste-driven-quat-ga` memory) — replaces `quat_pref_score`
+    /// (a linear fit over the hand metrics above, which underperformed an
+    /// embedding backbone on held-out accuracy: 84.0%±3.3% vs 89.4%±3.1%).
+    /// Written only by `train_taste_quat.py --score-only`.
+    #[serde(default)] pub quat_taste: f32,
+    /// MAP-Elites archive cell this genome currently occupies, e.g.
+    /// "sph2_sol4_ord1" — empty string if never inserted into an archive.
+    #[serde(default)] pub quat_me_cell: String,
 }
 
 fn default_view_zoom() -> f32 { 1.0 }

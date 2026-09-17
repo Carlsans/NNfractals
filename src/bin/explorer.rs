@@ -2719,6 +2719,20 @@ struct QuatIndividual {
     /// so a predator can only ever specialize on axes the GA is already
     /// selecting on, never some unrelated signal.
     metric_vec: Vec<f64>,
+    /// `--map-elites` mode only: this individual's SigLIP taste score
+    /// (`quat_taste.rs`), [0,1] — either the quality signal itself
+    /// (`--fitness-metric` not given) or just carried along for the saved
+    /// genome's `quat_taste` field when a scalar spec supplies quality
+    /// instead. 0.0 (not "unscored") outside `--map-elites` mode.
+    taste: f64,
+    /// `--map-elites` mode only: (sphericity, hit_rate, organization_ordinal)
+    /// — the archive's 3 behaviour-descriptor axes, see `quat_map_elites`.
+    descriptors: [f64; 3],
+    /// `--map-elites` mode only: fraction of `sphericity_full_diagnostic`'s
+    /// 300 sampled directions that hit the surface — same value as
+    /// `descriptors[1]`, kept as its own named field since it also gates
+    /// archive insertion (see `map_elites_evaluate`'s hard constraint).
+    hit_rate: f64,
 }
 
 impl QuatIndividual {
@@ -2736,7 +2750,35 @@ impl QuatIndividual {
             total: 0.0,
             phenotype: [0.0; 6],
             metric_vec: Vec::new(),
+            taste: 0.0,
+            descriptors: [0.0; 3],
+            hit_rate: 0.0,
         }
+    }
+
+    /// A stable content-addressable id — FNV-1a over the program/warp DAGs
+    /// (serialized deterministically via serde_json) plus julia/phoenix/
+    /// bailout — used as the `--map-elites` archive's saved-filename stem
+    /// and the taste sidecar's embedding-cache key. Unlike
+    /// `save_quat_population`'s per-checkpoint `rng2.random()` id (which
+    /// re-randomizes every save, so nothing can be tracked across
+    /// checkpoints), the SAME genome content always hashes to the SAME id
+    /// — required for an elite that survives many generations unchanged
+    /// to be recognized as "already embedded" rather than re-scored from
+    /// scratch every checkpoint.
+    fn content_hash(&self) -> u64 {
+        let mut s = String::new();
+        s.push_str(&serde_json::to_string(&self.program).unwrap_or_default());
+        s.push('|');
+        s.push_str(&serde_json::to_string(&self.warp).unwrap_or_default());
+        s.push('|');
+        s.push_str(&format!("{}|{:?}|{:?}|{:?}", self.julia_mode, self.jc, self.phoenix, self.bailout_radius));
+        let mut h: u64 = 0xcbf29ce484222325;
+        for b in s.as_bytes() {
+            h ^= *b as u64;
+            h = h.wrapping_mul(0x100000001b3);
+        }
+        h
     }
 
     /// A throwaway `Genome` wrapping this individual's fields — lets us
@@ -3017,9 +3059,118 @@ fn lookup_metric(genome: &Genome, name: &str, full: Option<&QuatFullMetrics>, or
 /// expensive full sweep runs AT MOST ONCE per individual regardless of
 /// how many non-structural terms are in the combo — computed once,
 /// looked up per term.
+/// Lazily-spawned taste sidecar, shared across every `taste_score_for_genome`
+/// call in a run — spawning the SigLIP backbone process per-genome would be
+/// far too slow. Stays `None` for the whole run after a failed first spawn
+/// (missing `quat_taste_scorer.py`/`taste_model_quat.npz`), logged once
+/// rather than silently scoring 0.0 forever without saying why.
+static TASTE_SCORER: std::sync::OnceLock<std::sync::Mutex<Option<nnfractals::quat_taste::QuatTasteScorer>>> = std::sync::OnceLock::new();
+
+/// Renders the exact still every saved genome's browser thumbnail uses
+/// (300x400, C=0, "lava" colormap — the corpus's `train_taste_quat.py`
+/// trained against this exact framing) and scores it through the taste
+/// sidecar. Returns 0.0 (not a fallback score — a real "no signal")
+/// whenever the sidecar/model aren't available, so a `taste` term in a
+/// `--fitness-metric` combo degrades to "contributes nothing" rather than
+/// crashing the run.
+///
+/// The sidecar's embedding cache is keyed by an FNV-1a hash of the
+/// rendered pixel bytes (not a genome id) — this run predates
+/// `QuatIndividual::content_hash` (that stable id lands in Phase 2b for
+/// the MAP-Elites archive), but "same rendered image -> same cache key"
+/// is exactly the property the cache needs, and is trivially correct
+/// without any genome-schema coupling.
+fn taste_score_for_genome(genome: &Genome, use_gpu: bool) -> f64 {
+    let mutex = TASTE_SCORER.get_or_init(|| {
+        let scorer = nnfractals::quat_taste::QuatTasteScorer::new();
+        if scorer.is_none() {
+            eprintln!("  [taste] quat_taste_scorer.py/taste_model_quat.npz not found — the 'taste' metric term will score 0.0 for every genome this run.");
+        }
+        std::sync::Mutex::new(scorer)
+    });
+    let mut guard = mutex.lock().unwrap();
+    let Some(scorer) = guard.as_mut() else { return 0.0 };
+
+    let formula = nnfractals::quat_dag::QuatDagFormula { prog: &genome.program, warp: &genome.warp, julia: genome.julia_mode, jc: (genome.julia_cre, genome.julia_cim), phoenix: (genome.phoenix_re, genome.phoenix_im) };
+    let domain_radius = 1.6;
+    let fov_deg = 45.0;
+    let bg_color = (0.03, 0.02, 0.06);
+    let params = nnfractals::quat_dag::RaymarchDagParams {
+        formula, time_axis: nnfractals::quat_fractal::TimeAxis::C, time_val: 0.0, domain_radius,
+        max_iter: 50, bailout: genome.bailout_radius as f64, max_march_steps: 150,
+        hit_epsilon: domain_radius * 1e-4, step_safety: 0.8, light_dir: (0.5, 0.8, 0.3),
+        normal_eps: domain_radius * 1e-3, color_probe_offset: domain_radius * 1e-2, aa: 1,
+    };
+    let (w, h) = (300u32, 400u32);
+    let radius = recommended_orbit_radius(domain_radius, fov_deg, w, h);
+    let cam = nnfractals::quat_raymarch::RaymarchCamera { eye: (0.0, 0.0, -radius), target: (0.0, 0.0, 0.0), up_hint: (0.0, 1.0, 0.0), fov_y: fov_deg.to_radians() };
+    let mut mode = resolve_dag_gpu_mode(params.formula.prog, params.formula.warp, use_gpu);
+    let (shading, color_t) = render_dag_frame_with_mode(&mut mode, &params, &cam, w, h);
+    let rgb = raymarch_frame_to_rgb(&shading, &color_t, params.max_iter, "lava", bg_color);
+
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for &b in &rgb {
+        hash ^= b as u64;
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    let key = format!("{hash:016x}");
+    let scratch_dir = std::path::Path::new("explorer_out/taste_scratch");
+    std::fs::create_dir_all(scratch_dir).ok();
+    let path = scratch_dir.join(format!("{key}.png"));
+    if io::save_png(&rgb, w, h, &path).is_err() { return 0.0; }
+    let score = scorer.score_blocking(&key, std::slice::from_ref(&path)).unwrap_or(0.0);
+    std::fs::remove_file(&path).ok();
+    score as f64
+}
+
+/// `--map-elites` mode's per-individual evaluation: scores quality (taste
+/// by default, or the active `--fitness-metric` spec if one is given —
+/// same "quality = taste by default, or the spec's scalar if given" rule
+/// the plan calls for), computes the 3 archive behaviour-descriptor axes,
+/// and enforces the hard pre-insertion constraints (see the plan's Phase
+/// 2b: reject, don't penalize). Returns `None` for anything that should
+/// never occupy an archive cell — the caller must not insert on `None`.
+fn map_elites_evaluate(
+    ind: &mut QuatIndividual,
+    fitness_metric: &Option<Vec<(String, f64)>>,
+    probe_size: u32,
+    use_gpu: bool,
+) -> Option<([u8; 3], f64)> {
+    let genome = ind.as_genome();
+    let quality = match fitness_metric {
+        Some(metric) => {
+            score_individual_for_metric(ind, metric, probe_size, use_gpu);
+            ind.geometric
+        }
+        None => {
+            let t = taste_score_for_genome(&genome, use_gpu);
+            ind.taste = t;
+            t
+        }
+    };
+    let formula = nnfractals::quat_dag::QuatDagFormula { prog: &ind.program, warp: &ind.warp, julia: ind.julia_mode, jc: ind.jc, phoenix: ind.phoenix };
+    let bailout_sq = (ind.bailout_radius as f64) * (ind.bailout_radius as f64);
+    let (hit_count, n_dir, _mean_r, _roundness, sphericity) = nnfractals::quat_organization::sphericity_full_diagnostic(&formula, 1.6, 60, bailout_sq);
+    let hit_rate = if n_dir > 0 { hit_count as f64 / n_dir as f64 } else { 0.0 };
+    let organization = nnfractals::quat_organization::compute_organization_metrics(&formula, 1.6, 60, bailout_sq);
+    ind.hit_rate = hit_rate;
+    ind.descriptors = [sphericity as f64, hit_rate, organization.ordinal_complexity as f64];
+
+    // Hard constraints (reject, don't penalize — sphericity itself is an
+    // archive AXIS, never a rejection reason). hit_rate < 0.05 doubles as
+    // both "empty" and "nothing visible" — sphericity_full_diagnostic's
+    // 300-direction scan already IS a visibility probe, so no separate
+    // multi-view render is needed just to check this.
+    if hit_rate < 0.05 || !quality.is_finite() || ind.descriptors.iter().any(|d| !d.is_finite()) {
+        return None;
+    }
+    let cell = nnfractals::quat_map_elites::descriptor_cell(ind.descriptors[0], ind.descriptors[1], ind.descriptors[2]);
+    Some((cell, quality))
+}
+
 fn score_individual_for_metric(ind: &mut QuatIndividual, spec: &[(String, f64)], probe_size: u32, use_gpu: bool) {
     let genome = ind.as_genome();
-    let needs_full = spec.iter().any(|(name, _)| !STRUCTURAL_METRIC_NAMES.contains(&name.as_str()) && !ORGANIZATION_METRIC_NAMES.contains(&name.as_str()));
+    let needs_full = spec.iter().any(|(name, _)| name != "taste" && !STRUCTURAL_METRIC_NAMES.contains(&name.as_str()) && !ORGANIZATION_METRIC_NAMES.contains(&name.as_str()));
     let needs_organization = spec.iter().any(|(name, _)| ORGANIZATION_METRIC_NAMES.contains(&name.as_str()));
     let full = if needs_full { Some(score_genome_dag_full(&genome, probe_size, use_gpu)) } else { None };
     let organization = if needs_organization {
@@ -3034,7 +3185,9 @@ fn score_individual_for_metric(ind: &mut QuatIndividual, spec: &[(String, f64)],
     } else {
         ind.phenotype = [0.0; 6];
     }
-    let raw_vals: Vec<f64> = spec.iter().map(|(name, _)| lookup_metric(&genome, name, full.as_ref(), organization.as_ref())).collect();
+    let raw_vals: Vec<f64> = spec.iter().map(|(name, _)| {
+        if name == "taste" { taste_score_for_genome(&genome, use_gpu) } else { lookup_metric(&genome, name, full.as_ref(), organization.as_ref()) }
+    }).collect();
     ind.geometric = spec.iter().zip(&raw_vals).map(|((_, w), v)| w * v).sum();
     ind.aesthetic = 0.0;
     ind.metric_vec = raw_vals;
@@ -3408,6 +3561,7 @@ fn cmd_quat_dag_evolve(
                     phoenix: parent_a.phoenix,
                     bailout_radius: parent_a.bailout_radius,
                     geometric: 0.0, aesthetic: 0.0, diversity: 0.0, total: 0.0, phenotype: [0.0; 6], metric_vec: Vec::new(),
+                    taste: 0.0, descriptors: [0.0; 3], hit_rate: 0.0,
                 }
             } else {
                 source = "mutation";
@@ -3432,6 +3586,7 @@ fn cmd_quat_dag_evolve(
                     phoenix: parent.phoenix,
                     bailout_radius: parent.bailout_radius,
                     geometric: 0.0, aesthetic: 0.0, diversity: 0.0, total: 0.0, phenotype: [0.0; 6], metric_vec: Vec::new(),
+                    taste: 0.0, descriptors: [0.0; 3], hit_rate: 0.0,
                 }
             };
             match &fitness_metric {
@@ -3529,6 +3684,439 @@ fn cmd_quat_dag_evolve(
     let final_stems = save_quat_population(&population_vec, out_dir, &fitness_metric, generations, probe_size, use_gpu, &mut rng2, &checkpoint_stems);
     eprintln!("quat-dag-evolve: saved {} genomes + thumbnails to {out_dir}", population_vec.len());
     write_contact_sheet(std::path::Path::new(out_dir), &final_stems);
+}
+
+/// `quat-dag-evolve --map-elites`'s main loop — see `quat_map_elites`'s
+/// module doc and the approved plan's Phase 2 for why this exists (every
+/// scalar-fitness run of this GA converges onto one lineage; an archive of
+/// niches structurally can't). Population = the archive itself: gen 0
+/// seeds and inserts pool immigrants directly; every later generation
+/// breeds `population` children whose parents come from
+/// `archive.sample_parent` (never from a truncated "survivors" list —
+/// there is no such list here), scores each, and inserts it into its own
+/// niche. Deliberately does NOT share `cmd_quat_dag_evolve`'s breeding
+/// block verbatim: parent selection is structurally different (archive
+/// cells, not `next_gen[0..survivor_count]`), so unifying them would cost
+/// more clarity than it would save duplication.
+#[allow(clippy::too_many_arguments)]
+fn cmd_quat_dag_evolve_map_elites(
+    pool_dir: &str,
+    out_dir: &str,
+    population: usize,
+    generations: usize,
+    probe_size: u32,
+    use_gpu: bool,
+    seed: u64,
+    crossover_mode: CrossoverMode,
+    mutation_strength: nnfractals::quat_genome_ops::MutationStrength,
+    fitness_metric: Option<Vec<(String, f64)>>,
+    stagnation_gens: usize,
+) {
+    use rand::SeedableRng;
+    let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
+    const IMMIGRANT_FRAC: f64 = 0.55;
+    const CROSSOVER_FRAC: f64 = 0.30;
+    const RECENT_WINDOW: usize = 5;
+
+    eprintln!(
+        "fitness method: MAP-Elites — quality={}",
+        match &fitness_metric {
+            Some(spec) => format!("single/combo metric — {}", spec.iter().map(|(n, w)| format!("{n}:{w:.2}")).collect::<Vec<_>>().join(", ")),
+            None => "taste (SigLIP preference model, src/quat_taste.rs)".to_string(),
+        }
+    );
+    eprintln!(
+        "breeding mix: crossover={:.0}% ({}) | immigrant={:.0}% | mutation={:.0}% | archive axes=sphericity,hit_rate,organization_ordinal ({} bins each = {} cells) | stagnation-gens={stagnation_gens}",
+        CROSSOVER_FRAC * 100.0,
+        match crossover_mode { CrossoverMode::Legacy => "legacy", CrossoverMode::Subtree => "subtree" },
+        IMMIGRANT_FRAC * 100.0,
+        (1.0 - IMMIGRANT_FRAC - CROSSOVER_FRAC) * 100.0,
+        nnfractals::quat_map_elites::N_BINS,
+        nnfractals::quat_map_elites::N_BINS.pow(3),
+    );
+
+    let mut pool_files: Vec<PathBuf> = std::fs::read_dir(pool_dir)
+        .unwrap_or_else(|e| panic!("failed to read --pool-dir {pool_dir:?}: {e}"))
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("nn"))
+        .collect();
+    pool_files.shuffle(&mut rng);
+    eprintln!("quat-dag-evolve --map-elites: seeding from {pool_dir} ({} files available)", pool_files.len());
+
+    std::fs::create_dir_all(out_dir).ok();
+
+    let mut archive: nnfractals::quat_map_elites::Archive<QuatIndividual> = nnfractals::quat_map_elites::Archive::new();
+
+    // Gen 0: seed directly from the pool and insert whatever clears the
+    // hard constraints — no breeding yet, nothing to inherit from.
+    let start = std::time::Instant::now();
+    let mut seeded = 0usize;
+    for path in &pool_files {
+        if seeded >= population { break; }
+        let Ok(g) = io::load_genome(path) else { continue };
+        if g.program.is_empty() { continue; }
+        let mut ind = QuatIndividual::from_genome(&g);
+        if let Some((cell, quality)) = map_elites_evaluate(&mut ind, &fitness_metric, probe_size, use_gpu) {
+            archive.insert(cell, ind, quality, 0);
+        }
+        seeded += 1;
+    }
+    eprintln!(
+        "gen 0: {:.0}s | seeded {seeded} candidates | archive: {}/{} cells ({:.0}% coverage) | mean quality={:.3} max quality={:.3}",
+        start.elapsed().as_secs_f64(), archive.len(), nnfractals::quat_map_elites::N_BINS.pow(3), archive.coverage() * 100.0, archive.mean_quality(), archive.max_quality()
+    );
+    log_map_elites_stats(out_dir, 0, &archive, start.elapsed().as_secs_f64(), false);
+
+    const STAGNATION_EPSILON: f64 = 0.005;
+    let mut best_coverage_ever = archive.coverage();
+    let mut best_mean_quality_ever = archive.mean_quality();
+    let mut stagnant_gens: usize = 0;
+
+    const CHECKPOINT_INTERVAL: usize = 15;
+    let mut checkpoint_stems: Vec<String> = Vec::new();
+
+    for gen_idx in 1..=generations {
+        let gen_start = std::time::Instant::now();
+        let mut inserted = 0usize;
+        let mut new_cells = 0usize;
+        let mut attempts = 0usize;
+        while inserted < population && attempts < population * 10 {
+            attempts += 1;
+            let roll: f64 = rng.random();
+            let mut child = if roll < IMMIGRANT_FRAC && !pool_files.is_empty() {
+                let path = &pool_files[rng.random_range(0..pool_files.len())];
+                match io::load_genome(path) {
+                    Ok(g) if !g.program.is_empty() => QuatIndividual::from_genome(&g),
+                    _ => continue,
+                }
+            } else if roll < IMMIGRANT_FRAC + CROSSOVER_FRAC && archive.len() >= 2 {
+                let Some(parent_a) = archive.sample_parent(&mut rng, gen_idx, RECENT_WINDOW) else { continue };
+                let parent_a = parent_a.clone();
+                let Some(parent_b) = archive.sample_parent(&mut rng, gen_idx, RECENT_WINDOW) else { continue };
+                let program = match crossover_mode {
+                    CrossoverMode::Legacy => nnfractals::genome::crossover_program(&parent_a.program, &parent_b.program, &mut rng, 24),
+                    CrossoverMode::Subtree => nnfractals::quat_genome_ops::crossover_program_subtree(&parent_a.program, &parent_b.program, &mut rng, 24),
+                };
+                QuatIndividual {
+                    program,
+                    warp: parent_a.warp.clone(),
+                    julia_mode: parent_a.julia_mode,
+                    jc: parent_a.jc,
+                    phoenix: parent_a.phoenix,
+                    bailout_radius: parent_a.bailout_radius,
+                    geometric: 0.0, aesthetic: 0.0, diversity: 0.0, total: 0.0, phenotype: [0.0; 6], metric_vec: Vec::new(),
+                    taste: 0.0, descriptors: [0.0; 3], hit_rate: 0.0,
+                }
+            } else {
+                let Some(parent) = archive.sample_parent(&mut rng, gen_idx, RECENT_WINDOW) else { continue };
+                let p1 = nnfractals::quat_genome_ops::mutate_program_tuned(&parent.program, &mut rng, 24, mutation_strength.max_depth, &mutation_strength);
+                let program = nnfractals::quat_genome_ops::mutate_program_tuned(&p1, &mut rng, 24, mutation_strength.max_depth, &mutation_strength);
+                QuatIndividual {
+                    program,
+                    warp: parent.warp.clone(),
+                    julia_mode: parent.julia_mode,
+                    jc: parent.jc,
+                    phoenix: parent.phoenix,
+                    bailout_radius: parent.bailout_radius,
+                    geometric: 0.0, aesthetic: 0.0, diversity: 0.0, total: 0.0, phenotype: [0.0; 6], metric_vec: Vec::new(),
+                    taste: 0.0, descriptors: [0.0; 3], hit_rate: 0.0,
+                }
+            };
+            if let Some((cell, quality)) = map_elites_evaluate(&mut child, &fitness_metric, probe_size, use_gpu) {
+                match archive.insert(cell, child, quality, gen_idx) {
+                    nnfractals::quat_map_elites::InsertOutcome::NewCell => { new_cells += 1; }
+                    nnfractals::quat_map_elites::InsertOutcome::Improved => {}
+                    nnfractals::quat_map_elites::InsertOutcome::Rejected => {}
+                }
+            }
+            inserted += 1;
+        }
+        eprintln!(
+            "gen {gen_idx}: {:.0}s | {inserted} candidates ({new_cells} new cells) | archive: {}/{} cells ({:.0}% coverage) | mean quality={:.3} max quality={:.3}",
+            gen_start.elapsed().as_secs_f64(), archive.len(), nnfractals::quat_map_elites::N_BINS.pow(3), archive.coverage() * 100.0, archive.mean_quality(), archive.max_quality()
+        );
+
+        // Stagnation (Phase 2b: measured on archive coverage + mean
+        // quality, NEVER wipes the archive — unlike the scalar path's
+        // champion-only reset, throwing away 124/125 niches to chase one
+        // scalar record would defeat the entire point of an archive).
+        let coverage = archive.coverage();
+        let mean_quality = archive.mean_quality();
+        let improved = coverage > best_coverage_ever + STAGNATION_EPSILON || mean_quality > best_mean_quality_ever + STAGNATION_EPSILON;
+        if improved {
+            best_coverage_ever = best_coverage_ever.max(coverage);
+            best_mean_quality_ever = best_mean_quality_ever.max(mean_quality);
+            stagnant_gens = 0;
+        } else {
+            stagnant_gens += 1;
+        }
+        let mut stagnation_event = false;
+        if stagnant_gens >= stagnation_gens {
+            stagnation_event = true;
+            stagnant_gens = 0;
+            eprintln!("  [stagnation] no new cells/quality gain in {stagnation_gens} generations — next {RECENT_WINDOW} gens replace ALL parents with fresh pool immigrants (archive itself is untouched)");
+            // Implemented as a temporary override of the breeding roll for
+            // the next few generations rather than a separate code path —
+            // simplest correct way to inject fresh genetic material
+            // without touching archive state.
+            for _ in 0..RECENT_WINDOW {
+                let extra_gen = gen_idx;
+                for _ in 0..(population / 4).max(4) {
+                    if pool_files.is_empty() { break; }
+                    let path = &pool_files[rng.random_range(0..pool_files.len())];
+                    let Ok(g) = io::load_genome(path) else { continue };
+                    if g.program.is_empty() { continue; }
+                    let mut ind = QuatIndividual::from_genome(&g);
+                    if let Some((cell, quality)) = map_elites_evaluate(&mut ind, &fitness_metric, probe_size, use_gpu) {
+                        archive.insert(cell, ind, quality, extra_gen);
+                    }
+                }
+            }
+        }
+        log_map_elites_stats(out_dir, gen_idx, &archive, gen_start.elapsed().as_secs_f64(), stagnation_event);
+
+        if gen_idx % CHECKPOINT_INTERVAL == 0 && gen_idx != generations {
+            let ckpt_start = std::time::Instant::now();
+            let (stems, stems_by_cell) = save_map_elites_archive(&archive, out_dir, gen_idx, probe_size, use_gpu, &checkpoint_stems);
+            checkpoint_stems = stems;
+            write_map_elites_grid(std::path::Path::new(out_dir), &archive, &stems_by_cell);
+            eprintln!("  [checkpoint] gen {gen_idx}/{generations}: saved {} elites to {out_dir} in {:.0}s", checkpoint_stems.len(), ckpt_start.elapsed().as_secs_f64());
+        }
+    }
+
+    let (final_stems, stems_by_cell) = save_map_elites_archive(&archive, out_dir, generations, probe_size, use_gpu, &checkpoint_stems);
+    eprintln!("quat-dag-evolve --map-elites: saved {} elites to {out_dir} ({:.0}% archive coverage)", final_stems.len(), archive.coverage() * 100.0);
+    write_map_elites_grid(std::path::Path::new(out_dir), &archive, &stems_by_cell);
+}
+
+/// MAP-Elites twin of `save_quat_population`: saves every archive elite
+/// under a stable `me_<cellname>_<content_hash>` filename (NOT a random
+/// id — see `QuatIndividual::content_hash`'s doc comment) so an elite that
+/// survives unchanged across checkpoints keeps the same filename instead
+/// of being deleted and re-saved under a new random name every time.
+/// Deletes `prev_stems` first, same "out_dir always reflects only the
+/// latest snapshot" convention as `save_quat_population`. Returns the new
+/// stems plus a cell -> stem map (`write_map_elites_grid` needs to find
+/// each cell's thumbnail).
+#[allow(clippy::too_many_arguments)]
+fn save_map_elites_archive(
+    archive: &nnfractals::quat_map_elites::Archive<QuatIndividual>,
+    out_dir: &str,
+    generations: usize,
+    probe_size: u32,
+    use_gpu: bool,
+    prev_stems: &[String],
+) -> (Vec<String>, std::collections::HashMap<[u8; 3], String>) {
+    std::fs::create_dir_all(out_dir).expect("create out_dir");
+    for stem in prev_stems {
+        let base = std::path::Path::new(out_dir).join(stem);
+        let _ = std::fs::remove_file(base.with_extension("nn"));
+        let _ = std::fs::remove_file(base.with_extension("png"));
+        for i in 0..THUMB_ANIM_FRAMES {
+            let _ = std::fs::remove_file(std::path::Path::new(out_dir).join(format!("{stem}_thumb_{i:02}.png")));
+        }
+    }
+    let mut saved_stems = Vec::new();
+    let mut stems_by_cell = std::collections::HashMap::new();
+    for (cell, elite) in archive.elites() {
+        let ind = &elite.individual;
+        let mut g = ind.as_genome();
+        g.fitness = elite.quality as f32;
+        g.quat_taste = ind.taste as f32;
+        let cname = nnfractals::quat_map_elites::cell_name(*cell);
+        g.quat_me_cell = cname.clone();
+        g.formula_readable = format!(
+            "quat-dag-evolve --map-elites gen={generations} cell={cname} quality={:.3} gen_added={} sph={:.3} sol={:.3} ord={:.3}",
+            elite.quality, elite.gen_added, ind.descriptors[0], ind.descriptors[1], ind.descriptors[2]
+        );
+        let full = score_genome_dag_full(&g, probe_size, use_gpu);
+        apply_quat_full_metrics(&mut g, &full);
+        apply_organization_metrics(&mut g);
+        let stem = format!("me_{cname}_{:016x}", ind.content_hash());
+        let path = std::path::Path::new(out_dir).join(format!("{stem}.nn"));
+        io::save_genome(&g, &path).unwrap_or_else(|e| panic!("failed to save {path:?}: {e}"));
+        render_genome_thumbnails(&g, std::path::Path::new(out_dir), &stem, use_gpu);
+        saved_stems.push(stem.clone());
+        stems_by_cell.insert(*cell, stem);
+    }
+    (saved_stems, stems_by_cell)
+}
+
+/// Contact sheet for `--map-elites`: rows = sphericity bin, cols =
+/// hit_rate/solidity bin — the third axis (organization_ordinal) folds
+/// into "show whichever ordinal bin currently holds the best quality at
+/// that (sphericity, solidity) pair," rather than a 3rd nested strip
+/// dimension, to keep one picture readable. Empty (sphericity, solidity)
+/// pairs (no occupied ordinal bin at all) render as a dark placeholder,
+/// same convention as `write_contact_sheet`'s general "worth looking at
+/// once" goal.
+fn write_map_elites_grid(out_dir: &std::path::Path, archive: &nnfractals::quat_map_elites::Archive<QuatIndividual>, stems_by_cell: &std::collections::HashMap<[u8; 3], String>) {
+    let cell_w = 150u32;
+    let cell_h = 200u32;
+    let n = nnfractals::quat_map_elites::N_BINS as u32;
+    let mut sheet = image::RgbImage::from_pixel(n * cell_w, n * cell_h, image::Rgb([20, 20, 24]));
+    for sph in 0..n {
+        for sol in 0..n {
+            let mut best: Option<(&[u8; 3], f64)> = None;
+            for (cell, elite) in archive.elites() {
+                if cell[0] as u32 == sph && cell[1] as u32 == sol && best.map(|(_, q)| elite.quality > q).unwrap_or(true) {
+                    best = Some((cell, elite.quality));
+                }
+            }
+            let Some((cell, _)) = best else { continue };
+            let Some(stem) = stems_by_cell.get(cell) else { continue };
+            let path = out_dir.join(format!("{stem}.png"));
+            let Ok(img) = image::open(&path) else { continue };
+            let thumb = img.resize(cell_w, cell_h, image::imageops::FilterType::Triangle).to_rgb8();
+            image::imageops::overlay(&mut sheet, &thumb, (sph * cell_w) as i64, (sol * cell_h) as i64);
+        }
+    }
+    let path = out_dir.join("_me_grid.png");
+    sheet.save(&path).ok();
+    eprintln!("  wrote MAP-Elites grid ({n}x{n}, rows=sphericity cols=solidity): {}", path.display());
+}
+
+/// MAP-Elites twin of `log_gen_stats` — appends to the same
+/// `evolve_stats.jsonl` (a run only ever runs in one mode, so there's no
+/// schema collision within one file) with the archive-shaped fields the
+/// plan's Phase 2b calls for: `cells_filled`, `coverage`, `mean_quality`,
+/// `max_quality`, plus `taste_model_mtime` so the dashboard can show
+/// whether a retrain (Phase 3) has landed since the run started.
+fn log_map_elites_stats(out_dir: &str, gen_idx: usize, archive: &nnfractals::quat_map_elites::Archive<QuatIndividual>, secs: f64, stagnation_event: bool) {
+    let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    let taste_mtime = std::fs::metadata("taste_model_quat.npz").ok().and_then(|m| m.modified().ok())
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map(|d| d.as_secs());
+    let taste_mtime_field = taste_mtime.map(|v| v.to_string()).unwrap_or_else(|| "null".to_string());
+    let total_cells = nnfractals::quat_map_elites::N_BINS.pow(3);
+    let line = format!(
+        "{{\"gen\":{gen_idx},\"ts\":{ts},\"secs\":{secs:.1},\"mode\":\"map_elites\",\"cells_filled\":{},\"total_cells\":{total_cells},\"coverage\":{:.4},\"mean_quality\":{:.4},\"max_quality\":{:.4},\"stagnation_event\":{stagnation_event},\"taste_model_mtime\":{taste_mtime_field}}}",
+        archive.len(), archive.coverage(), archive.mean_quality(), archive.max_quality().max(0.0)
+    );
+    let path = std::path::Path::new(out_dir).join("evolve_stats.jsonl");
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+        use std::io::Write as _;
+        let _ = writeln!(f, "{line}");
+    }
+}
+
+/// `taste-pairs`: picks up to `n` genomes from a `--map-elites` archive
+/// dir worth Carl rating next, copies them (`.nn` + `.png` + thumbs — all
+/// already rendered, since `save_map_elites_archive` wrote them) into
+/// `out_dir`, and writes `pairs.txt` listing the intended pairings. The
+/// browser needs NO routing change to pick these up: `is_quat_genome_path`
+/// prefix-matches on `fractals_dag_quat` (see `src/lib.rs`), and
+/// `out_dir`'s default (`fractals_dag_quat_to_rate`) already satisfies
+/// that — confirmed during planning, not assumed.
+///
+/// Selection (simplified from the plan's full 4-criterion design — see
+/// the doc comment below on what's deliberately NOT implemented yet):
+///   (a) uncertainty — genomes whose `quat_taste` sits closest to the
+///       archive's median (the model is least confident there, so a
+///       human comparison teaches it the most).
+///   (b) diversity — capped at 2 picks per archive CELL (`quat_me_cell`),
+///       so one crowded niche can't dominate a rating batch.
+///   (c) recency — automatic: a `--map-elites` out-dir only ever holds
+///       the LATEST checkpoint's elites (`save_map_elites_archive`
+///       deletes the previous checkpoint's files first), so every
+///       candidate here already IS the most recent snapshot.
+///   (d) always includes the current top-3 `quat_taste` elites, so Carl
+///       can veto the model's own favourites.
+///
+/// NOT implemented (the plan's fuller version, deferred — this is a
+/// first working cut, not the final word): using the taste sidecar's
+/// `EMBED` command for an embedding-distance diversity check on top of
+/// the cell cap, and folding in `Starred/`/`favorite:true` genomes as
+/// extra positives (that's training-time, in `train_taste_quat.py
+/// --starred`, already supported there — see Phase 1's `--starred` flag
+/// — just not wired into THIS selection step).
+fn cmd_taste_pairs(archive_dir: &str, out_dir: &str, n: usize) {
+    #[derive(Clone)]
+    struct Candidate {
+        stem: String,
+        taste: f32,
+        cell: String,
+    }
+    let mut candidates: Vec<Candidate> = std::fs::read_dir(archive_dir)
+        .unwrap_or_else(|e| panic!("failed to read --archive {archive_dir:?}: {e}"))
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("nn"))
+        .filter_map(|p| {
+            let g = io::load_genome(&p).ok()?;
+            let stem = p.file_stem()?.to_str()?.to_string();
+            Some(Candidate { stem, taste: g.quat_taste, cell: g.quat_me_cell })
+        })
+        .collect();
+    if candidates.is_empty() {
+        eprintln!("taste-pairs: no genomes found in --archive {archive_dir:?} — nothing to do.");
+        return;
+    }
+
+    let mut tastes: Vec<f32> = candidates.iter().map(|c| c.taste).collect();
+    tastes.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let median = tastes[tastes.len() / 2];
+
+    candidates.sort_by(|a, b| a.taste.partial_cmp(&b.taste).unwrap_or(std::cmp::Ordering::Equal));
+    let mut top3: Vec<Candidate> = candidates.iter().rev().take(3).cloned().collect();
+
+    let mut by_uncertainty = candidates.clone();
+    by_uncertainty.sort_by(|a, b| (a.taste - median).abs().partial_cmp(&(b.taste - median).abs()).unwrap_or(std::cmp::Ordering::Equal));
+
+    let mut selected: Vec<Candidate> = Vec::new();
+    let mut seen_stems: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut per_cell: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+
+    // Top-3 taste elites always get a slot first (Carl's veto power).
+    for c in top3.drain(..) {
+        if seen_stems.insert(c.stem.clone()) {
+            *per_cell.entry(c.cell.clone()).or_insert(0) += 1;
+            selected.push(c);
+        }
+    }
+    // Then fill the rest by uncertainty, capped at 2/cell.
+    for c in by_uncertainty {
+        if selected.len() >= n { break; }
+        if seen_stems.contains(&c.stem) { continue; }
+        let count = per_cell.entry(c.cell.clone()).or_insert(0);
+        if *count >= 2 { continue; }
+        *count += 1;
+        seen_stems.insert(c.stem.clone());
+        selected.push(c);
+    }
+
+    std::fs::create_dir_all(out_dir).expect("create --out dir");
+    for c in &selected {
+        for ext in ["nn", "png"] {
+            let src = std::path::Path::new(archive_dir).join(format!("{}.{ext}", c.stem));
+            let dst = std::path::Path::new(out_dir).join(format!("{}.{ext}", c.stem));
+            let _ = std::fs::copy(&src, &dst);
+        }
+        for i in 0..THUMB_ANIM_FRAMES {
+            let name = format!("{}_thumb_{i:02}.png", c.stem);
+            let src = std::path::Path::new(archive_dir).join(&name);
+            let dst = std::path::Path::new(out_dir).join(&name);
+            let _ = std::fs::copy(&src, &dst);
+        }
+    }
+
+    // Pairs.txt: shuffle, pair consecutive picks (odd one out is dropped
+    // from pairs.txt but stays in out_dir — the browser's own ⚖ Rate mode
+    // draws random pairs from whatever's in the folder anyway, this file
+    // is just a suggested pairing for a human/script working outside the
+    // browser).
+    let mut rng = rand::rng();
+    let mut shuffled = selected.clone();
+    shuffled.shuffle(&mut rng);
+    let mut pairs_txt = String::new();
+    for pair in shuffled.chunks(2) {
+        if let [a, b] = pair {
+            pairs_txt.push_str(&format!("{}.nn vs {}.nn\n", a.stem, b.stem));
+        }
+    }
+    std::fs::write(std::path::Path::new(out_dir).join("pairs.txt"), pairs_txt).ok();
+
+    eprintln!("taste-pairs: selected {}/{} candidates from {archive_dir} -> {out_dir} (median taste={median:.3})", selected.len(), candidates.len());
 }
 
 /// Deletes `prev_stems`' files (`.nn`, `.png`, the 8 animated-thumbnail
@@ -3738,6 +4326,135 @@ fn render_genome_thumbnails(genome: &Genome, out_dir: &std::path::Path, stem: &s
         let path = out_dir.join(format!("{stem}_thumb_{i:02}.png"));
         io::save_png(&rgb, THUMB_ANIM_SIZE, THUMB_ANIM_SIZE, &path).ok();
     }
+}
+
+/// View-set size for the taste model's "4D" input — see `render_genome_views`.
+const VIEW_ANGLES: usize = 3;
+const VIEW_C_VALUES: usize = 3;
+const VIEW_SIZE: u32 = 224;
+
+/// Renders a fixed 9-image view set (`{stem}_view_00..08.png`, 224×224 —
+/// SigLIP's native input size) for one genome: 3 orbit angles (0°, 120°,
+/// 240° around the same orbit axis `render_genome_thumbnails` uses) crossed
+/// with 3 C values (0, +c_half, -c_half). This is the taste model's "4D"
+/// input — a single still at C=0 only shows one cross-section of a
+/// quaternion object; sweeping C is how the model sees the shape actually
+/// changing through the 4th (julia-parameter) axis, the same way the
+/// existing animated thumbnail sweeps orbit angle to show 3D shape.
+///
+/// `c_half` follows the same bailout-scaled convention `quat_viewer.rs`'s
+/// `CRangeScan::start` uses as its initial probe step
+/// (`(bailout_radius * 0.25).max(0.02)`) — not a full adaptive boundary
+/// scan (that's tuned for finding the true degenerate-crossing point
+/// interactively), just a fixed, cheap fraction of bailout that stays
+/// in-range for the vast majority of genomes.
+///
+/// Deliberately NOT reusing `render_genome_thumbnails`' 96×96
+/// `_thumb_00..07.png` sequence: those are one orbit turn at FIXED C
+/// (shape only, no C-sweep) and too small for SigLIP's 224×224 native
+/// input — resizing up would add no information, only blur.
+fn render_genome_views(genome: &Genome, out_dir: &std::path::Path, stem: &str, use_gpu: bool) -> Vec<std::path::PathBuf> {
+    let formula = nnfractals::quat_dag::QuatDagFormula { prog: &genome.program, warp: &genome.warp, julia: genome.julia_mode, jc: (genome.julia_cre, genome.julia_cim), phoenix: (genome.phoenix_re, genome.phoenix_im) };
+    let domain_radius = 1.6;
+    let fov_deg = 45.0;
+    let bg_color = (0.03, 0.02, 0.06);
+    let base_params = nnfractals::quat_dag::RaymarchDagParams {
+        formula,
+        time_axis: nnfractals::quat_fractal::TimeAxis::C,
+        time_val: 0.0,
+        domain_radius,
+        max_iter: 50,
+        bailout: genome.bailout_radius as f64,
+        max_march_steps: 150,
+        hit_epsilon: domain_radius * 1e-4,
+        step_safety: 0.8,
+        light_dir: (0.5, 0.8, 0.3),
+        normal_eps: domain_radius * 1e-3,
+        color_probe_offset: domain_radius * 1e-2,
+        aa: 1,
+    };
+    let mut mode = resolve_dag_gpu_mode(base_params.formula.prog, base_params.formula.warp, use_gpu);
+    let radius = recommended_orbit_radius(domain_radius, fov_deg, VIEW_SIZE, VIEW_SIZE);
+    let orbit = nnfractals::quat_raymarch::RaymarchOrbitParams {
+        target: (0.0, 0.0, 0.0),
+        axis: (0.35, 1.0, 0.15),
+        radius,
+        turns: 1.0,
+        phase0: 0.0,
+        fov_y: fov_deg.to_radians(),
+    };
+    let c_half = (genome.bailout_radius as f64 * 0.25).max(0.02);
+    let c_values = [0.0, c_half, -c_half];
+    let mut paths = Vec::with_capacity(VIEW_ANGLES * VIEW_C_VALUES);
+    let mut idx = 0usize;
+    for a in 0..VIEW_ANGLES {
+        let t = a as f64 / VIEW_ANGLES as f64;
+        let cam = orbit.sample(t);
+        for &c in &c_values {
+            let frame_params = nnfractals::quat_dag::RaymarchDagParams { time_val: c, ..base_params };
+            let (shading, color_t) = render_dag_frame_with_mode(&mut mode, &frame_params, &cam, VIEW_SIZE, VIEW_SIZE);
+            let rgb = raymarch_frame_to_rgb(&shading, &color_t, frame_params.max_iter, "lava", bg_color);
+            let path = out_dir.join(format!("{stem}_view_{idx:02}.png"));
+            io::save_png(&rgb, VIEW_SIZE, VIEW_SIZE, &path).ok();
+            paths.push(path);
+            idx += 1;
+        }
+    }
+    paths
+}
+
+/// Renders one role-model still (a classic `QuatFormula`, not an evolved
+/// DAG genome) in the EXACT style `render_genome_thumbnails`' static
+/// branch uses (same 300x400 size, camera, domain_radius, colormap, bg
+/// color) so its embedding sits in the same distribution as every rated
+/// corpus genome's `.png` — anything else would make "role model vs.
+/// chaotic genome" bootstrap pairs compare apples to oranges. Also writes
+/// a stub `.nn` (`fractal_kind = "quat_builtin"`, empty `program` — never
+/// re-rendered or re-evolved, only read as JSON by the Python trainer for
+/// its `png_for` path and field writes) so it fits the same `--dirs
+/// train_corpus_quat` corpus-scanning convention every other tool uses.
+fn render_role_model_still(
+    formula: nnfractals::quat_fractal::QuatFormula,
+    bulb_power: f64,
+    mandelbox_scale: f64,
+    out_dir: &std::path::Path,
+    stem: &str,
+    label: &str,
+    use_gpu: bool,
+) {
+    let domain_radius = 1.6;
+    let fov_deg = 45.0;
+    let bg_color = (0.03, 0.02, 0.06);
+    let params = nnfractals::quat_raymarch::RaymarchParams {
+        formula,
+        time_axis: nnfractals::quat_fractal::TimeAxis::C,
+        time_val: 0.0,
+        domain_radius,
+        max_iter: 60,
+        bailout: 4.0,
+        max_march_steps: 150,
+        hit_epsilon: domain_radius * 1e-4,
+        step_safety: 0.8,
+        light_dir: (0.5, 0.8, 0.3),
+        normal_eps: domain_radius * 1e-3,
+        color_probe_offset: domain_radius * 1e-2,
+        aa: 1,
+        bulb_power,
+        mandelbox_scale,
+    };
+    let (w, h) = (300u32, 400u32);
+    let radius = recommended_orbit_radius(domain_radius, fov_deg, w, h);
+    let cam = nnfractals::quat_raymarch::RaymarchCamera { eye: (0.0, 0.0, -radius), target: (0.0, 0.0, 0.0), up_hint: (0.0, 1.0, 0.0), fov_y: fov_deg.to_radians() };
+    let (shading, color_t) = render_raymarch_frame_dispatch(&params, &cam, w, h, use_gpu);
+    let rgb = raymarch_frame_to_rgb(&shading, &color_t, params.max_iter, "lava", bg_color);
+    std::fs::create_dir_all(out_dir).expect("create out_dir");
+    io::save_png(&rgb, w, h, &out_dir.join(format!("{stem}.png"))).ok();
+
+    let mut g = Genome::default();
+    g.fractal_kind = "quat_builtin".to_string();
+    g.formula_readable = label.to_string();
+    let path = out_dir.join(format!("{stem}.nn"));
+    io::save_genome(&g, &path).unwrap_or_else(|e| panic!("failed to save {path:?}: {e}"));
 }
 
 fn report_generation(gen_idx: usize, population: &[QuatIndividual], secs: f64) {
@@ -5892,9 +6609,17 @@ fn main() {
             };
             let fitness_metric = get_flag(&args, "--fitness-metric").map(parse_fitness_metric_spec);
             let predator_prey = args.iter().any(|a| a == "--predator-prey");
+            let map_elites = args.iter().any(|a| a == "--map-elites");
             let stagnation_gens: usize = get_flag_or(&args, "--stagnation-gens", 25);
             let pref_model_path = get_flag(&args, "--pref-model").unwrap_or("pref_model_quat.json");
-            cmd_quat_dag_evolve(pool_dir, out_dir, population, generations, survivors, probe_size, use_gpu, seed, crossover_mode, mutation_strength, fitness_metric, predator_prey, stagnation_gens, pref_model_path);
+            if map_elites && predator_prey {
+                panic!("--map-elites and --predator-prey are mutually exclusive — MAP-Elites' niches ARE the diversity mechanism, predator-prey pressure has nothing to act on");
+            }
+            if map_elites {
+                cmd_quat_dag_evolve_map_elites(pool_dir, out_dir, population, generations, probe_size, use_gpu, seed, crossover_mode, mutation_strength, fitness_metric, stagnation_gens);
+            } else {
+                cmd_quat_dag_evolve(pool_dir, out_dir, population, generations, survivors, probe_size, use_gpu, seed, crossover_mode, mutation_strength, fitness_metric, predator_prey, stagnation_gens, pref_model_path);
+            }
         }
         Some("quat-dag-random") => {
             let out_dir = get_flag(&args, "--out-dir").unwrap_or("fractals_dag_quat");
@@ -5906,13 +6631,14 @@ fn main() {
         Some("quat-dag-thumbs") => {
             let dir = get_flag(&args, "--dir").unwrap_or_else(|| panic!("quat-dag-thumbs needs --dir DIR"));
             let use_gpu = args.iter().any(|a| a == "--gpu");
+            let views = args.iter().any(|a| a == "--views");
             let files: Vec<PathBuf> = std::fs::read_dir(dir)
                 .unwrap_or_else(|e| panic!("failed to read --dir {dir:?}: {e}"))
                 .filter_map(|e| e.ok())
                 .map(|e| e.path())
                 .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("nn"))
                 .collect();
-            eprintln!("quat-dag-thumbs: {} genomes in {dir}", files.len());
+            eprintln!("quat-dag-thumbs: {} genomes in {dir} (views={views})", files.len());
             let start = std::time::Instant::now();
             let mut done = 0usize;
             let mut stems = Vec::with_capacity(files.len());
@@ -5923,6 +6649,9 @@ fn main() {
                 };
                 let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("thumb").to_string();
                 render_genome_thumbnails(&genome, std::path::Path::new(dir), &stem, use_gpu);
+                if views {
+                    render_genome_views(&genome, std::path::Path::new(dir), &stem, use_gpu);
+                }
                 stems.push(stem);
                 done += 1;
                 if done % 10 == 0 {
@@ -5935,6 +6664,51 @@ fn main() {
             // metric name) groups by metric instead of by random id/mtime.
             stems.sort();
             write_contact_sheet(std::path::Path::new(dir), &stems);
+        }
+        Some("quat-role-model-views") => {
+            // Bulb power sweep + Mandelbox scale sweep + every other
+            // QuatFormula::ALL variant at defaults — the honest scope of
+            // usable role models found during planning: no .fract parser
+            // exists anywhere in this repo, so the 788 imported
+            // Mandelbulber files are NOT usable here, only these built-in
+            // hand-coded formulas (see project-taste-driven-quat-ga
+            // memory).
+            let out_dir = get_flag(&args, "--out").unwrap_or("explorer_out/role_models_views");
+            let use_gpu = args.iter().any(|a| a == "--gpu");
+            use nnfractals::quat_fractal::QuatFormula;
+            let mut stems = Vec::new();
+            let bulb_powers = [3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 12.0];
+            for p in bulb_powers {
+                let stem = format!("rm_bulb_p{p:.0}");
+                let label = format!("role-model bulb power={p:.0}");
+                render_role_model_still(QuatFormula::Bulb, p, -1.5, std::path::Path::new(out_dir), &stem, &label, use_gpu);
+                stems.push(stem);
+            }
+            let mandelbox_scales: [f64; 7] = [-2.0, -1.8, -1.5, -1.2, 2.0, 2.5, 3.0];
+            for s in mandelbox_scales {
+                let stem = format!("rm_mandelbox_s{}", (s * 10.0).round() as i32);
+                let label = format!("role-model mandelbox scale={s:.1}");
+                render_role_model_still(QuatFormula::Mandelbox, 8.0, s, std::path::Path::new(out_dir), &stem, &label, use_gpu);
+                stems.push(stem);
+            }
+            for f in QuatFormula::ALL {
+                if f == QuatFormula::Bulb || f == QuatFormula::Mandelbox {
+                    continue;
+                }
+                let stem = format!("rm_{}", f.name());
+                let label = format!("role-model {}", f.name());
+                render_role_model_still(f, 8.0, -1.5, std::path::Path::new(out_dir), &stem, &label, use_gpu);
+                stems.push(stem);
+            }
+            eprintln!("quat-role-model-views: rendered {} role models to {out_dir}", stems.len());
+            stems.sort();
+            write_contact_sheet(std::path::Path::new(out_dir), &stems);
+        }
+        Some("taste-pairs") => {
+            let archive_dir = get_flag(&args, "--archive").unwrap_or_else(|| panic!("taste-pairs needs --archive DIR (a --map-elites out-dir)"));
+            let out_dir = get_flag(&args, "--out").unwrap_or("fractals_dag_quat_to_rate");
+            let n: usize = get_flag_or(&args, "--n", 60);
+            cmd_taste_pairs(archive_dir, out_dir, n);
         }
         Some("quat-raymarch-video") => {
             let out_path = pos.get(1).map(PathBuf::from).unwrap_or_else(||

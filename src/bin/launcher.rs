@@ -856,6 +856,32 @@ impl App {
         self.spawn_tracked("Train taste model".into(), "scripts/train_pref.py", args);
     }
 
+    /// Train the quaternion GA's taste model from Carl's quat browser
+    /// ratings (`train_corpus_quat/ratings.jsonl`), including role-model
+    /// bootstrap pairs when they exist. Clone of `train_pref` above, for
+    /// the separate quat pipeline (see `project-taste-driven-quat-ga`
+    /// memory) — different corpus, different model file
+    /// (`taste_model_quat.npz`), different score field (`quat_taste`).
+    fn train_taste_quat(&mut self) {
+        let ratings = self.root.join("train_corpus_quat/ratings.jsonl");
+        if !ratings.exists() {
+            self.status = "no train_corpus_quat/ratings.jsonl — rate quat fractals in the browser (⚖ Rate) first".into();
+            return;
+        }
+        let mut args = vec![
+            "--ratings".to_string(),
+            ratings.to_string_lossy().into_owned(),
+            "--dirs".to_string(),
+            "train_corpus_quat".to_string(),
+        ];
+        let role_pairs = self.root.join("train_corpus_quat/role_model_pairs.jsonl");
+        if role_pairs.exists() {
+            args.push("--role-model-pairs".to_string());
+            args.push(role_pairs.to_string_lossy().into_owned());
+        }
+        self.spawn_tracked("Retrain quat taste".into(), "scripts/train_taste_quat.py", args);
+    }
+
     /// Preview (dry-run) or actually run the near-duplicate cleaner on the
     /// chosen folder at the chosen threshold. Progress/result stream through
     /// the same job-tracking machinery as train/rescore.
@@ -1343,6 +1369,18 @@ impl eframe::App for App {
                     .clicked()
                 {
                     self.train_pref();
+                }
+                if ui
+                    .add_enabled(!self.job.running, egui::Button::new("🎓  Retrain quat taste"))
+                    .on_hover_text("Train the quaternion GA's taste model from your quat browser \
+                                     ratings (train_corpus_quat/ratings.jsonl) and score every \
+                                     rated genome → quat_taste. A running `quat-dag-evolve \
+                                     --map-elites` picks the new weights up automatically on its \
+                                     next request (the taste sidecar hot-reloads on the model \
+                                     file's mtime — no restart needed).")
+                    .clicked()
+                {
+                    self.train_taste_quat();
                 }
             });
 
