@@ -27,6 +27,7 @@ import argparse
 import glob
 import json
 import sys
+import time
 from pathlib import Path
 
 import numpy as np
@@ -220,8 +221,11 @@ def main():
     ap.add_argument("--pooling", default="single", choices=["single", "mean", "mean_max"])
     ap.add_argument("--epochs", type=int, default=400)
     ap.add_argument("--reg", type=float, default=1e-3)
-    ap.add_argument("--holdout", type=float, default=0.0)
-    ap.add_argument("--holdout-repeats", type=int, default=1)
+    ap.add_argument("--holdout", type=float, default=0.2,
+                     help="fraction held out to report generalization accuracy; 0 to skip "
+                          "(defaults ON so a production run always has a real number to "
+                          "show — see taste_model_quat.json / the launcher GUI's stats panel)")
+    ap.add_argument("--holdout-repeats", type=int, default=15)
     ap.add_argument("--eval", action="store_true")
     ap.add_argument("--human-pairs-only-check", action="store_true",
                      help="also report held-out accuracy on human pairs alone, "
@@ -275,6 +279,12 @@ def main():
         human_diffs, human_weights = build_diffs(human_comps, emb)
         Xhuman = torch.tensor(np.stack(human_diffs), dtype=torch.float32, device=device) if human_diffs else None
 
+        # Reported back to the caller (not just logged) so the production
+        # path can write these into taste_model_quat.json and the launcher
+        # GUI's stats panel — see project-taste-driven-quat-ga memory for
+        # why Carl wanted this visible without scrolling a log.
+        holdout_stats = {"all_mean": None, "all_std": None, "human_mean": None, "human_std": None}
+
         if args.holdout > 0.0:
             n = Xall.shape[0]
             n_val = max(1, int(n * args.holdout))
@@ -285,6 +295,8 @@ def main():
                 w_tr, _ = fit(Xall[tr_idx], Wall[tr_idx], args.epochs, args.reg, device)
                 vals.append(acc(w_tr, Xall[val_idx]))
             vals = np.array(vals)
+            holdout_stats["all_mean"] = float(vals.mean() * 100)
+            holdout_stats["all_std"] = float(vals.std() * 100)
             log(f"[{pooling}] holdout {args.holdout:.0%} x {len(vals)} splits (all pairs): "
                 f"VAL acc {vals.mean()*100:.1f}% +/- {vals.std()*100:.1f}%  "
                 f"(chance 50%, {n - n_val} train / {n_val} val pairs each)")
@@ -308,13 +320,20 @@ def main():
                     w_tr, _ = fit(Xall[tr_mask], Wall[tr_mask], args.epochs, args.reg, device)
                     hvals.append(acc(w_tr, Xhuman[val_idx]))
                 hvals = np.array(hvals)
+                holdout_stats["human_mean"] = float(hvals.mean() * 100)
+                holdout_stats["human_std"] = float(hvals.std() * 100)
                 log(f"[{pooling}] holdout on HUMAN PAIRS ONLY (trained w/ role-model pairs mixed in): "
                     f"VAL acc {hvals.mean()*100:.1f}% +/- {hvals.std()*100:.1f}%")
+            elif Xhuman is not None:
+                # No role-model pairs mixed in this run -> the all-pairs
+                # holdout number already IS the human-only number.
+                holdout_stats["human_mean"] = holdout_stats["all_mean"]
+                holdout_stats["human_std"] = holdout_stats["all_std"]
 
         w, final_loss = fit(Xall, Wall, args.epochs, args.reg, device)
         log(f"[{pooling}] trained on {Xall.shape[0]} pairs (dim {Xall.shape[1]}); "
             f"train pairwise accuracy {acc(w, Xall)*100:.1f}%  (loss {final_loss:.4f})")
-        return w, emb, Xall.shape[1]
+        return w, emb, Xall.shape[1], holdout_stats
 
     if args.eval:
         # Report all three poolings for the gate comparison. Phase 1b's
@@ -328,7 +347,7 @@ def main():
         log("eval mode — not scoring galleries.")
         return
 
-    w, emb, dim = run_for_pooling(args.pooling)
+    w, emb, dim, holdout_stats = run_for_pooling(args.pooling)
 
     all_nn = []
     for d in args.dirs:
@@ -339,11 +358,11 @@ def main():
 
     raw = {p: float(np.dot(emb_all[p], w_np)) for p in emb_all}
     lo, hi = 0.0, 1.0
+    written = 0
     if raw:
         vals = np.array(list(raw.values()))
         lo, hi = float(np.percentile(vals, 1)), float(np.percentile(vals, 99))
         rng = (hi - lo) or 1.0
-        written = 0
         items = list(raw.items())
         n = len(items)
         for k, (p, r) in enumerate(items):
@@ -358,15 +377,40 @@ def main():
             if k % 200 == 0 or k + 1 == n:
                 progress("write", k + 1, n)
         log(f"wrote quat_taste to {written} .nn files")
-        print(f"DONE {written}", flush=True)
 
     out = Path("taste_model_quat.npz")
     np.savez(out, w=w_np, lo=lo, hi=hi, backbone=args.backbone, pooling=args.pooling, n_views=N_VIEWS)
-    Path("taste_model_quat.json").write_text(json.dumps({
+    # The JSON twin carries everything the launcher GUI's stats panel
+    # needs to show "current model" without spawning Python or reading the
+    # .npz — held-out accuracy, corpus composition, and when this model
+    # was trained. Written every production run (not --eval), which is
+    # also the reason the CLI defaults --holdout/--holdout-repeats ON now
+    # (see argparse defaults above) rather than requiring them to be
+    # remembered on every invocation.
+    model_json = {
         "backbone": args.backbone, "pooling": args.pooling, "n_views": N_VIEWS,
         "dim": dim, "lo": lo, "hi": hi,
-    }, indent=2))
+        "n_human_pairs": len(human_comps),
+        "n_role_pairs": len(role_comps),
+        "n_starred_pairs": len(starred_comps),
+        "holdout_all_acc": holdout_stats["all_mean"],
+        "holdout_all_std": holdout_stats["all_std"],
+        "holdout_human_acc": holdout_stats["human_mean"],
+        "holdout_human_std": holdout_stats["human_std"],
+        "trained_at": int(time.time()),
+    }
+    Path("taste_model_quat.json").write_text(json.dumps(model_json, indent=2))
     log(f"saved model -> {out} (+ .json twin)  (lo={lo:.4f} hi={hi:.4f})")
+
+    # One rich summary line — this is what the launcher GUI shows directly
+    # under the progress bar (JobMsg::Summary), so it needs to carry the
+    # number Carl actually cares about (held-out accuracy), not just a
+    # file count.
+    if holdout_stats["human_mean"] is not None:
+        acc_str = f"held-out {holdout_stats['human_mean']:.1f}%+/-{holdout_stats['human_std']:.1f}% on {len(human_comps)} human pairs"
+    else:
+        acc_str = f"{len(human_comps)} human pairs (no holdout run)"
+    print(f"DONE {written} genomes scored | {acc_str}", flush=True)
 
 
 if __name__ == "__main__":

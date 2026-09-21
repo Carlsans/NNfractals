@@ -221,6 +221,61 @@ struct JobState {
     got_summary: bool,
 }
 
+/// Snapshot of `taste_model_quat.json` — everything `train_taste_quat.py`
+/// records about its own last production run, read straight off disk
+/// (never computed here) so the launcher's stats panel reflects the
+/// CURRENT model whether or not a training job ran in this GUI session.
+/// Mirrors the JSON shape exactly; every field is optional except the
+/// ones the script always writes, since older model files (trained before
+/// held-out stats existed) should still load rather than vanish.
+#[derive(Deserialize)]
+struct QuatTasteStats {
+    backbone: String,
+    pooling: String,
+    #[serde(default)]
+    n_human_pairs: u32,
+    #[serde(default)]
+    n_role_pairs: u32,
+    #[serde(default)]
+    holdout_human_acc: Option<f32>,
+    #[serde(default)]
+    holdout_human_std: Option<f32>,
+    #[serde(default)]
+    holdout_all_acc: Option<f32>,
+    #[serde(default)]
+    holdout_all_std: Option<f32>,
+    #[serde(default)]
+    trained_at: Option<u64>,
+}
+
+impl QuatTasteStats {
+    fn load(path: &Path) -> Option<Self> {
+        let s = std::fs::read_to_string(path).ok()?;
+        serde_json::from_str(&s).ok()
+    }
+
+    /// "12m ago" / "3h ago" / "2d ago" style relative time — short on
+    /// purpose, this sits inline in a one-line stats readout, not its own
+    /// column.
+    fn trained_ago(&self) -> String {
+        let Some(t) = self.trained_at else { return "unknown".to_string() };
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(t);
+        let secs = now.saturating_sub(t);
+        if secs < 90 {
+            format!("{secs}s ago")
+        } else if secs < 3600 {
+            format!("{}m ago", secs / 60)
+        } else if secs < 86400 {
+            format!("{}h ago", secs / 3600)
+        } else {
+            format!("{}d ago", secs / 86400)
+        }
+    }
+}
+
 /// Parse one stdout/stderr line from the python job and forward it to the UI.
 fn parse_job_line(tx: &mpsc::Sender<JobMsg>, line: &str) {
     if let Some(rest) = line.strip_prefix("PROGRESS ") {
@@ -395,6 +450,11 @@ struct App {
     job_rx: Option<mpsc::Receiver<JobMsg>>,
     known_folders: Vec<String>,
     rescore_folder: String,
+    /// Last-known stats for the quaternion GA's taste model
+    /// (`taste_model_quat.json`), reloaded at startup and after every
+    /// "Retrain quat taste" job — `None` if the model has never been
+    /// trained on this machine.
+    quat_taste_stats: Option<QuatTasteStats>,
 
     // Dedup preview/run controls.
     dedup_folder: String,
@@ -430,6 +490,7 @@ impl App {
         let prefs_path = root.join(PREFS_FILE);
         let prefs = LauncherPrefs::load(&prefs_path);
         let known_folders = discover_pools(&root);
+        let quat_taste_stats = QuatTasteStats::load(&root.join("taste_model_quat.json"));
         let rescore_folder = known_folders
             .iter()
             .find(|d| d.as_str() == "fractals_1")
@@ -449,6 +510,7 @@ impl App {
             job_rx: None,
             known_folders: known_folders.clone(),
             rescore_folder,
+            quat_taste_stats,
             dedup_folder: known_folders
                 .iter()
                 .find(|d| d.as_str() == "fractals_1")
@@ -668,6 +730,9 @@ impl App {
                     self.job.running = false;
                     self.job.got_summary = true;
                     self.job.message = m;
+                    if self.job.name == "Retrain quat taste" {
+                        self.reload_quat_taste_stats();
+                    }
                 }
                 JobMsg::Exited { success, detail } => {
                     self.job.running = false;
@@ -677,6 +742,9 @@ impl App {
                         // usually a beat behind, so it must never win).
                         if !self.job.got_summary {
                             self.job.message = detail;
+                        }
+                        if self.job.name == "Retrain quat taste" {
+                            self.reload_quat_taste_stats();
                         }
                     } else {
                         self.job.message = format!("FAILED: {detail}");
@@ -879,7 +947,23 @@ impl App {
             args.push("--role-model-pairs".to_string());
             args.push(role_pairs.to_string_lossy().into_owned());
         }
+        // Explicit even though the script now defaults these on — the
+        // whole point of this button existing is a real held-out accuracy
+        // number in the stats panel below it, not just a "done" message.
+        args.push("--holdout".to_string());
+        args.push("0.2".to_string());
+        args.push("--holdout-repeats".to_string());
+        args.push("15".to_string());
         self.spawn_tracked("Retrain quat taste".into(), "scripts/train_taste_quat.py", args);
+    }
+
+    /// Reload `taste_model_quat.json` (written by every production
+    /// `train_taste_quat.py` run) into `self.quat_taste_stats` — called at
+    /// startup and right after a "Retrain quat taste" job finishes, so the
+    /// stats panel reflects the CURRENT model on disk without needing a
+    /// fresh job to have just run in this session.
+    fn reload_quat_taste_stats(&mut self) {
+        self.quat_taste_stats = QuatTasteStats::load(&self.root.join("taste_model_quat.json"));
     }
 
     /// Preview (dry-run) or actually run the near-duplicate cleaner on the
@@ -1383,6 +1467,64 @@ impl eframe::App for App {
                     self.train_taste_quat();
                 }
             });
+
+            // ── Quat taste model stats — Carl's ask: "obtain pertinent
+            // stats about the training in gui", not just a log line that
+            // scrolls away. Always visible (not gated on a job having run
+            // this session) since it's read straight off
+            // taste_model_quat.json, which persists across launcher
+            // restarts. ──
+            match &self.quat_taste_stats {
+                Some(s) => {
+                    egui::Frame::group(ui.style()).show(ui, |ui| {
+                        ui.set_width(ui.available_width().min(520.0));
+                        ui.horizontal(|ui| {
+                            ui.label(egui::RichText::new("quat taste model").strong());
+                            ui.label(
+                                egui::RichText::new(format!("· trained {}", s.trained_ago()))
+                                    .weak(),
+                            );
+                        });
+                        ui.horizontal_wrapped(|ui| {
+                            let acc_text = match (s.holdout_human_acc, s.holdout_human_std) {
+                                (Some(acc), Some(std)) => format!("held-out {acc:.1}% ± {std:.1}%"),
+                                (Some(acc), None) => format!("held-out {acc:.1}%"),
+                                _ => "held-out: not measured this run".to_string(),
+                            };
+                            let acc_color = match s.holdout_human_acc {
+                                Some(acc) if acc < 72.0 => Color32::LIGHT_RED, // below the plan's own floor
+                                Some(acc) if acc < 78.0 => egui::Color32::from_rgb(230, 180, 90), // drifting
+                                Some(_) => egui::Color32::from_rgb(120, 200, 150),
+                                None => Color32::GRAY,
+                            };
+                            ui.label(egui::RichText::new(acc_text).color(acc_color).monospace());
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "{} human pairs · {} role-model pairs · {}/{}",
+                                    s.n_human_pairs, s.n_role_pairs, s.backbone, s.pooling
+                                ))
+                                .weak()
+                                .monospace(),
+                            );
+                        });
+                        if let (Some(all_acc), Some(all_std)) = (s.holdout_all_acc, s.holdout_all_std) {
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "(all pairs incl. role models: {all_acc:.1}% ± {all_std:.1}%)"
+                                ))
+                                .weak()
+                                .small(),
+                            );
+                        }
+                    });
+                }
+                None => {
+                    ui.label(
+                        egui::RichText::new("quat taste model: never trained on this machine")
+                            .weak(),
+                    );
+                }
+            }
 
             // ── Rescore a folder with the current (already-trained) model ──
             ui.horizontal(|ui| {
