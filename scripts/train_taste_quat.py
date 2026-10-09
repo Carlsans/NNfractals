@@ -36,12 +36,11 @@ from PIL import Image
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from train_pref import load_backbone, png_for, progress, log  # noqa: E402
-
-N_VIEWS = 9
+from taste_pooling import N_VIEWS, pool_grid  # noqa: E402
 
 
 def view_paths_for(nn_path):
-    """The 9 `_view_NN.png` paths for one genome's .nn path, in order."""
+    """The N_VIEWS (angles x C values) `_view_NN.png` paths for one genome's .nn path, in order."""
     stem = Path(nn_path).with_suffix("")
     return [Path(f"{stem}_view_{i:02}.png") for i in range(N_VIEWS)]
 
@@ -49,7 +48,7 @@ def view_paths_for(nn_path):
 def embed_genomes(embed, nn_paths, device, pooling, batch=32):
     """Returns {nn_path: np.array(D)} (D = 768, or 1536 for mean_max),
     pooling each genome's view set (falling back to its single .png when
-    the view set is incomplete). `pooling="single"` skips the view set
+    the view set is incomplete). `pooling="grid"` = 6 angles x 4 C values pooled to [mean,max,C-std] (3*D); see taste_pooling.py. `pooling="single"` skips the view set
     entirely and always uses the single C=0 .png — the production default:
     Phase 1b's gate found multi-view pooling UNDERPERFORMS single-view on
     held-out accuracy (87.7% vs 89.4%), most likely because Carl's ratings
@@ -68,6 +67,14 @@ def embed_genomes(embed, nn_paths, device, pooling, batch=32):
             single = png_for(p)
             if single.exists():
                 per_genome_imgs[p] = [single]
+            else:
+                continue
+        elif pooling == "grid":
+            # Grid pooling needs the complete angle x C set (fixed feature
+            # layout); genomes without it are skipped, never padded.
+            views = view_paths_for(p)
+            if all(v.exists() for v in views):
+                per_genome_imgs[p] = views
             else:
                 continue
         else:
@@ -114,6 +121,11 @@ def embed_genomes(embed, nn_paths, device, pooling, batch=32):
         if not img_vecs:
             continue
         arr = np.stack(img_vecs)
+        if pooling == "grid":
+            if len(img_vecs) != N_VIEWS:
+                continue
+            out[p] = pool_grid(arr)
+            continue
         mean = arr.mean(axis=0)
         if pooling == "mean_max" and len(img_vecs) > 1:
             mx = arr.max(axis=0)
@@ -126,6 +138,9 @@ def embed_genomes(embed, nn_paths, device, pooling, batch=32):
     return out
 
 
+ROT3D_WEIGHT = 2.0
+
+
 def load_comparisons(path, weight=1.0):
     comps = []
     if not path:
@@ -136,7 +151,11 @@ def load_comparisons(path, weight=1.0):
             continue
         try:
             d = json.loads(line)
-            comps.append((d["winner"], d["loser"], float(d.get("weight", weight))))
+            # Ratings made against the live rotating view (browser logs
+            # "view":"rot3d") saw what grid pooling sees; the older ones were
+            # judged from one still, so they get less trust.
+            w = float(d.get("weight", weight)) * (ROT3D_WEIGHT if d.get("view") == "rot3d" else 1.0)
+            comps.append((d["winner"], d["loser"], w))
         except Exception:
             pass
     return comps
@@ -218,7 +237,7 @@ def main():
     ap.add_argument("--starred", help="optional dir of starred/favorite genomes -> extra positives (Phase 3)")
     ap.add_argument("--score-only", action="store_true")
     ap.add_argument("--backbone", default="siglip", choices=["siglip", "dinov2"])
-    ap.add_argument("--pooling", default="single", choices=["single", "mean", "mean_max"])
+    ap.add_argument("--pooling", default="single", choices=["single", "mean", "mean_max", "grid"])
     ap.add_argument("--epochs", type=int, default=400)
     ap.add_argument("--reg", type=float, default=1e-3)
     ap.add_argument("--holdout", type=float, default=0.2,
@@ -344,6 +363,7 @@ def main():
         run_for_pooling("single")
         run_for_pooling("mean")
         run_for_pooling("mean_max")
+        run_for_pooling("grid")
         log("eval mode — not scoring galleries.")
         return
 

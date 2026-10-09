@@ -23,6 +23,11 @@ path = "src/bin/quat_viewer.rs"
 required-features = ["viewer", "wgpu-backend"]
 
 [[bin]]
+name = "nnfractals-anim-viewer"
+path = "src/bin/anim_viewer.rs"
+required-features = ["viewer", "wgpu-backend"]
+
+[[bin]]
 name = "nnfractals-launcher"
 path = "src/bin/launcher.rs"
 required-features = ["launcher"]

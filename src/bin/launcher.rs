@@ -13,14 +13,15 @@ use std::collections::HashMap;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::mpsc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use clap::Parser;
 use eframe::egui::{self, Color32};
 use serde::{Deserialize, Serialize};
-use sysinfo::{ProcessesToUpdate, System};
+use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
 
 use nnfractals::config::Config;
 use nnfractals::fitness_profile::{self, FieldSpec, FitnessProfile, Group, Sign, FIELDS};
@@ -148,13 +149,19 @@ fn install_desktop_entry() -> Result<PathBuf, String> {
 
 // ── Process / resource monitoring ────────────────────────────────────────────
 
-/// One running evolution or scorer process with its resource usage.
+/// One running project process with its resource usage. `kind` used to be
+/// a fixed `&'static str` ("evolution"/"scorer" only) — widened to `String`
+/// so `classify_proc` can build a specific label like
+/// "explorer:quat-render-timeline" from the actual subcommand, per Carl's
+/// 2026-09-23 ask: "I would like it more detailed with the current project
+/// task running and their cpu and gpu consumption."
 struct ProcRow {
     pid: u32,
-    kind: &'static str, // "evolution" | "scorer"
-    cpu: f32,           // percent (can exceed 100 across cores)
-    ram_mb: u64,        // resident set size
-    vram_mb: u64,       // GPU memory (from nvidia-smi), 0 if none/unknown
+    kind: String,
+    cpu: f32,      // percent (can exceed 100 across cores)
+    ram_mb: u64,   // resident set size
+    vram_mb: u64,  // GPU memory (from nvidia-smi), 0 if none/unknown
+    gpu_pct: Option<u32>, // GPU (SM) utilization at the sampled instant, from `nvidia-smi pmon` — None if unmeasured/unavailable, distinct from a genuine 0%.
 }
 
 /// Per-PID GPU memory (MiB) from `nvidia-smi`. Empty if nvidia-smi is absent.
@@ -171,6 +178,37 @@ fn gpu_mem_by_pid() -> HashMap<u32, u64> {
                     *m.entry(pid).or_insert(0) += mb;
                 }
             }
+        }
+    }
+    m
+}
+
+/// Per-PID GPU (SM) utilization percent, a single instantaneous sample from
+/// `nvidia-smi pmon -c 1` — the "cpu AND gpu consumption" half of Carl's
+/// 2026-09-23 ask (`gpu_mem_by_pid` above only ever covered VRAM, not
+/// compute load). `pmon` reports "-" for a process with no measurable
+/// activity in the sampled instant rather than "0" — parsed as absent
+/// (`None` in the caller), not folded into 0, so an idle-but-GPU-resident
+/// process reads as "—" instead of a possibly-misleading "0%". Empty map if
+/// `nvidia-smi`/`pmon` is unavailable. `-c 1` makes this call take about a
+/// second (it's a real sampling window, not an instant query) — acceptable
+/// for an explicit/60s-interval refresh, not something to call every frame.
+fn gpu_util_by_pid() -> HashMap<u32, u32> {
+    let mut m = HashMap::new();
+    let Ok(out) = Command::new("nvidia-smi").args(["pmon", "-c", "1", "-s", "u"]).output() else {
+        return m;
+    };
+    for line in String::from_utf8_lossy(&out.stdout).lines() {
+        if line.starts_with('#') {
+            continue;
+        }
+        // Columns: gpu pid type sm mem enc dec jpg ofa fb ccpm command...
+        let cols: Vec<&str> = line.split_whitespace().collect();
+        if cols.len() < 4 {
+            continue;
+        }
+        if let (Ok(pid), Ok(sm)) = (cols[1].parse::<u32>(), cols[3].parse::<u32>()) {
+            m.insert(pid, sm);
         }
     }
     m
@@ -320,12 +358,58 @@ fn discover_pools(root: &Path) -> Vec<String> {
 /// no matter what arguments it was launched with — notably `--profile`, added
 /// when fitness profiles landed. Matching on the command line instead would
 /// have quietly stopped finding profile-launched runs.
-fn classify_proc(name: &str, cmd: &[String]) -> Option<&'static str> {
+/// "evolution" and "scorer" are load-bearing labels other code matches on
+/// (`stop_evolution`'s kill list, `status_evolution`'s counts) — never
+/// rename those two without updating every `r.kind == "..."` site too.
+/// Everything past them is new (Carl, 2026-09-23: "I would like it more
+/// detailed with the current project task running") and purely
+/// informational — nothing else in the launcher matches on these labels,
+/// in particular `stop_evolution` deliberately filters to JUST "evolution"/
+/// "scorer" before killing anything, so adding a label here never widens
+/// what its Stop button reaches.
+///
+/// `/proc/<pid>/comm` (what `sysinfo` reports as `name()`) truncates to 15
+/// bytes, so every nnfractals binary is matched by PREFIX
+/// (`name.starts_with(..)`), not equality — "nnfractals-anim-viewer"
+/// reports as "nnfractals-anim".
+fn classify_proc(name: &str, cmd: &[String]) -> Option<String> {
     if name == "nnfractals" {
-        return Some("evolution");
+        return Some("evolution".to_string());
     }
     if cmd.iter().any(|a| a.contains("aesthetic_scorer.py")) {
-        return Some("scorer");
+        return Some("scorer".to_string());
+    }
+    const FAMILY: &[(&str, &str)] = &[
+        ("nnfractals-anim", "anim-viewer"),
+        ("nnfractals-queu", "queue"),
+        ("nnfractals-view", "viewer"),
+        ("nnfractals-brow", "browser"),
+        ("nnfractals-laun", "launcher"),
+        ("nnfractals-quat", "quat-viewer"),
+        ("nnfractals-reel", "reels"),
+    ];
+    for (prefix, label) in FAMILY {
+        if name.starts_with(prefix) {
+            return Some(label.to_string());
+        }
+    }
+    if name == "explorer" {
+        // The first non-flag argument is the subcommand — e.g.
+        // "quat-render-timeline", "quat-dag-evolve", "queue-run" — far
+        // more useful than a bare "explorer" when several are running at
+        // once for different reasons.
+        let sub = cmd.iter().skip(1).find(|a| !a.starts_with('-'));
+        return Some(match sub {
+            Some(s) => format!("explorer:{s}"),
+            None => "explorer".to_string(),
+        });
+    }
+    // Scoped to OUR renders specifically (this exact arg shape is what
+    // `encode_rgb_frames` always builds), not every ffmpeg process on the
+    // machine — an unrelated personal transcode shouldn't show up here,
+    // and must never be a candidate for anything that kills what's listed.
+    if name == "ffmpeg" && cmd.iter().any(|a| a == "rawvideo") {
+        return Some("ffmpeg".to_string());
     }
     None
 }
@@ -405,6 +489,8 @@ const PREFS_FILE: &str = "launcher_prefs.toml";
 struct LauncherPrefs {
     #[serde(default = "default_dedup_threshold")]
     dedup_threshold: f32,
+    #[serde(default)]
+    quat_evo: QuatEvoPrefs,
 }
 
 fn default_dedup_threshold() -> f32 {
@@ -413,7 +499,99 @@ fn default_dedup_threshold() -> f32 {
 
 impl Default for LauncherPrefs {
     fn default() -> Self {
-        Self { dedup_threshold: default_dedup_threshold() }
+        Self { dedup_threshold: default_dedup_threshold(), quat_evo: QuatEvoPrefs::default() }
+    }
+}
+
+/// Which of `quat-dag-evolve`'s three mutually-exclusive selection
+/// strategies to run — mirrors the CLI's own `--predator-prey`/`--map-elites`
+/// flags (neither = the plain elitist blend), kept as one enum here so the
+/// GUI can never construct the invalid "both" combination the CLI itself
+/// rejects with a panic (`explorer.rs`'s `quat-dag-evolve` arg parsing).
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Default)]
+enum QuatEvoMode {
+    #[default]
+    Blend,
+    PredatorPrey,
+    MapElites,
+}
+
+/// Carl, 2026-09-24: "I want to be able to run quat fractal evolution
+/// throught gui" — every knob `explorer quat-dag-evolve` accepts on the
+/// command line, so a launcher-started run is never a reduced subset of
+/// what the CLI can do. Persisted across restarts (`LauncherPrefs`) like
+/// `dedup_threshold` already is, so Carl's tuned population/generations
+/// settings survive a launcher restart instead of resetting to the CLI's
+/// own defaults every time.
+#[derive(Serialize, Deserialize, Clone)]
+struct QuatEvoPrefs {
+    pool_dir: String,
+    out_dir: String,
+    population: usize,
+    generations: usize,
+    survivors: usize,
+    probe_size: u32,
+    seed: u64,
+    gpu: bool,
+    mode: QuatEvoMode,
+    stagnation_gens: usize,
+    /// Empty = the default geometric+taste blend (or, under `--map-elites`,
+    /// the built-in taste sidecar) — see `quat-dag-evolve`'s own
+    /// `--fitness-metric` doc comment for the override syntax.
+    fitness_metric: String,
+    /// Only meaningful outside `MapElites` mode — that code path doesn't
+    /// take a `--pref-model` argument at all (it reads `taste_model_quat.json`
+    /// via its own hot-reloading taste sidecar instead, a DIFFERENT trained
+    /// model from this one).
+    pref_model: String,
+    crossover_subtree: bool,
+    /// Carl, 2026-09-27: "give the possibility to start a new directory
+    /// automatically when a stagnation event occur. I want to generate
+    /// without ending." When on, `Start` launches a supervisor
+    /// (`start_quat_evolve_forever`) instead of a single process: each
+    /// child run gets `--generations 0` (unbounded — see
+    /// `explorer.rs`'s `generations_label` doc comment) and its own
+    /// `<out_dir>_gen<N>` directory; the supervisor tails that run's
+    /// `evolve_stats.jsonl` for a `"stagnation_event":true` line, kills it,
+    /// and starts the next one — forever, until Stop is clicked.
+    #[serde(default)]
+    generate_forever: bool,
+}
+
+impl Default for QuatEvoPrefs {
+    fn default() -> Self {
+        Self {
+            pool_dir: "fractals_dag".into(),
+            out_dir: "fractals_dag_quat".into(),
+            population: 120,
+            generations: 25,
+            survivors: 15,
+            probe_size: 128,
+            seed: 1,
+            gpu: false,
+            // Carl, 2026-09-27: "the latest fractals generation I tried are
+            // bad. When we did different tests with the taste model,
+            // results were much better." Root-caused, not guessed: `Blend`
+            // mode scores on `pref_model_quat.json` (`quat_pref::QuatPrefModel`,
+            // the OLD 30-metric linear model — last trained Sep 17, since
+            // abandoned) via `--pref-model`; `MapElites` mode scores on
+            // `taste_model_quat.json` (the SigLIP model, actively retrained
+            // as recently as Sep 25) by default, with no stale dependency.
+            // The project's own completed plan (`project-taste-driven-quat-ga`
+            // memory) explicitly measured SigLIP beating the old linear
+            // model on held-out accuracy (89.4% vs 84.0%) and adopted it —
+            // `Blend` was never supposed to still be the default anywhere.
+            mode: QuatEvoMode::MapElites,
+            // 40, not the CLI's own bare default of 25 — matches the actual
+            // stagnation-gens value used across the six `..._taste_me`..`_me6`
+            // populations that memory documents as Carl's established good
+            // practice, not a number invented for this default.
+            stagnation_gens: 40,
+            fitness_metric: String::new(),
+            pref_model: "pref_model_quat.json".into(),
+            crossover_subtree: false,
+            generate_forever: false,
+        }
     }
 }
 
@@ -456,6 +634,16 @@ struct App {
     /// trained on this machine.
     quat_taste_stats: Option<QuatTasteStats>,
 
+    // ── Quaternion evolution (`explorer quat-dag-evolve`) ──────────────────
+    quat_evo: QuatEvoPrefs,
+    /// Last few lines of `quat_evolve.log`, refreshed alongside `refresh_procs`
+    /// — a lightweight progress readout without teaching the Rust binary the
+    /// python jobs' structured `JobMsg` progress protocol.
+    quat_evo_log_tail: String,
+    /// `Some` while a "generate forever" supervisor is active — see
+    /// `QuatForeverHandle`'s own doc comment.
+    quat_forever: Option<QuatForeverHandle>,
+
     // Dedup preview/run controls.
     dedup_folder: String,
     dedup_threshold: f32,
@@ -484,6 +672,97 @@ struct App {
     fp_delete_confirm: bool,
 }
 
+/// Builds the full `explorer quat-dag-evolve` argument list from a config
+/// snapshot, with `out_dir`/`seed`/`generations` given explicitly rather
+/// than read off `e` directly — `start_quat_evolve_forever`'s supervisor
+/// thread needs a FRESH `out_dir`/`seed` per rotation and always forces
+/// `generations` to 0 (unbounded — see `explorer.rs`'s `generations_label`
+/// doc comment), while `start_quat_evolve`'s single-run path just passes
+/// `e`'s own fields straight through. One function either way, so the two
+/// paths can never quietly drift apart on which flags they pass.
+fn build_quat_evolve_args(e: &QuatEvoPrefs, out_dir: &str, seed: u64, generations: usize) -> Vec<String> {
+    let mut args: Vec<String> = vec![
+        "quat-dag-evolve".into(),
+        "--pool-dir".into(), e.pool_dir.clone(),
+        "--out-dir".into(), out_dir.to_string(),
+        "--population".into(), e.population.to_string(),
+        "--generations".into(), generations.to_string(),
+        "--survivors".into(), e.survivors.to_string(),
+        "--probe-size".into(), e.probe_size.to_string(),
+        "--seed".into(), seed.to_string(),
+        "--stagnation-gens".into(), e.stagnation_gens.to_string(),
+    ];
+    if e.gpu {
+        args.push("--gpu".into());
+    }
+    if e.crossover_subtree {
+        args.push("--crossover-mode".into());
+        args.push("subtree".into());
+    }
+    match e.mode {
+        QuatEvoMode::Blend => {}
+        QuatEvoMode::PredatorPrey => args.push("--predator-prey".into()),
+        QuatEvoMode::MapElites => args.push("--map-elites".into()),
+    }
+    if !e.fitness_metric.trim().is_empty() {
+        args.push("--fitness-metric".into());
+        args.push(e.fitness_metric.trim().to_string());
+    }
+    // `cmd_quat_dag_evolve_map_elites` doesn't take a `--pref-model`
+    // argument at all (see `QuatEvoPrefs::pref_model`'s doc comment) —
+    // passing it in MapElites mode would be silently ignored by the CLI,
+    // but omitting it here keeps the actually-launched command line an
+    // honest reflection of what's in effect.
+    if e.mode != QuatEvoMode::MapElites && !e.pref_model.trim().is_empty() {
+        args.push("--pref-model".into());
+        args.push(e.pref_model.clone());
+    }
+    args
+}
+
+/// Appends one `=== <timestamp> launcher: explorer <args> ===` line —
+/// shared by both the single-run and "generate forever" paths so every
+/// launch, in either mode, leaves the same kind of marker in its log.
+fn write_quat_evolve_log_header(open_log: &impl Fn() -> std::io::Result<std::fs::File>, args: &[String]) {
+    use std::io::Write;
+    if let Ok(mut header) = open_log() {
+        let now = Command::new("date").arg("+%F %T").output().ok()
+            .and_then(|o| String::from_utf8(o.stdout).ok())
+            .map(|s| s.trim().to_string())
+            .unwrap_or_default();
+        let _ = writeln!(header, "=== {now} launcher: explorer {} ===", args.join(" "));
+    }
+}
+
+/// Lowest `N` such that `<root>/<base_out_dir>_gen<N>` does not already
+/// exist — so restarting "generate forever" after a launcher restart (or
+/// after Stop/Start again) continues numbering forward instead of
+/// overwriting a previous rotation's directory.
+fn next_forever_index(root: &Path, base_out_dir: &str) -> usize {
+    let prefix = format!("{base_out_dir}_gen");
+    std::fs::read_dir(root)
+        .into_iter()
+        .flatten()
+        .filter_map(|e| e.ok())
+        .filter_map(|e| e.file_name().into_string().ok())
+        .filter_map(|name| name.strip_prefix(&prefix).and_then(|suf| suf.parse::<usize>().ok()))
+        .max()
+        .map(|n| n + 1)
+        .unwrap_or(1)
+}
+
+/// Live handle to a running "generate forever" supervisor
+/// (`App::start_quat_evolve_forever`) — the supervisor itself runs on its
+/// own thread (it blocks between polls), so the only things the GUI thread
+/// touches are these `Arc`s: `stop` to ask it to wind down, `status` for
+/// the one-line readout under the Start/Stop row, `runs_completed` for the
+/// "rotation 4" counter.
+struct QuatForeverHandle {
+    stop: Arc<AtomicBool>,
+    status: Arc<Mutex<String>>,
+    runs_completed: Arc<AtomicUsize>,
+}
+
 impl App {
     fn new() -> Self {
         let root = project_root();
@@ -491,6 +770,7 @@ impl App {
         let prefs = LauncherPrefs::load(&prefs_path);
         let known_folders = discover_pools(&root);
         let quat_taste_stats = QuatTasteStats::load(&root.join("taste_model_quat.json"));
+        let quat_evo = prefs.quat_evo.clone();
         let rescore_folder = known_folders
             .iter()
             .find(|d| d.as_str() == "fractals_1")
@@ -511,6 +791,9 @@ impl App {
             known_folders: known_folders.clone(),
             rescore_folder,
             quat_taste_stats,
+            quat_evo,
+            quat_evo_log_tail: String::new(),
+            quat_forever: None,
             dedup_folder: known_folders
                 .iter()
                 .find(|d| d.as_str() == "fractals_1")
@@ -776,14 +1059,46 @@ impl App {
         );
     }
 
-    /// Scan the process table for evolution (`nnfractals`) + aesthetic scorer
-    /// (`aesthetic_scorer.py`) processes — regardless of who started them — and
-    /// read their CPU/RAM (sysinfo) + VRAM (nvidia-smi).
+    /// Scan the process table for every project task this launcher
+    /// recognizes (`classify_proc`) — regardless of who started it — and
+    /// read its CPU/RAM (sysinfo) + VRAM + GPU compute utilization
+    /// (nvidia-smi).
+    ///
+    /// `refresh_processes`'s own default `ProcessRefreshKind` (memory/cpu/
+    /// disk/exe) never includes the command line — confirmed live via a
+    /// debug trace: `classify_proc` was receiving `cmd=[]` for every
+    /// process, always, no matter what it actually ran with. That silently
+    /// broke BOTH the pre-existing scorer detection
+    /// (`cmd.iter().any(|a| a.contains("aesthetic_scorer.py"))` can never
+    /// match an empty slice) and the explorer subcommand label this session
+    /// added ("explorer:quat-dag-evolve" vs. a bare, useless "explorer") —
+    /// found while verifying the new Quaternion Evolution section's
+    /// Processes-list integration. `refresh_processes_specifics` with the
+    /// same defaults plus `.with_cmd(UpdateKind::Always)` fixes both at once.
     fn refresh_procs(&mut self) {
-        self.sys.refresh_processes(ProcessesToUpdate::All, true);
+        self.sys.refresh_processes_specifics(
+            ProcessesToUpdate::All,
+            true,
+            ProcessRefreshKind::new()
+                .with_memory()
+                .with_cpu()
+                .with_disk_usage()
+                .with_exe(UpdateKind::OnlyIfNotSet)
+                .with_cmd(UpdateKind::Always),
+        );
         let vram = gpu_mem_by_pid();
+        let gpu_pct = gpu_util_by_pid();
         let mut rows: Vec<ProcRow> = Vec::new();
         for (pid, p) in self.sys.processes() {
+            // `sysinfo` (this version, on Linux) enumerates every OS THREAD
+            // as its own entry in `processes()`, not just top-level
+            // processes — confirmed live: a single multi-threaded
+            // `nnfractals-launcher` produced ~25 near-identical rows here,
+            // one per worker thread, before this filter existed.
+            // `thread_kind()` is `None` only for the real process itself.
+            if p.thread_kind().is_some() {
+                continue;
+            }
             let name = p.name().to_string_lossy();
             let cmd: Vec<String> = p.cmd().iter().map(|a| a.to_string_lossy().into_owned()).collect();
             let Some(kind) = classify_proc(&name, &cmd) else { continue };
@@ -795,13 +1110,15 @@ impl App {
                 cpu: p.cpu_usage(),
                 ram_mb: p.memory() / 1024 / 1024,
                 vram_mb: vram.get(&id).copied().unwrap_or(0),
+                gpu_pct: gpu_pct.get(&id).copied(),
             });
         }
-        rows.sort_by(|a, b| (a.kind, a.pid).cmp(&(b.kind, b.pid)));
+        rows.sort_by(|a, b| (&a.kind, a.pid).cmp(&(&b.kind, b.pid)));
         self.procs = rows;
         self.gpu_line = gpu_overall().unwrap_or_else(|| "GPU: nvidia-smi unavailable".into());
         self.known_folders = discover_pools(&self.root);
         self.last_refresh = Some(Instant::now());
+        self.tail_quat_evolve_log();
     }
 
     /// Report how many evolution/scorer processes are running (works even for
@@ -820,9 +1137,15 @@ impl App {
     /// Stop ALL evolution + scorer processes by PID (SIGTERM, then SIGKILL any
     /// stragglers), independent of run.sh's .run_pids. Also runs `run.sh stop`
     /// for its bookkeeping.
+    ///
+    /// Explicitly scoped to `kind == "evolution" | "scorer"` — `self.procs`
+    /// now also lists the viewer/queue/render family (see `classify_proc`),
+    /// and this button must never reach for those (it would kill Carl's
+    /// active viewer window or an in-flight render out from under him).
     fn stop_evolution(&mut self) {
         self.refresh_procs();
-        let pids: Vec<u32> = self.procs.iter().map(|r| r.pid).collect();
+        let in_scope = |r: &&ProcRow| r.kind == "evolution" || r.kind == "scorer";
+        let pids: Vec<u32> = self.procs.iter().filter(in_scope).map(|r| r.pid).collect();
         if pids.is_empty() {
             self.status = "no evolution / scorer processes to stop".into();
             return;
@@ -832,7 +1155,7 @@ impl App {
         }
         std::thread::sleep(Duration::from_millis(1200));
         self.refresh_procs();
-        for r in &self.procs {
+        for r in self.procs.iter().filter(in_scope) {
             let _ = Command::new("kill").arg("-9").arg(r.pid.to_string()).status();
         }
         // Best-effort run.sh cleanup (clears .run_pids, pkills scorer stragglers).
@@ -842,6 +1165,219 @@ impl App {
         }
         self.refresh_procs();
         self.status = format!("stopped {} process(es)", pids.len());
+    }
+
+    /// Number of currently-running `explorer quat-dag-evolve` processes —
+    /// same shape as `status_evolution`'s `evo`/`sc` counts, filtered to the
+    /// specific label `classify_proc` gives this subcommand.
+    fn quat_evolve_running_count(&self) -> usize {
+        self.procs.iter().filter(|r| r.kind == "explorer:quat-dag-evolve").count()
+    }
+
+    /// Launches `explorer quat-dag-evolve` with every knob in `self.quat_evo`,
+    /// logging to `quat_evolve.log` (appended, with a launch-time header line,
+    /// matching `run.sh`'s own `evolution.log` convention) — Carl, 2026-09-24:
+    /// "I want to be able to run quat fractal evolution throught gui". Fire-
+    /// and-forget like `spawn()` (this can run for hours; there's no reason
+    /// the launcher should block or need to stay in the foreground) — live
+    /// status comes from the existing Processes section, which already
+    /// recognizes "explorer:quat-dag-evolve" (`classify_proc`), plus a tail
+    /// of the log file this function starts writing.
+    fn start_quat_evolve(&mut self) {
+        if self.quat_evolve_running_count() > 0 || self.quat_forever.is_some() {
+            self.status = "quat evolution is already running".into();
+            return;
+        }
+        self.save_quat_evo_prefs();
+        let args = build_quat_evolve_args(&self.quat_evo, &self.quat_evo.out_dir, self.quat_evo.seed, self.quat_evo.generations);
+        let bin = sibling("explorer");
+        let log_path = self.root.join("quat_evolve.log");
+        let open_log = || {
+            std::fs::OpenOptions::new().create(true).append(true).open(&log_path)
+        };
+        let (out_file, err_file) = match (open_log(), open_log()) {
+            (Ok(o), Ok(e)) => (o, e),
+            (Err(e), _) | (_, Err(e)) => {
+                self.status = format!("could not open {}: {e}", log_path.display());
+                return;
+            }
+        };
+        write_quat_evolve_log_header(&open_log, &args);
+        match Command::new(&bin).args(&args).current_dir(&self.root).stdout(out_file).stderr(err_file).spawn() {
+            Ok(child) => {
+                std::thread::spawn(move || {
+                    let mut child = child;
+                    let _ = child.wait();
+                });
+                self.status = "quat evolution started — logging to quat_evolve.log".into();
+                std::thread::sleep(Duration::from_millis(400));
+                self.refresh_procs();
+            }
+            Err(e) => self.status = format!("could not start quat evolution: {e}"),
+        }
+    }
+
+    fn save_quat_evo_prefs(&self) {
+        LauncherPrefs { dedup_threshold: self.dedup_threshold, quat_evo: self.quat_evo.clone() }
+            .save(&self.prefs_path);
+    }
+
+    /// Launches the "generate forever" supervisor (checkbox next to Start):
+    /// runs `explorer quat-dag-evolve` (unbounded, `--generations 0`) in
+    /// `<out_dir>_gen<N>`, tails that run's `evolve_stats.jsonl` for a
+    /// `"stagnation_event":true` line, kills it and moves on to
+    /// `<out_dir>_gen<N+1>` (fresh seed) when it sees one — forever, until
+    /// `stop_quat_evolve` sets `stop`. Carl, 2026-09-27: "give the
+    /// possibility to start a new directory automatically when a
+    /// stagnation event occur. I want to generate without ending."
+    ///
+    /// Runs on its own thread rather than reusing `start_quat_evolve`'s
+    /// fire-and-forget `Command::spawn` + reap pattern, because this needs
+    /// to actively WATCH each child (poll its log for the stagnation
+    /// marker) and decide to relaunch — not just start it once.
+    fn start_quat_evolve_forever(&mut self) {
+        if self.quat_evolve_running_count() > 0 || self.quat_forever.is_some() {
+            self.status = "quat evolution is already running".into();
+            return;
+        }
+        self.save_quat_evo_prefs();
+        let root = self.root.clone();
+        let base_out_dir = self.quat_evo.out_dir.clone();
+        let mut seed = self.quat_evo.seed;
+        let e = self.quat_evo.clone();
+        let bin = sibling("explorer");
+        let log_path = root.join("quat_evolve_forever.log");
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let status = Arc::new(Mutex::new(String::new()));
+        let runs_completed = Arc::new(AtomicUsize::new(0));
+        let (stop2, status2, runs2) = (stop.clone(), status.clone(), runs_completed.clone());
+
+        std::thread::spawn(move || {
+            let open_log = || std::fs::OpenOptions::new().create(true).append(true).open(&log_path);
+            let mut idx = next_forever_index(&root, &base_out_dir);
+            loop {
+                if stop2.load(Ordering::Relaxed) { break; }
+                let out_dir = format!("{base_out_dir}_gen{idx}");
+                let args = build_quat_evolve_args(&e, &out_dir, seed, 0);
+                write_quat_evolve_log_header(&open_log, &args);
+                let (out_file, err_file) = match (open_log(), open_log()) {
+                    (Ok(o), Ok(er)) => (o, er),
+                    _ => {
+                        *status2.lock().unwrap() = format!("could not open {}", log_path.display());
+                        break;
+                    }
+                };
+                let mut child = match Command::new(&bin).args(&args).current_dir(&root).stdout(out_file).stderr(err_file).spawn() {
+                    Ok(c) => c,
+                    Err(err) => {
+                        *status2.lock().unwrap() = format!("run {idx} ({out_dir}) failed to start: {err}");
+                        break;
+                    }
+                };
+                *status2.lock().unwrap() = format!("run {idx} ({out_dir}) — seeding");
+                let stats_path = root.join(&out_dir).join("evolve_stats.jsonl");
+                let mut read_len: u64 = 0;
+                loop {
+                    if stop2.load(Ordering::Relaxed) {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        *status2.lock().unwrap() = "stopped".into();
+                        return;
+                    }
+                    match child.try_wait() {
+                        Ok(Some(_)) => break, // child exited on its own — start the next one
+                        Ok(None) => {}
+                        Err(_) => break,
+                    }
+                    if let Ok(content) = std::fs::read_to_string(&stats_path) {
+                        if content.len() as u64 > read_len {
+                            let new_part = content.get(read_len as usize..).unwrap_or("");
+                            let mut last_gen = None;
+                            for line in new_part.lines() {
+                                if let Some(g) = line.split("\"gen\":").nth(1).and_then(|s| s.split(',').next()) {
+                                    last_gen = Some(g.to_string());
+                                }
+                            }
+                            read_len = content.len() as u64;
+                            if let Some(g) = last_gen {
+                                *status2.lock().unwrap() = format!("run {idx} ({out_dir}) — gen {g}");
+                            }
+                            if new_part.lines().any(|l| l.contains("\"stagnation_event\":true")) {
+                                *status2.lock().unwrap() = format!("run {idx} ({out_dir}) stagnated — starting a fresh directory");
+                                let _ = child.kill();
+                                let _ = child.wait();
+                                break;
+                            }
+                        }
+                    }
+                    std::thread::sleep(Duration::from_secs(2));
+                }
+                idx += 1;
+                seed = seed.wrapping_add(1);
+                runs2.fetch_add(1, Ordering::Relaxed);
+            }
+            *status2.lock().unwrap() = "stopped".into();
+        });
+
+        self.quat_forever = Some(QuatForeverHandle { stop, status, runs_completed });
+        self.status = "quat evolution (generate forever) started — logging to quat_evolve_forever.log".into();
+        std::thread::sleep(Duration::from_millis(400));
+        self.refresh_procs();
+    }
+
+    /// Stop every running `explorer quat-dag-evolve` process (SIGTERM, then
+    /// SIGKILL any stragglers) — deliberately its own function rather than
+    /// widening `stop_evolution`'s scope, for the exact reason that
+    /// function's own doc comment gives: it must never reach for anything
+    /// outside the 2D `evolution`/`scorer` pair. Also winds down a
+    /// "generate forever" supervisor if one is running: setting `stop`
+    /// alone isn't enough on its own (the supervisor only checks it between
+    /// polls, up to ~2s away), so the current child is killed here too,
+    /// same as the plain-run path.
+    fn stop_quat_evolve(&mut self) {
+        let forever = self.quat_forever.take();
+        if let Some(h) = &forever {
+            h.stop.store(true, Ordering::Relaxed);
+        }
+        self.refresh_procs();
+        let in_scope = |r: &&ProcRow| r.kind == "explorer:quat-dag-evolve";
+        let pids: Vec<u32> = self.procs.iter().filter(in_scope).map(|r| r.pid).collect();
+        if pids.is_empty() && forever.is_none() {
+            self.status = "no quat evolution process running".into();
+            return;
+        }
+        for pid in &pids {
+            let _ = Command::new("kill").arg(pid.to_string()).status();
+        }
+        std::thread::sleep(Duration::from_millis(1200));
+        self.refresh_procs();
+        for r in self.procs.iter().filter(in_scope) {
+            let _ = Command::new("kill").arg("-9").arg(r.pid.to_string()).status();
+        }
+        self.refresh_procs();
+        if forever.is_some() {
+            self.status = "stopped quat evolution (generate forever)".into();
+        } else {
+            self.status = format!("stopped {} quat evolution process(es)", pids.len());
+        }
+    }
+
+    /// Last 6 lines of `quat_evolve.log` (or `quat_evolve_forever.log` while
+    /// "generate forever" is active), if any — called alongside
+    /// `refresh_procs` so the readout ages the same ~60s as everything else
+    /// in the Processes section.
+    fn tail_quat_evolve_log(&mut self) {
+        let log_name = if self.quat_forever.is_some() { "quat_evolve_forever.log" } else { "quat_evolve.log" };
+        let path = self.root.join(log_name);
+        self.quat_evo_log_tail = match std::fs::read_to_string(&path) {
+            Ok(s) => {
+                let lines: Vec<&str> = s.lines().collect();
+                let start = lines.len().saturating_sub(6);
+                lines[start..].join("\n")
+            }
+            Err(_) => String::new(),
+        };
     }
 
     /// Spawn a sibling binary with the project root as cwd.
@@ -990,7 +1526,8 @@ impl App {
             args.push(binary.to_string_lossy().into_owned());
             // Confirmed deletions are a deliberate choice of threshold —
             // remember it as the default for next time.
-            LauncherPrefs { dedup_threshold: self.dedup_threshold }.save(&self.prefs_path);
+            LauncherPrefs { dedup_threshold: self.dedup_threshold, quat_evo: self.quat_evo.clone() }
+                .save(&self.prefs_path);
         }
         let name = if dry_run {
             format!("Preview dedup {folder}")
@@ -1311,9 +1848,10 @@ impl eframe::App for App {
         let ctx = ui.ctx().clone();
         self.show_fitness_window(&ctx, avail_h);
 
-        // While a job runs, repaint frequently for smooth progress; otherwise
-        // just keep the resource monitor ticking.
-        if self.job.running {
+        // While a job OR a "generate forever" supervisor runs, repaint
+        // frequently for smooth progress; otherwise just keep the resource
+        // monitor ticking.
+        if self.job.running || self.quat_forever.is_some() {
             ui.ctx().request_repaint_after(Duration::from_millis(250));
         } else {
             ui.ctx().request_repaint_after(Duration::from_secs(60));
@@ -1383,7 +1921,7 @@ impl eframe::App for App {
                     // so typing/pasting a quat genome's path here always
                     // opened it in the 2D viewer instead.
                     let bin_name = if nnfractals::is_quat_genome_path(std::path::Path::new(&p)) {
-                        "nnfractals-quat-viewer"
+                        "nnfractals-anim-viewer"
                     } else {
                         "nnfractals-viewer"
                     };
@@ -1443,6 +1981,138 @@ impl eframe::App for App {
                 egui::RichText::new("Instances share one gallery and log to evolution.log.")
                     .weak(),
             );
+
+            ui.add_space(8.0);
+            ui.separator();
+
+            // ── Quaternion Evolution (`explorer quat-dag-evolve`) — Carl,
+            // 2026-09-24: "I want to be able to run quat fractal evolution
+            // throught gui" ──
+            ui.label(egui::RichText::new("Quaternion Evolution").strong());
+            ui.horizontal(|ui| {
+                ui.label("Population:");
+                ui.add(egui::DragValue::new(&mut self.quat_evo.population).range(4..=2000));
+                ui.label("Generations:");
+                ui.add(egui::DragValue::new(&mut self.quat_evo.generations).range(1..=2000));
+                ui.label("Survivors:");
+                let max_survivors = self.quat_evo.population.max(1);
+                ui.add(egui::DragValue::new(&mut self.quat_evo.survivors).range(1..=max_survivors));
+            });
+            ui.horizontal(|ui| {
+                ui.label("Mode:");
+                ui.selectable_value(&mut self.quat_evo.mode, QuatEvoMode::MapElites, "MAP-Elites")
+                    .on_hover_text("The default: maintains one elite per structural niche instead of \
+                                     a single ranked population, scored by your actively-retrained \
+                                     SigLIP taste model (taste_model_quat.json) — no stale dependency. \
+                                     \"Retrain quat taste\" below hot-reloads straight into a running \
+                                     search, no restart needed.");
+                ui.selectable_value(&mut self.quat_evo.mode, QuatEvoMode::PredatorPrey, "predator-prey")
+                    .on_hover_text("Adds a second, adversarial population to break long \
+                                     stagnation plateaus.");
+                ui.selectable_value(&mut self.quat_evo.mode, QuatEvoMode::Blend, "blend")
+                    .on_hover_text("Selects on a 50/50 blend of the geometric pre-filter and \
+                                     pref_model_quat.json (quat_pref::QuatPrefModel) — an older, linear \
+                                     model that lost to the SigLIP taste model on held-out accuracy and \
+                                     has since gone stale. Kept for the --fitness-metric override use \
+                                     case; MAP-Elites is the recommended default.");
+            });
+            ui.horizontal(|ui| {
+                ui.label("Out dir:");
+                ui.add(egui::TextEdit::singleline(&mut self.quat_evo.out_dir).desired_width(160.0));
+                ui.checkbox(&mut self.quat_evo.gpu, "GPU");
+                ui.label("Seed:");
+                ui.add(egui::DragValue::new(&mut self.quat_evo.seed));
+            });
+            ui.horizontal(|ui| {
+                ui.checkbox(&mut self.quat_evo.generate_forever, "generate forever")
+                    .on_hover_text("Carl, 2026-09-27: \"give the possibility to start a new directory \
+                                     automatically when a stagnation event occur. I want to generate \
+                                     without ending.\" Each run gets its own \"<out dir>_gen<N>\" \
+                                     directory and runs unbounded; the moment it stagnates \
+                                     (evolve_stats.jsonl's stagnation_event), it's stopped and the \
+                                     next one starts fresh, forever — until you click Stop.");
+                if self.quat_evo.generate_forever {
+                    ui.label(egui::RichText::new(format!("→ {}_gen1, _gen2, …", self.quat_evo.out_dir)).weak());
+                }
+            });
+            egui::CollapsingHeader::new("Advanced")
+                .id_salt("quat_evo_advanced")
+                .default_open(false)
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label("Pool dir:");
+                        ui.add(egui::TextEdit::singleline(&mut self.quat_evo.pool_dir).desired_width(160.0))
+                            .on_hover_text("Seeds the initial population from this folder's existing genomes.");
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("Stagnation gens:");
+                        ui.add(egui::DragValue::new(&mut self.quat_evo.stagnation_gens).range(1..=2000));
+                        ui.label("Probe size:");
+                        ui.add(egui::DragValue::new(&mut self.quat_evo.probe_size).range(16..=1024));
+                    });
+                    ui.checkbox(&mut self.quat_evo.crossover_subtree, "subtree crossover (default: legacy)");
+                    ui.horizontal(|ui| {
+                        ui.label("Fitness metric override:");
+                        ui.add(egui::TextEdit::singleline(&mut self.quat_evo.fitness_metric).desired_width(260.0))
+                    })
+                    .inner
+                    .on_hover_text("Empty = the default geometric+taste blend. A bare metric name \
+                                     (e.g. convexity, box_dim) or a weighted combo \
+                                     (\"silhouette_irregularity:1.0,shading_gradient:0.7\") selects \
+                                     purely on that instead.");
+                    if self.quat_evo.mode != QuatEvoMode::MapElites {
+                        ui.horizontal(|ui| {
+                            ui.label("Pref model:");
+                            ui.add(egui::TextEdit::singleline(&mut self.quat_evo.pref_model).desired_width(200.0))
+                        })
+                        .inner
+                        .on_hover_text("Not used under MAP-Elites, which reads taste_model_quat.json \
+                                         via its own hot-reloading sidecar instead.");
+                    }
+                });
+            ui.horizontal(|ui| {
+                let running = self.quat_evolve_running_count();
+                let forever_active = self.quat_forever.is_some();
+                if ui
+                    .add_enabled(running == 0 && !forever_active, egui::Button::new("▶  Start"))
+                    .on_hover_text(if self.quat_evo.generate_forever {
+                        "Launch the \"generate forever\" supervisor — logs to quat_evolve_forever.log."
+                    } else {
+                        "Launch `explorer quat-dag-evolve` in the background, logging to quat_evolve.log."
+                    })
+                    .clicked()
+                {
+                    if self.quat_evo.generate_forever {
+                        self.start_quat_evolve_forever();
+                    } else {
+                        self.start_quat_evolve();
+                    }
+                }
+                if ui
+                    .add_enabled(running > 0 || forever_active, egui::Button::new("■  Stop"))
+                    .on_hover_text("Stop the running quat-dag-evolve process (and, in \"generate \
+                                     forever\" mode, the supervisor itself — it won't start another).")
+                    .clicked()
+                {
+                    self.stop_quat_evolve();
+                }
+                if let Some(h) = &self.quat_forever {
+                    let runs = h.runs_completed.load(Ordering::Relaxed);
+                    let status = h.status.lock().map(|s| s.clone()).unwrap_or_default();
+                    ui.label(egui::RichText::new(format!("{status} · {runs} rotation(s) so far")).color(Color32::LIGHT_GREEN));
+                } else if running > 0 {
+                    ui.label(egui::RichText::new(format!("running ({running})")).color(Color32::LIGHT_GREEN));
+                }
+            });
+            if !self.quat_evo_log_tail.is_empty() {
+                egui::Frame::group(ui.style()).show(ui, |ui| {
+                    ui.set_width(ui.available_width().min(640.0));
+                    ui.label(egui::RichText::new(&self.quat_evo_log_tail).monospace().small());
+                });
+            }
+
+            ui.add_space(8.0);
+            ui.separator();
 
             ui.horizontal(|ui| {
                 if ui
@@ -1655,27 +2325,37 @@ impl eframe::App for App {
             });
             ui.label(egui::RichText::new(&self.gpu_line).monospace());
             if self.procs.is_empty() {
-                ui.label(egui::RichText::new("no evolution / scorer processes running").weak());
+                ui.label(egui::RichText::new("no project processes running").weak());
             } else {
                 egui::Grid::new("proc_grid")
                     .striped(true)
-                    .num_columns(5)
+                    .num_columns(6)
                     .show(ui, |ui| {
                         ui.strong("pid");
-                        ui.strong("kind");
+                        ui.strong("task");
                         ui.strong("cpu%");
                         ui.strong("ram");
                         ui.strong("vram");
+                        ui.strong("gpu%");
                         ui.end_row();
                         for r in &self.procs {
                             ui.monospace(r.pid.to_string());
-                            ui.label(r.kind);
+                            ui.label(&r.kind);
                             ui.monospace(format!("{:.0}", r.cpu));
                             ui.monospace(format!("{} MB", r.ram_mb));
                             ui.monospace(if r.vram_mb > 0 {
                                 format!("{} MiB", r.vram_mb)
                             } else {
                                 "—".into()
+                            });
+                            // Distinct from vram: this is COMPUTE load
+                            // (nvidia-smi pmon's "sm%"), not memory — the
+                            // number that actually shows whether a
+                            // process is the one saturating the GPU right
+                            // now, per Carl's 2026-09-23 ask.
+                            ui.monospace(match r.gpu_pct {
+                                Some(p) => format!("{p}%"),
+                                None => "—".into(),
                             });
                             ui.end_row();
                         }

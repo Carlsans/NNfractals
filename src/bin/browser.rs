@@ -399,8 +399,8 @@ fn viewer_path() -> PathBuf {
     locate_bin("nnfractals-viewer")
 }
 
-fn quat_viewer_path() -> PathBuf {
-    locate_bin("nnfractals-quat-viewer")
+fn quat_anim_viewer_path() -> PathBuf {
+    locate_bin("nnfractals-anim-viewer")
 }
 
 /// Quaternion genomes (`fractals_dag_quat/`) are saved through the same
@@ -520,11 +520,31 @@ struct App {
     pair: Option<(usize, usize)>,
     rating_cache: HashMap<PathBuf, Option<TextureHandle>>,
     ratings_logged: usize,
+    /// Live rotating 3D views for the current pair (quat genomes only), one
+    /// per side. Rebuilt lazily whenever the pair changes. Both sides share
+    /// `live_clock`, so they always show the same orbit angle and C phase.
+    live: [Option<LiveSide>; 2],
+    live_paused: bool,
+    live_clock: f64,
+    live_last: Option<std::time::Instant>,
+    /// Manual orbit offset (turns) added by dragging either image.
+    live_turn_offset: f64,
 
     // Autoreload: periodically pick up newly-saved fractals without a full reload.
     autoreload: bool,
     last_refresh: std::time::Instant,
 }
+
+/// One side of the rating pair rendered as a live rotating raymarch.
+struct LiveSide {
+    nn: PathBuf,
+    view: Option<nnfractals::quat_live_view::LiveQuatView>,
+    tex: Option<TextureHandle>,
+}
+
+const LIVE_ROTATE_SECS: f64 = 10.0; // one full orbit
+const LIVE_C_SWEEP_SECS: f64 = 12.0; // one full C oscillation
+const LIVE_SIZE: u32 = 320;
 
 impl App {
     fn new(prefs: BrowserPrefs, prefs_path: PathBuf, folder: PathBuf) -> Self {
@@ -556,6 +576,11 @@ impl App {
             pair: None,
             rating_cache: HashMap::new(),
             ratings_logged: 0,
+            live: [None, None],
+            live_paused: false,
+            live_clock: 0.0,
+            live_last: None,
+            live_turn_offset: 0.0,
             autoreload: prefs_autoreload,
             last_refresh: std::time::Instant::now(),
         }
@@ -666,7 +691,7 @@ impl App {
     }
 
     fn open_path(&mut self, path: &Path) {
-        let bin = if is_quat_genome_path(path) { quat_viewer_path() } else { viewer_path() };
+        let bin = if is_quat_genome_path(path) { quat_anim_viewer_path() } else { viewer_path() };
         match std::process::Command::new(bin).arg(path).spawn() {
             Ok(child) => {
                 // Reap it. The viewer is single-instance: when one is already
@@ -1011,6 +1036,14 @@ impl App {
             b = r.random_range(0..self.rows.len());
         }
         self.pair = Some((a, b));
+        self.live = [None, None];
+        self.live_clock = 0.0;
+        self.live_turn_offset = 0.0;
+    }
+
+    /// Both sides of the current pair are being shown as live 3D views.
+    fn pair_is_live(&self) -> bool {
+        self.live.iter().all(|l| l.as_ref().map_or(false, |l| l.view.is_some()))
     }
 
     /// Copy a fractal's .nn + .png into `train_corpus/` (same hash-name; skip if
@@ -1026,6 +1059,16 @@ impl App {
         let dst_png = dst_nn.with_extension("png");
         if src_png.exists() && !dst_png.exists() {
             let _ = std::fs::copy(&src_png, &dst_png);
+        }
+        // The angle × C view set the grid-pooled taste model embeds.
+        if let (Some(dir), Some(stem)) = (src_nn.parent(), src_nn.file_stem().and_then(|s| s.to_str())) {
+            for i in 0..(nnfractals::quat_live_view::VIEW_ANGLES * nnfractals::quat_live_view::VIEW_C_VALUES) {
+                let name = format!("{stem}_view_{i:02}.png");
+                let (src, dst) = (dir.join(&name), corpus.join(&name));
+                if src.exists() && !dst.exists() {
+                    let _ = std::fs::copy(&src, &dst);
+                }
+            }
         }
         dst_nn.to_string_lossy().into_owned()
     }
@@ -1049,7 +1092,10 @@ impl App {
         let _ = std::fs::create_dir_all(&corpus);
         let wp = self.persist_to_corpus(&wsrc, &corpus);
         let lp = self.persist_to_corpus(&lsrc, &corpus);
-        let line = format!("{{\"winner\": {:?}, \"loser\": {:?}}}\n", wp, lp);
+        // "view":"rot3d" marks ratings judged from the live rotating view
+        // (the trainer weights those higher than the older still-based ones).
+        let view_tag = if self.pair_is_live() { ", \"view\": \"rot3d\"" } else { "" };
+        let line = format!("{{\"winner\": {:?}, \"loser\": {:?}{}}}\n", wp, lp, view_tag);
         let path = corpus.join("ratings.jsonl");
         use std::io::Write;
         if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
@@ -1061,8 +1107,48 @@ impl App {
         }
     }
 
-    /// Draw one fractal image as a big clickable button; returns true if picked.
-    fn rating_cell(&mut self, ui: &mut egui::Ui, idx: usize, side: f32) -> bool {
+    /// Draw one fractal as a big clickable view; returns true if picked. Quat
+    /// genomes render as a live rotating raymarch (`slot` = 0/1 = left/right);
+    /// anything else, or a GPU/compile failure, falls back to the static still.
+    fn rating_cell(&mut self, ui: &mut egui::Ui, idx: usize, slot: usize, side: f32) -> bool {
+        let nn = self.rows[idx].nn_path.clone();
+        if is_quat_genome_path(&nn) {
+            let stale = self.live[slot].as_ref().map_or(true, |l| l.nn != nn);
+            if stale {
+                let view = nnfractals::io::load_genome(&nn)
+                    .ok()
+                    .and_then(|g| nnfractals::quat_live_view::LiveQuatView::new(&g));
+                self.live[slot] = Some(LiveSide { nn: nn.clone(), view, tex: None });
+            }
+            let turn = self.live_clock / LIVE_ROTATE_SECS + self.live_turn_offset;
+            let phase = self.live_clock / LIVE_C_SWEEP_SECS * std::f64::consts::TAU;
+            if let Some(ls) = self.live[slot].as_mut() {
+                if let Some(view) = ls.view.as_mut() {
+                    let c = view.c_half() * phase.sin();
+                    let rgb = view.render_rgb(turn, c, LIVE_SIZE);
+                    let img = egui::ColorImage::from_rgb([LIVE_SIZE as usize; 2], &rgb);
+                    match ls.tex.as_mut() {
+                        Some(t) => t.set(img, egui::TextureOptions::LINEAR),
+                        None => ls.tex = Some(ui.ctx().load_texture(format!("live_rate_{slot}"), img, egui::TextureOptions::LINEAR)),
+                    }
+                }
+            }
+            if let Some(t) = self.live[slot].as_ref().and_then(|l| l.tex.as_ref()) {
+                let mut clicked = false;
+                let mut drag_dx = 0.0f32;
+                ui.vertical_centered(|ui| {
+                    let img = egui::Image::new(egui::load::SizedTexture::new(t.id(), egui::vec2(side, side)))
+                        .sense(egui::Sense::click_and_drag());
+                    let resp = ui.add(img);
+                    clicked = resp.clicked();
+                    drag_dx = resp.drag_delta().x;
+                });
+                if drag_dx != 0.0 {
+                    self.live_turn_offset -= drag_dx as f64 / side as f64 * 0.5;
+                }
+                return clicked;
+            }
+        }
         let path = self.rows[idx].png_path.clone();
         let tex = self
             .rating_cache
@@ -1114,18 +1200,38 @@ impl App {
             });
         });
 
+        let now = std::time::Instant::now();
+        if let Some(last) = self.live_last {
+            if !self.live_paused {
+                self.live_clock += (now - last).as_secs_f64().min(0.25);
+            }
+        }
+        self.live_last = Some(now);
+        if self.live.iter().any(|l| l.is_some()) {
+            ui.horizontal(|ui| {
+                ui.checkbox(&mut self.live_paused, "pause rotation");
+                ui.label(egui::RichText::new("live 3D: rotating + C sweep · drag to orbit").weak());
+            });
+        }
+
         let avail = ui.available_size();
         let side = ((avail.x / 2.0) - 24.0).min(avail.y - 12.0).max(64.0);
 
         let mut chosen: Option<bool> = None; // Some(true) = left wins
         ui.columns(2, |cols| {
-            if self.rating_cell(&mut cols[0], li, side) {
+            if self.rating_cell(&mut cols[0], li, 0, side) {
                 chosen = Some(true);
             }
-            if self.rating_cell(&mut cols[1], ri, side) {
+            if self.rating_cell(&mut cols[1], ri, 1, side) {
                 chosen = Some(false);
             }
         });
+        // Keep animating. Checked AFTER the cells are drawn: the live views
+        // are created lazily inside `rating_cell`, so on the first frame they
+        // don't exist yet and an earlier check would never schedule a repaint.
+        if !self.live_paused && self.live.iter().any(|l| l.as_ref().map_or(false, |l| l.view.is_some())) {
+            ui.ctx().request_repaint_after(std::time::Duration::from_millis(50));
+        }
         // Filename under each image — for a single-metric test run this
         // is where the metric name actually lives (--fitness-metric
         // bakes it into the filename, e.g. "convexity_3f8a91b2...") so a

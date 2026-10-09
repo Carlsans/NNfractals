@@ -195,6 +195,7 @@ pub fn recommend_thread_count(min_free_cores: usize, window: std::time::Duration
 
 /// What `process_queue_item` reports as it goes, for a caller to relay
 /// however it likes — updating GUI state and repainting, or just printing.
+#[derive(Debug)]
 pub enum QueueProgress {
     /// The render subprocess's PID, once it's known (lets a caller offer a
     /// "cancel" button, or in a headless run, just log it).
@@ -376,7 +377,7 @@ fn process_quat_queue_item(
     let out_dir = PathBuf::from(&item.output_dir);
     std::fs::create_dir_all(&out_dir)
         .map_err(|e| format!("cannot create output directory {}: {e}", out_dir.display()))?;
-    let ext = if q.mode == "orbit" { "mp4" } else { "png" };
+    let ext = if q.mode == "orbit" || q.mode == "timeline" { "mp4" } else { "png" };
     let base = format!("{}_{}", item.genome_label, q.mode);
     let mut out_path = out_dir.join(format!("{base}.{ext}"));
     let mut n = 2;
@@ -423,9 +424,38 @@ fn process_quat_queue_item(
                 .args(["--colormap", &q.colormap])
                 .arg("--gpu");
         }
+        "timeline" => {
+            let Some(timeline) = &q.timeline else {
+                return Err(format!(
+                    "queue item {} ({}) is mode \"timeline\" but carries no timeline data",
+                    item.id, item.genome_label
+                ));
+            };
+            // The subprocess takes a path, not inline JSON on the command
+            // line — same reason `enqueue()` already copies the genome
+            // itself into `queue_dir()` rather than passing it by value.
+            let timeline_path = queue_dir().join(format!("{}_timeline.json", item.id));
+            let timeline_json = serde_json::to_string_pretty(timeline)
+                .map_err(|e| format!("failed to serialize timeline for queue item {}: {e}", item.id))?;
+            std::fs::write(&timeline_path, timeline_json)
+                .map_err(|e| format!("failed to write {}: {e}", timeline_path.display()))?;
+            cmd.arg("quat-render-timeline")
+                .arg(&out_path)
+                .args(["--genome", &genome_arg])
+                .args(["--timeline", &timeline_path.to_string_lossy()])
+                .args(["--width", &q.width.to_string()])
+                .args(["--height", &q.height.to_string()])
+                .args(["--fps", &q.fps.to_string()])
+                .args(["--trim-start", &q.trim_start_s.to_string()])
+                .args(["--trim-end", &q.trim_end_s.to_string()])
+                .args(["--max-iter", &q.max_iter.to_string()])
+                .args(["--aa", &q.aa.max(2).to_string()])
+                .args(["--colormap", &q.colormap])
+                .arg("--gpu");
+        }
         other => {
             return Err(format!(
-                "unknown quaternion render mode {other:?} on queue item {} ({}) — expected \"static\" or \"orbit\"",
+                "unknown quaternion render mode {other:?} on queue item {} ({}) — expected \"static\", \"orbit\", or \"timeline\"",
                 item.id, item.genome_label
             ));
         }
@@ -579,5 +609,105 @@ mod tests {
     fn thread_recommendation_never_exceeds_the_machine() {
         assert_eq!(recommend_thread_count_for(4, -5.0, 0),
                    4, "a negative sample (measurement noise) must not hand out MORE than exists");
+    }
+
+    /// Animation-viewer plan, Phase 7's own checkpoint: "queue the Phase 5 POC
+    /// as a ~3s render, confirm the queue manager processes it to an .mp4" —
+    /// exercised here through the REAL `process_quat_queue_item` glue
+    /// (temp-timeline-JSON write, `explorer quat-render-timeline` subprocess
+    /// spawn, stderr frame-progress parsing), not just the CLI command or
+    /// `enqueue()`'s data plumbing in isolation (both already verified
+    /// separately). Calls `process_quat_queue_item` directly with a
+    /// hand-built `QueueItem`/`QuatRenderSpec` — bypassing `load_queue`/
+    /// `save_queue`/`enqueue()` entirely, so this never touches the real
+    /// `video_queue/queue.json` (which has real pending/completed items in
+    /// it). Only I/O: a genome copied into the real `queue_dir()` (as
+    /// `process_quat_queue_item` requires — cleaned up after) and an output
+    /// file in a private temp dir.
+    #[test]
+    fn process_quat_queue_item_renders_a_timeline_spec_to_an_mp4() {
+        use crate::formula::{op};
+        use crate::genome::{Genome, ProgramBuilder};
+        use crate::video_export::{QueueStatus, QuatRenderSpec};
+
+        let mut b = ProgramBuilder::new();
+        let z = b.push(op::Z, 0, 0, 0.0, 0.0).unwrap();
+        let c = b.push(op::C, 0, 0, 0.0, 0.0).unwrap();
+        let z2 = b.push(op::SQR, z, 0, 0.0, 0.0).unwrap();
+        b.push(op::ADD, z2, c, 0.0, 0.0).unwrap();
+        let genome = Genome { program: b.into_nodes(), bailout_radius: 4.0, view_zoom: 1.0, ..Default::default() };
+
+        let nn_filename = format!("nnf_queue_runner_test_{}.nn", std::process::id());
+        let nn_path = queue_dir().join(&nn_filename);
+        crate::io::save_genome(&genome, &nn_path).expect("save throwaway test genome into queue_dir()");
+
+        let out_dir = std::env::temp_dir().join(format!("nnf_queue_runner_test_out_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&out_dir);
+
+        let mut tl = crate::anim_timeline::AnimationTimeline::new(genome.content_hash());
+        tl.trim_start_s = 0.0;
+        tl.trim_end_s = 1.0;
+
+        let item = QueueItem {
+            id: format!("queue-runner-test-{}", std::process::id()),
+            nn_filename: nn_filename.clone(),
+            genome_label: "queue_runner_test".to_string(),
+            start: crate::video_export::CapturedView { cx: 0.0, cx_lo: 0.0, cy: 0.0, cy_lo: 0.0, zoom: 1.0, aspect: 1.0 },
+            end: crate::video_export::CapturedView { cx: 0.0, cx_lo: 0.0, cy: 0.0, cy_lo: 0.0, zoom: 1.0, aspect: 1.0 },
+            steps: 1, fps: 5, width: 64, height: 64,
+            invert_coords: false, invert_range: false,
+            colormap: "turbo".to_string(), angle_coloring: false,
+            output_dir: out_dir.to_string_lossy().to_string(),
+            status: QueueStatus::Pending, output_path: None, error: None,
+            created_at: 0, waypoints: Vec::new(), chain_label: None,
+            time_mod: Vec::new(), time_frames: DEFAULT_TIME_FRAMES,
+            blend_nn_filename: None, blend_shape: String::new(), blend_amp: 0.0,
+            time_prog: Vec::new(), rife_fps: 0, keyframe_stride: 0, quat: None,
+        };
+        let spec = QuatRenderSpec {
+            mode: "timeline".to_string(),
+            width: 64, height: 64, fps: 5,
+            max_iter: 20, aa: 2, colormap: "turbo".to_string(),
+            timeline: Some(tl), trim_start_s: 0.0, trim_end_s: 1.0,
+            ..Default::default()
+        };
+
+        // `locate_bin("explorer")` resolves relative to `current_exe()`, which
+        // for every REAL caller (the queue GUI, `explorer queue-run` itself)
+        // sits directly in `target/release/`. A `cargo test --lib` binary
+        // instead runs from `target/release/deps/`, one level deeper, so
+        // `locate_bin` can't find the sibling `explorer` binary this test
+        // needs — a test-environment artifact, not a bug in `locate_bin`
+        // (nothing production ever runs from `deps/`). Work around it with a
+        // symlink at the exact path `locate_bin` will check next
+        // (`dir.join(name)`), cleaned up unconditionally afterward, rather
+        // than changing the production lookup logic for a test-only need.
+        let test_exe = std::env::current_exe().expect("current_exe");
+        let deps_dir = test_exe.parent().expect("deps dir").to_path_buf();
+        let release_dir = deps_dir.parent().expect("release dir").to_path_buf();
+        let real_explorer = release_dir.join("explorer");
+        assert!(real_explorer.exists(),
+            "release explorer binary must be built first (cargo build --release --features wgpu-backend --bin explorer): {}",
+            real_explorer.display());
+        let shim_path = deps_dir.join("explorer");
+        let _ = std::fs::remove_file(&shim_path);
+        std::os::unix::fs::symlink(&real_explorer, &shim_path).expect("create explorer shim symlink for locate_bin");
+
+        let progress: std::sync::Mutex<Vec<QueueProgress>> = std::sync::Mutex::new(Vec::new());
+        let result = process_quat_queue_item(&item, &spec, &|p| progress.lock().unwrap().push(p));
+
+        let _ = std::fs::remove_file(&shim_path);
+        let _ = std::fs::remove_file(&nn_path);
+
+        let out_path = result.expect("a real timeline queue item should render successfully");
+        let meta = std::fs::metadata(&out_path).expect("rendered output file should exist");
+        assert!(meta.len() > 0, "rendered output should be non-empty: {out_path}");
+        assert!(out_path.ends_with(".mp4"), "timeline mode should produce an mp4: {out_path}");
+
+        let seen = progress.lock().unwrap();
+        assert!(seen.iter().any(|p| matches!(p, QueueProgress::Pid(_))), "should report a subprocess pid: {seen:?}");
+        assert!(seen.iter().any(|p| matches!(p, QueueProgress::Frame(_, _))), "should report frame progress: {seen:?}");
+
+        let _ = std::fs::remove_dir_all(&out_dir);
     }
 }

@@ -77,6 +77,117 @@ fn play_completion_sound() {
     reap(std::process::Command::new("canberra-gtk-play").args(["--id", "complete"]).spawn());
 }
 
+// ── Auto-pause while the animation viewer is in use ──────────────────────
+//
+// Carl, 2026-09-23: "When the animation tool run at the same time as a
+// queued element, the GPU can saturate, stalling both queue and animator.
+// Could you add a pause functionnality to the rendering process? When the
+// animator is being viewed... the queue is paused... wait 3 second before
+// pausing... when the animator is not in use, restart the queue."
+//
+// A quaternion render item (`process_quat_queue_item`) shells out to
+// `explorer` as a SEPARATE PROCESS — `RENDER_CONTROL` is a static in THIS
+// process, so setting it alone (what the manual Pause button already did)
+// never reaches that child at all. SIGSTOP/SIGCONT on the tracked
+// `current_pid` is what actually halts its GPU work from outside, the same
+// PID the existing "Cancel" button already signals — `RENDER_CONTROL` is
+// still set too, since a 2D item's frame loop runs in-process and checks it
+// between frames.
+
+/// Which window manager currently has focus, and on what — niri first (this
+/// project's primary desktop; JSON IPC, no ambiguity), then a generic
+/// X11/EWMH fallback via `xdotool` for other window managers. `None` when
+/// neither answers, so the caller can refuse to guess rather than mis-pause
+/// or mis-resume on a desktop it doesn't recognize.
+fn focused_window_is_animator() -> Option<bool> {
+    if let Ok(out) = std::process::Command::new("niri").args(["msg", "-j", "focused-window"]).output() {
+        if out.status.success() {
+            if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&out.stdout) {
+                if v.is_null() {
+                    return Some(false); // niri answered: nothing is focused.
+                }
+                if let Some(app_id) = v.get("app_id").and_then(|a| a.as_str()) {
+                    return Some(app_id == "NNFractals Animation Viewer");
+                }
+            }
+        }
+    }
+    // Most non-niri Linux window managers (X11 or XWayland-backed): the
+    // active window's title matches what `anim_viewer.rs` sets verbatim.
+    if let Ok(out) = std::process::Command::new("xdotool").args(["getactivewindow", "getwindowname"]).output() {
+        if out.status.success() {
+            return Some(String::from_utf8_lossy(&out.stdout).trim() == "NNFractals Animation Viewer");
+        }
+    }
+    None
+}
+
+/// Pauses the CURRENT render — both the in-process 2D frame loop
+/// (`RENDER_CONTROL`, checked between frames) and, if a quaternion item is
+/// running its own `explorer` child process, that process itself (SIGSTOP,
+/// so its GPU submissions actually stop — see this section's own doc
+/// comment for why `RENDER_CONTROL` alone can't reach it).
+fn pause_render(current_pid: &Arc<Mutex<Option<u32>>>) {
+    nnfractals::video_export::RENDER_CONTROL.set_paused(true);
+    if let Some(pid) = *current_pid.lock().unwrap() {
+        let _ = std::process::Command::new("kill").args(["-STOP", &pid.to_string()]).status();
+    }
+}
+
+/// Resumes whatever `pause_render` paused. SIGCONT on a process that was
+/// never stopped (or has already exited) is a harmless no-op either way.
+fn resume_render(current_pid: &Arc<Mutex<Option<u32>>>) {
+    nnfractals::video_export::RENDER_CONTROL.set_paused(false);
+    if let Some(pid) = *current_pid.lock().unwrap() {
+        let _ = std::process::Command::new("kill").args(["-CONT", &pid.to_string()]).status();
+    }
+}
+
+/// Polls window focus and drives the pause/resume above — separate from
+/// `auto_paused`'s OWNER semantics: this thread only ever resumes a render
+/// IT paused (tracked via `auto_paused`), so it never fights a pause Carl
+/// set manually via the button (that one clears `auto_paused` on click —
+/// see the button handler). Only bothers polling the window manager at all
+/// while something is actually rendering (`current_pid` is `Some`) — no
+/// point spawning `niri`/`xdotool` every tick while the queue is idle.
+fn spawn_focus_watch_thread(
+    current_pid: Arc<Mutex<Option<u32>>>,
+    auto_paused: Arc<AtomicBool>,
+    ctx: egui::Context,
+) {
+    const POLL: std::time::Duration = std::time::Duration::from_millis(500);
+    const PAUSE_DEBOUNCE: std::time::Duration = std::time::Duration::from_secs(3);
+    thread::spawn(move || {
+        let mut focused_since: Option<std::time::Instant> = None;
+        loop {
+            thread::sleep(POLL);
+            if current_pid.lock().unwrap().is_none() {
+                focused_since = None;
+                continue;
+            }
+            match focused_window_is_animator() {
+                Some(true) => {
+                    let since = *focused_since.get_or_insert_with(std::time::Instant::now);
+                    if since.elapsed() >= PAUSE_DEBOUNCE
+                        && !nnfractals::video_export::RENDER_CONTROL.is_paused()
+                    {
+                        pause_render(&current_pid);
+                        auto_paused.store(true, Ordering::SeqCst);
+                        ctx.request_repaint();
+                    }
+                }
+                Some(false) | None => {
+                    focused_since = None;
+                    if auto_paused.swap(false, Ordering::SeqCst) {
+                        resume_render(&current_pid);
+                        ctx.request_repaint();
+                    }
+                }
+            }
+        }
+    });
+}
+
 // ── Single-instance IPC ──────────────────────────────────────────────────
 
 struct SocketGuard(PathBuf);
@@ -297,6 +408,13 @@ struct App {
     /// and kept by the time this has anything to say.
     rife_status: Arc<Mutex<Option<String>>>,
     cancelling: Arc<AtomicBool>,
+    /// True while the CURRENT pause was applied by `spawn_focus_watch_thread`
+    /// (animator in focus), not by Carl clicking Pause himself — so losing
+    /// animator focus only auto-resumes a render THIS mechanism paused,
+    /// never overriding a pause he set on purpose. Cleared on every manual
+    /// Pause/Resume click, which is what actually gives the button that
+    /// override behavior — see the button handler.
+    auto_paused: Arc<AtomicBool>,
 
     /// When set, the processing thread will not START a new item outside this
     /// wall-clock window. Shared with the thread rather than re-read from disk:
@@ -362,11 +480,13 @@ impl App {
         let rife_status = Arc::new(Mutex::new(None));
         let cancelling = Arc::new(AtomicBool::new(false));
         let hold = Arc::new(Mutex::new(None));
+        let auto_paused = Arc::new(AtomicBool::new(false));
         spawn_processing_thread(
             running.clone(), progress.clone(), current_id.clone(),
             current_pid.clone(), rife_status.clone(), cancelling.clone(), hold.clone(),
             cc.egui_ctx.clone(),
         );
+        spawn_focus_watch_thread(current_pid.clone(), auto_paused.clone(), cc.egui_ctx.clone());
 
         App {
             items,
@@ -380,6 +500,7 @@ impl App {
             current_pid,
             rife_status,
             cancelling,
+            auto_paused,
             hold,
             hold_on: false,
             hold_from: "23:00".into(),
@@ -433,6 +554,16 @@ impl App {
 }
 
 impl eframe::App for App {
+    /// Safety net for the auto-pause feature: closing this window must
+    /// never leave a render subprocess orphaned in a SIGSTOPped state
+    /// forever (it would just sit there, indistinguishable from a genuine
+    /// hang, with nothing left running to SIGCONT it back).
+    fn on_exit(&mut self) {
+        if self.auto_paused.load(Ordering::SeqCst) {
+            resume_render(&self.current_pid);
+        }
+    }
+
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         while self.wake_rx.try_recv().is_ok() {
@@ -494,10 +625,14 @@ impl eframe::App for App {
                 let (label, hover) = if paused {
                     ("▶ Resume", "Resume the paused render")
                 } else {
-                    ("⏸ Pause", "Pause the render in progress — takes effect at the next frame boundary, and frees the CPU while paused")
+                    ("⏸ Pause", "Pause the render in progress — takes effect at the next frame boundary (and, for a GPU quaternion render running as its own process, SIGSTOPs it directly), freeing the CPU/GPU while paused")
                 };
                 if ui.add_enabled(running, egui::Button::new(label)).on_hover_text(hover).clicked() {
-                    nnfractals::video_export::RENDER_CONTROL.set_paused(!paused);
+                    if paused { resume_render(&self.current_pid); } else { pause_render(&self.current_pid); }
+                    // A manual click always overrides the auto-pause-on-
+                    // animator-focus mechanism for this pause/resume cycle —
+                    // see `auto_paused`'s own doc comment.
+                    self.auto_paused.store(false, Ordering::SeqCst);
                 }
 
                 // Overnight rendering: hold new items until a wall-clock
@@ -551,7 +686,11 @@ impl eframe::App for App {
 
                 ui.separator();
                 let status = if paused && running {
-                    "PAUSED".to_string()
+                    if self.auto_paused.load(Ordering::SeqCst) {
+                        "PAUSED (animator in use)".to_string()
+                    } else {
+                        "PAUSED".to_string()
+                    }
                 } else if running {
                     match &current_id {
                         Some(_) => match progress {
@@ -656,7 +795,7 @@ impl eframe::App for App {
                             ));
                         });
 
-                        if it.status == QueueStatus::Pending {
+                        if it.status == QueueStatus::Pending && it.quat.is_none() {
                             let buf = self.edit_bufs.entry(it.id.clone())
                                 .or_insert_with(|| EditBuf::from_item(it));
                             ui.horizontal(|ui| {
@@ -705,6 +844,25 @@ impl eframe::App for App {
                                     to_remove_id = Some(it.id.clone());
                                 }
                             });
+                        } else if it.status == QueueStatus::Pending {
+                            // A quat item (quat_viewer.rs / anim_viewer.rs render→queue):
+                            // resolution/fps/frame-count live on `it.quat`, not the
+                            // editable outer fields above, and `process_quat_queue_item`
+                            // never reads RIFE at all (see its own doc comment — no RIFE
+                            // pass exists for a quat render yet). Editing any of those
+                            // outer fields here would silently do nothing once rendering
+                            // starts, so this shows the REAL (now-correct, see `enqueue`)
+                            // values read-only instead of inviting an edit that's a no-op.
+                            ui.horizontal(|ui| {
+                                ui.label(format!("{} frames @ {} fps, {}×{} (quat render — not editable here)",
+                                                  it.steps, it.fps, it.width, it.height));
+                                if ui.button("✕ Remove")
+                                    .on_hover_text("Cancels this queued job — removes it and its copied genome file. Only available while Pending.")
+                                    .clicked()
+                                {
+                                    to_remove_id = Some(it.id.clone());
+                                }
+                            });
                         } else if it.status == QueueStatus::Done {
                             if let Some(out) = &it.output_path {
                                 let path = PathBuf::from(out);
@@ -719,7 +877,17 @@ impl eframe::App for App {
                             }
                         } else if it.status == QueueStatus::Processing {
                             ui.horizontal(|ui| {
-                                ui.label(format!("{} steps @ {} fps, {}×{}", it.steps, it.fps, it.width, it.height));
+                                let unit = if it.quat.is_some() { "frames" } else { "steps" };
+                                ui.label(format!("{} {unit} @ {} fps, {}×{}", it.steps, it.fps, it.width, it.height));
+                                // Per-row live progress, not just the single global
+                                // status line up top — with more than one item queued
+                                // it wasn't obvious the top bar's "frame D/T" even
+                                // referred to THIS row. Carl (2026-09-22): "no progress
+                                // at all, no way to know where the rendering is at."
+                                match progress {
+                                    Some((d, t)) => { ui.colored_label(Color32::from_rgb(100, 200, 255), format!("frame {d}/{t}")); }
+                                    None => { ui.label("starting…"); }
+                                }
                                 // `current_pid` is only `Some` once ffmpeg has
                                 // actually spawned (see `VideoMsg::Started`) —
                                 // there's a brief window right at the start of

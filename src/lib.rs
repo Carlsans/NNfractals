@@ -29,10 +29,17 @@ pub mod quat_dag;
 pub mod quat_dag_fitness;
 pub mod quat_genome_ops;
 pub mod quat_organization;
+pub mod quat_boundedness;
 pub mod quat_predator;
 pub mod quat_pref;
 pub mod quat_taste;
+pub mod quat_live_view;
 pub mod quat_map_elites;
+pub mod anim_timeline;
+pub mod anim_persist;
+pub mod anim_profile;
+pub mod orient;
+pub mod anim_eval;
 pub mod debug_overlay;
 #[cfg(feature = "wgpu-backend")]
 pub mod explore;
@@ -137,7 +144,7 @@ pub fn is_quat_genome_path(path: &std::path::Path) -> bool {
     path.components().any(|c| {
         c.as_os_str()
             .to_str()
-            .is_some_and(|s| s.starts_with("fractals_dag_quat"))
+            .is_some_and(|s| s.starts_with("fractals_dag_quat") || s == "train_corpus_quat")
     })
 }
 
@@ -183,6 +190,7 @@ mod is_quat_genome_path_tests {
     #[test]
     fn recognizes_the_literal_folder() {
         assert!(is_quat_genome_path(Path::new("fractals_dag_quat/abc123.nn")));
+        assert!(is_quat_genome_path(Path::new("train_corpus_quat/abc123.nn")));
     }
 
     #[test]

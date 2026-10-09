@@ -32,6 +32,7 @@ use rayon::prelude::*;
 use crate::quat_fractal::{quat_escape_de_params, QuatFormula, TimeAxis};
 use crate::quat_motion::{add, cross, dot, look_at_basis, normalize, scale, sub, Vec3};
 
+#[derive(Clone, Copy, Debug)]
 pub struct RaymarchCamera {
     pub eye: Vec3,
     pub target: Vec3,
@@ -167,6 +168,44 @@ pub(crate) fn ray_sphere(eye: Vec3, dir: Vec3, radius: f64) -> Option<(f64, f64)
     let t1 = (-b + sqrt_disc) / (2.0 * a);
     if t1 < 0.0 {
         return None; // sphere is entirely behind the eye
+    }
+    Some((t0.max(0.0), t1))
+}
+
+/// Ray/axis-aligned-box intersection (the standard "slab method"): `bmin`
+/// and `bmax` are the box's per-axis low/high corners. Returns `(t_near,
+/// t_far)` (both `>= 0`; `t_near = 0` if `eye` starts inside the box) when
+/// the ray crosses it at all. Added for the animation-viewer plan's
+/// bounding-box axis (replacing `ray_sphere`'s single radius with
+/// independent per-axis extents) — additive, next to `ray_sphere`, which
+/// stays exactly as-is for every existing caller (the hand-built
+/// `QuatFormula` stack via `RaymarchParams`, and any `RaymarchDagParams`
+/// caller that leaves `box_bounds` as `None`).
+pub(crate) fn ray_box(eye: Vec3, dir: Vec3, bmin: Vec3, bmax: Vec3) -> Option<(f64, f64)> {
+    let mut t0 = 0.0f64;
+    let mut t1 = f64::INFINITY;
+    let e = [eye.0, eye.1, eye.2];
+    let d = [dir.0, dir.1, dir.2];
+    let lo = [bmin.0, bmin.1, bmin.2];
+    let hi = [bmax.0, bmax.1, bmax.2];
+    for axis in 0..3 {
+        if d[axis].abs() < 1e-300 {
+            if e[axis] < lo[axis] || e[axis] > hi[axis] {
+                return None; // parallel to this axis' slab and outside it
+            }
+        } else {
+            let inv = 1.0 / d[axis];
+            let mut ta = (lo[axis] - e[axis]) * inv;
+            let mut tb = (hi[axis] - e[axis]) * inv;
+            if ta > tb {
+                std::mem::swap(&mut ta, &mut tb);
+            }
+            t0 = t0.max(ta);
+            t1 = t1.min(tb);
+            if t0 > t1 {
+                return None;
+            }
+        }
     }
     Some((t0.max(0.0), t1))
 }
@@ -376,6 +415,55 @@ mod tests {
     fn ray_sphere_returns_none_for_a_sphere_entirely_behind_the_eye() {
         let hit = ray_sphere((0.0, 0.0, -5.0), (0.0, 0.0, -1.0), 1.6);
         assert!(hit.is_none());
+    }
+
+    #[test]
+    fn ray_box_hits_a_centered_cube_head_on() {
+        let hit = ray_box((0.0, 0.0, -5.0), (0.0, 0.0, 1.0), (-1.6, -1.6, -1.6), (1.6, 1.6, 1.6));
+        let (t0, t1) = hit.expect("ray through the center must hit");
+        assert!((t0 - 3.4).abs() < 1e-9, "t0={t0}");
+        assert!((t1 - 6.6).abs() < 1e-9, "t1={t1}");
+    }
+
+    #[test]
+    fn ray_box_misses_when_aimed_well_clear() {
+        let hit = ray_box((0.0, 10.0, -5.0), (0.0, 0.0, 1.0), (-1.6, -1.6, -1.6), (1.6, 1.6, 1.6));
+        assert!(hit.is_none());
+    }
+
+    #[test]
+    fn ray_box_returns_none_for_a_box_entirely_behind_the_eye() {
+        let hit = ray_box((0.0, 0.0, -5.0), (0.0, 0.0, -1.0), (-1.6, -1.6, -1.6), (1.6, 1.6, 1.6));
+        assert!(hit.is_none());
+    }
+
+    #[test]
+    fn ray_box_reaches_further_into_the_corners_than_the_equivalent_sphere() {
+        // The whole point of switching to a box: a ray aimed at a diagonal
+        // corner should reach materially farther than a same-half-extent
+        // sphere would let it, since the sphere caps every direction at
+        // exactly `radius` while the box's corners extend to
+        // radius*sqrt(3).
+        let dir = normalize((1.0, 1.0, 1.0));
+        let eye = (-5.0, -5.0, -5.0);
+        let (_, t1_box) = ray_box(eye, dir, (-1.6, -1.6, -1.6), (1.6, 1.6, 1.6)).unwrap();
+        let (_, t1_sphere) = ray_sphere(eye, dir, 1.6).unwrap();
+        assert!(t1_box > t1_sphere, "box t1={t1_box} should exceed sphere t1={t1_sphere}");
+    }
+
+    #[test]
+    fn ray_box_respects_independent_per_axis_extents() {
+        // A box squashed flat on X (min=max=0) must be missed by a ray
+        // that would have hit a symmetric box/sphere at that same origin —
+        // this is the actual behavior the animation viewer's per-axis
+        // bounding-box editor depends on (shrinking one axis crops the
+        // render on that axis specifically, not uniformly).
+        let hit = ray_box((0.0, 0.0, -5.0), (0.0, 0.0, 1.0), (0.0, -1.6, -1.6), (0.0, 1.6, 1.6));
+        // Straight down the Z axis at x=0 should still clip it (edge case,
+        // x stays exactly 0 the whole ray), but a ray offset in X must miss.
+        assert!(hit.is_some(), "a ray exactly on the flattened plane still crosses it");
+        let offset_hit = ray_box((0.5, 0.0, -5.0), (0.0, 0.0, 1.0), (0.0, -1.6, -1.6), (0.0, 1.6, 1.6));
+        assert!(offset_hit.is_none(), "a ray off the flattened X=0 plane must miss a box with zero X extent");
     }
 
     #[test]

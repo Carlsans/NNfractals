@@ -44,6 +44,7 @@ from PIL import Image
 
 sys.path.insert(0, str(Path(__file__).resolve().parent / "scripts"))
 from train_pref import load_backbone  # noqa: E402
+from taste_pooling import pool_grid, grid_mean_block  # noqa: E402
 
 
 def log(*a):
@@ -58,6 +59,7 @@ class TasteHead:
         self.lo = 0.0
         self.hi = 1.0
         self.backbone = "siglip"
+        self.pooling = "single"
         self.reload_if_changed(force=True)
 
     def reload_if_changed(self, force=False):
@@ -74,6 +76,7 @@ class TasteHead:
         self.lo = float(data["lo"]) if "lo" in data else 0.0
         self.hi = float(data["hi"]) if "hi" in data else 1.0
         self.backbone = str(data["backbone"]) if "backbone" in data else "siglip"
+        self.pooling = str(data["pooling"]) if "pooling" in data else "single"
         self.mtime = mtime
         log(f"[taste] model {'loaded' if force else 'reloaded'} from {self.model_path} (mtime={mtime:.0f})")
         return True
@@ -133,25 +136,34 @@ def main():
             continue
         cmd, key, paths = parts[0], parts[1], parts[2:]
         try:
-            cache_path = args.cache_dir / f"{key}.npy"
+            head.reload_if_changed()
+            grid = head.pooling == "grid"
+            # Grid-pooled features have a different layout than the legacy
+            # single/mean ones, so they cache under their own suffix.
+            cache_path = args.cache_dir / (f"{key}.grid.npy" if grid else f"{key}.npy")
             if cache_path.exists():
                 vec = np.load(cache_path)
             else:
                 imgs = [Image.open(p).convert("RGB") for p in paths]
                 with torch.no_grad():
                     e = embed(imgs).cpu().numpy()
-                vec = e.mean(axis=0).astype(np.float32)
-                norm = np.linalg.norm(vec)
-                if norm > 1e-8:
-                    vec = vec / norm
+                if grid:
+                    vec = pool_grid(e)
+                else:
+                    vec = e.mean(axis=0).astype(np.float32)
+                    norm = np.linalg.norm(vec)
+                    if norm > 1e-8:
+                        vec = vec / norm
                 np.save(cache_path, vec)
+            # EMBED/DIST consumers expect a plain backbone-sized embedding.
+            emb_vec = grid_mean_block(vec) if grid else vec
 
             if cmd == "SCORE":
                 head.reload_if_changed()
                 print(f"{head.score(vec):.5f}", flush=True)
             elif cmd == "EMBED":
                 head.reload_if_changed()
-                vec_str = ",".join(f"{x:.6f}" for x in vec)
+                vec_str = ",".join(f"{x:.6f}" for x in emb_vec)
                 print(f"{head.score(vec):.5f}|{vec_str}", flush=True)
             elif cmd == "DIST":
                 if centroids is None:
@@ -159,7 +171,7 @@ def main():
                 if centroids is None:
                     print("ERROR: no role_model_centroids.npz", flush=True)
                 else:
-                    sims = centroids @ vec
+                    sims = centroids @ emb_vec
                     dist = float(np.sqrt(np.clip(2.0 - 2.0 * sims.max(), 0.0, None)))
                     print(f"{dist:.5f}", flush=True)
             else:

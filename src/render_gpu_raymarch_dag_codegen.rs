@@ -36,10 +36,14 @@ use crate::quat_fractal::TimeAxis;
 use crate::quat_raymarch::RaymarchCamera;
 
 const TEMPLATE: &str = include_str!("raymarch_dag_codegen_template.wgsl");
-/// 37 plain scalar fields (see the template's `Params` struct) — 2 fewer
-/// u32s than the interpreter's `Params` (no `prog_len`/`warp_len`; the
-/// program is baked into the shader, not uploaded as data).
-const PARAMS_BYTES: u64 = 37 * 4;
+/// 59 plain scalar fields (see the template's `Params` struct): the
+/// original 37 (2 of which — `use_box`/`use_axis_perm` — were unused
+/// `_pad0`/`_pad1` padding before the animation-viewer plan's Phase 2)
+/// plus 10 from Phase 2 (box min/max, axis permutation) plus 7 from
+/// Phase 6 (clip plane: enabled flag + pos + normal) plus 3 from the
+/// Slide Iteration effect (enabled flag + min + max) plus 2 for the
+/// "hide top N%" resolved cutoff (enabled flag + value).
+const PARAMS_BYTES: u64 = 59 * 4;
 const WG: u32 = 8;
 
 fn wgsl_f32(v: f32) -> String {
@@ -403,8 +407,51 @@ impl CompiledDagPipeline {
             w.f32(params.light_dir.1);
             w.f32(params.light_dir.2);
             w.u32(params.aa);
-            w.u32(0);
-            w.u32(0);
+            // ── Animation-viewer plan, Phase 2: additive fields (were
+            // 2 padding u32s). `box_bounds`/`axis_assignment` are `None`
+            // for every caller before this plan, so use_box/use_axis_perm
+            // write 0 and the shader falls back to the original
+            // domain_radius-sphere/time_axis behavior exactly. ─────────
+            w.u32(params.box_bounds.is_some() as u32);
+            w.u32(params.axis_assignment.is_some() as u32);
+            let (bmin, bmax) = params.box_bounds.unwrap_or(((0.0, 0.0, 0.0), (0.0, 0.0, 0.0)));
+            w.f32(bmin.0);
+            w.f32(bmin.1);
+            w.f32(bmin.2);
+            w.f32(bmax.0);
+            w.f32(bmax.1);
+            w.f32(bmax.2);
+            let parts = params.axis_assignment
+                .map(|a| (a.x, a.y, a.z, a.t))
+                .unwrap_or((crate::anim_timeline::QuatPart::R, crate::anim_timeline::QuatPart::A, crate::anim_timeline::QuatPart::B, crate::anim_timeline::QuatPart::C));
+            w.u32(parts.0.index() as u32);
+            w.u32(parts.1.index() as u32);
+            w.u32(parts.2.index() as u32);
+            w.u32(parts.3.index() as u32);
+            // ── Animation-viewer plan, Phase 6: orientable difference/
+            // cutaway clip plane. clip_plane=None (every caller before
+            // this plan) writes clip_enabled=0, which march_sample's
+            // "if (params.clip_enabled != 0u)" branch skips entirely.
+            w.u32(params.clip_plane.is_some() as u32);
+            let (clip_pos, clip_normal) = params.clip_plane.unwrap_or(((0.0, 0.0, 0.0), (0.0, 0.0, 0.0)));
+            w.f32(clip_pos.0);
+            w.f32(clip_pos.1);
+            w.f32(clip_pos.2);
+            w.f32(clip_normal.0);
+            w.f32(clip_normal.1);
+            w.f32(clip_normal.2);
+            // ── Slide Iteration effect: hidden escape-iteration band.
+            // slide_iter=None (every caller before this effect) writes
+            // slide_iter_enabled=0, which de_at's own gating skips entirely.
+            w.u32(params.slide_iter.is_some() as u32);
+            let (slide_min, slide_max) = params.slide_iter.unwrap_or((0.0, 0.0));
+            w.f32(slide_min);
+            w.f32(slide_max);
+            // ── "hide top N%" resolved cutoff. hide_above=None (every
+            // caller's own probe pass, and every caller before this
+            // control existed) writes hide_above_enabled=0.
+            w.u32(params.hide_above.is_some() as u32);
+            w.f32(params.hide_above.unwrap_or(0.0));
         }
         queue.write_buffer(&self.params_buf, 0, &pb);
 
@@ -473,6 +520,7 @@ mod tests {
             time_axis: TimeAxis::C,
             time_val: 0.0,
             domain_radius: 1.6,
+            box_bounds: None, axis_assignment: None, clip_plane: None, slide_iter: None, hide_above: None,
             max_iter: 40,
             bailout: 4.0,
             max_march_steps: 200,
@@ -556,6 +604,115 @@ mod tests {
             OpNode { op: op::LOG, a: 5, b: 0, kre: 0.0, kim: 0.0 },
         ];
         assert_matches_cpu(&prog, &[], base_params(&prog, &[]), 64, 64);
+    }
+
+    /// Animation-viewer plan, Phase 2: exercises the NEW `use_box`/
+    /// `box_min/max` shader branch (not just the `None` fallback every
+    /// other test in this file uses) — GPU-vs-CPU parity, same discipline
+    /// as every test in this module.
+    #[test]
+    fn codegen_matches_cpu_with_box_bounds() {
+        let prog = [
+            OpNode { op: op::Z, a: 0, b: 0, kre: 0.0, kim: 0.0 },
+            OpNode { op: op::C, a: 0, b: 0, kre: 0.0, kim: 0.0 },
+            OpNode { op: op::SQR, a: 0, b: 0, kre: 0.0, kim: 0.0 },
+            OpNode { op: op::ADD, a: 2, b: 1, kre: 0.0, kim: 0.0 },
+        ];
+        let mut params = base_params(&prog, &[]);
+        // A genuinely non-cubic box (asymmetric per-axis extents) so a
+        // bug that only handles the symmetric-cube case wouldn't be caught.
+        params.box_bounds = Some(((-1.2, -0.9, -1.6), (1.4, 1.1, 1.6)));
+        assert_matches_cpu(&prog, &[], params, 64, 64);
+    }
+
+    /// Exercises the NEW `use_axis_perm`/`axis_part_*` shader branch.
+    #[test]
+    fn codegen_matches_cpu_with_axis_assignment() {
+        use crate::anim_timeline::{AxisAssignment, QuatPart};
+        let prog = [
+            OpNode { op: op::Z, a: 0, b: 0, kre: 0.0, kim: 0.0 },
+            OpNode { op: op::C, a: 0, b: 0, kre: 0.0, kim: 0.0 },
+            OpNode { op: op::SQR, a: 0, b: 0, kre: 0.0, kim: 0.0 },
+            OpNode { op: op::ADD, a: 2, b: 1, kre: 0.0, kim: 0.0 },
+        ];
+        let mut params = base_params(&prog, &[]);
+        // A genuine (non-identity-like) permutation: time on R, spatial
+        // axes reshuffled across A/B/C rather than left in order.
+        params.axis_assignment = Some(AxisAssignment { x: QuatPart::C, y: QuatPart::B, z: QuatPart::A, t: QuatPart::R });
+        params.time_val = 0.35;
+        assert_matches_cpu(&prog, &[], params, 64, 64);
+    }
+
+    /// Both new fields at once — the actual combination the animation
+    /// viewer's live render loop will use once axis assignment + the
+    /// bounding-box editor are wired up.
+    #[test]
+    fn codegen_matches_cpu_with_box_bounds_and_axis_assignment_together() {
+        use crate::anim_timeline::{AxisAssignment, QuatPart};
+        let prog = [
+            OpNode { op: op::Z, a: 0, b: 0, kre: 0.0, kim: 0.0 },
+            OpNode { op: op::C, a: 0, b: 0, kre: 0.0, kim: 0.0 },
+            OpNode { op: op::SQR, a: 0, b: 0, kre: 0.0, kim: 0.0 },
+            OpNode { op: op::ADD, a: 2, b: 1, kre: 0.0, kim: 0.0 },
+        ];
+        let mut params = base_params(&prog, &[]);
+        params.box_bounds = Some(((-1.0, -1.3, -1.6), (1.0, 1.3, 1.6)));
+        params.axis_assignment = Some(AxisAssignment { x: QuatPart::A, y: QuatPart::C, z: QuatPart::R, t: QuatPart::B });
+        params.time_val = -0.2;
+        assert_matches_cpu(&prog, &[], params, 64, 64);
+    }
+
+    /// Animation-viewer plan, Phase 6: exercises the NEW `clip_enabled`/
+    /// `clip_pos`/`clip_normal` shader branch — GPU-vs-CPU parity.
+    #[test]
+    fn codegen_matches_cpu_with_clip_plane() {
+        let prog = [
+            OpNode { op: op::Z, a: 0, b: 0, kre: 0.0, kim: 0.0 },
+            OpNode { op: op::C, a: 0, b: 0, kre: 0.0, kim: 0.0 },
+            OpNode { op: op::SQR, a: 0, b: 0, kre: 0.0, kim: 0.0 },
+            OpNode { op: op::ADD, a: 2, b: 1, kre: 0.0, kim: 0.0 },
+        ];
+        let mut params = base_params(&prog, &[]);
+        params.box_bounds = Some(((-1.6, -1.6, -1.6), (1.6, 1.6, 1.6)));
+        // A deliberately non-axis-aligned plane through a point not at the
+        // box's own origin, so a bug that only handles the "through the
+        // exact center, axis-aligned" case wouldn't be caught.
+        params.clip_plane = Some(((0.2, -0.1, 0.0), (0.6, 0.8, 0.0)));
+        assert_matches_cpu(&prog, &[], params, 64, 64);
+    }
+
+    /// Slide Iteration effect: exercises the NEW `slide_iter_enabled`/
+    /// `slide_iter_min`/`slide_iter_max` shader branch — GPU-vs-CPU parity.
+    /// A mid-range band (neither empty nor covering the whole [0,max_iter)
+    /// span) so both "hidden" and "still visible" points are exercised.
+    #[test]
+    fn codegen_matches_cpu_with_slide_iteration() {
+        let prog = [
+            OpNode { op: op::Z, a: 0, b: 0, kre: 0.0, kim: 0.0 },
+            OpNode { op: op::C, a: 0, b: 0, kre: 0.0, kim: 0.0 },
+            OpNode { op: op::SQR, a: 0, b: 0, kre: 0.0, kim: 0.0 },
+            OpNode { op: op::ADD, a: 2, b: 1, kre: 0.0, kim: 0.0 },
+        ];
+        let mut params = base_params(&prog, &[]);
+        params.box_bounds = Some(((-1.6, -1.6, -1.6), (1.6, 1.6, 1.6)));
+        params.slide_iter = Some((5.0, 20.0));
+        assert_matches_cpu(&prog, &[], params, 64, 64);
+    }
+
+    /// `hide_above` — exercises the NEW `hide_above_enabled`/`hide_above`
+    /// shader branch — GPU-vs-CPU parity.
+    #[test]
+    fn codegen_matches_cpu_with_hide_above() {
+        let prog = [
+            OpNode { op: op::Z, a: 0, b: 0, kre: 0.0, kim: 0.0 },
+            OpNode { op: op::C, a: 0, b: 0, kre: 0.0, kim: 0.0 },
+            OpNode { op: op::SQR, a: 0, b: 0, kre: 0.0, kim: 0.0 },
+            OpNode { op: op::ADD, a: 2, b: 1, kre: 0.0, kim: 0.0 },
+        ];
+        let mut params = base_params(&prog, &[]);
+        params.box_bounds = Some(((-0.3, -0.3, -0.3), (0.3, 0.3, 0.3)));
+        params.hide_above = Some(params.max_iter as f64);
+        assert_matches_cpu(&prog, &[], params, 64, 64);
     }
 
     #[test]

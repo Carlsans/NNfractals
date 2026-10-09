@@ -1806,19 +1806,26 @@ fn cmd_quat_mandelbrot(
         }
     }
     let (tx, rx) = std::sync::mpsc::channel::<VideoMsg>();
-    encode_rgb_frames(frame_iter, n, fps, width, height, out_path, &tx, &|| {});
-    drop(tx);
-    for msg in rx {
-        match msg {
-            VideoMsg::Started { pid } => eprintln!("ffmpeg started (pid {pid})"),
-            VideoMsg::Progress { done, total } => eprint!("\rframe {done}/{total}   "),
-            VideoMsg::Done(p) => eprintln!("\ndone: {}", p.display()),
-            VideoMsg::Failed(e) => {
-                eprintln!("\nFAILED: {e}");
-                std::process::exit(1);
+    // See `cmd_quat_render_timeline`'s identical block for why this must be
+    // a `thread::scope`, not a plain in-line call — an unbounded
+    // `mpsc::channel` lets every progress message silently queue up for the
+    // whole render otherwise, so nothing prints until it's already done.
+    std::thread::scope(|scope| {
+        scope.spawn(move || {
+            encode_rgb_frames(frame_iter, n, fps, width, height, out_path, &tx, &|| {});
+        });
+        for msg in rx {
+            match msg {
+                VideoMsg::Started { pid } => eprintln!("ffmpeg started (pid {pid})"),
+                VideoMsg::Progress { done, total } => eprint!("\rframe {done}/{total}   "),
+                VideoMsg::Done(p) => eprintln!("\ndone: {}", p.display()),
+                VideoMsg::Failed(e) => {
+                    eprintln!("\nFAILED: {e}");
+                    std::process::exit(1);
+                }
             }
         }
-    }
+    });
 }
 
 /// Renders a `quat-voxel-stl`: voxelizes a quaternion fractal at a FIXED C
@@ -2099,16 +2106,128 @@ fn cmd_quat_raymarch_dag_video(
         }
     }
     let (tx, rx) = std::sync::mpsc::channel::<VideoMsg>();
-    encode_rgb_frames(frame_iter, n, fps, width, height, out_path, &tx, &|| {});
-    drop(tx);
-    for msg in rx {
-        match msg {
-            VideoMsg::Started { pid } => eprintln!("ffmpeg started (pid {pid})"),
-            VideoMsg::Progress { done, total } => eprint!("\rframe {done}/{total}   "),
-            VideoMsg::Done(p) => eprintln!("\ndone: {}", p.display()),
-            VideoMsg::Failed(e) => {
-                eprintln!("\nFAILED: {e}");
-                std::process::exit(1);
+    // See `cmd_quat_render_timeline`'s identical block for why this must be
+    // a `thread::scope`, not a plain in-line call — an unbounded
+    // `mpsc::channel` lets every progress message silently queue up for the
+    // whole render otherwise, so nothing prints until it's already done.
+    std::thread::scope(|scope| {
+        scope.spawn(move || {
+            encode_rgb_frames(frame_iter, n, fps, width, height, out_path, &tx, &|| {});
+        });
+        for msg in rx {
+            match msg {
+                VideoMsg::Started { pid } => eprintln!("ffmpeg started (pid {pid})"),
+                VideoMsg::Progress { done, total } => eprint!("\rframe {done}/{total}   "),
+                VideoMsg::Done(p) => eprintln!("\ndone: {}", p.display()),
+                VideoMsg::Failed(e) => {
+                    eprintln!("\nFAILED: {e}");
+                    std::process::exit(1);
+                }
+            }
+        }
+    });
+}
+
+/// Animation-viewer plan, Phase 7: renders a full `AnimationTimeline`
+/// (axis assignment, bounding box, X/Y/Z/T track clips, effects-lane
+/// cutaways, camera orbit, delta_t) to a video — the batch-render half of
+/// the "live preview and rendered output must always show the same
+/// animation" requirement. Every per-frame parameter comes from
+/// `nnfractals::anim_eval::build_frame_params`, the EXACT SAME function
+/// `anim_viewer.rs`'s live preview calls — this is deliberate, not
+/// incidental: it's what makes preview/render parity a structural
+/// guarantee instead of two hand-synced implementations.
+#[allow(clippy::too_many_arguments)]
+fn cmd_quat_render_timeline(
+    timeline: &nnfractals::anim_timeline::AnimationTimeline,
+    trim_start_s: f64, trim_end_s: f64,
+    genome: &nnfractals::genome::Genome,
+    genome_label: &str,
+    width: u32, height: u32, fps: u32,
+    colormap_name: &str,
+    bg_color: (f32, f32, f32),
+    max_iter: u32, aa: u32,
+    use_gpu: bool,
+    out_path: &Path,
+) {
+    use nnfractals::video_export::{encode_rgb_frames, VideoMsg};
+    let delta_t = timeline.delta_t;
+    let seconds = nnfractals::anim_timeline::wallclock_span(trim_end_s - trim_start_s, delta_t);
+    let n = ((seconds * fps as f64).round() as u32).max(2);
+    eprintln!(
+        "quat-render-timeline: {genome_label} trim=[{trim_start_s:.2},{trim_end_s:.2}]s delta_t={delta_t:.2} -> {seconds:.2}s @ {fps}fps ({n} frames) {width}x{height} colormap={colormap_name} gpu={use_gpu} -> {}",
+        out_path.display()
+    );
+    let formula = nnfractals::quat_dag::QuatDagFormula {
+        prog: &genome.program, warp: &genome.warp, julia: genome.julia_mode,
+        jc: (genome.julia_cre, genome.julia_cim), phoenix: (genome.phoenix_re, genome.phoenix_im),
+    };
+    let mut mode = resolve_dag_gpu_mode(formula.prog, formula.warp, use_gpu);
+    let quality = nnfractals::anim_eval::RenderQuality { max_iter, aa };
+    let frame_iter = (0..n).map(|i| {
+        let t = nnfractals::anim_timeline::frame_pos_s(i, n, trim_start_s, trim_end_s);
+        let (params, cam) = nnfractals::anim_eval::build_frame_params(timeline, formula, t, genome.bailout_radius as f64, quality);
+        let (shading, color_t) = render_dag_frame_with_mode(&mut mode, &params, &cam, width, height);
+        raymarch_frame_to_rgb(&shading, &color_t, params.max_iter, colormap_name, bg_color)
+    });
+    if let Some(dir) = out_path.parent() {
+        if !dir.as_os_str().is_empty() {
+            std::fs::create_dir_all(dir).expect("create out dir");
+        }
+    }
+    let (tx, rx) = std::sync::mpsc::channel::<VideoMsg>();
+    // `encode_rgb_frames` must run on its OWN thread while this one drains
+    // `rx` concurrently — `mpsc::channel` is unbounded, so calling it
+    // in-line here and draining `rx` only afterward (the previous shape)
+    // let EVERY `tx.send(VideoMsg::Progress {..})` queue up silently for the
+    // whole render and only get printed in one instant burst right at the
+    // end. Carl (2026-09-22): a real ~4-minute render sat at "starting…"
+    // the entire time — genuinely rendering (GPU busy, output file growing)
+    // but with zero live progress ever reaching stderr, because nothing
+    // was there to print it until `encode_rgb_frames` had already
+    // returned. `thread::scope` (not a `'static` `thread::spawn`) is what
+    // lets this borrow `timeline`/`formula`/`mode`/etc. without cloning.
+    let mut video_path: Option<std::path::PathBuf> = None;
+    std::thread::scope(|scope| {
+        scope.spawn(move || {
+            encode_rgb_frames(frame_iter, n, fps, width, height, out_path, &tx, &|| {});
+        });
+        for msg in rx {
+            match msg {
+                VideoMsg::Started { pid } => eprintln!("ffmpeg started (pid {pid})"),
+                VideoMsg::Progress { done, total } => eprint!("\rframe {done}/{total}   "),
+                VideoMsg::Done(p) => {
+                    eprintln!("\ndone: {}", p.display());
+                    video_path = Some(p);
+                }
+                VideoMsg::Failed(e) => {
+                    eprintln!("\nFAILED: {e}");
+                    std::process::exit(1);
+                }
+            }
+        }
+    });
+    let resolved: Vec<_> = timeline.audio_clips.iter()
+        .filter_map(|c| nnfractals::anim_timeline::resolve_audio_clip_for_render(c, trim_start_s, trim_end_s))
+        .collect();
+    if !resolved.is_empty() {
+        let Some(silent_path) = video_path else {
+            eprintln!("  audio mux skipped: no output video path was reported");
+            return;
+        };
+        let muxed_path = out_path.to_path_buf();
+        let tmp_path = out_path.with_extension("premux.mp4");
+        if let Err(e) = std::fs::rename(&silent_path, &tmp_path) {
+            eprintln!("  audio mux FAILED: couldn't stage silent video for muxing: {e}");
+            return;
+        }
+        match nnfractals::video_export::mux_audio_clips(&tmp_path, &resolved, &muxed_path) {
+            Ok(()) => {
+                let _ = std::fs::remove_file(&tmp_path);
+                eprintln!("  audio muxed from {} clip(s)", resolved.len());
+            }
+            Err(e) => {
+                eprintln!("  audio mux FAILED ({e}) — silent video kept at {}", tmp_path.display());
             }
         }
     }
@@ -2227,6 +2346,7 @@ fn score_genome_dag(genome: &Genome, probe_size: u32, use_gpu: bool) -> nnfracta
         time_axis: nnfractals::quat_fractal::TimeAxis::C,
         time_val: 0.0,
         domain_radius,
+        box_bounds: None, axis_assignment: None, clip_plane: None, slide_iter: None, hide_above: None,
         max_iter: 60,
         bailout: genome.bailout_radius as f64,
         max_march_steps: 150,
@@ -2298,6 +2418,7 @@ fn score_genome_dag_full(genome: &Genome, probe_size: u32, use_gpu: bool) -> Qua
         time_axis: nnfractals::quat_fractal::TimeAxis::C,
         time_val: 0.0,
         domain_radius,
+        box_bounds: None, axis_assignment: None, clip_plane: None, slide_iter: None, hide_above: None,
         max_iter: 60,
         bailout: genome.bailout_radius as f64,
         max_march_steps: 150,
@@ -2571,7 +2692,37 @@ fn apply_organization_metrics(g: &mut Genome) {
     g.quat_organization_multifractal = finite_or_zero(m.multifractal_width);
     g.quat_organization_compression = finite_or_zero(m.compression_complexity);
     g.quat_organization_chaoticity = finite_or_zero(m.chaoticity);
+    g.quat_organization_entropy = finite_or_zero(m.field_entropy);
+    g.quat_organization_continuity = finite_or_zero(m.continuity);
+    g.quat_organization_richness = finite_or_zero(m.organized_richness);
     g.quat_sphericity = finite_or_zero(m.sphericity);
+}
+
+/// Writes `quat_boundedness::compute_boundedness`'s result onto `g` — see
+/// that module's doc comment for what "a limit" means here. `-1.0` is the
+/// documented sentinel for "no limit found" (see the fields' own doc
+/// comments in genome.rs); never `finite_or_zero`'d to 0.0, which would
+/// silently collide with "never computed".
+fn apply_boundedness_metrics(g: &mut Genome) {
+    let formula = nnfractals::quat_dag::QuatDagFormula {
+        prog: &g.program,
+        warp: &g.warp,
+        julia: g.julia_mode,
+        jc: (g.julia_cre, g.julia_cim),
+        phoenix: (g.phoenix_re, g.phoenix_im),
+    };
+    let bailout_sq = (g.bailout_radius as f64) * (g.bailout_radius as f64);
+    let report = nnfractals::quat_boundedness::compute_boundedness(&formula, 200, bailout_sq);
+    let as_f32 = |v: Option<f64>| v.map(|x| x as f32).filter(|x| x.is_finite()).unwrap_or(-1.0);
+    g.quat_bound_r_pos = as_f32(report.r.pos);
+    g.quat_bound_r_neg = as_f32(report.r.neg);
+    g.quat_bound_a_pos = as_f32(report.a.pos);
+    g.quat_bound_a_neg = as_f32(report.a.neg);
+    g.quat_bound_b_pos = as_f32(report.b.pos);
+    g.quat_bound_b_neg = as_f32(report.b.neg);
+    g.quat_bound_c_pos = as_f32(report.c.pos);
+    g.quat_bound_c_neg = as_f32(report.c.neg);
+    g.quat_fully_bounded = if report.fully_bounded() { 1.0 } else { 0.0 };
 }
 
 /// Reads one named `quat_*` metric straight off a `QuatFullMetrics` —
@@ -2932,7 +3083,7 @@ const STRUCTURAL_METRIC_NAMES: [&str; 5] = ["node_count", "opcode_diversity", "m
 /// shared across every organization term in a combo spec, exactly the
 /// same one-computation-many-lookups pattern `full` already uses for the
 /// render-based metrics.
-const ORGANIZATION_METRIC_NAMES: [&str; 7] = [
+const ORGANIZATION_METRIC_NAMES: [&str; 10] = [
     "organization_statistical",
     "organization_ordinal",
     "organization_multifractal",
@@ -2940,6 +3091,9 @@ const ORGANIZATION_METRIC_NAMES: [&str; 7] = [
     "organization_compression_capped",
     "organization_chaoticity",
     "sphericity",
+    "organization_entropy",
+    "organization_continuity",
+    "organization_richness",
 ];
 
 /// Compression ratio past which `organization_compression_capped` starts
@@ -3015,6 +3169,9 @@ fn lookup_metric(genome: &Genome, name: &str, full: Option<&QuatFullMetrics>, or
             "organization_compression" => organization.compression_complexity,
             "organization_chaoticity" => organization.chaoticity,
             "sphericity" => organization.sphericity,
+            "organization_entropy" => organization.field_entropy,
+            "organization_continuity" => organization.continuity,
+            "organization_richness" => organization.organized_richness,
             _ => unreachable!(),
         }) as f64;
     }
@@ -3091,12 +3248,36 @@ fn taste_score_for_genome(genome: &Genome, use_gpu: bool) -> f64 {
     let mut guard = mutex.lock().unwrap();
     let Some(scorer) = guard.as_mut() else { return 0.0 };
 
+    // Grid-pooled models (angles × C values) score the whole view set, the
+    // same images `train_taste_quat.py --pooling grid` embedded. Re-read the
+    // JSON twin each call: the model can be retrained mid-run.
+    let grid = nnfractals::quat_taste::TasteModelConfig::load(std::path::Path::new("taste_model_quat.json"))
+        .map(|c| c.pooling == "grid").unwrap_or(false);
+    if grid {
+        let scratch_dir = std::path::Path::new("explorer_out/taste_scratch");
+        std::fs::create_dir_all(scratch_dir).ok();
+        let stem = format!("grid_{}", std::process::id());
+        let paths = render_genome_views(genome, scratch_dir, &stem, use_gpu);
+        let mut hash: u64 = 0xcbf29ce484222325;
+        for p in &paths {
+            for b in std::fs::read(p).unwrap_or_default() {
+                hash ^= b as u64;
+                hash = hash.wrapping_mul(0x100000001b3);
+            }
+        }
+        let key = format!("{hash:016x}");
+        let score = scorer.score_blocking(&key, &paths).unwrap_or(0.0);
+        for p in &paths { std::fs::remove_file(p).ok(); }
+        return score as f64;
+    }
+
     let formula = nnfractals::quat_dag::QuatDagFormula { prog: &genome.program, warp: &genome.warp, julia: genome.julia_mode, jc: (genome.julia_cre, genome.julia_cim), phoenix: (genome.phoenix_re, genome.phoenix_im) };
     let domain_radius = 1.6;
     let fov_deg = 45.0;
     let bg_color = (0.03, 0.02, 0.06);
     let params = nnfractals::quat_dag::RaymarchDagParams {
         formula, time_axis: nnfractals::quat_fractal::TimeAxis::C, time_val: 0.0, domain_radius,
+        box_bounds: None, axis_assignment: None, clip_plane: None, slide_iter: None, hide_above: None,
         max_iter: 50, bailout: genome.bailout_radius as f64, max_march_steps: 150,
         hit_epsilon: domain_radius * 1e-4, step_safety: 0.8, light_dir: (0.5, 0.8, 0.3),
         normal_eps: domain_radius * 1e-3, color_probe_offset: domain_radius * 1e-2, aa: 1,
@@ -3317,6 +3498,13 @@ enum CrossoverMode {
     Subtree,
 }
 
+/// `generations == 0` means "run forever" (see both `cmd_quat_dag_evolve`'s
+/// and `cmd_quat_dag_evolve_map_elites`'s main loops) — this is just the
+/// display-side spelling of that, for progress lines like "gen 15/{total}".
+fn generations_label(generations: usize) -> String {
+    if generations == 0 { "\u{221e}".to_string() } else { generations.to_string() }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn cmd_quat_dag_evolve(
     pool_dir: &str,
@@ -3519,7 +3707,15 @@ fn cmd_quat_dag_evolve(
     let mut rng2 = rand::rngs::StdRng::seed_from_u64(seed ^ 0xDEAD_BEEF_u64);
     let mut checkpoint_stems: Vec<String> = Vec::new();
 
-    for gen_idx in 1..=generations {
+    // `generations == 0` means "run forever" — Carl, 2026-09-27: "I want to
+    // generate without ending." Left for an external supervisor (the
+    // launcher's "generate forever" mode) to stop by killing this process;
+    // `CHECKPOINT_INTERVAL` above already guarantees at most 14 generations
+    // of progress are ever at risk from an unceremonious kill.
+    let mut gen_idx = 0usize;
+    loop {
+        gen_idx += 1;
+        if generations != 0 && gen_idx > generations { break; }
         let gen_start = std::time::Instant::now();
         let survivor_count = survivors.min(population_vec.len());
         let mut next_gen: Vec<QuatIndividual> = population_vec.drain(..survivor_count).collect();
@@ -3677,7 +3873,7 @@ fn cmd_quat_dag_evolve(
             let ckpt_start = std::time::Instant::now();
             checkpoint_stems = save_quat_population(&population_vec, out_dir, &fitness_metric, gen_idx, probe_size, use_gpu, &mut rng2, &checkpoint_stems);
             write_contact_sheet(std::path::Path::new(out_dir), &checkpoint_stems);
-            eprintln!("  [checkpoint] gen {gen_idx}/{generations}: saved {} genomes to {out_dir} in {:.0}s", checkpoint_stems.len(), ckpt_start.elapsed().as_secs_f64());
+            eprintln!("  [checkpoint] gen {gen_idx}/{}: saved {} genomes to {out_dir} in {:.0}s", generations_label(generations), checkpoint_stems.len(), ckpt_start.elapsed().as_secs_f64());
         }
     }
 
@@ -3776,7 +3972,12 @@ fn cmd_quat_dag_evolve_map_elites(
     const CHECKPOINT_INTERVAL: usize = 15;
     let mut checkpoint_stems: Vec<String> = Vec::new();
 
-    for gen_idx in 1..=generations {
+    // `generations == 0` means "run forever" — see `generations_label`'s
+    // doc comment and `cmd_quat_dag_evolve`'s identical loop.
+    let mut gen_idx = 0usize;
+    loop {
+        gen_idx += 1;
+        if generations != 0 && gen_idx > generations { break; }
         let gen_start = std::time::Instant::now();
         let mut inserted = 0usize;
         let mut new_cells = 0usize;
@@ -3881,7 +4082,7 @@ fn cmd_quat_dag_evolve_map_elites(
             let (stems, stems_by_cell) = save_map_elites_archive(&archive, out_dir, gen_idx, probe_size, use_gpu, &checkpoint_stems);
             checkpoint_stems = stems;
             write_map_elites_grid(std::path::Path::new(out_dir), &archive, &stems_by_cell);
-            eprintln!("  [checkpoint] gen {gen_idx}/{generations}: saved {} elites to {out_dir} in {:.0}s", checkpoint_stems.len(), ckpt_start.elapsed().as_secs_f64());
+            eprintln!("  [checkpoint] gen {gen_idx}/{}: saved {} elites to {out_dir} in {:.0}s", generations_label(generations), checkpoint_stems.len(), ckpt_start.elapsed().as_secs_f64());
         }
     }
 
@@ -4283,6 +4484,7 @@ fn render_genome_thumbnails(genome: &Genome, out_dir: &std::path::Path, stem: &s
         time_axis: nnfractals::quat_fractal::TimeAxis::C,
         time_val: 0.0,
         domain_radius,
+        box_bounds: None, axis_assignment: None, clip_plane: None, slide_iter: None, hide_above: None,
         max_iter: 50,
         bailout: genome.bailout_radius as f64,
         max_march_steps: 150,
@@ -4329,14 +4531,15 @@ fn render_genome_thumbnails(genome: &Genome, out_dir: &std::path::Path, stem: &s
 }
 
 /// View-set size for the taste model's "4D" input — see `render_genome_views`.
-const VIEW_ANGLES: usize = 3;
-const VIEW_C_VALUES: usize = 3;
+/// Grid shape and C values are shared with the live rotating rating view
+/// (`nnfractals::quat_live_view`) so what Carl judges is what the model sees.
+use nnfractals::quat_live_view::{VIEW_ANGLES, VIEW_C_VALUES};
 const VIEW_SIZE: u32 = 224;
 
-/// Renders a fixed 9-image view set (`{stem}_view_00..08.png`, 224×224 —
+/// Renders a fixed VIEW_ANGLES×VIEW_C_VALUES view set (`{stem}_view_00..NN.png`, 224×224 —
 /// SigLIP's native input size) for one genome: 3 orbit angles (0°, 120°,
-/// 240° around the same orbit axis `render_genome_thumbnails` uses) crossed
-/// with 3 C values (0, +c_half, -c_half). This is the taste model's "4D"
+/// 60°… around the same orbit axis `render_genome_thumbnails` uses) crossed
+/// with C values evenly spaced over [-c_half, +c_half]. This is the taste model's "4D"
 /// input — a single still at C=0 only shows one cross-section of a
 /// quaternion object; sweeping C is how the model sees the shape actually
 /// changing through the 4th (julia-parameter) axis, the same way the
@@ -4363,6 +4566,7 @@ fn render_genome_views(genome: &Genome, out_dir: &std::path::Path, stem: &str, u
         time_axis: nnfractals::quat_fractal::TimeAxis::C,
         time_val: 0.0,
         domain_radius,
+        box_bounds: None, axis_assignment: None, clip_plane: None, slide_iter: None, hide_above: None,
         max_iter: 50,
         bailout: genome.bailout_radius as f64,
         max_march_steps: 150,
@@ -4383,8 +4587,7 @@ fn render_genome_views(genome: &Genome, out_dir: &std::path::Path, stem: &str, u
         phase0: 0.0,
         fov_y: fov_deg.to_radians(),
     };
-    let c_half = (genome.bailout_radius as f64 * 0.25).max(0.02);
-    let c_values = [0.0, c_half, -c_half];
+    let c_values = nnfractals::quat_live_view::view_c_values(genome.bailout_radius as f64);
     let mut paths = Vec::with_capacity(VIEW_ANGLES * VIEW_C_VALUES);
     let mut idx = 0usize;
     for a in 0..VIEW_ANGLES {
@@ -4575,19 +4778,26 @@ fn cmd_quat_raymarch_video(
         }
     }
     let (tx, rx) = std::sync::mpsc::channel::<VideoMsg>();
-    encode_rgb_frames(frame_iter, n, fps, width, height, out_path, &tx, &|| {});
-    drop(tx);
-    for msg in rx {
-        match msg {
-            VideoMsg::Started { pid } => eprintln!("ffmpeg started (pid {pid})"),
-            VideoMsg::Progress { done, total } => eprint!("\rframe {done}/{total}   "),
-            VideoMsg::Done(p) => eprintln!("\ndone: {}", p.display()),
-            VideoMsg::Failed(e) => {
-                eprintln!("\nFAILED: {e}");
-                std::process::exit(1);
+    // See `cmd_quat_render_timeline`'s identical block for why this must be
+    // a `thread::scope`, not a plain in-line call — an unbounded
+    // `mpsc::channel` lets every progress message silently queue up for the
+    // whole render otherwise, so nothing prints until it's already done.
+    std::thread::scope(|scope| {
+        scope.spawn(move || {
+            encode_rgb_frames(frame_iter, n, fps, width, height, out_path, &tx, &|| {});
+        });
+        for msg in rx {
+            match msg {
+                VideoMsg::Started { pid } => eprintln!("ffmpeg started (pid {pid})"),
+                VideoMsg::Progress { done, total } => eprint!("\rframe {done}/{total}   "),
+                VideoMsg::Done(p) => eprintln!("\ndone: {}", p.display()),
+                VideoMsg::Failed(e) => {
+                    eprintln!("\nFAILED: {e}");
+                    std::process::exit(1);
+                }
             }
         }
-    }
+    });
 }
 
 /// Prints a `quat-gravity-report`: simulates+probes a trajectory (no video
@@ -6348,6 +6558,7 @@ fn main() {
                 time_axis,
                 time_val: get_flag_or(&args, "--c", 0.0),
                 domain_radius: get_flag_or(&args, "--domain-radius", 1.6),
+                box_bounds: None, axis_assignment: None, clip_plane: None, slide_iter: None, hide_above: None,
                 max_iter: get_flag_or(&args, "--max-iter", 60),
                 bailout: get_flag_or(&args, "--bailout", genome.bailout_radius as f64),
                 max_march_steps: get_flag_or(&args, "--max-march-steps", 200),
@@ -6411,6 +6622,7 @@ fn main() {
                 time_axis,
                 time_val: c0,
                 domain_radius: get_flag_or(&args, "--domain-radius", 1.6),
+                box_bounds: None, axis_assignment: None, clip_plane: None, slide_iter: None, hide_above: None,
                 max_iter: get_flag_or(&args, "--max-iter", 60),
                 bailout: get_flag_or(&args, "--bailout", genome.bailout_radius as f64),
                 max_march_steps: get_flag_or(&args, "--max-march-steps", 200),
@@ -6449,6 +6661,38 @@ fn main() {
             let use_gpu = args.iter().any(|a| a == "--gpu");
             eprintln!("  [framing] --radius defaulted to {default_radius:.2} for {width}x{height} at fov-deg={fov_deg_for_orbit} (aspect-aware; pass --radius to override)");
             cmd_quat_raymarch_dag_video(params, orbit, pulse, genome_label, frames, fps, width, height, colormap_name, bg_color, use_gpu, &out_path);
+        }
+        Some("quat-render-timeline") => {
+            let out_path = pos.get(1).map(PathBuf::from).unwrap_or_else(||
+                PathBuf::from(format!("explorer_out/quat_mandelbrot/render_timeline_{}.mp4", timestamp())));
+            let genome_path = get_flag(&args, "--genome").unwrap_or_else(|| panic!("quat-render-timeline needs --genome path.nn"));
+            let genome = io::load_genome(std::path::Path::new(genome_path)).unwrap_or_else(|e| panic!("failed to load genome {genome_path:?}: {e}"));
+            if genome.program.is_empty() {
+                panic!("genome {genome_path:?} has an empty DAG program (legacy 58-basis genome?) — quat-render-timeline only supports DAG-based genomes");
+            }
+            let timeline_path = get_flag(&args, "--timeline").unwrap_or_else(|| panic!("quat-render-timeline needs --timeline path.json"));
+            let timeline_json = std::fs::read_to_string(timeline_path).unwrap_or_else(|e| panic!("failed to read timeline {timeline_path:?}: {e}"));
+            let timeline: nnfractals::anim_timeline::AnimationTimeline = serde_json::from_str(&timeline_json)
+                .unwrap_or_else(|e| panic!("failed to parse timeline {timeline_path:?}: {e}"));
+            let width: u32 = get_flag_or(&args, "--width", 1080);
+            let height: u32 = get_flag_or(&args, "--height", 1080);
+            let fps: u32 = get_flag_or(&args, "--fps", 30);
+            let max_iter: u32 = get_flag_or(&args, "--max-iter", 60);
+            let aa: u32 = get_flag_or(&args, "--aa", 2);
+            // Defaults to the timeline's OWN persisted trim range, but a
+            // caller (the render queue, or a direct CLI invocation) can
+            // export a sub-range of a longer authored timeline without
+            // needing to re-save the timeline JSON itself.
+            let trim_start_s: f64 = get_flag_or(&args, "--trim-start", timeline.trim_start_s);
+            let trim_end_s: f64 = get_flag_or(&args, "--trim-end", timeline.trim_end_s);
+            let colormap_name = get_flag(&args, "--colormap").unwrap_or("lava").to_string();
+            let bg_color = {
+                let v = parse_vec3(get_flag(&args, "--bg-color").unwrap_or("0.03,0.02,0.06"));
+                (v.0 as f32, v.1 as f32, v.2 as f32)
+            };
+            let genome_label = std::path::Path::new(genome_path).file_stem().and_then(|s| s.to_str()).unwrap_or(genome_path).to_string();
+            let use_gpu = args.iter().any(|a| a == "--gpu");
+            cmd_quat_render_timeline(&timeline, trim_start_s, trim_end_s, &genome, &genome_label, width, height, fps, &colormap_name, bg_color, max_iter, aa, use_gpu, &out_path);
         }
         Some("quat-formula-full-metrics") => {
             let formula_name = get_flag(&args, "--formula").unwrap_or("bulb");
@@ -6585,6 +6829,121 @@ fn main() {
                 }
             }
             eprintln!("\r  rescored {done}/{} in {:.0}s ({skipped} skipped — empty/legacy programs)", files.len(), start.elapsed().as_secs_f64());
+        }
+        Some("quat-bounded-scan") => {
+            // Carl, 2026-09-23: "I want to know what fractals actually
+            // have a set limit when observed from outside with
+            // raycasting... the 4 axis have actually limits on all 4
+            // axis. Please also note these limits once extracted. Please
+            // run the metric for every quaternion on the GA, do it no
+            // question please, I'm leaving." — writes the 9 new
+            // `quat_bound_*`/`quat_fully_bounded` fields (see genome.rs
+            // and quat_boundedness.rs) onto every genome, same
+            // genotype-untouched convention as `quat-dag-rescore`, and
+            // additionally writes a plain-text summary listing every
+            // fully-bounded genome's actual limits (the fields alone are
+            // durable but not glanceable across ~2500 files at once).
+            //
+            // `--dir DIR` scans one folder; omitted, scans EVERY folder at
+            // the project root whose name matches `is_quat_genome_path`'s
+            // own "fractals_dag_quat*" convention (lib.rs) — "every
+            // quaternion on the GA" means every such folder, not just one.
+            //
+            // Parallelized with rayon (unlike quat-dag-rescore's
+            // sequential loop): this metric is pure CPU point evaluation
+            // with no GPU/shared-render-pipeline state to contend over,
+            // so there's no reason to leave real wall-clock time on the
+            // table across ~2500 genomes.
+            use rayon::prelude::*;
+            use std::sync::atomic::Ordering;
+            use std::sync::Mutex;
+            let explicit_dir = get_flag(&args, "--dir");
+            let dirs: Vec<PathBuf> = match explicit_dir {
+                Some(d) => vec![PathBuf::from(d)],
+                None => {
+                    let mut ds: Vec<PathBuf> = std::fs::read_dir(".")
+                        .unwrap_or_else(|e| panic!("failed to read project root: {e}"))
+                        .filter_map(|e| e.ok())
+                        .map(|e| e.path())
+                        .filter(|p| p.is_dir())
+                        .filter(|p| {
+                            p.file_name().and_then(|n| n.to_str())
+                                .is_some_and(|n| n.starts_with("fractals_dag_quat"))
+                        })
+                        .collect();
+                    ds.sort();
+                    ds
+                }
+            };
+            if dirs.is_empty() {
+                panic!("quat-bounded-scan found no fractals_dag_quat* folders under the project root (and no --dir was given)");
+            }
+            eprintln!("quat-bounded-scan: {} folder(s): {}", dirs.len(),
+                dirs.iter().map(|d| d.display().to_string()).collect::<Vec<_>>().join(", "));
+
+            let done = std::sync::atomic::AtomicUsize::new(0);
+            let skipped = std::sync::atomic::AtomicUsize::new(0);
+            let fully_bounded_lines: Mutex<Vec<String>> = Mutex::new(Vec::new());
+            let start = std::time::Instant::now();
+            let mut total_files = 0usize;
+
+            for dir in &dirs {
+                let files: Vec<PathBuf> = std::fs::read_dir(dir)
+                    .unwrap_or_else(|e| panic!("failed to read {dir:?}: {e}"))
+                    .filter_map(|e| e.ok())
+                    .map(|e| e.path())
+                    .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("nn"))
+                    .collect();
+                total_files += files.len();
+                files.par_iter().for_each(|path| {
+                    let mut genome = match io::load_genome(path) {
+                        Ok(g) if !g.program.is_empty() => g,
+                        _ => { skipped.fetch_add(1, Ordering::Relaxed); return; }
+                    };
+                    apply_boundedness_metrics(&mut genome);
+                    if genome.quat_fully_bounded >= 0.5 {
+                        let line = format!(
+                            "{}: R=[{:.4},{:.4}] A=[{:.4},{:.4}] B=[{:.4},{:.4}] C=[{:.4},{:.4}]",
+                            path.display(),
+                            -genome.quat_bound_r_neg, genome.quat_bound_r_pos,
+                            -genome.quat_bound_a_neg, genome.quat_bound_a_pos,
+                            -genome.quat_bound_b_neg, genome.quat_bound_b_pos,
+                            -genome.quat_bound_c_neg, genome.quat_bound_c_pos,
+                        );
+                        fully_bounded_lines.lock().unwrap().push(line);
+                    }
+                    io::save_genome(&genome, path).unwrap_or_else(|e| panic!("failed to re-save {path:?}: {e}"));
+                    let n = done.fetch_add(1, Ordering::Relaxed) + 1;
+                    if n % 50 == 0 {
+                        eprint!("\r  scanned {n}/{total_files} ({:.0}s)   ", start.elapsed().as_secs_f64());
+                    }
+                });
+            }
+            let done = done.load(Ordering::Relaxed);
+            let skipped = skipped.load(Ordering::Relaxed);
+            let mut lines = fully_bounded_lines.into_inner().unwrap();
+            lines.sort();
+            eprintln!(
+                "\r  scanned {done}/{total_files} in {:.0}s ({skipped} skipped — empty/legacy programs); {} fully bounded on all 4 axes",
+                start.elapsed().as_secs_f64(), lines.len()
+            );
+            let report_path = PathBuf::from("quat_boundedness_report.txt");
+            let mut report = format!(
+                "quat-bounded-scan — {done}/{total_files} genomes scanned across {} folder(s), {skipped} skipped, {} fully bounded on all 4 axes\n\
+                 folders: {}\n\
+                 search radius: {} (quat_boundedness::SEARCH_MAX)\n\
+                 columns: R=[neg,pos] A=[neg,pos] B=[neg,pos] C=[neg,pos] — the raw R/A/B/C limits, in the same units as bailout_radius\n\n",
+                dirs.len(), lines.len(),
+                dirs.iter().map(|d| d.display().to_string()).collect::<Vec<_>>().join(", "),
+                nnfractals::quat_boundedness::SEARCH_MAX,
+            );
+            for line in &lines {
+                report.push_str(line);
+                report.push('\n');
+            }
+            std::fs::write(&report_path, &report)
+                .unwrap_or_else(|e| panic!("failed to write {report_path:?}: {e}"));
+            eprintln!("  report written to {}", report_path.display());
         }
         Some("quat-dag-evolve") => {
             let pool_dir = get_flag(&args, "--pool-dir").unwrap_or("fractals_dag");
@@ -6859,7 +7218,7 @@ fn main() {
             eprintln!("  nnfractals-explorer quat-raymarch-genome-video [out.mp4] --genome path.nn (a DAG-based genome) [--time-axis r|a|b|c (c)] [--c F (fixed, no pulse) | --c0/--c1 F (-0.6/0.6, sine pulse by default)] [--c-shape ramp|sine|cosine|triangle|sawtooth|pulse|orbit (sine)] [--c-freq F (1.5)] [--c-phase F (0.0)] [--frames N (90)] [--fps N (30)] [--width N (640)] [--height N (640)] [--target R,A,B (0,0,0)] [--axis R,A,B (0,1,0)] [--radius F (4.0)] [--turns F (1.0)] [--phase0 F (0.0)] [--fov-deg F (45.0)] [--domain-radius F (1.6)] [--max-iter N (60)] [--bailout F (=genome's own bailout_radius)] [--max-march-steps N (200)] [--hit-eps F (=1e-4*domain-radius)] [--step-safety F (0.8)] [--light R,A,B (0.5,0.8,0.3)] [--normal-eps F (=1e-3*domain-radius)] [--color-probe-offset F (=1e-2*domain-radius)] [--colormap name (lava)] [--bg-color R,G,B (0.03,0.02,0.06)] [--aa N (1)] [--gpu]");
             eprintln!("  nnfractals-explorer quat-formula-full-metrics [--formula name (bulb)] [--probe-size N (128)] [--gpu] [--out path.json (explorer_out/quat_formula_full_metrics.json)] — scores a classic hardcoded formula (not an evolved genome) across ALL 4 --time-axis choices (r/a/b/c), same probe camera/metric machinery as an evolved genome's own scoring, so the numbers are directly comparable to a .nn file's saved quat_* fields; writes one JSON object per axis plus an all-4-axes average");
             eprintln!("  nnfractals-explorer quat-dag-score --genome path.nn (score ONE genome: anisotropy/coverage/solidity/shading_richness/color_entropy + weighted total, see quat_dag_fitness.rs) | --pool-dir DIR (score+rank a random SAMPLE of genomes in DIR) [--sample N (500)] [--seed N (42)] [--top N (20)] [--out-list path.csv (write the full ranked list)] [--probe-size N (96, square low-res probe renders)] [--gpu]");
-            eprintln!("  nnfractals-explorer quat-dag-evolve [--pool-dir DIR (fractals_dag, seeds the initial population)] [--out-dir DIR (fractals_dag_quat — deliberately separate, never writes into --pool-dir)] [--population N (40)] [--generations N (10)] [--survivors N (12), elitist: carried over each generation unchanged] [--probe-size N (128)] [--seed N (1)] [--gpu] [--crossover-mode legacy|subtree (legacy)] [--mutation-min-edits N] [--mutation-max-edits N] [--mutation-const-scale F] [--mutation-max-depth N] [--fitness-metric SPEC] [--pref-model PATH (pref_model_quat.json)] — evolves the DAG genome's `program` (mutation/crossover, same as the 2D GA unless --crossover-mode subtree) selecting on a 50/50 blend of the geometric pre-filter (quat_dag_fitness) and Carl's own trained preference model (quat_pref::QuatPrefModel — scripts/train_pref_quat.py, a linear fit over the ~30 quat_* metrics from the browser's ⚖ Rate pairwise comparisons; falls back to geometric-only, NOT the generic 2D NIMA/TOPIQ/AP25 ensemble, if --pref-model isn't found), UNLESS --fitness-metric SPEC is set, which selects purely on SPEC instead — a bare metric name (any quat_dag_fitness/quat_dag_fitness's extended-metrics field, e.g. convexity/box_dim/opcode_diversity — structural names need no rendering at all, much faster), or a comma-separated weighted combo (e.g. \"silhouette_irregularity:1.0,shading_gradient:0.7,color_shading_corr:0.5\", fitness = weighted sum); every saved filename is prefixed with the metric name(s) used (see quat-dag-thumbs for static + animated thumbnails) and every genome gets all ~30 quat_* metric fields backfilled (see quat-dag-rescore to backfill an existing archive)");
+            eprintln!("  nnfractals-explorer quat-dag-evolve [--pool-dir DIR (fractals_dag, seeds the initial population)] [--out-dir DIR (fractals_dag_quat — deliberately separate, never writes into --pool-dir)] [--population N (40)] [--generations N (10), 0 = run forever — stop it (SIGTERM) yourself, e.g. from the launcher's \"generate forever\" supervisor] [--survivors N (12), elitist: carried over each generation unchanged] [--probe-size N (128)] [--seed N (1)] [--gpu] [--crossover-mode legacy|subtree (legacy)] [--mutation-min-edits N] [--mutation-max-edits N] [--mutation-const-scale F] [--mutation-max-depth N] [--fitness-metric SPEC] [--pref-model PATH (pref_model_quat.json)] — evolves the DAG genome's `program` (mutation/crossover, same as the 2D GA unless --crossover-mode subtree) selecting on a 50/50 blend of the geometric pre-filter (quat_dag_fitness) and Carl's own trained preference model (quat_pref::QuatPrefModel — scripts/train_pref_quat.py, a linear fit over the ~30 quat_* metrics from the browser's ⚖ Rate pairwise comparisons; falls back to geometric-only, NOT the generic 2D NIMA/TOPIQ/AP25 ensemble, if --pref-model isn't found), UNLESS --fitness-metric SPEC is set, which selects purely on SPEC instead — a bare metric name (any quat_dag_fitness/quat_dag_fitness's extended-metrics field, e.g. convexity/box_dim/opcode_diversity — structural names need no rendering at all, much faster), or a comma-separated weighted combo (e.g. \"silhouette_irregularity:1.0,shading_gradient:0.7,color_shading_corr:0.5\", fitness = weighted sum); every saved filename is prefixed with the metric name(s) used (see quat-dag-thumbs for static + animated thumbnails) and every genome gets all ~30 quat_* metric fields backfilled (see quat-dag-rescore to backfill an existing archive)");
             eprintln!("  nnfractals-explorer quat-dag-thumbs --dir DIR [--gpu] — (re)generates the static `{{stem}}.png` and animated `{{stem}}_thumb_00..07.png` thumbnail sequence (nnfractals-browser reads both) for every genome already in DIR, without touching the genomes themselves");
             eprintln!("  nnfractals-explorer quat-raymarch-video [out.mp4] [--formula name (bulb)] [--time-axis r|a|b|c (c)] [--c F (fixed value, no pulse — omit this and use --c0/--c1 instead for the default pulsing behavior)] [--c0 F (-0.6)] [--c1 F (0.6)] [--c-shape ramp|sine|cosine|triangle|sawtooth|pulse|orbit (sine — the time-axis value breathes within [c0,c1] as the camera orbits, NOT fixed like the single-frame quat-raymarch; pass --c-shape ramp for a one-way sweep instead, or --c alone for the old fixed-value behavior)] [--c-freq F (1.5 — cycles per clip; with the default --turns 1.0, this IS cycles per camera revolution)] [--c-phase F (0.0)] [--frames N (90)] [--fps N (30)] [--width N (640)] [--height N (640)] [--target R,A,B (0,0,0)] [--axis R,A,B (0,1,0)] [--radius F (4.0)] [--turns F (1.0)] [--phase0 F (0.0)] [--fov-deg F (45.0)] [--domain-radius F (1.6)] [--max-iter N (60)] [--bailout F (4.0)] [--max-march-steps N (200)] [--hit-eps F (=1e-4*domain-radius)] [--step-safety F (0.8)] [--light R,A,B (0.5,0.8,0.3)] [--normal-eps F (=1e-3*domain-radius)] [--color-probe-offset F (=1e-2*domain-radius)] [--colormap name (lava)] [--bg-color R,G,B (0.03,0.02,0.06)] [--aa N (1)] [--gpu (dispatch the WGSL compute shader instead of CPU rayon — verified pixel-for-pixel against the CPU path in render_gpu_raymarch's own tests; falls back to CPU if no GPU adapter is available)]");
             eprintln!("      voxelizes the quaternion fractal at a FIXED C (the time axis quat-mandelbrot animates) into an res^3 (R,A,B) field, extracts a surface with Naive Surface Nets, smooths it, decimates to ~target-tris, writes an STL.");

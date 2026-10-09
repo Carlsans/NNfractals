@@ -1717,6 +1717,150 @@ pub fn interpolate_with_rife(
     Ok(out)
 }
 
+/// Muxes `audio_path` onto the (silent) video at `video_path`, writing the
+/// result to `out_path` — animation-viewer plan, Phase 7, the "reference +
+/// mux only" audio scope (confirmed plan answer: no audio-reactive
+/// analysis, just sync-while-editing and mux-on-export). `offset_s` must
+/// be `>= 0` (ffmpeg's `-itsoffset` can't go negative — a documented,
+/// low-stakes v1 limitation: negative pre-roll, audio starting before the
+/// visible timeline, isn't supported). Video re-encodes nothing (`-c:v
+/// copy`) — only the audio stream is touched.
+pub fn mux_audio(video_path: &Path, audio_path: &Path, offset_s: f64, gain_db: f64, out_path: &Path) -> Result<(), String> {
+    use std::process::Command;
+    let ex = Command::new("ffmpeg")
+        .args(["-hide_banner", "-loglevel", "error", "-y", "-i"])
+        .arg(video_path)
+        .args(["-itsoffset", &offset_s.max(0.0).to_string(), "-i"])
+        .arg(audio_path)
+        .args([
+            "-map", "0:v", "-map", "1:a",
+            "-c:v", "copy", "-c:a", "aac",
+            "-af", &format!("volume={gain_db}dB"),
+            "-shortest",
+        ])
+        .arg(out_path)
+        .output()
+        .map_err(|e| format!("could not run ffmpeg: {e}"))?;
+    if !ex.status.success() {
+        let tail = String::from_utf8_lossy(&ex.stderr).lines().rev().take(6).collect::<Vec<_>>().join(" | ");
+        return Err(format!("audio mux failed: {tail}"));
+    }
+    Ok(())
+}
+
+/// Mixes N resolved audio inputs onto `video_path`'s (silent) video stream —
+/// the multi-clip audio lane's counterpart to `mux_audio` above (which stays
+/// untouched: it has exactly one caller and is a fine degenerate single-clip
+/// path if ever needed again, so this is a new sibling function, not a
+/// signature change to it). Each input is `-ss`/`-t` trimmed at read time,
+/// then delayed via an `adelay` filter (NOT `-itsoffset` — verified by
+/// actually rendering a 2-clip test case and measuring the muxed output:
+/// `-itsoffset` shifts an input's demuxed timestamps, but `amix`'s
+/// `duration=longest` did not extend to account for that shift, silently
+/// truncating the whole mix to the FIRST input's own unshifted length
+/// instead of the true longest-after-delay span — `adelay` inserts real
+/// silence samples ahead of the audio inside the filtergraph itself, which
+/// `amix`'s duration logic correctly measures). `duration=longest` (not
+/// `first`, since no one input is privileged the way a fixed video track
+/// would be), with the final `-shortest` still capping the output at the
+/// video's own length as the backstop. Empty `inputs` just copies the video
+/// through untouched (no audio stream added).
+pub fn mux_audio_clips(video_path: &Path, inputs: &[crate::anim_timeline::ResolvedAudioInput], out_path: &Path) -> Result<(), String> {
+    use std::process::Command;
+    if inputs.is_empty() {
+        std::fs::copy(video_path, out_path).map(|_| ()).map_err(|e| format!("could not copy silent video through: {e}"))?;
+        return Ok(());
+    }
+    let mut cmd = Command::new("ffmpeg");
+    cmd.args(["-hide_banner", "-loglevel", "error", "-y", "-i"]).arg(video_path);
+    for inp in inputs {
+        cmd.args(["-ss", &inp.source_seek_s.max(0.0).to_string()])
+            .args(["-t", &inp.play_len_s.max(0.0).to_string()])
+            .arg("-i")
+            .arg(&inp.file_path);
+    }
+    let mut filter = String::new();
+    for (i, inp) in inputs.iter().enumerate() {
+        let delay_ms = (inp.output_delay_s.max(0.0) * 1000.0).round() as i64;
+        filter.push_str(&format!("[{}:a]adelay=delays={delay_ms}:all=1,volume={}dB[a{i}];", i + 1, inp.gain_db));
+    }
+    let labels: String = (0..inputs.len()).map(|i| format!("[a{i}]")).collect();
+    filter.push_str(&format!("{labels}amix=inputs={}:duration=longest:dropout_transition=0[aout]", inputs.len()));
+    cmd.args(["-filter_complex", &filter])
+        .args(["-map", "0:v", "-map", "[aout]", "-c:v", "copy", "-c:a", "aac", "-shortest"])
+        .arg(out_path);
+    let out = cmd.output().map_err(|e| format!("could not run ffmpeg: {e}"))?;
+    if !out.status.success() {
+        let tail = String::from_utf8_lossy(&out.stderr).lines().rev().take(6).collect::<Vec<_>>().join(" | ");
+        return Err(format!("multi-clip audio mux failed: {tail}"));
+    }
+    Ok(())
+}
+
+/// Probes an audio file's duration in seconds via `ffprobe` — used at
+/// import time to seed `AudioClip::source_duration_s`, which the GUI uses
+/// to clamp `trim_out_s`. Same shell-out-and-parse-stdout shape as
+/// `decode_audio_peaks` below, just via `ffprobe` instead of `ffmpeg`.
+pub fn probe_audio_duration_s(path: &Path) -> Result<f64, String> {
+    use std::process::Command;
+    let out = Command::new("ffprobe")
+        .args(["-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0"])
+        .arg(path)
+        .output()
+        .map_err(|e| format!("could not run ffprobe: {e}"))?;
+    if !out.status.success() {
+        let tail = String::from_utf8_lossy(&out.stderr).lines().rev().take(4).collect::<Vec<_>>().join(" | ");
+        return Err(format!("ffprobe failed: {tail}"));
+    }
+    String::from_utf8_lossy(&out.stdout).trim().parse::<f64>().map_err(|e| format!("could not parse ffprobe duration output: {e}"))
+}
+
+/// Decodes `path` to mono f32 samples via ffmpeg and downsamples to
+/// `buckets` (min, max) peak pairs for waveform drawing — animation-viewer
+/// plan, Phase 7. Mirrors `reels.rs`'s existing ffmpeg-stdout-decode
+/// pattern (raw bytes off stdout, no intermediate files) rather than
+/// `interpolate_with_rife`'s explode-to-PNG-files pattern above, since
+/// audio has no equivalent "frame folder" step.
+pub fn decode_audio_peaks(path: &Path, buckets: usize) -> Result<Vec<(f32, f32)>, String> {
+    use std::io::Read as _;
+    use std::process::{Command, Stdio};
+    let mut child = Command::new("ffmpeg")
+        .args(["-hide_banner", "-loglevel", "error", "-i"])
+        .arg(path)
+        .args(["-f", "f32le", "-ac", "1", "-ar", "8000", "-"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("could not run ffmpeg: {e}"))?;
+    let mut raw = Vec::new();
+    child.stdout.take().expect("stdout was piped").read_to_end(&mut raw).map_err(|e| format!("reading ffmpeg stdout: {e}"))?;
+    let status = child.wait().map_err(|e| format!("waiting for ffmpeg: {e}"))?;
+    if !status.success() {
+        let mut stderr = String::new();
+        if let Some(mut pipe) = child.stderr.take() {
+            let _ = pipe.read_to_string(&mut stderr);
+        }
+        let tail: String = stderr.lines().rev().take(6).collect::<Vec<_>>().join(" | ");
+        return Err(format!("ffmpeg decode failed: {tail}"));
+    }
+    let samples: Vec<f32> = raw.chunks_exact(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect();
+    if samples.is_empty() || buckets == 0 {
+        return Ok(Vec::new());
+    }
+    let buckets = buckets.min(samples.len().max(1));
+    let per_bucket = (samples.len() as f64 / buckets as f64).max(1.0);
+    let mut peaks = Vec::with_capacity(buckets);
+    for i in 0..buckets {
+        let start = (i as f64 * per_bucket) as usize;
+        let end = (((i + 1) as f64 * per_bucket) as usize).min(samples.len()).max(start + 1).min(samples.len());
+        let slice = &samples[start..end];
+        let min = slice.iter().cloned().fold(f32::INFINITY, f32::min);
+        let max = slice.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+        peaks.push((min, max));
+    }
+    Ok(peaks)
+}
+
 /// Encode an ALREADY-RENDERED set of RGB24 frames and return the same
 /// normalized compressed/raw ratio the camera-path probes use, so time scores
 /// and zoom scores are directly comparable.
@@ -2011,7 +2155,10 @@ pub struct QueueItem {
 /// identical command line.
 #[derive(Clone, Serialize, Deserialize, Default)]
 pub struct QuatRenderSpec {
-    /// "static" (`quat-raymarch-genome`) or "orbit" (`quat-raymarch-genome-video`).
+    /// "static" (`quat-raymarch-genome`), "orbit" (`quat-raymarch-genome-video`),
+    /// or "timeline" (animation-viewer plan, Phase 7 —
+    /// `quat-render-timeline`, driven by `timeline`/`trim_start_s`/`trim_end_s`
+    /// below instead of the static/orbit fields).
     pub mode: String,
     pub eye: (f64, f64, f64),
     pub target: (f64, f64, f64),
@@ -2032,6 +2179,17 @@ pub struct QuatRenderSpec {
     pub max_iter: u32,
     pub aa: u32,
     pub colormap: String,
+    /// "timeline" mode only — a full `AnimationTimeline`, embedded as a
+    /// native nested serde struct (consistent with `waypoints:
+    /// Vec<CapturedView>` already being one) rather than a JSON-string
+    /// blob. `#[serde(default)]` so every `QuatRenderSpec` written before
+    /// Phase 7 still deserializes.
+    #[serde(default)]
+    pub timeline: Option<crate::anim_timeline::AnimationTimeline>,
+    #[serde(default)]
+    pub trim_start_s: f64,
+    #[serde(default)]
+    pub trim_end_s: f64,
 }
 
 /// Everything a caller must decide to queue one export.
@@ -2150,16 +2308,49 @@ pub fn enqueue(spec: QueueSpec) -> Result<QueueItem, String> {
     // non-empty waypoint list as "always moves".
     let waypoints = if spec.waypoints.len() > 2 { spec.waypoints } else { Vec::new() };
 
+    // A quat item's REAL width/height/fps/frame-count live on `quat_spec`
+    // (`QuatRenderSpec`), never on the outer `QueueSpec` fields above — every
+    // quat-render call site (`quat_viewer.rs`, `anim_viewer.rs`) builds
+    // `QueueSpec` with `..Default::default()` covering those outer fields,
+    // so they'd otherwise silently freeze at `QueueSpec::default()`'s
+    // 1280x720/30fps regardless of what was actually configured. That is
+    // exactly what Carl reported (2026-09-22): "the queue manager does not
+    // report the proper resolution" — `queue.rs` displays `it.width` /
+    // `it.height` / `it.fps` / `it.steps` for every item uniformly, with no
+    // quat-awareness, so it showed the stale defaults instead of the real
+    // values buried in `it.quat`. Fixed at this one shared construction
+    // site rather than teaching every display/edit call site in `queue.rs`
+    // to reach into `it.quat` instead — the same "one bottleneck, not
+    // scattered special-casing" reasoning `QueueSpec`'s own doc comment
+    // gives for existing at all.
+    let (steps, fps, width, height) = match &spec.quat_spec {
+        Some(q) => {
+            let frames = match q.mode.as_str() {
+                "orbit" => q.frames.max(1),
+                "timeline" => q.timeline.as_ref()
+                    .map(|tl| {
+                        let seconds = crate::anim_timeline::wallclock_span(
+                            q.trim_end_s - q.trim_start_s, tl.delta_t);
+                        ((seconds * q.fps as f64).round() as u32).max(2)
+                    })
+                    .unwrap_or(2),
+                _ => 1, // "static": a single still image, not a video.
+            };
+            (frames, q.fps, q.width, q.height)
+        }
+        None => (spec.steps, spec.fps, spec.width, spec.height),
+    };
+
     let item = QueueItem {
         id,
         nn_filename,
         genome_label: spec.genome_label,
         start,
         end,
-        steps: spec.steps,
-        fps: spec.fps,
-        width: spec.width,
-        height: spec.height,
+        steps,
+        fps,
+        width,
+        height,
         invert_coords: spec.invert_coords,
         invert_range: spec.invert_range,
         colormap: spec.colormap,
@@ -2892,6 +3083,68 @@ mod tests {
         let err = r.err().expect("a missing nn_src still fails, just not on waypoints");
         assert!(!err.contains("camera waypoints"), "quat items must skip 2D waypoint validation: {err}");
         assert!(err.contains("cannot copy"), "{err}");
+    }
+
+    /// Animation-viewer plan, Phase 7: a real, successful enqueue of a
+    /// "timeline" mode `QuatRenderSpec` — confirms the whole path
+    /// `queue_runner::process_quat_queue_item`'s new "timeline" arm relies
+    /// on (`QueueItem.quat.timeline`/`trim_start_s`/`trim_end_s` surviving
+    /// intact through `enqueue()`) actually works, not just that the mode
+    /// string is accepted. Uses a real (throwaway) genome file since
+    /// `enqueue` copies it — cleaned up afterward like every other
+    /// temp-file test in this module.
+    #[test]
+    fn enqueue_carries_a_timeline_render_spec_through_intact() {
+        let genome = mandelbrot_genome();
+        let nn_path = std::env::temp_dir().join(format!("nnf_timeline_enqueue_test_{}.nn", std::process::id()));
+        crate::io::save_genome(&genome, &nn_path).expect("save throwaway test genome");
+
+        let mut tl = crate::anim_timeline::AnimationTimeline::new(0xABCDEF);
+        tl.delta_t = 2.0;
+        tl.trim_start_s = 1.0;
+        tl.trim_end_s = 4.0;
+
+        let item = enqueue(QueueSpec {
+            nn_src: nn_path.clone(),
+            genome_label: "timeline_enqueue_test".to_string(),
+            quat_spec: Some(QuatRenderSpec {
+                mode: "timeline".to_string(),
+                width: 640, height: 480, fps: 30,
+                timeline: Some(tl.clone()),
+                trim_start_s: 1.0, trim_end_s: 4.0,
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+
+        let _ = std::fs::remove_file(&nn_path);
+        let item = item.expect("a real genome file should enqueue successfully");
+        // enqueue() writes into the REAL project queue.json (load_queue/
+        // save_queue), not a temp file — clean up this test's own item
+        // (by id, so any other real items already in the queue are left
+        // untouched) plus the genome copy enqueue() made in queue_dir().
+        let _ = std::fs::remove_file(queue_dir().join(&item.nn_filename));
+        let remaining: Vec<QueueItem> = load_queue().into_iter().filter(|i| i.id != item.id).collect();
+        save_queue(&remaining);
+
+        let quat = item.quat.expect("quat spec must be carried onto the QueueItem");
+        assert_eq!(quat.mode, "timeline");
+        assert_eq!(quat.trim_start_s, 1.0);
+        assert_eq!(quat.trim_end_s, 4.0);
+        let round_tripped = quat.timeline.expect("the AnimationTimeline itself must survive intact");
+        assert_eq!(round_tripped.delta_t, 2.0);
+        assert_eq!(round_tripped.genome_content_hash, 0xABCDEF);
+
+        // The OUTER QueueItem fields — what `queue.rs` actually displays —
+        // must mirror the quat spec's real values, not stay frozen at
+        // `QueueSpec::default()`'s 1280x720/30fps. This is the exact bug
+        // Carl reported (2026-09-22): "the queue manager does not report
+        // the proper resolution."
+        assert_eq!(item.width, 640, "outer width must come from quat_spec, not QueueSpec::default()'s 1280");
+        assert_eq!(item.height, 480, "outer height must come from quat_spec, not QueueSpec::default()'s 720");
+        assert_eq!(item.fps, 30);
+        // trim span 3.0s / delta_t 2.0 = 1.5s wall-clock @ 30fps = 45 frames.
+        assert_eq!(item.steps, 45, "outer steps must reflect the timeline's real frame count");
     }
 
     #[test]

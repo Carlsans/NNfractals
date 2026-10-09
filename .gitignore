@@ -24,6 +24,8 @@ evolution4.pid
 evo3.log
 evo4.log
 video_queue/
+anim_settings/
+anim_profiles/
 diversity_loop_state.json
 colormap_loop_state.json
 .run_pids

@@ -97,6 +97,41 @@ fn shannon_entropy(probs: &[f32]) -> f32 {
     probs.iter().filter(|&&p| p > 0.0).map(|&p| -p * p.log2()).sum()
 }
 
+const ENTROPY_BINS: usize = 32;
+
+/// Escape-time values bucketed into a normalized 32-bin histogram —
+/// shared by `statistical_complexity` (entropy AND disequilibrium) and
+/// `escape_time_entropy_norm` (entropy alone), so the two stay built from
+/// literally the same binning.
+fn escape_time_hist_probs(samples: &[FieldSample], max_iter: u32) -> [f32; ENTROPY_BINS] {
+    let mut hist = [0u32; ENTROPY_BINS];
+    for s in samples {
+        let t = (s.escape_time / max_iter.max(1) as f32).clamp(0.0, 1.0);
+        let b = ((t * (ENTROPY_BINS as f32 - 1.0)) as usize).min(ENTROPY_BINS - 1);
+        hist[b] += 1;
+    }
+    let n = samples.len().max(1) as f32;
+    let mut probs = [0.0f32; ENTROPY_BINS];
+    for i in 0..ENTROPY_BINS {
+        probs[i] = hist[i] as f32 / n;
+    }
+    probs
+}
+
+/// Plain (non-LMC) normalized Shannon entropy of the escape-time
+/// histogram, in [0,1]. High = escape times spread broadly across the
+/// range (a visually rich/detailed field); low = mostly one value (a
+/// blank/flat field). A standalone positive signal — see
+/// `organized_richness`'s doc comment for why this is deliberately NOT
+/// multiplied by disequilibrium the way `statistical_complexity` is.
+fn escape_time_entropy_norm(samples: &[FieldSample], max_iter: u32) -> f32 {
+    if samples.is_empty() {
+        return 0.0;
+    }
+    let probs = escape_time_hist_probs(samples, max_iter);
+    shannon_entropy(&probs) / (ENTROPY_BINS as f32).log2()
+}
+
 /// LMC-style statistical complexity: `H · D` over a histogram of escape
 /// times — entropy (disorder) times disequilibrium (distance from a
 /// uniform histogram). Zero for a field that's all one value (D≈0, no
@@ -106,22 +141,14 @@ fn shannon_entropy(probs: &[f32]) -> f32 {
 /// spot to spatial arrangement; `ordinal_complexity` below is the
 /// spatial-structure-aware complement, not a replacement).
 fn statistical_complexity(samples: &[FieldSample], max_iter: u32) -> f32 {
-    const BINS: usize = 32;
     if samples.is_empty() {
         return 0.0;
     }
-    let mut hist = [0u32; BINS];
-    for s in samples {
-        let t = (s.escape_time / max_iter.max(1) as f32).clamp(0.0, 1.0);
-        let b = ((t * (BINS as f32 - 1.0)) as usize).min(BINS - 1);
-        hist[b] += 1;
-    }
-    let n = samples.len() as f32;
-    let probs: Vec<f32> = hist.iter().map(|&c| c as f32 / n).collect();
-    let h_norm = shannon_entropy(&probs) / (BINS as f32).log2();
-    let uniform = 1.0 / BINS as f32;
+    let probs = escape_time_hist_probs(samples, max_iter);
+    let h_norm = shannon_entropy(&probs) / (ENTROPY_BINS as f32).log2();
+    let uniform = 1.0 / ENTROPY_BINS as f32;
     let d: f32 = probs.iter().map(|&p| (p - uniform).powi(2)).sum::<f32>().sqrt();
-    let d_max = ((1.0 - uniform).powi(2) + (BINS as f32 - 1.0) * uniform.powi(2)).sqrt();
+    let d_max = ((1.0 - uniform).powi(2) + (ENTROPY_BINS as f32 - 1.0) * uniform.powi(2)).sqrt();
     let d_norm = if d_max > 1e-9 { (d / d_max).clamp(0.0, 1.0) } else { 0.0 };
     (h_norm * d_norm).clamp(0.0, 1.0)
 }
@@ -297,6 +324,59 @@ fn chaoticity(f: &QuatDagFormula, samples: &[FieldSample], domain_radius: f64, m
     }
     let mean = total / count as f64;
     (1.0 - (-mean / 5.0).exp()).clamp(0.0, 1.0) as f32
+}
+
+/// Same finite-difference construction as `chaoticity`, generalized from
+/// perturbing R alone to perturbing all 4 axes (R, A, B, C) in turn and
+/// averaging — Carl, 2026-09-28, from browsing many fractals across the
+/// viewer's X/Y/Z/T sliders: "most interesting fractals have hi entropy,
+/// but are continuous (differentiable) along all axis. If the fractal is
+/// mostly noise, it will not be continuous." `chaoticity` alone can't
+/// answer that — it only ever nudges R, so a formula that's smooth along
+/// R but chaotic along A/B/C would score falsely low here. Same
+/// `eps`/`ln_1p`/exponential-squash construction as `chaoticity`, so the
+/// two stay comparable in scale.
+fn discontinuity(f: &QuatDagFormula, samples: &[FieldSample], domain_radius: f64, max_iter: u32, bailout_sq: f64) -> f32 {
+    let eps = domain_radius * 1e-3;
+    let mut total = 0.0f64;
+    let mut count = 0usize;
+    for s in samples.iter().step_by(4) {
+        let p = s.point;
+        let neighbors = [
+            Quat::new(p.r + eps, p.a, p.b, p.c),
+            Quat::new(p.r, p.a + eps, p.b, p.c),
+            Quat::new(p.r, p.a, p.b + eps, p.c),
+            Quat::new(p.r, p.a, p.b, p.c + eps),
+        ];
+        for n in neighbors {
+            let (et2, _) = quat_dag_escape_de(f, n, max_iter, bailout_sq);
+            let diff = (et2 - s.escape_time).abs() as f64;
+            total += (diff / eps).ln_1p();
+            count += 1;
+        }
+    }
+    if count == 0 {
+        return 0.0;
+    }
+    let mean = total / count as f64;
+    (1.0 - (-mean / 5.0).exp()).clamp(0.0, 1.0) as f32
+}
+
+/// `1 - discontinuity` — 1.0 = a tiny nudge along any of the 4 axes never
+/// changes the escape time much (smooth/differentiable), 0.0 = highly
+/// sensitive to position (noise-like).
+fn continuity(f: &QuatDagFormula, samples: &[FieldSample], domain_radius: f64, max_iter: u32, bailout_sq: f64) -> f32 {
+    1.0 - discontinuity(f, samples, domain_radius, max_iter, bailout_sq)
+}
+
+/// Carl's stated rule as a plain product, not LMC's "penalize both
+/// extremes" framing: an AND, not a compromise. High entropy but noisy
+/// (low continuity) scores low; smooth but bland (low entropy) also
+/// scores low; only genuinely "organized" complexity — both high at
+/// once — scores high. This is the presumed-good training metric he
+/// asked for.
+fn organized_richness(entropy_norm: f32, continuity: f32) -> f32 {
+    (entropy_norm * continuity).clamp(0.0, 1.0)
 }
 
 /// One direction from the golden-angle Fibonacci-sphere spiral — a
@@ -536,6 +616,15 @@ pub struct OrganizationMetrics {
     pub compression_complexity: f32,
     pub chaoticity: f32,
     pub sphericity: f32,
+    /// Plain Shannon entropy of the escape-time histogram, in [0,1] —
+    /// see `escape_time_entropy_norm`'s doc comment.
+    pub field_entropy: f32,
+    /// `1 - discontinuity` (4-axis-generalized `chaoticity`), in [0,1] —
+    /// see `continuity`'s doc comment.
+    pub continuity: f32,
+    /// `field_entropy * continuity` — Carl's "hi entropy, but continuous"
+    /// rule as a single scalar. See `organized_richness`'s doc comment.
+    pub organized_richness: f32,
 }
 
 const N_FIELD_SAMPLES: usize = 3000;
@@ -543,6 +632,8 @@ const N_ORDINAL_CLUSTERS: usize = 600;
 
 pub fn compute_organization_metrics(f: &QuatDagFormula, domain_radius: f64, max_iter: u32, bailout_sq: f64) -> OrganizationMetrics {
     let samples = sample_field(f, N_FIELD_SAMPLES, domain_radius, max_iter, bailout_sq);
+    let field_entropy = escape_time_entropy_norm(&samples, max_iter);
+    let continuity_val = continuity(f, &samples, domain_radius, max_iter, bailout_sq);
     OrganizationMetrics {
         statistical_complexity: statistical_complexity(&samples, max_iter),
         ordinal_complexity: ordinal_complexity(f, domain_radius, max_iter, bailout_sq, N_ORDINAL_CLUSTERS),
@@ -550,6 +641,9 @@ pub fn compute_organization_metrics(f: &QuatDagFormula, domain_radius: f64, max_
         compression_complexity: compression_complexity(&samples, domain_radius, max_iter),
         chaoticity: chaoticity(f, &samples, domain_radius, max_iter, bailout_sq),
         sphericity: sphericity(f, domain_radius, max_iter, bailout_sq),
+        field_entropy,
+        continuity: continuity_val,
+        organized_richness: organized_richness(field_entropy, continuity_val),
     }
 }
 
@@ -731,6 +825,26 @@ mod tests {
     }
 
     #[test]
+    fn continuity_is_higher_for_a_smooth_formula_than_an_unstable_one() {
+        let smooth_prog = identity_program();
+        let unstable_prog = mandelbrot_program();
+        let smooth = formula(&smooth_prog);
+        let unstable = formula(&unstable_prog);
+        let smooth_samples = sample_field(&smooth, 400, 1.6, 40, 16.0);
+        let unstable_samples = sample_field(&unstable, 400, 1.6, 40, 16.0);
+        let c_smooth = continuity(&smooth, &smooth_samples, 1.6, 40, 16.0);
+        let c_unstable = continuity(&unstable, &unstable_samples, 1.6, 40, 16.0);
+        assert!(c_smooth >= c_unstable, "a linear field ({c_smooth}) should be at least as continuous as mandelbrot ({c_unstable})");
+    }
+
+    #[test]
+    fn organized_richness_is_the_product_of_entropy_and_continuity() {
+        assert_eq!(organized_richness(0.8, 0.5), 0.4);
+        assert_eq!(organized_richness(1.0, 0.0), 0.0, "zero continuity (pure noise) must zero out even high entropy");
+        assert_eq!(organized_richness(0.0, 1.0), 0.0, "zero entropy (blank field) must zero out even perfect continuity");
+    }
+
+    #[test]
     fn compute_organization_metrics_returns_finite_in_range_values() {
         let prog = mandelbrot_program();
         let f = formula(&prog);
@@ -742,6 +856,9 @@ mod tests {
             ("compression_complexity", m.compression_complexity),
             ("chaoticity", m.chaoticity),
             ("sphericity", m.sphericity),
+            ("field_entropy", m.field_entropy),
+            ("continuity", m.continuity),
+            ("organized_richness", m.organized_richness),
         ] {
             assert!(v.is_finite() && (0.0..=1.0).contains(&v), "{name} out of range: {v}");
         }

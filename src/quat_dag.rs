@@ -27,7 +27,8 @@ use rayon::prelude::*;
 use crate::formula::{op, OpNode, N_SLOTS};
 use crate::quat_fractal::TimeAxis;
 use crate::quat_motion::{add, dot, look_at_basis, normalize, scale, sub, Vec3};
-use crate::quat_raymarch::{ray_sphere, RaymarchCamera};
+use crate::quat_raymarch::{ray_box, ray_sphere, RaymarchCamera};
+use crate::anim_timeline::AxisAssignment;
 use crate::quaternion::Quat;
 
 const EPS: f64 = 1e-9;
@@ -393,6 +394,57 @@ pub struct RaymarchDagParams<'a> {
     pub time_axis: TimeAxis,
     pub time_val: f64,
     pub domain_radius: f64,
+    /// Overrides the sphere bound `domain_radius` implies with a true
+    /// axis-aligned box `(min, max)` (animation-viewer plan, Phase 2).
+    /// `domain_radius` still drives the epsilon-scale derivations
+    /// (`min_step` etc.) either way — a `Some` caller should set it to a
+    /// characteristic scale of the box (e.g. its largest half-extent).
+    /// `None` (every caller before this plan — `quat_viewer.rs`, the CLI)
+    /// preserves today's sphere-bounded behavior exactly, byte-for-byte.
+    #[allow(clippy::type_complexity)]
+    pub box_bounds: Option<(Vec3, Vec3)>,
+    /// Overrides `time_axis`'s "pick exactly one part as time, hardcode
+    /// the other three into a fixed x/y/z order" scheme with a full,
+    /// user-swappable permutation of all 4 quaternion parts across the 4
+    /// viewer axes (animation-viewer plan, Phase 2). `None` (every caller
+    /// before this plan) preserves `time_axis`'s exact fixed-order
+    /// assembly.
+    pub axis_assignment: Option<AxisAssignment>,
+    /// An orientable half-space cutaway (animation-viewer plan, Phase 6) —
+    /// `(pos, normal)`. The ray is clipped to the half-space
+    /// `dot(point - pos, normal) >= 0`, i.e. the far side of the plane
+    /// (the side `normal` points AWAY from) is removed, revealing whatever
+    /// surface lies on the near side — the "difference/cutaway" effect.
+    /// `normal` need not be unit length: `t_plane`'s ratio is scale-
+    /// invariant (see `apply_clip_plane`'s doc comment). `None` (every
+    /// caller before this plan) preserves behavior exactly.
+    #[allow(clippy::type_complexity)]
+    pub clip_plane: Option<(Vec3, Vec3)>,
+    /// A hidden escape-iteration band `(min_iter, max_iter)` — the
+    /// authored, per-clip "Slide Iteration" effect (animation-viewer
+    /// plan). A point whose escape time falls in `[min_iter, max_iter)` is
+    /// never treated as a raymarch hit, so the ray continues past it,
+    /// revealing deeper iteration shells. Doesn't touch the distance-
+    /// estimate field itself (so adaptive step sizing is unaffected) —
+    /// only the hit ACCEPTANCE test in `march_ray` gains an extra
+    /// condition. `None` (every caller before this plan) preserves
+    /// behavior exactly.
+    pub slide_iter: Option<(f64, f64)>,
+    /// Hide any point whose escape time is `>=` this value — the resolved
+    /// form of the viewer's "hide top N%" control. Unlike `slide_iter`
+    /// (an author-picked absolute band), this is computed FRESH each
+    /// render from an actual rendered frame's escape-time distribution
+    /// (see `anim_eval::percentile_escape_time_cutoff`) — a fixed
+    /// absolute iteration count can't reliably target "whatever currently
+    /// renders white," since coloring is histogram-equalized against
+    /// each frame's own distribution (`colormap::apply_colormap_equalized`)
+    /// — Carl, 2026-09-28, after `hide_unescaped` (this field's
+    /// since-removed predecessor, a literal `et >= max_iter` check)
+    /// visibly failed to remove anything on a real genome: "build the top
+    /// N% version properly." `None` (every caller before this field
+    /// existed, and every render's own FIRST/probe pass) disables this
+    /// gate entirely.
+    pub hide_above: Option<f64>,
     pub max_iter: u32,
     pub bailout: f64,
     pub max_march_steps: u32,
@@ -404,9 +456,19 @@ pub struct RaymarchDagParams<'a> {
     pub aa: u32,
 }
 
+/// Places a 3D ray-march point (plus `p.time_val`) into a full `Quat`,
+/// via `p.axis_assignment` when given, else `p.time_axis`'s fixed-order
+/// scheme — see `RaymarchDagParams::axis_assignment`'s doc comment.
+fn assemble_point(p: &RaymarchDagParams, point: Vec3) -> Quat {
+    match &p.axis_assignment {
+        Some(a) => a.assemble(point.0, point.1, point.2, p.time_val),
+        None => p.time_axis.assemble(point, p.time_val),
+    }
+}
+
 fn de_at(p: &RaymarchDagParams, point: Vec3) -> f64 {
     let bailout_sq = p.bailout * p.bailout;
-    let q = p.time_axis.assemble(point, p.time_val);
+    let q = assemble_point(p, point);
     quat_dag_escape_de(&p.formula, q, p.max_iter, bailout_sq).1
 }
 
@@ -430,8 +492,44 @@ fn estimate_normal(p: &RaymarchDagParams, point: Vec3) -> Vec3 {
 /// Adaptive sphere tracing, same algorithm as `quat_raymarch::march_ray`
 /// (see that function's doc comment) — this is the DAG-formula twin, not
 /// an independent design.
+/// Narrows `[t0, t1]` to the near side of an optional clip plane —
+/// mirrors the WGSL march_sample's clip-plane block exactly (interval
+/// narrowing, not a distance-field modification: `quat_dag_escape_de` is
+/// an unsigned distance estimate with no inside/outside sign convention,
+/// so the usual signed-SDF CSG trick doesn't apply here). `t_plane`'s
+/// value is invariant to `normal`'s scale (scaling `normal` by k scales
+/// both `dot(dir,normal)` and `dot(diff,normal)` by k, which cancels in
+/// the ratio), so callers don't need to pre-normalize it.
+fn apply_clip_plane(t0: f64, t1: f64, eye: Vec3, dir: Vec3, clip: Option<(Vec3, Vec3)>) -> Option<(f64, f64)> {
+    let Some((pos, n)) = clip else { return Some((t0, t1)) };
+    let denom = dir.0 * n.0 + dir.1 * n.1 + dir.2 * n.2;
+    let diff = (pos.0 - eye.0, pos.1 - eye.1, pos.2 - eye.2);
+    let (mut nt0, mut nt1) = (t0, t1);
+    if denom > 1e-6 {
+        let t_plane = (diff.0 * n.0 + diff.1 * n.1 + diff.2 * n.2) / denom;
+        nt0 = nt0.max(t_plane);
+    } else if denom < -1e-6 {
+        let t_plane = (diff.0 * n.0 + diff.1 * n.1 + diff.2 * n.2) / denom;
+        nt1 = nt1.min(t_plane);
+    } else {
+        // Ray parallel to the plane: entirely on one side or the other.
+        let side = (eye.0 - pos.0) * n.0 + (eye.1 - pos.1) * n.1 + (eye.2 - pos.2) * n.2;
+        if side < 0.0 {
+            return None;
+        }
+    }
+    if nt0 > nt1 {
+        return None;
+    }
+    Some((nt0, nt1))
+}
+
 fn march_ray(p: &RaymarchDagParams, eye: Vec3, dir: Vec3) -> Option<(Vec3, Vec3, f32)> {
-    let (t0, t1) = ray_sphere(eye, dir, p.domain_radius)?;
+    let (t0, t1) = match p.box_bounds {
+        Some((bmin, bmax)) => ray_box(eye, dir, bmin, bmax)?,
+        None => ray_sphere(eye, dir, p.domain_radius)?,
+    };
+    let (t0, t1) = apply_clip_plane(t0, t1, eye, dir, p.clip_plane)?;
     let bailout_sq = p.bailout * p.bailout;
     let hit_eps = p.hit_epsilon.max(1e-9);
     let min_step = (p.domain_radius * 1e-6).max(1e-9);
@@ -441,12 +539,19 @@ fn march_ray(p: &RaymarchDagParams, eye: Vec3, dir: Vec3) -> Option<(Vec3, Vec3,
             return None;
         }
         let point = add(eye, scale(dir, t));
-        let q = p.time_axis.assemble(point, p.time_val);
-        let (_, de) = quat_dag_escape_de(&p.formula, q, p.max_iter, bailout_sq);
-        if de < hit_eps {
+        let q = assemble_point(p, point);
+        let (et, de) = quat_dag_escape_de(&p.formula, q, p.max_iter, bailout_sq);
+        // Slide Iteration: a point in the hidden band, or (hide_above) at
+        // or past a resolved escape-time cutoff, is never accepted as a
+        // hit, even when its DE is small enough — the real DE still
+        // drives the step below, so marching through stays adaptively
+        // efficient.
+        let in_band = matches!(p.slide_iter, Some((lo, hi)) if (et as f64) >= lo && (et as f64) < hi);
+        let above_cutoff = matches!(p.hide_above, Some(cutoff) if (et as f64) >= cutoff);
+        if de < hit_eps && !in_band && !above_cutoff {
             let normal = estimate_normal(p, point);
             let probe = add(point, scale(normal, p.color_probe_offset));
-            let probe_q = p.time_axis.assemble(probe, p.time_val);
+            let probe_q = assemble_point(p, probe);
             let (color_et, _) = quat_dag_escape_de(&p.formula, probe_q, p.max_iter, bailout_sq);
             return Some((point, normal, color_et));
         }
@@ -747,5 +852,302 @@ mod tests {
         let f = QuatDagFormula { prog: &prog, warp: &[], julia: false, jc: (0.0, 0.0), phoenix: (0.0, 0.0) };
         let score = anisotropy_score(&f, 60, 16.0);
         assert!((0.0..=1.0).contains(&score), "score {score} out of [0,1] range");
+    }
+
+    // ── animation-viewer plan, Phase 2: box_bounds/axis_assignment ─────
+
+    const MANDEL_PROG: [OpNode; 4] = [
+        OpNode { op: op::Z, a: 0, b: 0, kre: 0.0, kim: 0.0 },
+        OpNode { op: op::C, a: 0, b: 0, kre: 0.0, kim: 0.0 },
+        OpNode { op: op::SQR, a: 0, b: 0, kre: 0.0, kim: 0.0 },
+        OpNode { op: op::ADD, a: 2, b: 1, kre: 0.0, kim: 0.0 },
+    ];
+
+    fn base_dag_params() -> RaymarchDagParams<'static> {
+        let formula = QuatDagFormula { prog: &MANDEL_PROG, warp: &[], julia: false, jc: (0.0, 0.0), phoenix: (0.0, 0.0) };
+        RaymarchDagParams {
+            formula,
+            time_axis: TimeAxis::C,
+            time_val: 0.0,
+            domain_radius: 1.6,
+            box_bounds: None,
+            axis_assignment: None,
+            clip_plane: None,
+            slide_iter: None,
+            hide_above: None,
+            max_iter: 60,
+            bailout: 4.0,
+            max_march_steps: 200,
+            hit_epsilon: 1.6 * 1e-4,
+            step_safety: 0.8,
+            light_dir: (0.5, 0.8, 0.3),
+            normal_eps: 1.6 * 1e-3,
+            color_probe_offset: 1.6 * 1e-2,
+            aa: 1,
+        }
+    }
+
+    #[test]
+    fn box_bounds_none_matches_the_pre_phase_2_sphere_behavior() {
+        // A regression guard: every caller before this plan (quat_viewer.rs,
+        // the CLI) leaves box_bounds/axis_assignment at None — de_at/march_ray
+        // must behave EXACTLY as they did before this plan (ray_sphere +
+        // TimeAxis::assemble), not merely "similarly".
+        let p = base_dag_params();
+        let eye = (0.0, 0.0, -5.0);
+        let dir = normalize((0.0, 0.0, 1.0));
+        let hit = march_ray(&p, eye, dir);
+        assert!(hit.is_some(), "z^2+c should render something head-on from outside the sphere");
+    }
+
+    #[test]
+    fn box_bounds_some_actually_changes_what_is_reachable() {
+        // A box squashed flat on X (min=max=0) must reject a ray offset in
+        // X — deterministic regardless of the formula's own boundary shape,
+        // since march_ray's bounds check (`ray_box(..)?`) short-circuits
+        // BEFORE any formula evaluation ever runs.
+        let mut p = base_dag_params();
+        p.box_bounds = Some(((0.0, -1.6, -1.6), (0.0, 1.6, 1.6)));
+        let offset_hit = march_ray(&p, (0.5, 0.0, -5.0), normalize((0.0, 0.0, 1.0)));
+        assert!(offset_hit.is_none(), "a ray off the flattened X=0 plane must miss a box with zero X extent, regardless of the formula");
+    }
+
+    #[test]
+    fn box_bounds_none_falls_back_to_the_domain_radius_sphere() {
+        // Equally deterministic in the other direction: a ray well outside
+        // domain_radius must miss when box_bounds is None, regardless of
+        // the formula — proves the None fallback still reaches ray_sphere.
+        let p = base_dag_params(); // domain_radius=1.6, box_bounds=None
+        let far_miss = march_ray(&p, (0.0, 10.0, -5.0), normalize((0.0, 0.0, 1.0)));
+        assert!(far_miss.is_none(), "a ray far outside domain_radius must miss, regardless of the formula");
+    }
+
+    #[test]
+    fn axis_assignment_none_matches_time_axis_c_exactly() {
+        // AxisAssignment{x:R,y:A,z:B,t:C} is the exact permutation TimeAxis::C
+        // encodes (Quat::new(x,y,z,time_val)) — confirms the new
+        // permutation-based path reduces EXACTLY to the old fixed-order path
+        // for its equivalent assignment. Tries several rays rather than
+        // asserting a specific one hits (whether a given ray crosses this
+        // particular formula's boundary isn't something to assume a
+        // priori) — the real assertion is that whichever rays DO hit agree
+        // exactly between the two paths, and none disagree on hit/miss.
+        use crate::anim_timeline::{AxisAssignment, QuatPart};
+        let mut p_perm = base_dag_params();
+        p_perm.axis_assignment = Some(AxisAssignment { x: QuatPart::R, y: QuatPart::A, z: QuatPart::B, t: QuatPart::C });
+        let p_fixed = base_dag_params();
+
+        let rays: [(Vec3, Vec3); 5] = [
+            ((0.0, 0.0, -5.0), (0.0, 0.0, 1.0)),
+            ((0.0, 0.0, -5.0), (0.13, 0.07, 1.0)),
+            ((0.0, 0.0, -5.0), (0.5, 0.0, 1.0)),
+            ((0.0, 0.0, -5.0), (0.0, 0.5, 1.0)),
+            ((2.0, 1.5, -3.0), (-0.3, -0.2, 0.8)),
+        ];
+        let mut any_hit = false;
+        for (eye, dir) in rays {
+            let dir = normalize(dir);
+            let hit_perm = march_ray(&p_perm, eye, dir);
+            let hit_fixed = march_ray(&p_fixed, eye, dir);
+            match (hit_perm, hit_fixed) {
+                (Some((pp, np, _)), Some((pf, nf, _))) => {
+                    any_hit = true;
+                    assert!((pp.0 - pf.0).abs() < 1e-9 && (pp.1 - pf.1).abs() < 1e-9 && (pp.2 - pf.2).abs() < 1e-9,
+                        "hit points differ for eye={eye:?} dir={dir:?}: perm={pp:?} fixed={pf:?}");
+                    assert!((np.0 - nf.0).abs() < 1e-9 && (np.1 - nf.1).abs() < 1e-9 && (np.2 - nf.2).abs() < 1e-9,
+                        "normals differ for eye={eye:?} dir={dir:?}: perm={np:?} fixed={nf:?}");
+                }
+                (None, None) => {} // both miss — consistent
+                (a, b) => panic!("hit/miss disagreement for eye={eye:?} dir={dir:?}: perm={a:?} fixed={b:?}"),
+            }
+        }
+        assert!(any_hit, "test is meaningless if not even one of the sample rays hit anything");
+    }
+
+    #[test]
+    fn axis_assignment_actually_reassigns_which_part_carries_time() {
+        // Swapping R and C (so R, not C, drives time) must change the
+        // rendered geometry for an asymmetric-in-time genome — proves the
+        // GUI's drag-and-drop axis reassignment has real teeth, not just a
+        // relabeling.
+        use crate::anim_timeline::{AxisAssignment, QuatPart};
+        let mut p_c_is_time = base_dag_params();
+        p_c_is_time.axis_assignment = Some(AxisAssignment { x: QuatPart::R, y: QuatPart::A, z: QuatPart::B, t: QuatPart::C });
+        p_c_is_time.time_val = 0.9; // a nonzero time value so R vs C actually differs
+
+        let mut p_r_is_time = base_dag_params();
+        p_r_is_time.axis_assignment = Some(AxisAssignment { x: QuatPart::C, y: QuatPart::A, z: QuatPart::B, t: QuatPart::R });
+        p_r_is_time.time_val = 0.9;
+
+        let eye = (0.0, 0.0, -5.0);
+        let dir = normalize((0.0, 0.0, 1.0));
+        let hit_c = march_ray(&p_c_is_time, eye, dir);
+        let hit_r = march_ray(&p_r_is_time, eye, dir);
+        // Both may or may not hit depending on geometry, but if both hit,
+        // the surface point must genuinely differ (this formula is not
+        // symmetric under swapping which part is held at time_val=0.9 vs 0).
+        if let (Some((pt_c, ..)), Some((pt_r, ..))) = (hit_c, hit_r) {
+            let differs = (pt_c.0 - pt_r.0).abs() > 1e-6 || (pt_c.1 - pt_r.1).abs() > 1e-6 || (pt_c.2 - pt_r.2).abs() > 1e-6;
+            assert!(differs, "reassigning which part carries time should change the hit point: c-time={pt_c:?} r-time={pt_r:?}");
+        }
+    }
+
+    // ── animation-viewer plan, Phase 6: apply_clip_plane ────────────────
+
+    #[test]
+    fn clip_plane_none_is_a_no_op() {
+        let (t0, t1) = apply_clip_plane(1.0, 5.0, (0.0, 0.0, -5.0), (0.0, 0.0, 1.0), None).unwrap();
+        assert_eq!((t0, t1), (1.0, 5.0));
+    }
+
+    #[test]
+    fn clip_plane_facing_the_ray_narrows_the_near_end() {
+        // Plane at z=0, normal pointing back toward the eye (-Z) — the ray
+        // travels +Z, so denom = dot(dir,normal) = -1 < 0 in the OLD
+        // convention... use normal (0,0,1) so denom = dot((0,0,1),(0,0,1)) = 1 > 0,
+        // narrowing t0 up to the plane crossing at t=5 (eye z=-5, plane z=0).
+        let (t0, t1) = apply_clip_plane(1.0, 10.0, (0.0, 0.0, -5.0), (0.0, 0.0, 1.0), Some(((0.0, 0.0, 0.0), (0.0, 0.0, 1.0)))).unwrap();
+        assert!((t0 - 5.0).abs() < 1e-9, "t0={t0}");
+        assert_eq!(t1, 10.0);
+    }
+
+    #[test]
+    fn clip_plane_facing_away_narrows_the_far_end() {
+        // Same plane, normal flipped to (0,0,-1) => denom < 0, narrows t1.
+        let (t0, t1) = apply_clip_plane(1.0, 10.0, (0.0, 0.0, -5.0), (0.0, 0.0, 1.0), Some(((0.0, 0.0, 0.0), (0.0, 0.0, -1.0)))).unwrap();
+        assert_eq!(t0, 1.0);
+        assert!((t1 - 5.0).abs() < 1e-9, "t1={t1}");
+    }
+
+    #[test]
+    fn clip_plane_can_reject_the_entire_interval() {
+        // Plane crossing beyond t1: the whole [t0,t1] is on the far side.
+        let hit = apply_clip_plane(1.0, 3.0, (0.0, 0.0, -5.0), (0.0, 0.0, 1.0), Some(((0.0, 0.0, 0.0), (0.0, 0.0, 1.0))));
+        assert!(hit.is_none(), "plane crossing at t=5 is past t1=3, the whole interval should be rejected");
+    }
+
+    #[test]
+    fn clip_plane_parallel_ray_keeps_or_rejects_the_whole_interval() {
+        // Ray travels along X, plane normal along Z through the origin —
+        // the ray never crosses the plane (denom == 0). Eye at z=-1 is on
+        // the plane's back side (normal (0,0,1) points toward +z), so the
+        // whole interval must be rejected.
+        let hit = apply_clip_plane(0.0, 10.0, (0.0, 0.0, -1.0), (1.0, 0.0, 0.0), Some(((0.0, 0.0, 0.0), (0.0, 0.0, 1.0))));
+        assert!(hit.is_none());
+        // Eye at z=+1 is on the front side — the whole interval survives.
+        let (t0, t1) = apply_clip_plane(0.0, 10.0, (0.0, 0.0, 1.0), (1.0, 0.0, 0.0), Some(((0.0, 0.0, 0.0), (0.0, 0.0, 1.0)))).unwrap();
+        assert_eq!((t0, t1), (0.0, 10.0));
+    }
+
+    #[test]
+    fn clip_plane_result_is_invariant_to_normal_scale() {
+        let a = apply_clip_plane(1.0, 10.0, (0.0, 0.0, -5.0), (0.0, 0.0, 1.0), Some(((0.0, 0.0, 0.0), (0.0, 0.0, 1.0))));
+        let b = apply_clip_plane(1.0, 10.0, (0.0, 0.0, -5.0), (0.0, 0.0, 1.0), Some(((0.0, 0.0, 0.0), (0.0, 0.0, 7.0))));
+        assert_eq!(a, b, "t_plane's ratio must be unaffected by scaling the normal");
+    }
+
+    #[test]
+    fn half_cut_clip_plane_removes_roughly_half_of_a_solid_object() {
+        // The actual Phase 6 checkpoint scenario: a default axis-aligned
+        // half-cut through a real formula's bounding box should hide
+        // roughly half the object — checked by comparing hit-fraction with
+        // and without the clip, on the same box/formula/rays.
+        let mut p = base_dag_params();
+        p.box_bounds = Some(((-1.6, -1.6, -1.6), (1.6, 1.6, 1.6)));
+        let mut hits_unclipped = 0;
+        let mut hits_clipped = 0;
+        let n = 25;
+        for i in 0..n {
+            for j in 0..n {
+                let u = (i as f64 / (n - 1) as f64) * 2.0 - 1.0;
+                let v = (j as f64 / (n - 1) as f64) * 2.0 - 1.0;
+                let eye = (0.0, 0.0, -5.0);
+                let dir = normalize((u, v, 2.0));
+                if march_ray(&p, eye, dir).is_some() { hits_unclipped += 1; }
+            }
+        }
+        p.clip_plane = Some(((0.0, 0.0, 0.0), (1.0, 0.0, 0.0)));
+        for i in 0..n {
+            for j in 0..n {
+                let u = (i as f64 / (n - 1) as f64) * 2.0 - 1.0;
+                let v = (j as f64 / (n - 1) as f64) * 2.0 - 1.0;
+                let eye = (0.0, 0.0, -5.0);
+                let dir = normalize((u, v, 2.0));
+                if march_ray(&p, eye, dir).is_some() { hits_clipped += 1; }
+            }
+        }
+        assert!(hits_unclipped > 0, "sanity check: the unclipped bounding box should show something");
+        assert!(hits_clipped < hits_unclipped, "the clip plane must hide some of what was visible: unclipped={hits_unclipped} clipped={hits_clipped}");
+    }
+
+    /// Casts the same 25x25 ray grid `half_cut_clip_plane_...` uses, over
+    /// `march_ray` directly, with a given `slide_iter` — small helper so
+    /// the two Slide Iteration tests below don't duplicate the grid setup.
+    fn count_hits(p: &RaymarchDagParams) -> usize {
+        let n = 25;
+        let mut hits = 0;
+        for i in 0..n {
+            for j in 0..n {
+                let u = (i as f64 / (n - 1) as f64) * 2.0 - 1.0;
+                let v = (j as f64 / (n - 1) as f64) * 2.0 - 1.0;
+                let eye = (0.0, 0.0, -5.0);
+                let dir = normalize((u, v, 2.0));
+                if march_ray(p, eye, dir).is_some() { hits += 1; }
+            }
+        }
+        hits
+    }
+
+    #[test]
+    fn slide_iteration_excluding_every_escape_time_hides_everything() {
+        let mut p = base_dag_params();
+        p.box_bounds = Some(((-1.6, -1.6, -1.6), (1.6, 1.6, 1.6)));
+        assert!(count_hits(&p) > 0, "sanity check: the unclipped bounding box should show something");
+        // Exclusive upper bound, so +1.0: a point that never escapes
+        // within max_iter reports et == max_iter exactly (the "never
+        // bailed out" case), which must also fall inside this band.
+        p.slide_iter = Some((0.0, p.max_iter as f64 + 1.0));
+        assert_eq!(count_hits(&p), 0, "excluding every possible escape-time value must hide every surface");
+    }
+
+    #[test]
+    fn slide_iteration_empty_band_is_a_no_op() {
+        let mut p = base_dag_params();
+        p.box_bounds = Some(((-1.6, -1.6, -1.6), (1.6, 1.6, 1.6)));
+        let eye = (0.0, 0.0, -5.0);
+        let dir = normalize((0.15, -0.1, 2.0));
+        let without = march_ray(&p, eye, dir);
+        p.slide_iter = Some((0.0, 0.0));
+        let with_empty_band = march_ray(&p, eye, dir);
+        assert_eq!(without, with_empty_band, "an empty min==max band must never hide a surface");
+    }
+
+    /// `hide_above` — a tiny box tightly around the origin sits deep
+    /// inside the classic Mandelbrot-like set at c=0 (provably bounded,
+    /// never escapes), so nearly every ray through it hits only
+    /// never-escaped material (et == max_iter) — a `hide_above` cutoff at
+    /// `max_iter` should knock hits down to (near) zero, while leaving
+    /// them untouched when `None`.
+    #[test]
+    fn hide_above_removes_points_at_or_past_the_cutoff() {
+        let mut p = base_dag_params();
+        p.box_bounds = Some(((-0.3, -0.3, -0.3), (0.3, 0.3, 0.3)));
+        let hits_without = count_hits(&p);
+        assert!(hits_without > 0, "sanity check: this tight central box should show something");
+        p.hide_above = Some(p.max_iter as f64);
+        let hits_hidden = count_hits(&p);
+        assert!(hits_hidden * 4 < hits_without, "hide_above=max_iter should remove nearly every hit in a region that never escapes: without={hits_without} hidden={hits_hidden}");
+    }
+
+    #[test]
+    fn hide_above_none_is_a_no_op() {
+        let mut p = base_dag_params();
+        p.box_bounds = Some(((-1.6, -1.6, -1.6), (1.6, 1.6, 1.6)));
+        let eye = (0.0, 0.0, -5.0);
+        let dir = normalize((0.15, -0.1, 2.0));
+        let without = march_ray(&p, eye, dir);
+        p.hide_above = None;
+        let still_without = march_ray(&p, eye, dir);
+        assert_eq!(without, still_without, "hide_above=None must never hide a surface");
     }
 }

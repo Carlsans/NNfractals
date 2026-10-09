@@ -261,6 +261,16 @@ pub struct Genome {
     #[serde(default)] pub quat_organization_multifractal: f32,
     #[serde(default)] pub quat_organization_compression: f32,
     #[serde(default)] pub quat_organization_chaoticity: f32,
+    /// Plain Shannon entropy of the escape-time field, times continuity
+    /// (`quat_organization_continuity`) — Carl, 2026-09-28, from browsing
+    /// many fractals across the viewer's 4 axes: "most interesting
+    /// fractals have hi entropy, but are continuous (differentiable)
+    /// along all axis. If the fractal is mostly noise, it will not be
+    /// continuous." See `quat_organization::organized_richness`'s doc
+    /// comment.
+    #[serde(default)] pub quat_organization_entropy: f32,
+    #[serde(default)] pub quat_organization_continuity: f32,
+    #[serde(default)] pub quat_organization_richness: f32,
     /// Sphericity of the genome's shape at C=0 — 1.0 = perfectly
     /// spherical, 0.0 = highly direction-dependent. Carl's own
     /// observation: "most uninteresting fractals have a spherical shape
@@ -268,6 +278,32 @@ pub struct Genome {
     /// all." Meant as a PENALTY term (negative weight in a
     /// --fitness-metric combo), not maximized on its own.
     #[serde(default)] pub quat_sphericity: f32,
+
+    // ── Axis boundedness (quat_boundedness.rs) ──────────────────────────────
+    // Carl, 2026-09-23: "I want to know what fractals actually have a set
+    // limit when observed from outside with raycasting... the 4 axis have
+    // actually limits on all 4 axis. Please also note these limits once
+    // extracted." Written only by `explorer.rs`'s `apply_boundedness_metrics`
+    // (the `quat-bounded-scan` command) — 0.0 on every genome this has never
+    // been run against. Each `quat_bound_*_pos`/`_neg` is the discovered
+    // limit along that axis in that direction (raw units, same space
+    // `bailout_radius` and the render's own box_bounds live in), or the
+    // sentinel `-1.0` if no limit was found within `quat_boundedness::
+    // SEARCH_MAX` — NOT the same as 0.0 ("never computed"), since a real
+    // limit is never negative. `quat_fully_bounded` is 1.0 only when all 8
+    // of the direction scans found a real limit (Carl's own "all 4 axis"
+    // definition — see `BoundednessReport::fully_bounded`), 0.0 otherwise
+    // (including "never computed" — this field alone can't distinguish
+    // "checked, not bounded" from "not checked yet"; the 8 raw fields can).
+    #[serde(default)] pub quat_bound_r_pos: f32,
+    #[serde(default)] pub quat_bound_r_neg: f32,
+    #[serde(default)] pub quat_bound_a_pos: f32,
+    #[serde(default)] pub quat_bound_a_neg: f32,
+    #[serde(default)] pub quat_bound_b_pos: f32,
+    #[serde(default)] pub quat_bound_b_neg: f32,
+    #[serde(default)] pub quat_bound_c_pos: f32,
+    #[serde(default)] pub quat_bound_c_neg: f32,
+    #[serde(default)] pub quat_fully_bounded: f32,
 
     // ── Taste model (scripts/train_taste_quat.py, quat_taste_scorer.py) ────
     /// Bradley-Terry preference score fit on Carl's own pairwise ratings
@@ -286,6 +322,40 @@ fn default_view_zoom() -> f32 { 1.0 }
 fn default_bailout_radius() -> f32 { 4.0 }
 
 impl Genome {
+    /// A stable identity for this genome's rendered content (program +
+    /// warp + julia/phoenix/bailout, serialized deterministically via
+    /// serde_json), independent of its `id`/filename. Used to key
+    /// per-fractal animation settings (`anim_persist`) so renaming or
+    /// copying a `.nn` file never loses them.
+    ///
+    /// Byte-for-byte the same recipe `QuatIndividual::content_hash`
+    /// (`src/bin/explorer.rs`) already uses for the MAP-Elites archive's
+    /// saved-filename stem — kept in sync deliberately, not by accident:
+    /// changing this hashing logic without updating that one (or vice
+    /// versa) would silently break either the MAP-Elites archive's
+    /// "already embedded" recognition or the animation viewer's
+    /// per-fractal settings lookup.
+    pub fn content_hash(&self) -> u64 {
+        let mut s = String::new();
+        s.push_str(&serde_json::to_string(&self.program).unwrap_or_default());
+        s.push('|');
+        s.push_str(&serde_json::to_string(&self.warp).unwrap_or_default());
+        s.push('|');
+        s.push_str(&format!(
+            "{}|{:?}|{:?}|{:?}",
+            self.julia_mode,
+            (self.julia_cre, self.julia_cim),
+            (self.phoenix_re, self.phoenix_im),
+            self.bailout_radius
+        ));
+        let mut h: u64 = 0xcbf29ce484222325;
+        for b in s.as_bytes() {
+            h ^= *b as u64;
+            h = h.wrapping_mul(0x100000001b3);
+        }
+        h
+    }
+
     pub fn view_bounds(&self) -> (f32, f32, f32, f32) {
         let half = 2.0 / self.view_zoom;
         (self.view_cx - half, self.view_cx + half, self.view_cy - half, self.view_cy + half)
@@ -1888,5 +1958,37 @@ mod blend_tests {
         let after = eval_program(&stripped, zx, zy, cx, cy);
         assert!((before.0-after.0).abs() < 1e-6 && (before.1-after.1).abs() < 1e-6,
             "stripping changed the value: {before:?} -> {after:?}");
+    }
+}
+
+#[cfg(test)]
+mod content_hash_tests {
+    use super::*;
+
+    #[test]
+    fn deterministic_for_identical_content() {
+        let g = Genome { bailout_radius: 4.0, ..Genome::default() };
+        assert_eq!(g.content_hash(), g.content_hash());
+    }
+
+    #[test]
+    fn changes_when_the_program_changes() {
+        let a = Genome { bailout_radius: 4.0, ..Genome::default() };
+        let mut b = a.clone();
+        b.program = vec![OpNode { op: op::Z, a: 0, b: 0, kre: 0.0, kim: 0.0 }];
+        assert_ne!(a.content_hash(), b.content_hash());
+    }
+
+    #[test]
+    fn unaffected_by_fields_outside_the_rendered_content() {
+        // id, view_cx/cy/zoom, fitness, terms etc. must NOT change the hash
+        // — content_hash exists specifically to key per-fractal settings by
+        // "the same rendered fractal", not "the same save-file metadata".
+        let a = Genome { bailout_radius: 4.0, ..Genome::default() };
+        let mut b = a.clone();
+        b.id = a.id.wrapping_add(1);
+        b.view_cx = 99.0;
+        b.fitness = 0.5;
+        assert_eq!(a.content_hash(), b.content_hash());
     }
 }

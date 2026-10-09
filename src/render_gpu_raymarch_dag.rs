@@ -353,6 +353,7 @@ mod tests {
             time_axis: TimeAxis::C,
             time_val: 0.0,
             domain_radius: 1.6,
+            box_bounds: None, axis_assignment: None, clip_plane: None, slide_iter: None, hide_above: None,
             max_iter: 40,
             bailout: 4.0,
             max_march_steps: 200,
