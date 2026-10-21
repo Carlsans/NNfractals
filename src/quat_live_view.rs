@@ -24,16 +24,33 @@ pub const VIEW_C_VALUES: usize = 4;
 /// Half-range of the C sweep: same bailout-scaled convention as
 /// `quat_viewer::CRangeScan::start`'s initial probe step.
 pub fn view_c_half(bailout_radius: f64) -> f64 {
+    view_c_half_m(crate::quat_collapse::current(), bailout_radius)
+}
+
+/// [`view_c_half`] for an explicit collapse method. The angle-based methods
+/// (S3 family) read time as a 4D rotation angle, one turn wide.
+pub fn view_c_half_m(method: crate::quat_collapse::Method, bailout_radius: f64) -> f64 {
+    if method.time_is_angle() {
+        return std::f64::consts::PI;
+    }
     (bailout_radius * 0.25).max(0.02)
 }
 
 /// The `VIEW_C_VALUES` C values of the stored grid, evenly spaced over
 /// `[-c_half, +c_half]`.
 pub fn view_c_values(bailout_radius: f64) -> [f64; VIEW_C_VALUES] {
-    let h = view_c_half(bailout_radius);
+    view_c_values_m(crate::quat_collapse::current(), bailout_radius)
+}
+
+/// [`view_c_values`] for an explicit collapse method.
+pub fn view_c_values_m(method: crate::quat_collapse::Method, bailout_radius: f64) -> [f64; VIEW_C_VALUES] {
+    let h = view_c_half_m(method, bailout_radius);
     let mut out = [0.0; VIEW_C_VALUES];
+    let is_angle = method.time_is_angle();
     for (i, o) in out.iter_mut().enumerate() {
-        *o = -h + 2.0 * h * i as f64 / (VIEW_C_VALUES - 1) as f64;
+        // An angle wraps, so spread the values over one turn without repeating the end point.
+        *o = if is_angle { -h + 2.0 * h * i as f64 / VIEW_C_VALUES as f64 }
+             else { -h + 2.0 * h * i as f64 / (VIEW_C_VALUES - 1) as f64 };
     }
     out
 }
@@ -58,6 +75,11 @@ pub struct LiveQuatView {
     bailout: f64,
     colormap: String,
     max_iter: u32,
+    collapse: crate::quat_collapse::Collapse,
+    /// The genome's own projection (before the range factor) and the range factor.
+    own_collapse: Option<crate::quat_collapse::Collapse>,
+    range: f32,
+    domain: f64,
 }
 
 impl LiveQuatView {
@@ -77,12 +99,44 @@ impl LiveQuatView {
             bailout: g.bailout_radius as f64,
             colormap: "lava".to_string(),
             max_iter: 50,
-        })
+            collapse: crate::quat_collapse::Collapse::effective(g.collapse),
+            own_collapse: g.collapse,
+            range: g.view_range,
+            domain: DOMAIN_RADIUS,
+        }.with_range(g.view_range))
     }
 
-    pub fn c_half(&self) -> f64 {
-        view_c_half(self.bailout)
+    /// Applies a range factor (0 = default): sphere radius under S3, view
+    /// domain otherwise. Uniform-only, so no recompile.
+    pub fn with_range(mut self, range: f32) -> Self {
+        let (c, d) = crate::quat_collapse::view_setup(self.own_collapse, range);
+        self.collapse = crate::quat_collapse::Collapse::effective(c);
+        self.domain = d;
+        self.range = range;
+        self
     }
+
+    pub fn set_range(&mut self, range: f32) {
+        let (c, d) = crate::quat_collapse::view_setup(self.own_collapse, range);
+        self.collapse = crate::quat_collapse::Collapse::effective(c);
+        self.domain = d;
+        self.range = range;
+    }
+
+    /// The range factor in effect (1 when unset).
+    pub fn range(&self) -> f32 { if self.range > 0.0 { self.range } else { 1.0 } }
+
+    pub fn c_half(&self) -> f64 {
+        view_c_half_m(self.collapse.method, self.bailout)
+    }
+
+    /// The time value at sweep `phase` (radians, one loop = TAU): a rotation
+    /// angle for the angle-based methods, an oscillating C value otherwise.
+    pub fn time_at(&self, phase: f64) -> f64 {
+        if self.collapse.method.time_is_angle() { phase } else { self.c_half() * phase.sin() }
+    }
+
+    pub fn collapse(&self) -> crate::quat_collapse::Collapse { self.collapse }
 
     /// Renders one square frame. `turn` is the orbit position in turns
     /// (0..1 = one full orbit, identical to `RaymarchOrbitParams::sample`),
@@ -93,22 +147,22 @@ impl LiveQuatView {
             formula,
             time_axis: TimeAxis::C,
             time_val: c,
-            domain_radius: DOMAIN_RADIUS,
-            box_bounds: None, axis_assignment: None, clip_plane: None, slide_iter: None, hide_above: None,
+            domain_radius: self.domain,
+            box_bounds: None, axis_assignment: None, clip_plane: None, slide_iter: None, hide_above: None, axis_remap: None, collapse: Some(self.collapse),
             max_iter: self.max_iter,
             bailout: self.bailout,
             max_march_steps: 150,
-            hit_epsilon: DOMAIN_RADIUS * 1e-4,
+            hit_epsilon: self.domain * 1e-4,
             step_safety: 0.8,
             light_dir: (0.5, 0.8, 0.3),
-            normal_eps: DOMAIN_RADIUS * 1e-3,
-            color_probe_offset: DOMAIN_RADIUS * 1e-2,
+            normal_eps: self.domain * 1e-3,
+            color_probe_offset: self.domain * 1e-2,
             aa: 1,
         };
         let orbit = RaymarchOrbitParams {
             target: (0.0, 0.0, 0.0),
             axis: ORBIT_AXIS,
-            radius: orbit_radius(size, size),
+            radius: orbit_radius(size, size) * self.domain / DOMAIN_RADIUS,
             turns: 1.0,
             phase0: 0.0,
             fov_y: FOV_DEG.to_radians(),

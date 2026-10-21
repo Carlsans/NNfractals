@@ -36,23 +36,18 @@ use crate::quat_fractal::TimeAxis;
 use crate::quat_raymarch::RaymarchCamera;
 
 const TEMPLATE: &str = include_str!("raymarch_dag_codegen_template.wgsl");
-/// 59 plain scalar fields (see the template's `Params` struct): the
+/// 66 plain scalar fields (see the template's `Params` struct): the
 /// original 37 (2 of which — `use_box`/`use_axis_perm` — were unused
 /// `_pad0`/`_pad1` padding before the animation-viewer plan's Phase 2)
 /// plus 10 from Phase 2 (box min/max, axis permutation) plus 7 from
 /// Phase 6 (clip plane: enabled flag + pos + normal) plus 3 from the
 /// Slide Iteration effect (enabled flag + min + max) plus 2 for the
-/// "hide top N%" resolved cutoff (enabled flag + value).
-const PARAMS_BYTES: u64 = 59 * 4;
+/// "hide top N%" resolved cutoff (enabled flag + value) plus 7 for the
+/// per-axis remap (enabled flag + scale xyz + offset xyz).
+const PARAMS_BYTES: u64 = 72 * 4;
+/// The `consts` uniform: one vec4 per DAG slot (program kre/kim, warp kre/kim).
+const CONSTS_BYTES: u64 = (N_SLOTS as u64) * 16;
 const WG: u32 = 8;
-
-fn wgsl_f32(v: f32) -> String {
-    if v.is_finite() {
-        format!("{v:.9}")
-    } else {
-        "0.0".to_string()
-    }
-}
 
 fn operand(prefix: &str, idx: u8, i: usize, zero: &str) -> String {
     let idx = (idx as usize).min(N_SLOTS - 1);
@@ -78,7 +73,8 @@ fn codegen_warp(warp: &[OpNode]) -> String {
         let b = operand("w", node.b, i, "Quat(0.0, 0.0, 0.0, 0.0)");
         let expr = match node.op {
             op::Z | op::C => "point".to_string(),
-            op::CONST => format!("Quat({}, {}, 0.0, 0.0)", wgsl_f32(node.kre), wgsl_f32(node.kim)),
+            op::CONST => format!("Quat(consts[{i}].z, consts[{i}].w, 0.0, 0.0)"),
+            op::CONSTBC => format!("Quat(0.0, 0.0, consts[{i}].z, consts[{i}].w)"),
             op::SQR => format!("qmul({a}, {a})"),
             op::CUBE => format!("qmul(qmul({a}, {a}), {a})"),
             op::QUART => format!("qmul(qmul({a}, {a}), qmul({a}, {a}))"),
@@ -97,6 +93,7 @@ fn codegen_warp(warp: &[OpNode]) -> String {
             op::SUB => format!("qsub({a}, {b})"),
             op::MUL => format!("qmul({a}, {b})"),
             op::DIV => format!("qmul({a}, qrecip({b}))"),
+            op::BULB => format!("qbulb({a}, {b})"),
             _ => "Quat(0.0, 0.0, 0.0, 0.0)".to_string(),
         };
         out.push_str(&format!("    let w{i}: Quat = {expr};\n"));
@@ -126,7 +123,8 @@ fn codegen_main_deriv(prog: &[OpNode]) -> String {
         let (val, dval) = match node.op {
             op::Z => ("z".to_string(), "dz".to_string()),
             op::C => ("c".to_string(), "dc".to_string()),
-            op::CONST => (format!("Quat({}, {}, 0.0, 0.0)", wgsl_f32(node.kre), wgsl_f32(node.kim)), "0.0".to_string()),
+            op::CONST => (format!("Quat(consts[{i}].x, consts[{i}].y, 0.0, 0.0)"), "0.0".to_string()),
+            op::CONSTBC => (format!("Quat(0.0, 0.0, consts[{i}].x, consts[{i}].y)"), "0.0".to_string()),
             op::SQR => (format!("qmul({a}, {a})"), format!("2.0 * qnorm({a}) * {da}")),
             op::CUBE => (format!("qmul(qmul({a}, {a}), {a})"), format!("3.0 * qnorm({a}) * qnorm({a}) * {da}")),
             op::QUART => (
@@ -151,6 +149,7 @@ fn codegen_main_deriv(prog: &[OpNode]) -> String {
                 format!("qmul({a}, qrecip({b}))"),
                 format!("{da} / (qnorm({b}) + EPS) + qnorm({a}) * ({db} / (qnorm({b})*qnorm({b}) + EPS))"),
             ),
+            op::BULB => (format!("qbulb({a}, {b})"), format!("qbulb_deriv({a}, {b}, {da}, {db})")),
             _ => ("Quat(0.0, 0.0, 0.0, 0.0)".to_string(), "0.0".to_string()),
         };
         out.push_str(&format!("    let n{i}: Quat = {val};\n"));
@@ -234,7 +233,8 @@ async fn init_gpu() -> Option<(wgpu::Device, wgpu::Queue)> {
             *slot = Some(msg);
         }
     };
-    let inst = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+    if crate::gpu_disabled() { return None; }
+        let inst = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
     let adapter = match inst
         .request_adapter(&wgpu::RequestAdapterOptions {
             power_preference: wgpu::PowerPreference::HighPerformance,
@@ -276,11 +276,35 @@ pub struct CompiledDagPipeline {
     pipeline: wgpu::ComputePipeline,
     bgl: wgpu::BindGroupLayout,
     params_buf: wgpu::Buffer,
+    consts_buf: wgpu::Buffer,
+    /// What the generated code depends on — everything but the constants.
+    structure: (Vec<(u8, u8, u8)>, Vec<(u8, u8, u8)>),
     shading_buf: wgpu::Buffer,
     color_buf: wgpu::Buffer,
     shading_staging: wgpu::Buffer,
     color_staging: wgpu::Buffer,
     max_pixels: u64,
+}
+
+/// The generated code's dependency on a program: per node (op, a, b) as
+/// `codegen_*` reads them, for the first `N_SLOTS` nodes. Constants are
+/// deliberately left out — they live in the `consts` uniform.
+fn structure_of(prog: &[OpNode]) -> Vec<(u8, u8, u8)> {
+    prog.iter().take(N_SLOTS).map(|n| (n.op, n.a, n.b)).collect()
+}
+
+/// The `consts` uniform's bytes for `(prog, warp)`.
+fn consts_bytes(prog: &[OpNode], warp: &[OpNode]) -> [u8; CONSTS_BYTES as usize] {
+    let mut out = [0u8; CONSTS_BYTES as usize];
+    let finite = |v: f32| if v.is_finite() { v } else { 0.0 };
+    for (base, list) in [(0usize, prog), (8usize, warp)] {
+        for (i, n) in list.iter().take(N_SLOTS).enumerate() {
+            let at = i * 16 + base;
+            out[at..at + 4].copy_from_slice(&finite(n.kre).to_le_bytes());
+            out[at + 4..at + 8].copy_from_slice(&finite(n.kim).to_le_bytes());
+        }
+    }
+    out
 }
 
 fn mk_buf(device: &wgpu::Device, label: &'static str, size: u64, usage: wgpu::BufferUsages) -> wgpu::Buffer {
@@ -298,14 +322,71 @@ fn alloc_outputs(device: &wgpu::Device, max_pixels: u64) -> (wgpu::Buffer, wgpu:
     )
 }
 
+type PipeKey = (Vec<(u8, u8, u8)>, Vec<(u8, u8, u8)>);
+
+/// Compiled shader pipelines by program structure (everything the generated code depends on,
+/// constants excluded). The GA renders every genome many times (stills, sheets, continuity
+/// steps) and mutates constants without changing structure, so recompiling for each call wasted
+/// most of the CPU time. Bounded: cleared when it reaches `PIPE_CACHE_MAX`.
+static PIPE_CACHE: std::sync::LazyLock<Mutex<std::collections::HashMap<PipeKey, (wgpu::ComputePipeline, wgpu::BindGroupLayout)>>> =
+    std::sync::LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
+const PIPE_CACHE_MAX: usize = 600;
+/// Off with `quat-dag-evolve --no-pipeline-cache` (for timing comparisons).
+pub static PIPE_CACHE_ENABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+static PIPE_HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static PIPE_MISSES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// (cache hits, misses) of `CompiledDagPipeline::compile` so far in this process.
+pub fn pipeline_cache_stats() -> (u64, u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    (PIPE_HITS.load(Relaxed), PIPE_MISSES.load(Relaxed))
+}
+
 impl CompiledDagPipeline {
     /// Compiles a fresh shader/pipeline for this exact `(prog, warp)`
     /// pair. `None` if no GPU adapter is available.
     pub fn compile(prog: &[OpNode], warp: &[OpNode]) -> Option<Self> {
-        let g = gpu()?;
-        let g = g.lock().ok()?;
-        let device = &g.device;
+        // Only the device handle is taken under the lock (it is a cheap shared handle): building the
+        // shader module and pipeline is the driver's shader compiler running for ~0.5 s per new
+        // formula, and holding the global lock across it made GA scoring threads queue up behind
+        // each other. Compiling concurrently is safe; `render` still serialises submits.
+        let device = {
+            let g = gpu()?;
+            let g = g.lock().ok()?;
+            g.device.clone()
+        };
+        let device = &device;
 
+        let key: PipeKey = (structure_of(prog), structure_of(warp));
+        let use_cache = PIPE_CACHE_ENABLED.load(std::sync::atomic::Ordering::Relaxed);
+        let cached = if use_cache { PIPE_CACHE.lock().ok().and_then(|c| c.get(&key).cloned()) } else { None };
+        let (pipeline, bgl) = if let Some(hit) = cached {
+            PIPE_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            hit
+        } else {
+            PIPE_MISSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let built = Self::build_pipeline(device, prog, warp);
+            if use_cache {
+                if let Ok(mut c) = PIPE_CACHE.lock() {
+                    if c.len() >= PIPE_CACHE_MAX { c.clear(); }
+                    c.insert(key, built.clone());
+                }
+            }
+            built
+        };
+
+        let params_buf = mk_buf(device, "rmdc_params", PARAMS_BYTES, wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST);
+        let max_pixels = 128 * 128;
+        let (shading_buf, color_buf, shading_staging, color_staging) = alloc_outputs(device, max_pixels);
+
+        let consts_buf = mk_buf(device, "rmdc_consts", CONSTS_BYTES, wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST);
+        let structure = (structure_of(prog), structure_of(warp));
+        Some(Self { pipeline, bgl, params_buf, consts_buf, structure, shading_buf, color_buf, shading_staging, color_staging, max_pixels })
+    }
+
+    /// The expensive part of `compile`: generate the WGSL, build the shader module and the compute
+    /// pipeline (the driver's shader compiler runs here).
+    fn build_pipeline(device: &wgpu::Device, prog: &[OpNode], warp: &[OpNode]) -> (wgpu::ComputePipeline, wgpu::BindGroupLayout) {
         let src = generate_shader_source(prog, warp);
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("raymarch_dag_codegen"),
@@ -324,6 +405,7 @@ impl CompiledDagPipeline {
                 entry(0, wgpu::BufferBindingType::Uniform),
                 entry(1, wgpu::BufferBindingType::Storage { read_only: false }),
                 entry(2, wgpu::BufferBindingType::Storage { read_only: false }),
+                entry(3, wgpu::BufferBindingType::Uniform),
             ],
         });
         let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -339,19 +421,27 @@ impl CompiledDagPipeline {
             compilation_options: wgpu::PipelineCompilationOptions::default(),
             cache: None,
         });
+        (pipeline, bgl)
+    }
 
-        let params_buf = mk_buf(device, "rmdc_params", PARAMS_BYTES, wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST);
-        let max_pixels = 128 * 128;
-        let (shading_buf, color_buf, shading_staging, color_staging) = alloc_outputs(device, max_pixels);
-
-        Some(Self { pipeline, bgl, params_buf, shading_buf, color_buf, shading_staging, color_staging, max_pixels })
+    /// True when `(prog, warp)` differ from what this pipeline was compiled
+    /// for at most in their constants' values — then this pipeline renders
+    /// them correctly as-is (constants are read from `params.formula` on
+    /// every `render`), and no recompile is needed.
+    pub fn same_structure(&self, prog: &[OpNode], warp: &[OpNode]) -> bool {
+        self.structure.0 == structure_of(prog) && self.structure.1 == structure_of(warp)
     }
 
     pub fn render(&mut self, params: &RaymarchDagParams, cam: &RaymarchCamera, width: u32, height: u32) -> (Vec<f32>, Vec<f32>) {
-        let g = gpu().expect("compile() already proved a GPU is available");
-        let g = g.lock().expect("gpu mutex poisoned");
-        let device = &g.device;
-        let queue = &g.queue;
+        // Handles only: this pipeline owns every buffer it touches, and wgpu's device and queue
+        // are thread-safe, so GA scoring threads can submit and wait on their own renders
+        // concurrently instead of taking turns behind one global lock for the whole round trip.
+        let (device, queue) = {
+            let g = gpu().expect("compile() already proved a GPU is available");
+            let g = g.lock().expect("gpu mutex poisoned");
+            (g.device.clone(), g.queue.clone())
+        };
+        let (device, queue) = (&device, &queue);
 
         let pix = (width as u64) * (height as u64);
         if pix > self.max_pixels {
@@ -452,8 +542,18 @@ impl CompiledDagPipeline {
             // control existed) writes hide_above_enabled=0.
             w.u32(params.hide_above.is_some() as u32);
             w.f32(params.hide_above.unwrap_or(0.0));
+            // Per-axis stretch (axis_remap); None writes remap_enabled=0.
+            w.u32(params.axis_remap.is_some() as u32);
+            let (rs, ro) = params.axis_remap.unwrap_or(((1.0, 1.0, 1.0), (0.0, 0.0, 0.0)));
+            w.f32(rs.0); w.f32(rs.1); w.f32(rs.2);
+            w.f32(ro.0); w.f32(ro.1); w.f32(ro.2);
+            // 4D->3D collapse method (process-wide; see quat_collapse).
+            let (cm, cp) = crate::quat_collapse::Collapse::effective(params.collapse).uniform_words();
+            w.u32(cm);
+            w.f32(cp[0]); w.f32(cp[1]); w.f32(cp[2]); w.f32(cp[3]); w.f32(cp[4]);
         }
         queue.write_buffer(&self.params_buf, 0, &pb);
+        queue.write_buffer(&self.consts_buf, 0, &consts_bytes(params.formula.prog, params.formula.warp));
 
         let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: None,
@@ -462,6 +562,7 @@ impl CompiledDagPipeline {
                 wgpu::BindGroupEntry { binding: 0, resource: self.params_buf.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 1, resource: self.shading_buf.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 2, resource: self.color_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 3, resource: self.consts_buf.as_entire_binding() },
             ],
         });
 
@@ -520,7 +621,7 @@ mod tests {
             time_axis: TimeAxis::C,
             time_val: 0.0,
             domain_radius: 1.6,
-            box_bounds: None, axis_assignment: None, clip_plane: None, slide_iter: None, hide_above: None,
+            box_bounds: None, axis_assignment: None, clip_plane: None, slide_iter: None, hide_above: None, axis_remap: None, collapse: None,
             max_iter: 40,
             bailout: 4.0,
             max_march_steps: 200,
@@ -646,6 +747,56 @@ mod tests {
     /// Both new fields at once — the actual combination the animation
     /// viewer's live render loop will use once axis assignment + the
     /// bounding-box editor are wired up.
+    /// The per-axis stretch (`axis_remap`): thin X range stretched to the
+    /// same size as the wide ones, with an off-centre offset.
+    #[test]
+    fn codegen_matches_cpu_with_axis_remap() {
+        let prog = [
+            OpNode { op: op::Z, a: 0, b: 0, kre: 0.0, kim: 0.0 },
+            OpNode { op: op::C, a: 0, b: 0, kre: 0.0, kim: 0.0 },
+            OpNode { op: op::SQR, a: 0, b: 0, kre: 0.0, kim: 0.0 },
+            OpNode { op: op::ADD, a: 2, b: 1, kre: 0.0, kim: 0.0 },
+        ];
+        let mut params = base_params(&prog, &[]);
+        params.box_bounds = Some(((-1.6, -1.6, -1.6), (1.6, 1.6, 1.6)));
+        params.axis_remap = Some(((0.25, 1.0, 0.6), (0.1, -0.2, 0.05)));
+        assert_matches_cpu(&prog, &[], params, 64, 64);
+    }
+
+    /// Every 4D->3D collapse method, with non-default parameters, against the
+    /// CPU twin (`quat_dag::eval_collapsed`). Needs the GPU.
+    #[test]
+    fn codegen_matches_cpu_for_every_collapse_method() {
+        use crate::quat_collapse::{Collapse, Method};
+        let prog = [
+            OpNode { op: op::Z, a: 0, b: 0, kre: 0.0, kim: 0.0 },
+            OpNode { op: op::C, a: 0, b: 0, kre: 0.0, kim: 0.0 },
+            OpNode { op: op::SQR, a: 0, b: 0, kre: 0.0, kim: 0.0 },
+            OpNode { op: op::ADD, a: 2, b: 1, kre: 0.0, kim: 0.0 },
+        ];
+        let variants = [
+            Collapse { method: Method::Tilt, tilt: (0.5, -0.3), ..Collapse::default() },
+            Collapse { method: Method::Slab, slab_half: 0.12, ..Collapse::default() },
+            Collapse { method: Method::Offset, offset: 0.03, ..Collapse::default() },
+            Collapse { method: Method::S3, rho: 1.2, plane: 0, pole: [0.2, -0.4, 0.3], ..Collapse::default() },
+            Collapse { method: Method::S3, rho: 0.9, plane: 2, pole: [0.0; 3], ..Collapse::default() },
+            Collapse { method: Method::Proj3, ..Collapse::default() },
+            Collapse { method: Method::Spin, rho: 0.4, plane: 2, ..Collapse::default() },
+            Collapse { method: Method::Spin, rho: -0.3, plane: 0, ..Collapse::default() },
+            Collapse { method: Method::IsoSpin, rho: 0.5, plane: 1, ..Collapse::default() },
+            Collapse { method: Method::IsoS3, rho: 1.1, plane: 2, pole: [0.2, 0.1, -0.3], ..Collapse::default() },
+            Collapse { method: Method::IsoS3, rho: 0.9, plane: 0, pole: [0.0; 3], ..Collapse::default() },
+        ];
+        for c in variants {
+            let mut params = base_params(&prog, &[]);
+            params.box_bounds = Some(((-1.6, -1.6, -1.6), (1.6, 1.6, 1.6)));
+            params.time_val = 0.35;
+            params.collapse = Some(c);
+            eprintln!("collapse parity: {:?}", c.method);
+            assert_matches_cpu(&prog, &[], params, 48, 48);
+        }
+    }
+
     #[test]
     fn codegen_matches_cpu_with_box_bounds_and_axis_assignment_together() {
         use crate::anim_timeline::{AxisAssignment, QuatPart};
@@ -769,5 +920,58 @@ mod tests {
         assert!(src1.contains("fn eval_main_deriv"));
         assert!(src1.contains("fn eval_warp"));
         assert!(!src1.contains("GENERATED-CODE-MARKER"));
+    }
+
+    /// Constants come from the `consts` uniform, so one pipeline must render
+    /// a program with EDITED constants exactly like a pipeline freshly
+    /// compiled for it — the anim viewer's formula editor relies on this to
+    /// skip recompiles while a constant is dragged.
+    #[test]
+    fn edited_constants_render_without_recompile() {
+        if !gpu_available() {
+            eprintln!("skipping: no GPU adapter available in this environment");
+            return;
+        }
+        let k = |re: f32, im: f32| OpNode { op: op::CONST, a: 0, b: 0, kre: re, kim: im };
+        let n = |o: u8, a: u8, b: u8| OpNode { op: o, a, b, kre: 0.0, kim: 0.0 };
+        // z^2 + c + k, with a warp that adds its own constant.
+        let prog = |kv: (f32, f32)| vec![n(op::Z, 0, 0), n(op::SQR, 0, 0), n(op::C, 0, 0), n(op::ADD, 1, 2), k(kv.0, kv.1), n(op::ADD, 3, 4)];
+        let warp = |kv: (f32, f32)| vec![n(op::Z, 0, 0), k(kv.0, kv.1), n(op::ADD, 0, 1)];
+        let (p0, w0) = (prog((0.0, 0.0)), warp((0.0, 0.0)));
+        let (p1, w1) = (prog((-0.31, 0.12)), warp((0.05, -0.2)));
+        let mut reused = CompiledDagPipeline::compile(&p0, &w0).expect("gpu available");
+        assert!(reused.same_structure(&p1, &w1));
+        assert!(!reused.same_structure(&p1[..5], &w1));
+        let cam = base_cam();
+        let before = reused.render(&base_params(&p0, &w0), &cam, 48, 48);
+        let edited = reused.render(&base_params(&p1, &w1), &cam, 48, 48);
+        let fresh = CompiledDagPipeline::compile(&p1, &w1).unwrap().render(&base_params(&p1, &w1), &cam, 48, 48);
+        assert_eq!(edited, fresh, "reused pipeline with new constants differs from a fresh compile");
+        assert_ne!(before, edited, "the constant edit had no visible effect, so this test proves nothing");
+    }
+
+    /// Wall time of `compile` on real corpus genomes — what one live formula
+    /// edit costs in the anim viewer. GPU-bound, so ignored by default:
+    /// `cargo test --release --features wgpu-backend --lib compile_timing -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn compile_timing_on_corpus() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("train_corpus_quat");
+        let Ok(entries) = std::fs::read_dir(&dir) else { return };
+        let mut ms = Vec::new();
+        for e in entries.flatten().take(400) {
+            let p = e.path();
+            if p.extension().and_then(|s| s.to_str()) != Some("nn") { continue; }
+            let Ok(g) = crate::io::load_genome(&p) else { continue };
+            if g.program.is_empty() { continue; }
+            let t = std::time::Instant::now();
+            assert!(CompiledDagPipeline::compile(&g.program, &g.warp).is_some());
+            ms.push(t.elapsed().as_secs_f64() * 1000.0);
+            if ms.len() == 30 { break; }
+        }
+        let first = ms.remove(0); // includes device init
+        ms.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        eprintln!("compile ms: first(with init)={first:.0} min={:.1} median={:.1} max={:.1} n={}",
+            ms[0], ms[ms.len() / 2], ms[ms.len() - 1], ms.len());
     }
 }

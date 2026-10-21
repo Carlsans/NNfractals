@@ -45,14 +45,23 @@ pub mod op {
     pub const SUB:     u8 = 18; // a − b
     pub const MUL:     u8 = 19; // a · b
     pub const DIV:     u8 = 20; // a / b
-    pub const N_OPS:   usize = 21;
+    /// Generalised Mandelbulb power of a, parameters from b (quaternion): radial
+    /// power b.r (1.5–10), angular multiplier b.a (1–10), rotation offsets b.b on the
+    /// polar angle and b.c on the azimuth. bulb(a, 8+8i) is the Mandelbulb's power-8
+    /// step. 2D complex reading: |a|^b.re · e^(i·b.im·arg a). Quat GA only.
+    pub const BULB:    u8 = 21;
+    /// Leaf: constant in the quaternion's B and C parts, (0, 0, kre, kim). CONST only
+    /// fills (R, A), which makes the B and C directions interchangeable (every genome
+    /// then has a rotation symmetry: ring balls). 2D complex reading: (kre, kim).
+    pub const CONSTBC: u8 = 22;
+    pub const N_OPS:   usize = 23;
 
     /// Number of node inputs each op reads (0 leaf, 1 unary, 2 binary). Used by
     /// random program generation and mutation to wire valid DAGs.
     pub fn arity(o: u8) -> u8 {
         match o {
-            Z | C | CONST => 0,
-            ADD | SUB | MUL | DIV => 2,
+            Z | C | CONST | CONSTBC => 0,
+            ADD | SUB | MUL | DIV | BULB => 2,
             _ => 1,
         }
     }
@@ -63,13 +72,13 @@ pub mod op {
             RECIP=>"recip", SIN=>"sin", COS=>"cos", EXP=>"exp", LOG=>"log",
             TANH=>"tanh", CONJ=>"conj", ABSFOLD=>"absfold", ABSRE=>"absre",
             ABSIM=>"absim", NORMZ=>"normz", ADD=>"add", SUB=>"sub", MUL=>"mul",
-            DIV=>"div", _=>"?",
+            DIV=>"div", BULB=>"bulb", CONSTBC=>"kbc", _=>"?",
         }
     }
 }
 
 /// One node of an expression-DAG program. `a`/`b` index strictly-earlier nodes
-/// (ignored for ops whose arity is below 2). `kre`/`kim` used only by CONST.
+/// (ignored for ops whose arity is below 2). `kre`/`kim` used only by CONST and CONSTBC.
 #[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct OpNode {
     pub op: u8,
@@ -635,7 +644,7 @@ macro_rules! define_precision {
                     reg[i] = match node.op {
                         Z     => (zx, zy),
                         C     => (cx, cy),
-                        CONST => (node.kre as $ty, node.kim as $ty),
+                        CONST | CONSTBC => (node.kre as $ty, node.kim as $ty),
                         SQR   => (ax*ax - ay*ay, 2.0*ax*ay),
                         CUBE  => { let (a2,b2)=(ax*ax, ay*ay); (ax*(a2 - 3.0*b2), ay*(3.0*a2 - b2)) },
                         QUART => { let (a2,b2)=(ax*ax, ay*ay); (a2*a2 - 6.0*a2*b2 + b2*b2, 4.0*ax*ay*(a2 - b2)) },
@@ -654,6 +663,13 @@ macro_rules! define_precision {
                         SUB   => (ax - bx, ay - by),
                         MUL   => cmul(ax, ay, bx, by),
                         DIV   => { let d = bx*bx + by*by + EPS; cmul(ax, ay, bx/d, -by/d) },
+                        BULB  => {
+                            let nr = bx.max(1.5 as $ty).min(10.0 as $ty);
+                            let na = by.max(1.0 as $ty).min(10.0 as $ty);
+                            let r = (ax*ax + ay*ay).sqrt().powf(nr);
+                            let t = na * ay.atan2(ax);
+                            (r * t.cos(), r * t.sin())
+                        },
                         _     => (0.0 as $ty, 0.0 as $ty),
                     };
                 }

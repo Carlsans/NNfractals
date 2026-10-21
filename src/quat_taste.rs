@@ -41,6 +41,20 @@ pub struct QuatTasteScorer {
     is_ready: bool,
 }
 
+/// The taste model for the process-wide collapse method: `taste_model_quat_s3.npz`
+/// for S3 renders once one has been trained, else the plain-slice model (a
+/// bootstrap for the first S3 round, whose images it was not trained on).
+pub fn model_npz_path() -> std::path::PathBuf {
+    let sfx = crate::quat_collapse::taste_suffix();
+    let own = std::path::PathBuf::from(format!("taste_model_quat{sfx}.npz"));
+    if own.exists() { own } else { std::path::PathBuf::from("taste_model_quat.npz") }
+}
+
+/// JSON twin of [`model_npz_path`].
+pub fn model_json_path() -> std::path::PathBuf {
+    model_npz_path().with_extension("json")
+}
+
 impl QuatTasteScorer {
     /// Spawn the production sidecar. Returns `None` if Python, the
     /// script, or `taste_model_quat.npz` are missing — the caller
@@ -49,7 +63,8 @@ impl QuatTasteScorer {
     /// substitutes a generic scorer: a `None` here must propagate as "no
     /// taste score", not a fallback to some other metric.
     pub fn new() -> Option<Self> {
-        if !Path::new("quat_taste_scorer.py").exists() || !Path::new("taste_model_quat.npz").exists() {
+        let model = model_npz_path();
+        if !Path::new("quat_taste_scorer.py").exists() || !model.exists() {
             return None;
         }
         let python = crate::python_bin(Path::new("."));
@@ -57,7 +72,7 @@ impl QuatTasteScorer {
             .map(Stdio::from)
             .unwrap_or_else(|_| Stdio::null());
         let mut cmd = Command::new(python);
-        cmd.arg("quat_taste_scorer.py");
+        cmd.arg("quat_taste_scorer.py").arg("--model").arg(&model);
         Self::spawn(cmd, err_log)
     }
 

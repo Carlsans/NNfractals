@@ -386,7 +386,7 @@ impl QuatFormula {
     /// (`BULB_POWER`/`MANDELBOX_SCALE`) — see `step_with_params` for the
     /// override-capable version every real render call site now uses.
     #[inline]
-    fn step(self, q: Quat) -> Quat {
+    pub(crate) fn step(self, q: Quat) -> Quat {
         self.step_with_params(q, BULB_POWER, MANDELBOX_SCALE)
     }
 

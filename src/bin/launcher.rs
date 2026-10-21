@@ -13,7 +13,7 @@ use std::collections::HashMap;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -22,6 +22,9 @@ use clap::Parser;
 use eframe::egui::{self, Color32};
 use serde::{Deserialize, Serialize};
 use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
+
+#[path = "../launcher_tuning.rs"]
+mod launcher_tuning;
 
 use nnfractals::config::Config;
 use nnfractals::fitness_profile::{self, FieldSpec, FitnessProfile, Group, Sign, FIELDS};
@@ -556,7 +559,50 @@ struct QuatEvoPrefs {
     /// and starts the next one — forever, until Stop is clicked.
     #[serde(default)]
     generate_forever: bool,
+    /// 4D→3D collapse method ("slice", "tilt", "slab", "offset", "s3", "proj3").
+    #[serde(default = "d_collapse")]
+    collapse: String,
+    /// Phases of the time axis scored per genome (collapse methods only).
+    #[serde(default = "d_phases")]
+    eval_phases: u32,
+    /// Penalty weight for frame-to-frame flashing across the time axis.
+    #[serde(default)]
+    smooth_weight: f32,
+    /// Embedding-diversity weight for survivor/save selection (0 = off).
+    #[serde(default)]
+    embed_diversity: f32,
+    #[serde(default = "d_immigrant")]
+    immigrant_frac: f32,
+    #[serde(default = "d_crossover")]
+    crossover_frac: f32,
+    /// Save this many top genomes at the end (0 = CLI default).
+    #[serde(default)]
+    save_top: usize,
+    /// Stop when the elite mean has not risen for this many generations (0 = off).
+    #[serde(default)]
+    stop_flat: usize,
+    /// Scan each seed/immigrant for its best view range and let it evolve (`--auto-range`).
+    #[serde(default = "d_true")]
+    auto_range: bool,
+    /// Wall-clock limit of one run in minutes (`--max-seconds`; 0 = none).
+    #[serde(default)]
+    max_minutes: f32,
+    /// Threads scoring genomes in parallel (`--workers`; the GPU renderers still take turns).
+    #[serde(default = "d_workers")]
+    workers: usize,
+    /// Let the explorer hunt for the best thread count itself (`--auto-workers`), starting from `workers`.
+    #[serde(default)]
+    auto_workers: bool,
 }
+
+fn d_workers() -> usize { 4 }
+
+fn d_true() -> bool { true }
+
+fn d_collapse() -> String { "slice".into() }
+fn d_phases() -> u32 { 3 }
+fn d_immigrant() -> f32 { 0.55 }
+fn d_crossover() -> f32 { 0.30 }
 
 impl Default for QuatEvoPrefs {
     fn default() -> Self {
@@ -591,6 +637,18 @@ impl Default for QuatEvoPrefs {
             pref_model: "pref_model_quat.json".into(),
             crossover_subtree: false,
             generate_forever: false,
+            collapse: d_collapse(),
+            eval_phases: d_phases(),
+            smooth_weight: 0.0,
+            embed_diversity: 0.0,
+            immigrant_frac: d_immigrant(),
+            crossover_frac: d_crossover(),
+            save_top: 0,
+            stop_flat: 0,
+            auto_range: true,
+            max_minutes: 0.0,
+            workers: d_workers(),
+            auto_workers: false,
         }
     }
 }
@@ -626,6 +684,9 @@ struct App {
     // Background train/rescore job + live progress.
     job: JobState,
     job_rx: Option<mpsc::Receiver<JobMsg>>,
+    /// Extra environment for the next `spawn_tracked` job (consumed by it).
+    job_env: Vec<(String, String)>,
+    shown_collapse: String,
     known_folders: Vec<String>,
     rescore_folder: String,
     /// Last-known stats for the quaternion GA's taste model
@@ -649,6 +710,9 @@ struct App {
     dedup_threshold: f32,
     dedup_confirm: bool,
     prefs_path: PathBuf,
+
+    /// GA tunings + Optuna campaigns window (`launcher_tuning.rs`).
+    tuning_ui: launcher_tuning::TuningUi,
 
     // ── Fitness profiles ──────────────────────────────────────────────────
     show_fitness: bool,
@@ -698,6 +762,50 @@ fn build_quat_evolve_args(e: &QuatEvoPrefs, out_dir: &str, seed: u64, generation
     if e.crossover_subtree {
         args.push("--crossover-mode".into());
         args.push("subtree".into());
+    }
+    let collapsed = e.collapse != "slice";
+    if collapsed {
+        args.push("--collapse".into());
+        args.push(e.collapse.clone());
+        args.push("--eval-phases".into());
+        args.push(e.eval_phases.to_string());
+        if e.smooth_weight > 0.0 {
+            args.push("--smooth-weight".into());
+            args.push(e.smooth_weight.to_string());
+        }
+    }
+    if e.embed_diversity > 0.0 {
+        args.push("--embed-diversity".into());
+        args.push(e.embed_diversity.to_string());
+    }
+    if (e.immigrant_frac - d_immigrant()).abs() > 1e-6 || (e.crossover_frac - d_crossover()).abs() > 1e-6 {
+        args.push("--immigrant-frac".into());
+        args.push(e.immigrant_frac.to_string());
+        args.push("--crossover-frac".into());
+        args.push(e.crossover_frac.to_string());
+    }
+    if e.auto_range {
+        args.push("--auto-range".into());
+    }
+    if e.save_top > 0 {
+        args.push("--save-top".into());
+        args.push(e.save_top.to_string());
+    }
+    if e.stop_flat > 0 {
+        args.push("--stop-flat".into());
+        args.push(e.stop_flat.to_string());
+    }
+    args.push("--workers".into());
+    args.push(e.workers.max(1).to_string());
+    if e.auto_workers { args.push("--auto-workers".into()); }
+    if e.max_minutes > 0.0 {
+        args.push("--max-seconds".into());
+        args.push(format!("{:.0}", e.max_minutes * 60.0));
+    }
+    // Collapse scoring is taste-based; without an explicit metric the blend would ignore it.
+    if collapsed && e.fitness_metric.trim().is_empty() && e.mode != QuatEvoMode::MapElites {
+        args.push("--fitness-metric".into());
+        args.push("taste".into());
     }
     match e.mode {
         QuatEvoMode::Blend => {}
@@ -761,6 +869,9 @@ struct QuatForeverHandle {
     stop: Arc<AtomicBool>,
     status: Arc<Mutex<String>>,
     runs_completed: Arc<AtomicUsize>,
+    /// The seed the supervisor will use for its next run, copied back into
+    /// the Seed field each frame so a later Start never repeats one.
+    next_seed: Arc<AtomicU64>,
 }
 
 impl App {
@@ -788,6 +899,8 @@ impl App {
             last_refresh: None,
             job: JobState::default(),
             job_rx: None,
+            job_env: Vec::new(),
+            shown_collapse: String::new(),
             known_folders: known_folders.clone(),
             rescore_folder,
             quat_taste_stats,
@@ -803,6 +916,7 @@ impl App {
             dedup_threshold: prefs.dedup_threshold,
             dedup_confirm: false,
             prefs_path,
+            tuning_ui: launcher_tuning::TuningUi::new(&project_root()),
 
             show_fitness: false,
             fp_profiles: Vec::new(),
@@ -944,6 +1058,7 @@ impl App {
         cmd.arg(script)
             .args(&args)
             .current_dir(&self.root)
+            .envs(std::mem::take(&mut self.job_env))
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         // Mirror to a log file too (best-effort), matching the old behaviour.
@@ -1188,8 +1303,17 @@ impl App {
             self.status = "quat evolution is already running".into();
             return;
         }
-        self.save_quat_evo_prefs();
         let args = build_quat_evolve_args(&self.quat_evo, &self.quat_evo.out_dir, self.quat_evo.seed, self.quat_evo.generations);
+        // Carl, 2026-10-14: a new seed every run unless reproducing one on
+        // purpose — the Seed field counts up, set it back to replay a run.
+        self.quat_evo.seed = self.quat_evo.seed.wrapping_add(1);
+        self.save_quat_evo_prefs();
+        self.launch_quat_args(args);
+    }
+
+    /// Spawn `explorer <args>` fire-and-forget, logging to `quat_evolve.log` — shared by the
+    /// plain Start button and the tuning window's "Run once".
+    fn launch_quat_args(&mut self, args: Vec<String>) {
         let bin = sibling("explorer");
         let log_path = self.root.join("quat_evolve.log");
         let open_log = || {
@@ -1243,7 +1367,7 @@ impl App {
         self.save_quat_evo_prefs();
         let root = self.root.clone();
         let base_out_dir = self.quat_evo.out_dir.clone();
-        let mut seed = self.quat_evo.seed;
+        let next_seed = Arc::new(AtomicU64::new(self.quat_evo.seed));
         let e = self.quat_evo.clone();
         let bin = sibling("explorer");
         let log_path = root.join("quat_evolve_forever.log");
@@ -1251,7 +1375,7 @@ impl App {
         let stop = Arc::new(AtomicBool::new(false));
         let status = Arc::new(Mutex::new(String::new()));
         let runs_completed = Arc::new(AtomicUsize::new(0));
-        let (stop2, status2, runs2) = (stop.clone(), status.clone(), runs_completed.clone());
+        let (stop2, status2, runs2, next_seed2) = (stop.clone(), status.clone(), runs_completed.clone(), next_seed.clone());
 
         std::thread::spawn(move || {
             let open_log = || std::fs::OpenOptions::new().create(true).append(true).open(&log_path);
@@ -1259,6 +1383,7 @@ impl App {
             loop {
                 if stop2.load(Ordering::Relaxed) { break; }
                 let out_dir = format!("{base_out_dir}_gen{idx}");
+                let seed = next_seed2.fetch_add(1, Ordering::Relaxed);
                 let args = build_quat_evolve_args(&e, &out_dir, seed, 0);
                 write_quat_evolve_log_header(&open_log, &args);
                 let (out_file, err_file) = match (open_log(), open_log()) {
@@ -1314,13 +1439,12 @@ impl App {
                     std::thread::sleep(Duration::from_secs(2));
                 }
                 idx += 1;
-                seed = seed.wrapping_add(1);
                 runs2.fetch_add(1, Ordering::Relaxed);
             }
             *status2.lock().unwrap() = "stopped".into();
         });
 
-        self.quat_forever = Some(QuatForeverHandle { stop, status, runs_completed });
+        self.quat_forever = Some(QuatForeverHandle { stop, status, runs_completed, next_seed });
         self.status = "quat evolution (generate forever) started — logging to quat_evolve_forever.log".into();
         std::thread::sleep(Duration::from_millis(400));
         self.refresh_procs();
@@ -1467,18 +1591,23 @@ impl App {
     /// memory) — different corpus, different model file
     /// (`taste_model_quat.npz`), different score field (`quat_taste`).
     fn train_taste_quat(&mut self) {
-        let ratings = self.root.join("train_corpus_quat/ratings.jsonl");
+        // The collapse selected for the GA decides which corpus/model is retrained.
+        let angle_family = self.quat_evo.collapse == "auto"
+            || nnfractals::quat_collapse::Method::parse(&self.quat_evo.collapse).map_or(false, |m| m.time_is_angle());
+        let sfx = if angle_family { "_s3" } else { "" };
+        let corpus = format!("train_corpus_quat{sfx}");
+        let ratings = self.root.join(format!("{corpus}/ratings.jsonl"));
         if !ratings.exists() {
-            self.status = "no train_corpus_quat/ratings.jsonl — rate quat fractals in the browser (⚖ Rate) first".into();
+            self.status = format!("no {corpus}/ratings.jsonl — rate quat fractals in the browser (⚖ Rate) first");
             return;
         }
         let mut args = vec![
             "--ratings".to_string(),
             ratings.to_string_lossy().into_owned(),
             "--dirs".to_string(),
-            "train_corpus_quat".to_string(),
+            corpus.clone(),
         ];
-        let role_pairs = self.root.join("train_corpus_quat/role_model_pairs.jsonl");
+        let role_pairs = self.root.join(format!("{corpus}/role_model_pairs.jsonl"));
         if role_pairs.exists() {
             args.push("--role-model-pairs".to_string());
             args.push(role_pairs.to_string_lossy().into_owned());
@@ -1490,7 +1619,8 @@ impl App {
         args.push("0.2".to_string());
         args.push("--holdout-repeats".to_string());
         args.push("15".to_string());
-        self.spawn_tracked("Retrain quat taste".into(), "scripts/train_taste_quat.py", args);
+        self.job_env = if sfx.is_empty() { Vec::new() } else { vec![("NN_COLLAPSE".to_string(), "s3".to_string())] };
+        self.spawn_tracked(if sfx.is_empty() { "Retrain quat taste".into() } else { "Retrain quat taste (S3)".into() }, "scripts/train_taste_quat.py", args);
     }
 
     /// Reload `taste_model_quat.json` (written by every production
@@ -1499,7 +1629,11 @@ impl App {
     /// stats panel reflects the CURRENT model on disk without needing a
     /// fresh job to have just run in this session.
     fn reload_quat_taste_stats(&mut self) {
-        self.quat_taste_stats = QuatTasteStats::load(&self.root.join("taste_model_quat.json"));
+        let s3 = self.root.join("taste_model_quat_s3.json");
+        let angle_family = self.quat_evo.collapse == "auto"
+            || nnfractals::quat_collapse::Method::parse(&self.quat_evo.collapse).map_or(false, |m| m.time_is_angle());
+        let path = if angle_family && s3.exists() { s3 } else { self.root.join("taste_model_quat.json") };
+        self.quat_taste_stats = QuatTasteStats::load(&path);
     }
 
     /// Preview (dry-run) or actually run the near-duplicate cleaner on the
@@ -1847,11 +1981,23 @@ impl eframe::App for App {
         let avail_h = ui.available_height();
         let ctx = ui.ctx().clone();
         self.show_fitness_window(&ctx, avail_h);
+        {
+            let ga_running = self.quat_evolve_running_count() > 0 || self.quat_forever.is_some();
+            let was_open = self.tuning_ui.open;
+            let action = self.tuning_ui.show(&ctx, &self.root, &mut self.quat_evo, ga_running);
+            if was_open && !self.tuning_ui.open {
+                self.save_quat_evo_prefs();
+            }
+            if let Some(launcher_tuning::Action::RunOnce(args)) = action {
+                self.save_quat_evo_prefs();
+                self.launch_quat_args(args);
+            }
+        }
 
         // While a job OR a "generate forever" supervisor runs, repaint
         // frequently for smooth progress; otherwise just keep the resource
         // monitor ticking.
-        if self.job.running || self.quat_forever.is_some() {
+        if self.job.running || self.quat_forever.is_some() || self.tuning_ui.busy() {
             ui.ctx().request_repaint_after(Duration::from_millis(250));
         } else {
             ui.ctx().request_repaint_after(Duration::from_secs(60));
@@ -1920,7 +2066,7 @@ impl eframe::App for App {
                     // (browser.rs's own routing did, launcher.rs's didn't),
                     // so typing/pasting a quat genome's path here always
                     // opened it in the 2D viewer instead.
-                    let bin_name = if nnfractals::is_quat_genome_path(std::path::Path::new(&p)) {
+                    let bin_name = if nnfractals::is_quat_genome_file(std::path::Path::new(&p)) {
                         "nnfractals-anim-viewer"
                     } else {
                         "nnfractals-viewer"
@@ -2035,6 +2181,37 @@ impl eframe::App for App {
                     ui.label(egui::RichText::new(format!("→ {}_gen1, _gen2, …", self.quat_evo.out_dir)).weak());
                 }
             });
+            ui.horizontal(|ui| {
+                ui.label("4D→3D:");
+                egui::ComboBox::from_id_salt("quat_evo_collapse")
+                    .selected_text(self.quat_evo.collapse.clone())
+                    .show_ui(ui, |ui| {
+                        for m in nnfractals::quat_collapse::OFFERED {
+                            ui.selectable_value(&mut self.quat_evo.collapse, m.name().to_string(), m.name());
+                        }
+                    })
+                    .response
+                    .on_hover_text("How the 4D quaternion set is collapsed to 3D. S3 (3-sphere) keeps \
+                                     the time axis continuous. Non-slice methods are scored on several \
+                                     time phases (worst + mean) with a flash penalty.");
+                if self.quat_evo.collapse != self.shown_collapse {
+                    self.shown_collapse = self.quat_evo.collapse.clone();
+                    self.reload_quat_taste_stats();
+                    self.save_quat_evo_prefs();
+                }
+                if self.quat_evo.collapse != "slice" {
+                    ui.label("phases:");
+                    ui.add(egui::DragValue::new(&mut self.quat_evo.eval_phases).range(1..=16));
+                    ui.label("smooth:");
+                    ui.add(egui::DragValue::new(&mut self.quat_evo.smooth_weight).range(0.0..=2.0).speed(0.02))
+                        .on_hover_text("Penalty weight for flashing between consecutive time phases.");
+                }
+            });
+            ui.checkbox(&mut self.quat_evo.auto_range, "auto range")
+                .on_hover_text("Each formula is viewed at its own best range (how far out the previews look) \
+                                 instead of one fixed range. Seeds and immigrants are scanned for it and it \
+                                 drifts with mutation. Saved in the genome and used by the browser, the rater \
+                                 and the viewer.");
             egui::CollapsingHeader::new("Advanced")
                 .id_salt("quat_evo_advanced")
                 .default_open(false)
@@ -2051,6 +2228,22 @@ impl eframe::App for App {
                         ui.add(egui::DragValue::new(&mut self.quat_evo.probe_size).range(16..=1024));
                     });
                     ui.checkbox(&mut self.quat_evo.crossover_subtree, "subtree crossover (default: legacy)");
+                    ui.horizontal(|ui| {
+                        ui.label("Immigrants:");
+                        ui.add(egui::DragValue::new(&mut self.quat_evo.immigrant_frac).range(0.0..=1.0).speed(0.01));
+                        ui.label("Crossover:");
+                        ui.add(egui::DragValue::new(&mut self.quat_evo.crossover_frac).range(0.0..=1.0).speed(0.01));
+                        ui.label("Embed diversity:");
+                        ui.add(egui::DragValue::new(&mut self.quat_evo.embed_diversity).range(0.0..=5.0).speed(0.05))
+                            .on_hover_text("Picks survivors/saved genomes to look different (SigLIP embedding similarity penalty). 1.0-1.5 gave 60 distinct looks.");
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("Save top:");
+                        ui.add(egui::DragValue::new(&mut self.quat_evo.save_top).range(0..=500));
+                        ui.label("Stop when flat (gens):");
+                        ui.add(egui::DragValue::new(&mut self.quat_evo.stop_flat).range(0..=500))
+                            .on_hover_text("0 = off. Ends the run when the elite mean has not risen by 0.005 for this many generations.");
+                    });
                     ui.horizontal(|ui| {
                         ui.label("Fitness metric override:");
                         ui.add(egui::TextEdit::singleline(&mut self.quat_evo.fitness_metric).desired_width(260.0))
@@ -2096,7 +2289,15 @@ impl eframe::App for App {
                 {
                     self.stop_quat_evolve();
                 }
+                if ui.button("⚙  Tuning & campaigns").on_hover_text("Edit/save GA hyperparameter tunings (range bars), draw random ones, and run Optuna campaigns.").clicked() {
+                    self.tuning_ui.open = true;
+                }
                 if let Some(h) = &self.quat_forever {
+                    let next = h.next_seed.load(Ordering::Relaxed);
+                    if next != self.quat_evo.seed {
+                        self.quat_evo.seed = next;
+                        self.save_quat_evo_prefs();
+                    }
                     let runs = h.runs_completed.load(Ordering::Relaxed);
                     let status = h.status.lock().map(|s| s.clone()).unwrap_or_default();
                     ui.label(egui::RichText::new(format!("{status} · {runs} rotation(s) so far")).color(Color32::LIGHT_GREEN));
@@ -2503,7 +2704,7 @@ mod proc_matching_tests {
                 "./target/release/nnfractals", "--config", "config.toml",
                 "--profile", "Entropy only",
             ])),
-            Some("evolution")
+            Some("evolution".to_string())
         );
     }
 
@@ -2511,7 +2712,7 @@ mod proc_matching_tests {
     fn a_plain_run_is_recognised() {
         assert_eq!(
             classify_proc("nnfractals", &cmd(&["./target/release/nnfractals"])),
-            Some("evolution")
+            Some("evolution".to_string())
         );
     }
 
@@ -2519,7 +2720,7 @@ mod proc_matching_tests {
     fn the_scorer_sidecar_is_recognised_by_its_script() {
         assert_eq!(
             classify_proc("python3", &cmd(&["python3", "aesthetic_scorer.py"])),
-            Some("scorer")
+            Some("scorer".to_string())
         );
     }
 

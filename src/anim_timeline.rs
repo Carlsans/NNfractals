@@ -173,7 +173,13 @@ pub enum WaveShape { Sine, Triangle, Sawtooth, Orbit }
 /// `formula::TimeMod`'s `t ∈ [0,1)`, since an effect clip's `t` here is
 /// absolute authored-timeline seconds). `phase` in turns (0..1).
 #[derive(Copy, Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct Drive { pub shape: WaveShape, pub amp: f64, pub freq: f64, pub phase: f64 }
+pub struct Drive {
+    pub shape: WaveShape, pub amp: f64, pub freq: f64, pub phase: f64,
+    /// Keep the animated value inside the axis bounds (Translation: the box centre stays in the
+    /// bounds; Difference plane position: each coordinate stays in its axis range). The wave
+    /// flattens at the edge. Only honoured where the evaluator knows the bounds.
+    #[serde(default)] pub clip_to_bounds: bool,
+}
 
 /// The complex offset for `d` at absolute authored time `t` (seconds).
 /// `amp = 0` is always exactly 0.0 regardless of shape — the same no-op
@@ -392,6 +398,14 @@ pub struct AnimationTimeline {
     pub axis_assignment: AxisAssignment,
     #[serde(default)]
     pub bounds: BoundingBox,
+    /// When true the X/Y/Z bounds are stretched to a cube: each axis takes
+    /// the same room on screen however different their ranges are.
+    #[serde(default)]
+    pub equal_axis_scale: bool,
+    /// How the 4D set is collapsed to the 3D view (plain slice, 3-sphere, ...).
+    /// For `S3` the time value is a 4D rotation angle in radians.
+    #[serde(default)]
+    pub collapse: crate::quat_collapse::Collapse,
     #[serde(default)]
     pub x_track: AxisTimeline,
     #[serde(default)]
@@ -494,6 +508,8 @@ impl AnimationTimeline {
             genome_content_hash,
             axis_assignment: AxisAssignment::default(),
             bounds: BoundingBox::default(),
+            equal_axis_scale: false,
+            collapse: crate::quat_collapse::Collapse::default(),
             x_track: AxisTimeline::default(),
             y_track: AxisTimeline::default(),
             z_track: AxisTimeline::default(),
@@ -613,12 +629,32 @@ pub fn accumulated_angle(track: &AxisTimeline, t: f64) -> f64 {
 pub struct AxisContribution { pub translation: f64, pub scale: f64 }
 
 pub fn evaluate_axis_track(track: &AxisTimeline, t: f64) -> AxisContribution {
+    evaluate_axis_track_bounded(track, t, None)
+}
+
+/// `value` limited to `[lo, hi]` when `p` is a wave with `clip_to_bounds` set.
+fn clip_drive(p: &AnimParam, v: f64, lo: f64, hi: f64) -> f64 {
+    match p.drive {
+        Some(d) if d.clip_to_bounds && p.ramp.is_none() && lo <= hi => v.clamp(lo, hi),
+        _ => v,
+    }
+}
+
+/// `evaluate_axis_track` that also honours `Drive::clip_to_bounds` against this axis's
+/// `bound`: a clipped Translation keeps the box centre (`mid + translation`) inside it.
+pub fn evaluate_axis_track_bounded(track: &AxisTimeline, t: f64, bound: Option<&AxisBound>) -> AxisContribution {
     let mut translation = 0.0;
     let mut scale = 1.0;
     for clip in &track.clips {
         if !clip.active_at(t) { continue; }
         match &clip.effect {
-            Effect::Translation { offset } => translation += eval_anim_param(offset, t, clip.start_s, clip.end_s),
+            Effect::Translation { offset } => {
+                let v = eval_anim_param(offset, t, clip.start_s, clip.end_s);
+                translation += match bound {
+                    Some(b) => { let mid = (b.min + b.max) * 0.5; clip_drive(offset, v, b.min - mid, b.max - mid) }
+                    None => v,
+                };
+            }
             Effect::Scale { factor } => scale *= eval_anim_param(factor, t, clip.start_s, clip.end_s),
             Effect::Rotation { .. } => {} // handled by accumulated_angle
             Effect::Difference { .. } | Effect::FixedDifference { .. } | Effect::SlideIteration { .. } => {} // never on an axis track (GUI-enforced)
@@ -644,13 +680,24 @@ pub enum DifferencePlane {
 /// `AnimationTimeline::effects_lanes`'s doc) wins — regardless of which of
 /// the two kinds it is.
 pub fn evaluate_difference(lanes: &[AxisTimeline], t: f64) -> Option<DifferencePlane> {
+    evaluate_difference_bounded(lanes, t, None)
+}
+
+/// `evaluate_difference` that also honours `Drive::clip_to_bounds` on a world-fixed plane's
+/// position against the X/Y/Z bounds.
+pub fn evaluate_difference_bounded(lanes: &[AxisTimeline], t: f64, bounds: Option<&BoundingBox>) -> Option<DifferencePlane> {
     for lane in lanes.iter().rev() {
         for clip in &lane.clips {
             if !clip.active_at(t) { continue; }
             let (s, e) = (clip.start_s, clip.end_s);
             match &clip.effect {
                 Effect::Difference { pos, normal } => {
-                    let p = [eval_anim_param(&pos[0], t, s, e), eval_anim_param(&pos[1], t, s, e), eval_anim_param(&pos[2], t, s, e)];
+                    let mut p = [eval_anim_param(&pos[0], t, s, e), eval_anim_param(&pos[1], t, s, e), eval_anim_param(&pos[2], t, s, e)];
+                    if let Some(b) = bounds {
+                        for (i, ab) in [&b.x, &b.y, &b.z].into_iter().enumerate() {
+                            p[i] = clip_drive(&pos[i], p[i], ab.min, ab.max);
+                        }
+                    }
                     let n = [eval_anim_param(&normal[0], t, s, e), eval_anim_param(&normal[1], t, s, e), eval_anim_param(&normal[2], t, s, e)];
                     return Some(DifferencePlane::WorldFixed { pos: p, normal: n });
                 }
@@ -827,7 +874,7 @@ mod tests {
     #[test]
     fn drive_offset_amp_zero_is_always_a_no_op() {
         for shape in [WaveShape::Sine, WaveShape::Triangle, WaveShape::Sawtooth, WaveShape::Orbit] {
-            let d = Drive { shape, amp: 0.0, freq: 1.3, phase: 0.2 };
+            let d = Drive { shape, amp: 0.0, freq: 1.3, phase: 0.2, clip_to_bounds: false };
             for t in [0.0, 0.5, 1.0, 3.7, -2.0] {
                 assert_eq!(drive_offset(&d, t), 0.0, "shape={shape:?} t={t}");
             }
@@ -884,9 +931,9 @@ mod tests {
     fn ramp_none_leaves_the_existing_drive_path_untouched() {
         // Regression guard: when ramp is None, eval_anim_param must behave
         // exactly as it did before this field existed (constant + drive).
-        let p = AnimParam { constant: 1.0, drive: Some(Drive { shape: WaveShape::Sine, amp: 2.0, freq: 1.0, phase: 0.0 }), ramp: None };
+        let p = AnimParam { constant: 1.0, drive: Some(Drive { shape: WaveShape::Sine, amp: 2.0, freq: 1.0, phase: 0.0, clip_to_bounds: false }), ramp: None };
         for t in [0.0, 0.25, 0.5, 1.0, 3.3] {
-            let expected = 1.0 + drive_offset(&Drive { shape: WaveShape::Sine, amp: 2.0, freq: 1.0, phase: 0.0 }, t);
+            let expected = 1.0 + drive_offset(&Drive { shape: WaveShape::Sine, amp: 2.0, freq: 1.0, phase: 0.0, clip_to_bounds: false }, t);
             assert_eq!(eval_anim_param(&p, t, 0.0, 10.0), expected, "clip span must be irrelevant when ramp is None");
             // Confirm the clip span truly doesn't matter for the drive path.
             assert_eq!(eval_anim_param(&p, t, -50.0, 500.0), expected);
@@ -959,7 +1006,7 @@ mod tests {
     fn sine_driven_translation_oscillates_inside_the_clip_and_holds_flat_outside() {
         let track = AxisTimeline {
             clips: vec![clip(
-                Effect::Translation { offset: AnimParam { constant: 0.0, drive: Some(Drive { shape: WaveShape::Sine, amp: 0.4, freq: 0.5, phase: 0.0 }), ramp: None } },
+                Effect::Translation { offset: AnimParam { constant: 0.0, drive: Some(Drive { shape: WaveShape::Sine, amp: 0.4, freq: 0.5, phase: 0.0, clip_to_bounds: false }), ramp: None } },
                 0.0, 10.0,
             )],
         };
@@ -1010,7 +1057,7 @@ mod tests {
         let lane = AxisTimeline {
             clips: vec![clip(Effect::Difference {
                 pos: [
-                    AnimParam { constant: 0.0, drive: Some(Drive { shape: WaveShape::Sawtooth, amp: 1.6, freq: 0.1, phase: 0.0 }), ramp: None },
+                    AnimParam { constant: 0.0, drive: Some(Drive { shape: WaveShape::Sawtooth, amp: 1.6, freq: 0.1, phase: 0.0, clip_to_bounds: false }), ramp: None },
                     AnimParam::constant(0.0),
                     AnimParam::constant(0.0),
                 ],
@@ -1036,7 +1083,7 @@ mod tests {
     fn animation_timeline_serde_round_trip() {
         let mut tl = AnimationTimeline::new(0xDEADBEEFCAFEu64);
         tl.axis_assignment.assign(ViewerAxis::X, QuatPart::C);
-        tl.x_track.clips.push(clip(Effect::Translation { offset: AnimParam { constant: 0.0, drive: Some(Drive { shape: WaveShape::Sine, amp: 0.5, freq: 0.1, phase: 0.0 }), ramp: None } }, 0.0, 10.0));
+        tl.x_track.clips.push(clip(Effect::Translation { offset: AnimParam { constant: 0.0, drive: Some(Drive { shape: WaveShape::Sine, amp: 0.5, freq: 0.1, phase: 0.0, clip_to_bounds: false }), ramp: None } }, 0.0, 10.0));
         tl.effects_lanes.push(AxisTimeline { clips: vec![clip(Effect::Difference {
             pos: [AnimParam::constant(0.0); 3], normal: [AnimParam::constant(1.0), AnimParam::constant(0.0), AnimParam::constant(0.0)],
         }, 0.0, 5.0)] });
@@ -1162,5 +1209,20 @@ mod tests {
         let c = audio_clip("a.wav", -5.0, 0.0, 1000.0); // huge source, starts well before the window
         let r = resolve_audio_clip_for_render(&c, 0.0, 10.0).expect("still overlaps");
         assert!(r.play_len_s <= 10.0, "play_len_s={} must not exceed the 10s render span", r.play_len_s);
+    }
+
+    #[test]
+    fn clip_to_bounds_flattens_a_translation_wave_at_the_axis_edge() {
+        let mut track = AxisTimeline::default();
+        let mk = |clip| EffectClip {
+            effect: Effect::Translation { offset: AnimParam { constant: 0.0, drive: Some(Drive { shape: WaveShape::Sine, amp: 5.0, freq: 0.25, phase: 0.0, clip_to_bounds: clip }), ramp: None } },
+            start_s: 0.0, end_s: 10.0, label: String::new(),
+        };
+        let bound = AxisBound { min: -1.0, max: 1.0 };
+        track.clips.push(mk(true));
+        let c = evaluate_axis_track_bounded(&track, 1.0, Some(&bound)).translation; // sin(pi/2)*5 = 5
+        assert!((c - 1.0).abs() < 1e-9, "clipped to the bound edge, got {c}");
+        track.clips[0] = mk(false);
+        assert!((evaluate_axis_track_bounded(&track, 1.0, Some(&bound)).translation - 5.0).abs() < 1e-9);
     }
 }

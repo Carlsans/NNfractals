@@ -266,6 +266,9 @@ struct BrowserPrefs {
     autoreload: bool,
     #[serde(default = "default_starred_dir")]
     starred_dir: String,
+    /// 4D→3D collapse method for quaternion views/ratings ("slice", "s3", ...).
+    #[serde(default)]
+    collapse: String,
 }
 
 fn default_starred_dir() -> String {
@@ -290,6 +293,7 @@ impl Default for BrowserPrefs {
             window_height: 900,
             autoreload: false,
             starred_dir: default_starred_dir(),
+            collapse: String::new(),
         }
     }
 }
@@ -540,6 +544,8 @@ struct LiveSide {
     nn: PathBuf,
     view: Option<nnfractals::quat_live_view::LiveQuatView>,
     tex: Option<TextureHandle>,
+    /// A range chosen by scrolling over this side in the rater (saved with the rating).
+    range_override: Option<f32>,
 }
 
 const LIVE_ROTATE_SECS: f64 = 10.0; // one full orbit
@@ -551,6 +557,9 @@ impl App {
         let loader = Some(spawn_loader(folder.clone()));
         let known_folders = discover_fractal_dirs(&folder);
         let prefs_autoreload = prefs.autoreload;
+        if std::env::var("NN_COLLAPSE").is_err() {
+            if let Some(m) = nnfractals::quat_collapse::Method::parse(&prefs.collapse) { nnfractals::quat_collapse::set(m); }
+        }
         App {
             prefs,
             prefs_path,
@@ -691,7 +700,7 @@ impl App {
     }
 
     fn open_path(&mut self, path: &Path) {
-        let bin = if is_quat_genome_path(path) { quat_anim_viewer_path() } else { viewer_path() };
+        let bin = if nnfractals::is_quat_genome_file(path) { quat_anim_viewer_path() } else { viewer_path() };
         match std::process::Command::new(bin).arg(path).spawn() {
             Ok(child) => {
                 // Reap it. The viewer is single-instance: when one is already
@@ -858,6 +867,29 @@ impl App {
                 self.rating_mode = !self.rating_mode;
                 if self.rating_mode {
                     self.pick_pair();
+                }
+            }
+            {
+                let cur = nnfractals::quat_collapse::current();
+                let mut pick = cur;
+                egui::ComboBox::from_id_salt("browser_collapse")
+                    .selected_text(format!("4D→3D: {}", cur.name()))
+                    .show_ui(ui, |ui| {
+                        for m in nnfractals::quat_collapse::OFFERED {
+                            ui.selectable_value(&mut pick, m, m.name());
+                        }
+                    })
+                    .response
+                    .on_hover_text("How quaternion fractals are collapsed to 3D in the live view and\n\
+                                     for ratings. S3 (3-sphere) keeps the time axis continuous and\n\
+                                     has its own taste model and rating corpus\n\
+                                     (train_corpus_quat_s3, taste_model_quat_s3).");
+                if pick != cur {
+                    nnfractals::quat_collapse::set(pick);
+                    self.prefs.collapse = pick.name().to_string();
+                    self.save_prefs();
+                    self.live = [None, None];
+                    self.status = format!("4D→3D collapse: {} — ratings go to train_corpus_quat{}", pick.name(), nnfractals::quat_collapse::taste_suffix());
                 }
             }
             ui.separator();
@@ -1073,6 +1105,55 @@ impl App {
         dst_nn.to_string_lossy().into_owned()
     }
 
+    /// Writes the range chosen by scrolling in the rater into each changed
+    /// genome (with the projection it was judged under) and regenerates its
+    /// stored stills and view set, so the rating is trained on what was seen.
+    /// Returns the paths that changed.
+    fn commit_range_overrides(&mut self) -> Vec<PathBuf> {
+        let mut changed = Vec::new();
+        for slot in 0..2 {
+            let Some(ls) = self.live[slot].as_mut() else { continue };
+            let Some(r) = ls.range_override.take() else { continue };
+            let nn = ls.nn.clone();
+            let Ok(mut g) = nnfractals::io::load_genome(&nn) else { continue };
+            // The rater showed it under the genome's own projection, or the selector's.
+            let col = nnfractals::quat_collapse::Collapse::effective(g.collapse);
+            if g.collapse.is_none() { g.collapse = Some(col); }
+            g.view_range = r;
+            if nnfractals::io::save_genome(&g, &nn).is_err() { continue; }
+            // Regenerating the stills/views starts a GPU process (seconds); do it
+            // off the UI thread so the next pair appears at once.
+            if let Some(dir) = nn.parent().map(|d| d.to_path_buf()) {
+                let corpus = PathBuf::from(format!("train_corpus_quat{}", nnfractals::quat_collapse::taste_suffix_for(Some(col))));
+                let (nn2, exe, method) = (nn.clone(), locate_bin("explorer"), col.method.name().to_string());
+                std::thread::spawn(move || {
+                    let ok = std::process::Command::new(exe)
+                        .args(["quat-dag-thumbs", "--dir", &dir.to_string_lossy(), "--only", &nn2.to_string_lossy(), "--views", "--gpu", "--collapse", &method])
+                        .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null())
+                        .status().map_or(false, |s| s.success());
+                    if !ok { return; }
+                    // Replace the stale corpus copies with the regenerated ones.
+                    let stem = nn2.file_stem().and_then(|s| s.to_str()).unwrap_or("").to_string();
+                    if let Ok(rd) = std::fs::read_dir(&corpus) {
+                        for e in rd.filter_map(|e| e.ok()) {
+                            if e.file_name().to_string_lossy().starts_with(&stem) { let _ = std::fs::remove_file(e.path()); }
+                        }
+                    }
+                    let _ = std::fs::create_dir_all(&corpus);
+                    if let Ok(rd) = std::fs::read_dir(&dir) {
+                        for e in rd.filter_map(|e| e.ok()) {
+                            let n = e.file_name();
+                            if n.to_string_lossy().starts_with(&stem) { let _ = std::fs::copy(e.path(), corpus.join(&n)); }
+                        }
+                    }
+                });
+                self.status = format!("range ×{r:.2} saved for {} (previews regenerate in the background)", nn.file_name().and_then(|n| n.to_str()).unwrap_or("?"));
+            }
+            changed.push(nn);
+        }
+        changed
+    }
+
     fn log_rating(&mut self, winner: usize, loser: usize) {
         // Persist both compared images into a dedup-immune corpus and log the
         // comparison — referencing the corpus copies — to one central store, so
@@ -1088,8 +1169,10 @@ impl App {
         // drawn from ONE currently-loaded folder.
         let wsrc = self.rows[winner].nn_path.clone();
         let lsrc = self.rows[loser].nn_path.clone();
-        let corpus = PathBuf::from(if is_quat_genome_path(&wsrc) { "train_corpus_quat" } else { "train_corpus" });
+        let changed = self.commit_range_overrides();
+        let corpus = PathBuf::from(if nnfractals::is_quat_genome_file(&wsrc) { format!("train_corpus_quat{}", nnfractals::quat_collapse::taste_suffix_for(nnfractals::io::load_genome(&wsrc).ok().and_then(|g| g.collapse))) } else { "train_corpus".to_string() });
         let _ = std::fs::create_dir_all(&corpus);
+        let _ = &changed;
         let wp = self.persist_to_corpus(&wsrc, &corpus);
         let lp = self.persist_to_corpus(&lsrc, &corpus);
         // "view":"rot3d" marks ratings judged from the live rotating view
@@ -1112,19 +1195,19 @@ impl App {
     /// anything else, or a GPU/compile failure, falls back to the static still.
     fn rating_cell(&mut self, ui: &mut egui::Ui, idx: usize, slot: usize, side: f32) -> bool {
         let nn = self.rows[idx].nn_path.clone();
-        if is_quat_genome_path(&nn) {
+        if nnfractals::is_quat_genome_file(&nn) {
             let stale = self.live[slot].as_ref().map_or(true, |l| l.nn != nn);
             if stale {
                 let view = nnfractals::io::load_genome(&nn)
                     .ok()
                     .and_then(|g| nnfractals::quat_live_view::LiveQuatView::new(&g));
-                self.live[slot] = Some(LiveSide { nn: nn.clone(), view, tex: None });
+                self.live[slot] = Some(LiveSide { nn: nn.clone(), view, tex: None, range_override: None });
             }
             let turn = self.live_clock / LIVE_ROTATE_SECS + self.live_turn_offset;
             let phase = self.live_clock / LIVE_C_SWEEP_SECS * std::f64::consts::TAU;
             if let Some(ls) = self.live[slot].as_mut() {
                 if let Some(view) = ls.view.as_mut() {
-                    let c = view.c_half() * phase.sin();
+                    let c = view.time_at(phase);
                     let rgb = view.render_rgb(turn, c, LIVE_SIZE);
                     let img = egui::ColorImage::from_rgb([LIVE_SIZE as usize; 2], &rgb);
                     match ls.tex.as_mut() {
@@ -1136,13 +1219,30 @@ impl App {
             if let Some(t) = self.live[slot].as_ref().and_then(|l| l.tex.as_ref()) {
                 let mut clicked = false;
                 let mut drag_dx = 0.0f32;
+                let mut scroll_dy = 0.0f32;
+                let range_now = self.live[slot].as_ref().and_then(|l| l.view.as_ref()).map(|v| v.range());
                 ui.vertical_centered(|ui| {
                     let img = egui::Image::new(egui::load::SizedTexture::new(t.id(), egui::vec2(side, side)))
                         .sense(egui::Sense::click_and_drag());
                     let resp = ui.add(img);
                     clicked = resp.clicked();
                     drag_dx = resp.drag_delta().x;
+                    if resp.hovered() { scroll_dy = ui.input(|i| i.smooth_scroll_delta.y); }
+                    if let Some(r) = range_now {
+                        let edited = self.live[slot].as_ref().map_or(false, |l| l.range_override.is_some());
+                        ui.label(egui::RichText::new(format!("range ×{r:.2}{}  ·  scroll on the image to look farther / closer", if edited { "  (changed — saved with your pick)" } else { "" })).weak().small());
+                    }
                 });
+                if scroll_dy != 0.0 {
+                    if let Some(ls) = self.live[slot].as_mut() {
+                        if let Some(view) = ls.view.as_mut() {
+                            let r = (view.range() as f64 * (-scroll_dy as f64 * 0.003).exp())
+                                .clamp(nnfractals::quat_collapse::RANGE_MIN, nnfractals::quat_collapse::RANGE_MAX) as f32;
+                            view.set_range(r);
+                            ls.range_override = Some(r);
+                        }
+                    }
+                }
                 if drag_dx != 0.0 {
                     self.live_turn_offset -= drag_dx as f64 / side as f64 * 0.5;
                 }
@@ -1707,6 +1807,7 @@ impl eframe::App for App {
 }
 
 fn main() -> anyhow::Result<()> {
+    nnfractals::quat_collapse::init_from_env();
     let args = Args::parse();
     let prefs_path = PathBuf::from(PREFS_FILE);
     let prefs = BrowserPrefs::load(&prefs_path);

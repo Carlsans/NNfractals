@@ -39,6 +39,10 @@ from train_pref import load_backbone, png_for, progress, log  # noqa: E402
 from taste_pooling import N_VIEWS, pool_grid  # noqa: E402
 
 
+# S3 renders get their own model/ratings (NN_COLLAPSE=s3 -> "_s3" file suffix).
+import os as _os
+SUFFIX = "_s3" if _os.environ.get("NN_COLLAPSE") == "s3" else ""
+
 def view_paths_for(nn_path):
     """The N_VIEWS (angles x C values) `_view_NN.png` paths for one genome's .nn path, in order."""
     stem = Path(nn_path).with_suffix("")
@@ -162,9 +166,9 @@ def load_comparisons(path, weight=1.0):
 
 
 def score_only(args, device):
-    model_path = Path("taste_model_quat.npz")
+    model_path = Path(f"taste_model_quat{SUFFIX}.npz")
     if not model_path.exists():
-        raise SystemExit("no taste_model_quat.npz — train the taste model first.")
+        raise SystemExit(f"no {model_path} — train the taste model first.")
     data = np.load(model_path)
     w_np = np.asarray(data["w"], dtype=np.float32)
     lo = float(data["lo"]) if "lo" in data else 0.0
@@ -398,7 +402,7 @@ def main():
                 progress("write", k + 1, n)
         log(f"wrote quat_taste to {written} .nn files")
 
-    out = Path("taste_model_quat.npz")
+    out = Path(f"taste_model_quat{SUFFIX}.npz")
     np.savez(out, w=w_np, lo=lo, hi=hi, backbone=args.backbone, pooling=args.pooling, n_views=N_VIEWS)
     # The JSON twin carries everything the launcher GUI's stats panel
     # needs to show "current model" without spawning Python or reading the
@@ -419,7 +423,7 @@ def main():
         "holdout_human_std": holdout_stats["human_std"],
         "trained_at": int(time.time()),
     }
-    Path("taste_model_quat.json").write_text(json.dumps(model_json, indent=2))
+    Path(f"taste_model_quat{SUFFIX}.json").write_text(json.dumps(model_json, indent=2))
     log(f"saved model -> {out} (+ .json twin)  (lo={lo:.4f} hi={hi:.4f})")
 
     # One rich summary line — this is what the launcher GUI shows directly

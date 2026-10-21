@@ -981,6 +981,154 @@ fn get_flag_or<T: std::str::FromStr>(args: &[String], name: &str, default: T) ->
     get_flag(args, name).and_then(|s| s.parse().ok()).unwrap_or(default)
 }
 
+/// `--seed N`, or a fresh random seed when it's absent (Carl, 2026-10-14:
+/// "change the seed everytime unless you want to truly reproduct
+/// something"). Either way the seed is logged, so any run can be replayed.
+/// `collapse-video GENOME.nn --method M --out F.mp4`: renders one loop of the
+/// time sweep (slow orbit camera) as a video, and measures temporal
+/// smoothness on a fixed camera at low resolution. Prints one JSON line.
+fn cmd_collapse_video(nn: &std::path::Path, method: nnfractals::quat_collapse::Method, out: &std::path::Path, size: u32, seconds: f64, fps: u32) {
+    use std::io::Write;
+    nnfractals::quat_collapse::set(method);
+    let genome = io::load_genome(nn).unwrap_or_else(|e| panic!("load {}: {e}", nn.display()));
+    let n = (seconds * fps as f64).round() as usize;
+    let bailout = genome.bailout_radius as f64;
+    let domain_radius = 1.6;
+    let mk_params = |time_val: f64| nnfractals::quat_dag::RaymarchDagParams {
+        formula: nnfractals::quat_dag::QuatDagFormula { prog: &genome.program, warp: &genome.warp, julia: genome.julia_mode, jc: (genome.julia_cre, genome.julia_cim), phoenix: (genome.phoenix_re, genome.phoenix_im) },
+        time_axis: nnfractals::quat_fractal::TimeAxis::C, time_val, domain_radius,
+        box_bounds: None, axis_assignment: None, clip_plane: None, slide_iter: None, hide_above: None, axis_remap: None, collapse: None,
+        max_iter: 80, bailout, max_march_steps: 200,
+        hit_epsilon: domain_radius * 1e-4, step_safety: 0.8, light_dir: (0.5, 0.8, 0.3),
+        normal_eps: domain_radius * 1e-3, color_probe_offset: domain_radius * 1e-2, aa: 1,
+    };
+    let mut mode = resolve_dag_gpu_mode(&genome.program, &genome.warp, true);
+    let orbit = |sz: u32| nnfractals::quat_raymarch::RaymarchOrbitParams {
+        target: (0.0, 0.0, 0.0), axis: nnfractals::quat_live_view::ORBIT_AXIS,
+        radius: nnfractals::quat_live_view::orbit_radius(sz, sz), turns: 1.0, phase0: 0.0, fov_y: 45f64.to_radians(),
+    };
+    // Smoothness: fixed camera, 256 px, the same n time samples.
+    let o_small = orbit(256);
+    let cam0 = o_small.sample(0.0);
+    let mut prev: Option<Vec<u8>> = None;
+    let mut diffs: Vec<f64> = Vec::new();
+    let mut empty = 0usize;
+    let mut first: Option<Vec<u8>> = None;
+    for i in 0..=n {
+        let phase = (i % n) as f64 / n as f64;
+        let params = mk_params(nnfractals::quat_collapse::time_for_phase(bailout, phase));
+        let (sh, ct) = render_dag_frame_with_mode(&mut mode, &params, &cam0, 256, 256);
+        if sh.iter().filter(|v| **v > 0.0).count() < 256 * 256 / 200 { empty += 1; }
+        let rgb = raymarch_frame_to_rgb(&sh, &ct, params.max_iter, "lava", (0.03, 0.02, 0.06));
+        if i == 0 { first = Some(rgb.clone()); }
+        if let Some(pv) = &prev {
+            let d: f64 = pv.iter().zip(&rgb).map(|(a, b)| (*a as f64 - *b as f64).abs()).sum::<f64>() / (rgb.len() as f64 * 255.0);
+            diffs.push(d);
+        }
+        prev = Some(rgb);
+    }
+    let _ = first;
+    let mut sorted = diffs.clone();
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let mean = diffs.iter().sum::<f64>() / diffs.len().max(1) as f64;
+    let median = sorted[sorted.len() / 2];
+    let maxd = *sorted.last().unwrap_or(&0.0);
+    // Video: slow orbit (quarter turn) while the sweep runs one loop.
+    let o_big = orbit(size);
+    if let Some(parent) = out.parent() { std::fs::create_dir_all(parent).ok(); }
+    let mut ff = std::process::Command::new("ffmpeg")
+        .args(["-y", "-loglevel", "error", "-f", "rawvideo", "-pix_fmt", "rgb24", "-s", &format!("{size}x{size}"), "-r", &fps.to_string(), "-i", "-",
+               "-c:v", "libx264", "-crf", "16", "-preset", "medium", "-pix_fmt", "yuv420p"])
+        .arg(out).stdin(std::process::Stdio::piped()).spawn().expect("spawn ffmpeg");
+    {
+        let stdin = ff.stdin.as_mut().unwrap();
+        for i in 0..n {
+            let phase = i as f64 / n as f64;
+            let params = mk_params(nnfractals::quat_collapse::time_for_phase(bailout, phase));
+            let cam = o_big.sample(0.25 * phase);
+            let (sh, ct) = render_dag_frame_with_mode(&mut mode, &params, &cam, size, size);
+            let rgb = raymarch_frame_to_rgb(&sh, &ct, params.max_iter, "lava", (0.03, 0.02, 0.06));
+            stdin.write_all(&rgb).expect("ffmpeg stdin");
+        }
+    }
+    ff.wait().ok();
+    println!("{{\"method\":\"{}\",\"genome\":\"{}\",\"video\":\"{}\",\"mean_diff\":{:.5},\"median_diff\":{:.5},\"max_diff\":{:.5},\"flash_index\":{:.2},\"empty_frames\":{}}}",
+        method.name(), nn.display(), out.display(), mean, median, maxd, maxd / median.max(1e-6), empty);
+}
+
+/// `collapse-smooth GENOME.nn --method M [--size 96] [--steps 8,20,40,80]`:
+/// CPU-only. Temporal smoothness of one loop of the sweep (fixed camera) as a
+/// function of how finely the loop is sampled. If the flash index falls as the
+/// steps get finer, "flashing" was coarse sampling, not the method.
+fn cmd_collapse_smooth(nn: &std::path::Path, collapse: nnfractals::quat_collapse::Collapse, size: u32, steps: &[usize]) {
+    let method = collapse.method;
+    nnfractals::quat_collapse::set(method);
+    let genome = io::load_genome(nn).unwrap_or_else(|e| panic!("load {}: {e}", nn.display()));
+    let bailout = genome.bailout_radius as f64;
+    let domain_radius = 1.6;
+    let mut mode = resolve_dag_gpu_mode(&genome.program, &genome.warp, false);
+    let orbit = nnfractals::quat_raymarch::RaymarchOrbitParams {
+        target: (0.0, 0.0, 0.0), axis: nnfractals::quat_live_view::ORBIT_AXIS,
+        radius: nnfractals::quat_live_view::orbit_radius(size, size), turns: 1.0, phase0: 0.0, fov_y: 45f64.to_radians(),
+    };
+    let cam = orbit.sample(0.0);
+    for &n in steps {
+        let mut frames: Vec<Vec<u8>> = Vec::new();
+        for i in 0..n {
+            let params = nnfractals::quat_dag::RaymarchDagParams {
+                formula: nnfractals::quat_dag::QuatDagFormula { prog: &genome.program, warp: &genome.warp, julia: genome.julia_mode, jc: (genome.julia_cre, genome.julia_cim), phoenix: (genome.phoenix_re, genome.phoenix_im) },
+                time_axis: nnfractals::quat_fractal::TimeAxis::C,
+                time_val: nnfractals::quat_collapse::time_for_phase(bailout, i as f64 / n as f64), domain_radius,
+                box_bounds: None, axis_assignment: None, clip_plane: None, slide_iter: None, hide_above: None, axis_remap: None, collapse: Some(collapse),
+                max_iter: 50, bailout, max_march_steps: 150,
+                hit_epsilon: domain_radius * 1e-4, step_safety: 0.8, light_dir: (0.5, 0.8, 0.3),
+                normal_eps: domain_radius * 1e-3, color_probe_offset: domain_radius * 1e-2, aa: 1,
+            };
+            let (sh, ct) = render_dag_frame_with_mode(&mut mode, &params, &cam, size, size);
+            frames.push(raymarch_frame_to_rgb(&sh, &ct, params.max_iter, "lava", (0.03, 0.02, 0.06)));
+        }
+        // Pixel-scale shimmer (fine bands that jitter) is not a flash; the
+        // blurred diff (8x8 box average first) measures coherent change only.
+        let blur = |f: &Vec<u8>| -> Vec<f64> {
+            let (w, b) = (size as usize, 8usize);
+            let mut out = Vec::new();
+            for by in 0..w / b { for bx in 0..w / b { for ch in 0..3 {
+                let mut sum = 0.0;
+                for y in 0..b { for x in 0..b { sum += f[(((by * b + y) * w) + bx * b + x) * 3 + ch] as f64; } }
+                out.push(sum / (b * b) as f64 / 255.0);
+            } } }
+            out
+        };
+        let blurred: Vec<Vec<f64>> = frames.iter().map(blur).collect();
+        let mut d: Vec<f64> = (0..n).map(|i| {
+            let (a, b) = (&blurred[i], &blurred[(i + 1) % n]);
+            a.iter().zip(b).map(|(x, y)| (x - y).abs()).sum::<f64>() / a.len() as f64
+        }).collect();
+        let mean = d.iter().sum::<f64>() / n as f64;
+        let top3: Vec<String> = { let mut ix: Vec<usize> = (0..n).collect(); ix.sort_by(|a, b| d[*b].partial_cmp(&d[*a]).unwrap()); ix.iter().take(3).map(|i| format!("{:.3}", *i as f64 / n as f64)).collect() };
+        eprintln!("  biggest jumps at loop phase {}", top3.join(", "));
+        d.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let med = d[n / 2];
+        let max = d[n - 1];
+        println!("{{\"method\":\"{}\",\"genome\":\"{}\",\"steps\":{},\"blur_mean_diff\":{:.5},\"blur_median_diff\":{:.5},\"blur_max_diff\":{:.5},\"blur_flash_index\":{:.2}}}",
+            method.name(), nn.file_name().unwrap().to_string_lossy(), n, mean, med, max, max / med.max(1e-6));
+    }
+}
+
+fn seed_flag(args: &[String]) -> u64 {
+    match get_flag(args, "--seed").and_then(|s| s.parse().ok()) {
+        Some(seed) => {
+            eprintln!("seed: {seed}");
+            seed
+        }
+        None => {
+            let seed: u64 = rand::random();
+            eprintln!("seed: {seed} (random — pass --seed {seed} to reproduce this run)");
+            seed
+        }
+    }
+}
+
 /// Parses a "R,A,B" flag value (3 comma-separated floats) for
 /// `quat-mandelbrot`'s vector-valued flags (`--pivot`, `--axis`, `--origin`,
 /// `--direction`, `--basis-u`, `--basis-v`).
@@ -1990,13 +2138,29 @@ enum DagGpuMode {
     Cpu,
 }
 
+/// `--gpu-mode auto|codegen|interpreter`: which GPU path scoring renders use. `codegen` (auto)
+/// compiles a shader per program structure (cached); `interpreter` uses the one general shader.
+static GPU_FORCE_INTERPRETER: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// The image gate (one or two tiny renders that reject blank and noisy genomes) uses the general
+/// interpreter shader, so a genome that fails it never pays the ~2 s shader compile. Off with
+/// `--no-gate-interpreter`.
+static GATE_INTERPRETER: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
 fn resolve_dag_gpu_mode(prog: &[nnfractals::formula::OpNode], warp: &[nnfractals::formula::OpNode], use_gpu: bool) -> DagGpuMode {
+    resolve_dag_gpu_mode_ex(prog, warp, use_gpu, false)
+}
+
+fn resolve_dag_gpu_mode_ex(prog: &[nnfractals::formula::OpNode], warp: &[nnfractals::formula::OpNode], use_gpu: bool, prefer_interpreter: bool) -> DagGpuMode {
     if !use_gpu {
         return DagGpuMode::Cpu;
     }
     #[cfg(feature = "wgpu-backend")]
     {
-        if let Some(p) = nnfractals::render_gpu_raymarch_dag_codegen::CompiledDagPipeline::compile(prog, warp) {
+        if (prefer_interpreter || GPU_FORCE_INTERPRETER.load(std::sync::atomic::Ordering::Relaxed)) && nnfractals::render_gpu_raymarch_dag::gpu_available() {
+            return DagGpuMode::Interpreter;
+        }
+        if let Some(p) = prof("gpu compile", || nnfractals::render_gpu_raymarch_dag_codegen::CompiledDagPipeline::compile(prog, warp)) {
             // Deliberately no eprintln on this, the happy path taken once
             // per genome render — at population=120 this drowned out the
             // per-generation summary line under 100x its own volume in the
@@ -2026,10 +2190,10 @@ fn render_dag_frame_with_mode(
 ) -> (Vec<f32>, Vec<f32>) {
     match mode {
         #[cfg(feature = "wgpu-backend")]
-        DagGpuMode::Codegen(p) => p.render(params, cam, width, height),
+        DagGpuMode::Codegen(p) => prof("gpu render", || p.render(params, cam, width, height)),
         #[cfg(not(feature = "wgpu-backend"))]
         DagGpuMode::Codegen(_) => unreachable!("DagGpuMode::Codegen is never constructed without wgpu-backend"),
-        DagGpuMode::Interpreter => render_raymarch_dag_frame_dispatch(params, cam, width, height, true),
+        DagGpuMode::Interpreter => prof("gpu render (interpreter)", || render_raymarch_dag_frame_dispatch(params, cam, width, height, true)),
         DagGpuMode::Cpu => nnfractals::quat_dag::render_raymarch_dag_frame(params, cam, width, height),
     }
 }
@@ -2340,13 +2504,13 @@ fn score_genome_dag(genome: &Genome, probe_size: u32, use_gpu: bool) -> nnfracta
     let bailout_sq = (genome.bailout_radius as f64) * (genome.bailout_radius as f64);
     let anisotropy = nnfractals::quat_dag::anisotropy_score(&formula, 60, bailout_sq);
 
-    let domain_radius = 1.6;
+    let (collapse_eff, domain_radius) = nnfractals::quat_collapse::view_setup(genome.collapse, genome.view_range);
     let base_params = nnfractals::quat_dag::RaymarchDagParams {
         formula,
         time_axis: nnfractals::quat_fractal::TimeAxis::C,
         time_val: 0.0,
         domain_radius,
-        box_bounds: None, axis_assignment: None, clip_plane: None, slide_iter: None, hide_above: None,
+        box_bounds: None, axis_assignment: None, clip_plane: None, slide_iter: None, hide_above: None, axis_remap: None, collapse: collapse_eff,
         max_iter: 60,
         bailout: genome.bailout_radius as f64,
         max_march_steps: 150,
@@ -2412,13 +2576,13 @@ fn score_genome_dag_full(genome: &Genome, probe_size: u32, use_gpu: bool) -> Qua
     let bailout_sq = (genome.bailout_radius as f64) * (genome.bailout_radius as f64);
     let anisotropy = nnfractals::quat_dag::anisotropy_score(&formula, 60, bailout_sq);
 
-    let domain_radius = 1.6;
+    let (collapse_eff, domain_radius) = nnfractals::quat_collapse::view_setup(genome.collapse, genome.view_range);
     let base_params = nnfractals::quat_dag::RaymarchDagParams {
         formula,
         time_axis: nnfractals::quat_fractal::TimeAxis::C,
         time_val: 0.0,
         domain_radius,
-        box_bounds: None, axis_assignment: None, clip_plane: None, slide_iter: None, hide_above: None,
+        box_bounds: None, axis_assignment: None, clip_plane: None, slide_iter: None, hide_above: None, axis_remap: None, collapse: collapse_eff,
         max_iter: 60,
         bailout: genome.bailout_radius as f64,
         max_march_steps: 150,
@@ -2817,6 +2981,15 @@ mod quat_pref_feature_tests {
     }
 }
 
+/// [checked, simplified, nodes removed] since the last `take_simplify_stats`.
+static SIMPLIFY_STATS: [std::sync::atomic::AtomicUsize; 3] = [const { std::sync::atomic::AtomicUsize::new(0) }; 3];
+
+/// One line for the generation log, resetting the counters.
+fn take_simplify_stats() -> String {
+    let [n, k, removed] = SIMPLIFY_STATS.each_ref().map(|a| a.swap(0, std::sync::atomic::Ordering::Relaxed));
+    format!("  simplified {k}/{n} genomes, removed {removed} useless nodes")
+}
+
 /// One evolving individual in `quat-dag-evolve`'s population. Only
 /// `program` is mutated/crossed-over across generations — `warp`, the
 /// Julia/phoenix dynamics, and `bailout_radius` are inherited unchanged
@@ -2831,6 +3004,11 @@ struct QuatIndividual {
     jc: (f32, f32),
     phoenix: (f32, f32),
     bailout_radius: f32,
+    /// The 4D→3D projection this individual is scored and saved under
+    /// (`--collapse auto` evolves it; otherwise `None` = the run's global one).
+    collapse: Option<nnfractals::quat_collapse::Collapse>,
+    /// How far out this individual is viewed (`Genome::view_range`; 0 = unset).
+    view_range: f32,
     geometric: f64,
     aesthetic: f64,
     /// Novelty in opcode-histogram space (`Genome::formula_descriptor`) —
@@ -2895,6 +3073,8 @@ impl QuatIndividual {
             jc: (g.julia_cre, g.julia_cim),
             phoenix: (g.phoenix_re, g.phoenix_im),
             bailout_radius: g.bailout_radius,
+            collapse: g.collapse,
+            view_range: g.view_range,
             geometric: 0.0,
             aesthetic: 0.0,
             diversity: 0.0,
@@ -2936,6 +3116,23 @@ impl QuatIndividual {
     /// reuse `score_genome_dag` and the rendering/save pipeline exactly as
     /// they already exist, instead of duplicating them for owned
     /// prog/warp `Vec`s.
+    /// Removes every part of `program`/`warp` that changes nothing in the
+    /// fractal (`formula_simplify`), so useless elements never enter the
+    /// GA pool. Runs before scoring, so structural metrics see the
+    /// simplified program and saved genomes carry it.
+    fn simplify(&mut self) {
+        let f = nnfractals::quat_dag::QuatDagFormula { prog: &self.program, warp: &self.warp, julia: self.julia_mode, jc: self.jc, phoenix: self.phoenix };
+        let s = nnfractals::formula_simplify::simplify_formula(&f, self.bailout_radius);
+        use std::sync::atomic::Ordering::Relaxed;
+        SIMPLIFY_STATS[0].fetch_add(1, Relaxed);
+        if s.nodes_after < s.nodes_before {
+            SIMPLIFY_STATS[1].fetch_add(1, Relaxed);
+            SIMPLIFY_STATS[2].fetch_add(s.nodes_before - s.nodes_after, Relaxed);
+        }
+        self.program = s.program;
+        self.warp = s.warp;
+    }
+
     fn as_genome(&self) -> Genome {
         Genome {
             program: self.program.clone(),
@@ -2946,6 +3143,9 @@ impl QuatIndividual {
             phoenix_re: self.phoenix.0,
             phoenix_im: self.phoenix.1,
             bailout_radius: self.bailout_radius,
+            // A run under one fixed projection stamps it on every saved genome too.
+            view_range: self.view_range,
+            collapse: self.collapse.or_else(|| COLLAPSE_EVAL.load(std::sync::atomic::Ordering::Relaxed).then(nnfractals::quat_collapse::Collapse::global)),
             ..Default::default()
         }
     }
@@ -2981,6 +3181,7 @@ fn score_individual(
     use_gpu: bool,
     geometric_gate: f64,
 ) {
+    ind.simplify();
     let genome = ind.as_genome();
     let full = score_genome_dag_full(&genome, probe_size, use_gpu);
     let bd = &full.breakdown;
@@ -3216,6 +3417,134 @@ fn lookup_metric(genome: &Genome, name: &str, full: Option<&QuatFullMetrics>, or
 /// expensive full sweep runs AT MOST ONCE per individual regardless of
 /// how many non-structural terms are in the combo — computed once,
 /// looked up per term.
+/// Image-entropy band: deflate-compressed size / raw size of the same 300x400
+/// still the taste model sees, scored as a triangle peaking at `IMAGE_ENTROPY_TARGET`
+/// (0 for a blank frame, 0 for noise). Calibrated on Carl's S3 ratings: the
+/// ratio is not monotonic in his taste, a mid-complexity band predicts 64% of
+/// pairs while "more complex" alone predicts 46%. Averaged over 3 sweep moments.
+const IMAGE_ENTROPY_TARGET: f64 = 0.11;
+/// Mean absolute change between sweep frames (0..1 of full scale) that counts
+/// as "clearly moves with T"; calibrated on S3 winners that visibly react to
+/// the slider (about 0.02-0.035) versus inert ones (< 0.002).
+const IMAGE_MOTION_FULL: f64 = 0.03;
+static IMAGE_STATS_CACHE: std::sync::LazyLock<Memo<(f64, f64)>> = std::sync::LazyLock::new(Memo::new);
+fn image_entropy_band(genome: &Genome, use_gpu: bool) -> f64 { image_band_and_motion(genome, use_gpu).0 }
+fn image_motion(genome: &Genome, use_gpu: bool) -> f64 { image_band_and_motion(genome, use_gpu).1 }
+
+/// The 300x400 lava still the taste model sees (or a smaller one for gates), at sweep `phase`.
+fn render_still_rgb(genome: &Genome, phase: f64, w: u32, h: u32, use_gpu: bool) -> Vec<u8> {
+    render_still_rgb_ex(genome, phase, w, h, use_gpu, false)
+}
+
+fn render_still_rgb_ex(genome: &Genome, phase: f64, w: u32, h: u32, use_gpu: bool, prefer_interpreter: bool) -> Vec<u8> {
+    let method = nnfractals::quat_collapse::Collapse::effective(genome.collapse).method;
+    let time_val = nnfractals::quat_collapse::time_for_phase_m(method, genome.bailout_radius as f64, phase);
+    let formula = nnfractals::quat_dag::QuatDagFormula { prog: &genome.program, warp: &genome.warp, julia: genome.julia_mode, jc: (genome.julia_cre, genome.julia_cim), phoenix: (genome.phoenix_re, genome.phoenix_im) };
+    let (collapse_eff, domain_radius) = nnfractals::quat_collapse::view_setup(genome.collapse, genome.view_range);
+    let fov_deg = 45.0;
+    let params = nnfractals::quat_dag::RaymarchDagParams {
+        formula, time_axis: nnfractals::quat_fractal::TimeAxis::C, time_val, domain_radius,
+        box_bounds: None, axis_assignment: None, clip_plane: None, slide_iter: None, hide_above: None, axis_remap: None, collapse: collapse_eff,
+        max_iter: 50, bailout: genome.bailout_radius as f64, max_march_steps: 150,
+        hit_epsilon: domain_radius * 1e-4, step_safety: 0.8, light_dir: (0.5, 0.8, 0.3),
+        normal_eps: domain_radius * 1e-3, color_probe_offset: domain_radius * 1e-2, aa: 1,
+    };
+    let radius = recommended_orbit_radius(domain_radius, fov_deg, w, h);
+    let cam = nnfractals::quat_raymarch::RaymarchCamera { eye: (0.0, 0.0, -radius), target: (0.0, 0.0, 0.0), up_hint: (0.0, 1.0, 0.0), fov_y: fov_deg.to_radians() };
+    let mut mode = resolve_dag_gpu_mode_ex(params.formula.prog, params.formula.warp, use_gpu, prefer_interpreter);
+    let (shading, color_t) = render_dag_frame_with_mode(&mut mode, &params, &cam, w, h);
+    raymarch_frame_to_rgb(&shading, &color_t, params.max_iter, "lava", (0.03, 0.02, 0.06))
+}
+
+fn deflate_len(bytes: &[u8]) -> usize {
+    use std::io::Write;
+    let mut enc = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::new(6));
+    enc.write_all(bytes).ok();
+    enc.finish().map(|v| v.len()).unwrap_or(bytes.len())
+}
+
+/// (compressed/raw, compressed/compressed-after-shuffling-the-pixels). The second
+/// number is the knowledge-base's noise test: noise does not compress better once
+/// shuffled (ratio near 1), a structured picture does (ratio well below 1).
+fn compression_ratios(rgb: &[u8]) -> (f64, f64) {
+    let raw = rgb.len().max(1) as f64;
+    let c = deflate_len(rgb) as f64;
+    let n = rgb.len() / 3;
+    let mut idx: Vec<u32> = (0..n as u32).collect();
+    let mut x: u64 = 0x9E3779B97F4A7C15; // fixed xorshift: the same picture always gets the same shuffle
+    for i in (1..n).rev() {
+        x ^= x << 13; x ^= x >> 7; x ^= x << 17;
+        idx.swap(i, (x % (i as u64 + 1)) as usize);
+    }
+    let mut sh = Vec::with_capacity(rgb.len());
+    for &i in &idx { let o = i as usize * 3; sh.extend_from_slice(&rgb[o..o + 3]); }
+    let cs = deflate_len(&sh) as f64;
+    (c / raw, c / cs.max(1.0))
+}
+
+/// Shuffle ratio over the FOREGROUND pixels only (background = the corner colour).
+/// The whole-image ratio is diluted by the empty background, so dotted noise on a
+/// sphere passes it; foreground-only, noise sits near 1. Diagnostic only (term
+/// `image_fg_shuffle`): on the 2026-10-17 tournament dotted noise was 0.85–0.92 vs
+/// structured 0.65–0.81, but several of Carl's favourite S3 genomes (speckled surface,
+/// strong silhouette) score 0.9–0.98, so it must NOT be used as a hard noise cut.
+fn fg_shuffle_ratio(rgb: &[u8]) -> f64 {
+    if rgb.len() < 3 { return 0.0; }
+    let bg = [rgb[0] as i32, rgb[1] as i32, rgb[2] as i32];
+    let fg: Vec<u8> = rgb.chunks_exact(3)
+        .filter(|p| (p[0] as i32 - bg[0]).abs() + (p[1] as i32 - bg[1]).abs() + (p[2] as i32 - bg[2]).abs() >= 10)
+        .flatten().copied().collect();
+    if fg.len() < 300 { return 0.0; }
+    compression_ratios(&fg).1
+}
+
+/// Triangle score peaking at `target` (half-width = target): 0 at 0 and at 2*target.
+fn band_score(v: f64, target: f64) -> f64 { (1.0 - (v - target).abs() / target).max(0.0) }
+/// Peak of the shuffle-ratio band (calibrated on Carl's S3 pairs: 64% of picks at 0.5).
+const SHUFFLE_RATIO_TARGET: f64 = 0.5;
+
+/// Cheap first stage for the metric loop (low resolution, 3 renders): rejects blank,
+/// noise-like, and (when `require_motion`) T-inert genomes before the expensive
+/// scoring. True = pass.
+fn passes_image_gate(genome: &Genome, require_motion: bool, use_gpu: bool) -> bool {
+    let (w, h) = (75u32, 100u32);
+    let interp = GATE_INTERPRETER.load(std::sync::atomic::Ordering::Relaxed);
+    let f0 = render_still_rgb_ex(genome, 0.0, w, h, use_gpu, interp);
+    let (ratio, shuf) = compression_ratios(&f0);
+    if ratio < 0.02 || shuf > 0.9 { return false; } // blank, or noise
+    if !require_motion { return true; }
+    let f1 = render_still_rgb_ex(genome, 0.25, w, h, use_gpu, interp);
+    let d = f0.iter().zip(&f1).map(|(a, b)| (*a as f64 - *b as f64).abs()).sum::<f64>() / (f0.len() as f64 * 255.0);
+    d >= 0.0015 // T-inert
+}
+
+fn image_band_and_motion(genome: &Genome, use_gpu: bool) -> (f64, f64) {
+    let key = genome.content_hash() ^ (genome.view_range.to_bits() as u64).rotate_left(17);
+    if let Some(v) = IMAGE_STATS_CACHE.get(key) { return v; }
+    let mut vals = Vec::new();
+    let mut frames: Vec<Vec<u8>> = Vec::new();
+    for phase in [0.0, 0.25, 0.5, 0.75] {
+        let rgb = render_still_rgb(genome, phase, 300, 400, use_gpu);
+        if phase != 0.5 {
+            // Half deflate-ratio band, half shuffle-ratio band (the repo's noise test).
+            let (ratio, shuf) = compression_ratios(&rgb);
+            vals.push(0.5 * band_score(ratio, IMAGE_ENTROPY_TARGET) + 0.5 * band_score(shuf, SHUFFLE_RATIO_TARGET));
+        }
+        frames.push(rgb);
+    }
+    // Motion: the LARGEST mean frame-to-frame change over the sweep, so a formula
+    // that reacts at any moment counts, but a completely inert one scores 0.
+    let mut motion: f64 = 0.0;
+    for i in 0..frames.len() {
+        let (a, b) = (&frames[i], &frames[(i + 1) % frames.len()]);
+        let d = a.iter().zip(b).map(|(x, y)| (*x as f64 - *y as f64).abs()).sum::<f64>() / (a.len() as f64 * 255.0);
+        motion = motion.max(d);
+    }
+    let out = (vals.iter().sum::<f64>() / vals.len() as f64, (motion / IMAGE_MOTION_FULL).clamp(0.0, 1.0));
+    IMAGE_STATS_CACHE.put(key, out);
+    out
+}
+
 /// Lazily-spawned taste sidecar, shared across every `taste_score_for_genome`
 /// call in a run — spawning the SigLIP backbone process per-genome would be
 /// far too slow. Stays `None` for the whole run after a failed first spawn
@@ -3251,7 +3580,7 @@ fn taste_score_for_genome(genome: &Genome, use_gpu: bool) -> f64 {
     // Grid-pooled models (angles × C values) score the whole view set, the
     // same images `train_taste_quat.py --pooling grid` embedded. Re-read the
     // JSON twin each call: the model can be retrained mid-run.
-    let grid = nnfractals::quat_taste::TasteModelConfig::load(std::path::Path::new("taste_model_quat.json"))
+    let grid = nnfractals::quat_taste::TasteModelConfig::load(&nnfractals::quat_taste::model_json_path())
         .map(|c| c.pooling == "grid").unwrap_or(false);
     if grid {
         let scratch_dir = std::path::Path::new("explorer_out/taste_scratch");
@@ -3271,37 +3600,209 @@ fn taste_score_for_genome(genome: &Genome, use_gpu: bool) -> f64 {
         return score as f64;
     }
 
-    let formula = nnfractals::quat_dag::QuatDagFormula { prog: &genome.program, warp: &genome.warp, julia: genome.julia_mode, jc: (genome.julia_cre, genome.julia_cim), phoenix: (genome.phoenix_re, genome.phoenix_im) };
-    let domain_radius = 1.6;
-    let fov_deg = 45.0;
-    let bg_color = (0.03, 0.02, 0.06);
-    let params = nnfractals::quat_dag::RaymarchDagParams {
-        formula, time_axis: nnfractals::quat_fractal::TimeAxis::C, time_val: 0.0, domain_radius,
-        box_bounds: None, axis_assignment: None, clip_plane: None, slide_iter: None, hide_above: None,
-        max_iter: 50, bailout: genome.bailout_radius as f64, max_march_steps: 150,
-        hit_epsilon: domain_radius * 1e-4, step_safety: 0.8, light_dir: (0.5, 0.8, 0.3),
-        normal_eps: domain_radius * 1e-3, color_probe_offset: domain_radius * 1e-2, aa: 1,
-    };
-    let (w, h) = (300u32, 400u32);
-    let radius = recommended_orbit_radius(domain_radius, fov_deg, w, h);
-    let cam = nnfractals::quat_raymarch::RaymarchCamera { eye: (0.0, 0.0, -radius), target: (0.0, 0.0, 0.0), up_hint: (0.0, 1.0, 0.0), fov_y: fov_deg.to_radians() };
-    let mut mode = resolve_dag_gpu_mode(params.formula.prog, params.formula.warp, use_gpu);
-    let (shading, color_t) = render_dag_frame_with_mode(&mut mode, &params, &cam, w, h);
-    let rgb = raymarch_frame_to_rgb(&shading, &color_t, params.max_iter, "lava", bg_color);
+    use std::sync::atomic::Ordering::Relaxed;
+    let n_phases = EVAL_PHASES.load(Relaxed).max(1) as usize;
+    let phase_vec: Vec<f64> = if !COLLAPSE_EVAL.load(Relaxed) { vec![0.0] }
+        else if n_phases == 3 { vec![0.0, 0.25, 0.75] }
+        else { (0..n_phases).map(|i| i as f64 / n_phases as f64).collect() };
+    let phases: &[f64] = &phase_vec;
+    let mut scores: Vec<f64> = Vec::new();
+    let mut frames: Vec<Vec<u8>> = Vec::new();
+    for (pi, &phase) in phases.iter().enumerate() {
+        let method = nnfractals::quat_collapse::Collapse::effective(genome.collapse).method;
+        let time_val = if phases.len() == 1 { 0.0 } else { nnfractals::quat_collapse::time_for_phase_m(method, genome.bailout_radius as f64, phase) };
+        let formula = nnfractals::quat_dag::QuatDagFormula { prog: &genome.program, warp: &genome.warp, julia: genome.julia_mode, jc: (genome.julia_cre, genome.julia_cim), phoenix: (genome.phoenix_re, genome.phoenix_im) };
+        let (collapse_eff, domain_radius) = nnfractals::quat_collapse::view_setup(genome.collapse, genome.view_range);
+        let fov_deg = 45.0;
+        let bg_color = (0.03, 0.02, 0.06);
+        let params = nnfractals::quat_dag::RaymarchDagParams {
+            formula, time_axis: nnfractals::quat_fractal::TimeAxis::C, time_val, domain_radius,
+            box_bounds: None, axis_assignment: None, clip_plane: None, slide_iter: None, hide_above: None, axis_remap: None, collapse: collapse_eff,
+            max_iter: 50, bailout: genome.bailout_radius as f64, max_march_steps: 150,
+            hit_epsilon: domain_radius * 1e-4, step_safety: 0.8, light_dir: (0.5, 0.8, 0.3),
+            normal_eps: domain_radius * 1e-3, color_probe_offset: domain_radius * 1e-2, aa: 1,
+        };
+        let (w, h) = (300u32, 400u32);
+        let radius = recommended_orbit_radius(domain_radius, fov_deg, w, h);
+        let cam = nnfractals::quat_raymarch::RaymarchCamera { eye: (0.0, 0.0, -radius), target: (0.0, 0.0, 0.0), up_hint: (0.0, 1.0, 0.0), fov_y: fov_deg.to_radians() };
+        let mut mode = resolve_dag_gpu_mode(params.formula.prog, params.formula.warp, use_gpu);
+        let (shading, color_t) = render_dag_frame_with_mode(&mut mode, &params, &cam, w, h);
+        let rgb = raymarch_frame_to_rgb(&shading, &color_t, params.max_iter, "lava", bg_color);
 
-    let mut hash: u64 = 0xcbf29ce484222325;
-    for &b in &rgb {
-        hash ^= b as u64;
-        hash = hash.wrapping_mul(0x100000001b3);
+        let mut hash: u64 = 0xcbf29ce484222325;
+        for &b in &rgb {
+            hash ^= b as u64;
+            hash = hash.wrapping_mul(0x100000001b3);
+        }
+        let key = format!("{hash:016x}");
+        let scratch_dir = std::path::Path::new("explorer_out/taste_scratch");
+        std::fs::create_dir_all(scratch_dir).ok();
+        let path = scratch_dir.join(format!("{key}.png"));
+        if io::save_png(&rgb, w, h, &path).is_err() { return 0.0; }
+        // EMBED gives the same taste score plus the backbone embedding, which the
+        // GA uses to keep survivors visually different from each other.
+        let (score, emb) = match scorer.embed_blocking(&key, std::slice::from_ref(&path)) {
+            Some((s, e)) => (s, Some(e)),
+            None => (0.0, None),
+        };
+        std::fs::remove_file(&path).ok();
+        if pi == 0 { *LAST_EMBEDDING.lock().unwrap() = emb; }
+        scores.push(score as f64);
+        frames.push(rgb);
     }
-    let key = format!("{hash:016x}");
-    let scratch_dir = std::path::Path::new("explorer_out/taste_scratch");
-    std::fs::create_dir_all(scratch_dir).ok();
-    let path = scratch_dir.join(format!("{key}.png"));
-    if io::save_png(&rgb, w, h, &path).is_err() { return 0.0; }
-    let score = scorer.score_blocking(&key, std::slice::from_ref(&path)).unwrap_or(0.0);
-    std::fs::remove_file(&path).ok();
-    score as f64
+    if scores.len() == 1 { return scores[0]; }
+    // Several moments of the sweep: half mean, half worst, so a formula that
+    // only looks good at one instant (a flash) is not rewarded.
+    let mean = scores.iter().sum::<f64>() / scores.len() as f64;
+    let worst = scores.iter().cloned().fold(f64::INFINITY, f64::min);
+    let mut total = 0.5 * mean + 0.5 * worst;
+    // Optional smoothness term (--smooth-weight): a flash is one jump much
+    // bigger than the typical change between consecutive moments.
+    let w = f64::from_bits(SMOOTH_WEIGHT.load(Relaxed));
+    if w > 0.0 && frames.len() >= 3 {
+        let n = frames.len();
+        let mut d: Vec<f64> = (0..n).map(|i| {
+            let (a, b) = (&frames[i], &frames[(i + 1) % n]);
+            a.iter().zip(b).map(|(x, y)| (*x as f64 - *y as f64).abs()).sum::<f64>() / (a.len() as f64 * 255.0)
+        }).collect();
+        let maxd = d.iter().cloned().fold(0.0, f64::max);
+        d.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let flash = maxd / d[d.len() / 2].max(1e-4);
+        total -= w * ((flash - 1.0) / 2.0).clamp(0.0, 1.0);
+    }
+    total
+}
+
+/// Log-spaced range factors tried by the range scan.
+const RANGE_CANDIDATES: [f64; 8] = [0.2, 0.33, 0.55, 0.9, 1.5, 2.5, 4.2, 7.0];
+
+/// Finds how far out `genome` should be looked at: renders a few low-res
+/// frames at log-spaced ranges, drops empty and speckled ones with the cheap
+/// structure metrics, lets the taste model pick among the best three, then
+/// refines around the winner. Returns the range factor (1.0 = the old fixed
+/// view). The projection is the genome's own, or the process default.
+fn scan_range(genome: &Genome, use_gpu: bool) -> f32 {
+    // A scan is a coarse judgement: score at most 3 moments of the sweep.
+    let old_phases = EVAL_PHASES.load(std::sync::atomic::Ordering::Relaxed);
+    EVAL_PHASES.store(old_phases.min(3), std::sync::atomic::Ordering::Relaxed);
+    let r = scan_range_inner(genome, use_gpu);
+    EVAL_PHASES.store(old_phases, std::sync::atomic::Ordering::Relaxed);
+    r
+}
+
+fn scan_range_inner(genome: &Genome, use_gpu: bool) -> f32 {
+    let mut g = genome.clone();
+    let method = nnfractals::quat_collapse::Collapse::effective(g.collapse).method;
+    let formula = nnfractals::quat_dag::QuatDagFormula { prog: &genome.program, warp: &genome.warp, julia: genome.julia_mode, jc: (genome.julia_cre, genome.julia_cim), phoenix: (genome.phoenix_re, genome.phoenix_im) };
+    let mut mode = resolve_dag_gpu_mode(&genome.program, &genome.warp, use_gpu);
+    let (w, h) = (120u32, 160u32);
+    let times = [0.0, nnfractals::quat_collapse::time_for_phase_m(method, genome.bailout_radius as f64, 0.25)];
+    // (hit fraction, coverage, solidity, colour entropy) of one range, averaged over two moments.
+    let mut probe = |r: f64| -> (f64, f64, f64, f64) {
+        let (col, domain_radius) = nnfractals::quat_collapse::view_setup(genome.collapse, r as f32);
+        let radius = recommended_orbit_radius(domain_radius, 45.0, w, h);
+        let cam = nnfractals::quat_raymarch::RaymarchCamera { eye: (0.0, 0.0, -radius), target: (0.0, 0.0, 0.0), up_hint: (0.0, 1.0, 0.0), fov_y: 45f64.to_radians() };
+        let mut acc = (0.0f64, 0.0f64, 0.0f64, 0.0f64);
+        for &tv in &times {
+            let params = nnfractals::quat_dag::RaymarchDagParams {
+                formula, time_axis: nnfractals::quat_fractal::TimeAxis::C, time_val: tv, domain_radius,
+                box_bounds: None, axis_assignment: None, clip_plane: None, slide_iter: None, hide_above: None, axis_remap: None, collapse: col,
+                max_iter: 40, bailout: genome.bailout_radius as f64, max_march_steps: 120,
+                hit_epsilon: domain_radius * 1e-4, step_safety: 0.8, light_dir: (0.5, 0.8, 0.3),
+                normal_eps: domain_radius * 1e-3, color_probe_offset: domain_radius * 1e-2, aa: 1,
+            };
+            let (shading, color_t) = render_dag_frame_with_mode(&mut mode, &params, &cam, w, h);
+            let hit = shading.iter().filter(|v| **v > 0.0).count() as f64 / shading.len() as f64;
+            let (cov, sol, _rich, ent, _irr) = nnfractals::quat_dag_fitness::view_metrics(&shading, &color_t, w, h);
+            acc.0 += hit; acc.1 += cov as f64; acc.2 += sol as f64; acc.3 += ent as f64;
+        }
+        let n = times.len() as f64;
+        (acc.0 / n, acc.1 / n, acc.2 / n, acc.3 / n)
+    };
+    let mut pre: Vec<(f64, f64)> = Vec::new(); // (pre-score, range)
+    for &r in &RANGE_CANDIDATES {
+        let (hit, cov, sol, ent) = probe(r);
+        if hit < 0.03 { continue; }
+        pre.push((0.4 * cov + 0.3 * sol + 0.3 * ent, r));
+    }
+    if pre.is_empty() { return 1.0; }
+    pre.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
+    // Taste picks, but a speckled picture (low solidity) or a nearly empty one is
+    // penalised: the taste model is generous to fine grain, a human is not.
+    let mut best = (f64::NEG_INFINITY, 1.0f64);
+    let mut tried: Vec<f64> = Vec::new();
+    let mut score_at = |r: f64, g: &mut Genome, best: &mut (f64, f64), tried: &mut Vec<f64>, probe: &mut dyn FnMut(f64) -> (f64, f64, f64, f64)| {
+        if tried.iter().any(|t| (t / r - 1.0).abs() < 1e-3) { return; }
+        tried.push(r);
+        g.view_range = r as f32;
+        let (hit, _cov, sol, _ent) = probe(r);
+        let sc = taste_score_for_genome(g, use_gpu) - 0.6 * (0.45 - sol).max(0.0) - if hit < 0.05 { 0.3 } else { 0.0 };
+        if sc > best.0 { *best = (sc, r); }
+    };
+    // The old fixed view always competes, so a scan can never do worse than not scanning.
+    score_at(1.0, &mut g, &mut best, &mut tried, &mut probe);
+    for &(_, r) in pre.iter().take(3) { score_at(r, &mut g, &mut best, &mut tried, &mut probe); }
+    let centre = best.1;
+    for f in [0.77, 1.3] {
+        let r = (centre * f).clamp(nnfractals::quat_collapse::RANGE_MIN, nnfractals::quat_collapse::RANGE_MAX);
+        score_at(r, &mut g, &mut best, &mut tried, &mut probe);
+    }
+    best.1 as f32
+}
+
+/// Number of sweep moments scored per genome under `--collapse` (default 3).
+static EVAL_PHASES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(3);
+/// `--smooth-weight`: f64 bits of the weight on the flash penalty (0 = off).
+static SMOOTH_WEIGHT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// True when the GA scores several moments of the time sweep (`--collapse`).
+static COLLAPSE_EVAL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Embedding of the most recent `taste_score_for_genome` call.
+static LAST_EMBEDDING: std::sync::Mutex<Option<Vec<f32>>> = std::sync::Mutex::new(None);
+/// Embeddings by `individual_key`, for survivor-diversity selection.
+static EMBEDDINGS: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<String, Vec<f32>>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+/// Reorders the front of a score-sorted population so its first `k` entries
+/// are picked greedily by `total - lambda * (cosine similarity to the
+/// already-picked)`: a copy of an already-picked look is penalised, so the
+/// survivors cover different looks. `lambda <= 0` (or no embeddings) leaves
+/// the order alone. The picked ones come first, in pick order, then the rest.
+fn diverse_front(pop: &mut Vec<QuatIndividual>, k: usize, lambda: f64) {
+    if lambda <= 0.0 || pop.len() < 2 { return; }
+    let keys: Vec<String> = pop.iter().map(individual_key).collect();
+    let embs: Vec<Option<Vec<f32>>> = {
+        let m = EMBEDDINGS.lock().unwrap();
+        keys.iter().map(|k| m.get(k).cloned()).collect()
+    };
+    let sim = |a: &Option<Vec<f32>>, b: &Option<Vec<f32>>| -> f64 {
+        match (a, b) {
+            (Some(x), Some(y)) if x.len() == y.len() => x.iter().zip(y).map(|(p, q)| (*p as f64) * (*q as f64)).sum(),
+            _ => 0.0,
+        }
+    };
+    let n = pop.len();
+    let mut max_sim = vec![0.0f64; n];
+    let mut picked: Vec<usize> = Vec::with_capacity(k);
+    let mut taken = vec![false; n];
+    for _ in 0..k.min(n) {
+        let mut best = usize::MAX;
+        let mut best_v = f64::NEG_INFINITY;
+        for i in 0..n {
+            if taken[i] { continue; }
+            let v = pop[i].total - lambda * max_sim[i];
+            if v > best_v { best_v = v; best = i; }
+        }
+        taken[best] = true;
+        picked.push(best);
+        for i in 0..n {
+            if !taken[i] { max_sim[i] = max_sim[i].max(sim(&embs[best], &embs[i])); }
+        }
+    }
+    let rest: Vec<usize> = (0..n).filter(|i| !taken[*i]).collect();
+    let mut old: Vec<Option<QuatIndividual>> = std::mem::take(pop).into_iter().map(Some).collect();
+    *pop = picked.into_iter().chain(rest).map(|i| old[i].take().unwrap()).collect();
 }
 
 /// `--map-elites` mode's per-individual evaluation: scores quality (taste
@@ -3317,14 +3818,15 @@ fn map_elites_evaluate(
     probe_size: u32,
     use_gpu: bool,
 ) -> Option<([u8; 3], f64)> {
-    let genome = ind.as_genome();
     let quality = match fitness_metric {
         Some(metric) => {
+            // Simplifies `ind` itself.
             score_individual_for_metric(ind, metric, probe_size, use_gpu);
             ind.geometric
         }
         None => {
-            let t = taste_score_for_genome(&genome, use_gpu);
+            ind.simplify();
+            let t = taste_score_for_genome(&ind.as_genome(), use_gpu);
             ind.taste = t;
             t
         }
@@ -3349,29 +3851,341 @@ fn map_elites_evaluate(
     Some((cell, quality))
 }
 
-fn score_individual_for_metric(ind: &mut QuatIndividual, spec: &[(String, f64)], probe_size: u32, use_gpu: bool) {
-    let genome = ind.as_genome();
-    let needs_full = spec.iter().any(|(name, _)| name != "taste" && !STRUCTURAL_METRIC_NAMES.contains(&name.as_str()) && !ORGANIZATION_METRIC_NAMES.contains(&name.as_str()));
-    let needs_organization = spec.iter().any(|(name, _)| ORGANIZATION_METRIC_NAMES.contains(&name.as_str()));
-    let full = if needs_full { Some(score_genome_dag_full(&genome, probe_size, use_gpu)) } else { None };
+/// Exact identity of a quat individual after simplification: two with the
+/// same key render identically, so only one of them is worth scoring/keeping.
+fn individual_key(ind: &QuatIndividual) -> String {
+    use nnfractals::formula_text::program_to_text;
+    let t = |p: &[nnfractals::formula::OpNode]| if p.is_empty() { String::new() } else { program_to_text(p) };
+    let col = ind.collapse.map(|c| format!("{c:?}")).unwrap_or_default();
+    format!("{}|{}|{}|{:?}|{:?}|{}|{col}", t(&ind.program), t(&ind.warp), ind.julia_mode, ind.jc, ind.phoenix, ind.bailout_radius)
+}
+
+/// `--auto-range`: scan each seed/immigrant for its best view range and let
+/// the range drift with the formula (`mutate_range`).
+static AUTO_RANGE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn auto_range_active() -> bool { AUTO_RANGE.load(std::sync::atomic::Ordering::Relaxed) }
+
+/// A nudge of a view range factor (log-normal, about 25% per step).
+fn mutate_range(r: f32, rng: &mut impl rand::Rng) -> f32 {
+    let base = if r > 0.0 { r as f64 } else { 1.0 };
+    let z: f64 = rng.random_range(-1.0..1.0) + rng.random_range(-1.0..1.0); // ~triangular
+    (base * (0.2 * z).exp()).clamp(nnfractals::quat_collapse::RANGE_MIN, nnfractals::quat_collapse::RANGE_MAX) as f32
+}
+
+/// Candidate projections for `--collapse auto` (empty = not in auto mode).
+static AUTO_METHODS: std::sync::Mutex<Vec<nnfractals::quat_collapse::Method>> = std::sync::Mutex::new(Vec::new());
+
+fn auto_collapse_active() -> bool { !AUTO_METHODS.lock().unwrap().is_empty() }
+
+/// A random projection (method and parameters) from the `--collapse auto` candidates.
+fn random_collapse(rng: &mut impl rand::Rng) -> nnfractals::quat_collapse::Collapse {
+    use nnfractals::quat_collapse::{Collapse, Method};
+    let methods = AUTO_METHODS.lock().unwrap().clone();
+    let m = methods[rng.random_range(0..methods.len())];
+    let mut c = Collapse::of(m);
+    match m {
+        Method::S3 | Method::IsoS3 => {
+            c.rho = rng.random_range(0.7..1.6);
+            c.plane = if rng.random_bool(0.5) { 2 } else { rng.random_range(0..3) };
+            if rng.random_bool(0.4) { for p in c.pole.iter_mut() { *p = rng.random_range(-0.5..0.5); } }
+        }
+        Method::Spin | Method::IsoSpin => {
+            c.rho = rng.random_range(-0.8..0.8);
+            c.plane = rng.random_range(0..3);
+        }
+        Method::Tilt => { c.tilt = (rng.random_range(0.2..1.0), rng.random_range(0.2..1.0)); }
+        Method::Slab => { c.slab_half = rng.random_range(0.05..0.2); }
+        Method::Offset => { c.offset = rng.random_range(0.01..0.06); }
+        _ => {}
+    }
+    c
+}
+
+/// Small change to a projection: occasionally a new method, otherwise a nudge of its parameters.
+fn mutate_collapse(c: nnfractals::quat_collapse::Collapse, rng: &mut impl rand::Rng) -> nnfractals::quat_collapse::Collapse {
+    use nnfractals::quat_collapse::Method;
+    if rng.random_bool(0.3) { return random_collapse(rng); }
+    let mut c = c;
+    match c.method {
+        Method::S3 | Method::IsoS3 => {
+            c.rho = (c.rho * rng.random_range(0.85..1.18)).clamp(0.5, 2.0);
+            if rng.random_bool(0.2) { c.plane = rng.random_range(0..3); }
+            for p in c.pole.iter_mut() { *p += rng.random_range(-0.15..0.15); }
+        }
+        Method::Spin | Method::IsoSpin => {
+            c.rho = (c.rho + rng.random_range(-0.15..0.15)).clamp(-1.0, 1.0);
+            if rng.random_bool(0.2) { c.plane = rng.random_range(0..3); }
+        }
+        _ => {}
+    }
+    c
+}
+
+/// Cheap pre-check (300-direction visibility scan, no render): true when
+/// almost nothing of the fractal is visible, so spending a render and a
+/// taste evaluation on it is pointless. Same threshold as MAP-Elites' rejection.
+fn is_degenerate(ind: &QuatIndividual) -> bool {
+    let formula = nnfractals::quat_dag::QuatDagFormula { prog: &ind.program, warp: &ind.warp, julia: ind.julia_mode, jc: ind.jc, phoenix: ind.phoenix };
+    let bailout_sq = (ind.bailout_radius as f64) * (ind.bailout_radius as f64);
+    let (hits, n_dir, ..) = nnfractals::quat_organization::sphericity_full_diagnostic(&formula, 1.6, 60, bailout_sq);
+    n_dir > 0 && (hits as f64 / n_dir as f64) < 0.05
+}
+
+/// What to write to disk: best first, skipping near-zero scorers, at most
+/// `top` of them (0 = no limit). The sorted population is already unique.
+fn saveable(population: &[QuatIndividual], top: usize, embed_div: f64) -> Vec<QuatIndividual> {
+    let mut good: Vec<QuatIndividual> = population.iter().filter(|i| i.total > 0.02).cloned().collect();
+    if top > 0 {
+        diverse_front(&mut good, top, embed_div);
+        good.truncate(top);
+    }
+    good
+}
+
+/// Resolution-stability test: render at w×h and at 4w×4h, box-downsample the big one and
+/// compare. A real surface agrees with itself; sub-pixel fractal dust does not.
+/// Returns (mean |Δ| over RGB / 255, foreground-mask IoU between the two).
+fn resolution_stability(genome: &Genome, use_gpu: bool) -> (f64, f64) {
+    let (w, h) = (150usize, 200usize);
+    let small = render_still_rgb(genome, 0.0, w as u32, h as u32, use_gpu);
+    let big = render_still_rgb(genome, 0.0, 4 * w as u32, 4 * h as u32, use_gpu);
+    let bg = [small[0] as i32, small[1] as i32, small[2] as i32];
+    let is_fg = |p: [i32; 3]| (p[0] - bg[0]).abs() + (p[1] - bg[1]).abs() + (p[2] - bg[2]).abs() >= 10;
+    let (mut diff, mut inter, mut uni) = (0.0f64, 0usize, 0usize);
+    for y in 0..h {
+        for x in 0..w {
+            let mut acc = [0i32; 3];
+            let mut fg_big = 0;
+            for dy in 0..4 { for dx in 0..4 {
+                let o = ((4 * y + dy) * 4 * w + 4 * x + dx) * 3;
+                let p = [big[o] as i32, big[o + 1] as i32, big[o + 2] as i32];
+                for c in 0..3 { acc[c] += p[c]; }
+                if is_fg(p) { fg_big += 1; }
+            }}
+            let o = (y * w + x) * 3;
+            let ps = [small[o] as i32, small[o + 1] as i32, small[o + 2] as i32];
+            for c in 0..3 { diff += ((acc[c] / 16) - ps[c]).abs() as f64; }
+            let (a, b) = (is_fg(ps), fg_big >= 8);
+            if a && b { inter += 1; }
+            if a || b { uni += 1; }
+        }
+    }
+    (diff / (w * h * 3) as f64 / 255.0, if uni == 0 { 0.0 } else { inter as f64 / uni as f64 })
+}
+
+/// Coherent-motion test: 8 frames at small T steps (1/100 turn). Returns
+/// (deflate(frame-to-frame deltas) / deflate(frames), mean |Δ| per step / 255).
+/// ~0 ratio = static, ~1 = every step reshuffles (chaotic), in between = organised motion.
+fn motion_coherence(genome: &Genome, use_gpu: bool) -> (f64, f64) {
+    let frames: Vec<Vec<u8>> = (0..8).map(|i| render_still_rgb(genome, i as f64 * 0.01, 300, 400, use_gpu)).collect();
+    let (mut intra, mut inter, mut md) = (0.0f64, 0.0f64, 0.0f64);
+    for i in 1..frames.len() {
+        let (a, b) = (&frames[i - 1], &frames[i]);
+        let delta: Vec<u8> = a.iter().zip(b).map(|(x, y)| y.wrapping_sub(*x)).collect();
+        intra += deflate_len(b) as f64;
+        inter += deflate_len(&delta) as f64;
+        md += a.iter().zip(b).map(|(x, y)| (*x as f64 - *y as f64).abs()).sum::<f64>() / (a.len() as f64 * 255.0);
+    }
+    (inter / intra.max(1.0), md / (frames.len() - 1) as f64)
+}
+
+/// Fitness band over `t_continuity`'s ratio: static (-1) scores 0, smooth motion 0.5→1
+/// up to the peak at 0.25, falling to 0 at 0.7 (jumpy/noise). From Carl's ratings: in
+/// moving pairs the smoother one won 72% (S3) / 57% (slice); very smooth (<0.15) was
+/// rated a bit below mid (0.15–0.5); all tournament noise was ≥ 0.68.
+fn t_cont_band(r: f64) -> f64 {
+    if r < 0.0 { 0.0 } else if r < 0.25 { 0.5 + 2.0 * r } else { (1.0 - (r - 0.25) / 0.45).max(0.0) }
+}
+
+/// One sheet-style view (same orbit as `render_genome_views`: axis (0.35,1,0.15))
+/// at orbit position `orbit_t` ∈ [0,1) and T `phase`, `size`² RGB.
+fn render_view_rgb(genome: &Genome, orbit_t: f64, phase: f64, size: u32, use_gpu: bool) -> Vec<u8> {
+    let method = nnfractals::quat_collapse::Collapse::effective(genome.collapse).method;
+    let formula = nnfractals::quat_dag::QuatDagFormula { prog: &genome.program, warp: &genome.warp, julia: genome.julia_mode, jc: (genome.julia_cre, genome.julia_cim), phoenix: (genome.phoenix_re, genome.phoenix_im) };
+    let (collapse_eff, domain_radius) = nnfractals::quat_collapse::view_setup(genome.collapse, genome.view_range);
+    let fov_deg = 45.0;
+    let params = nnfractals::quat_dag::RaymarchDagParams {
+        formula, time_axis: nnfractals::quat_fractal::TimeAxis::C,
+        time_val: nnfractals::quat_collapse::time_for_phase_m(method, genome.bailout_radius as f64, phase), domain_radius,
+        box_bounds: None, axis_assignment: None, clip_plane: None, slide_iter: None, hide_above: None, axis_remap: None, collapse: collapse_eff,
+        max_iter: 50, bailout: genome.bailout_radius as f64, max_march_steps: 150,
+        hit_epsilon: domain_radius * 1e-4, step_safety: 0.8, light_dir: (0.5, 0.8, 0.3),
+        normal_eps: domain_radius * 1e-3, color_probe_offset: domain_radius * 1e-2, aa: 1,
+    };
+    let orbit = nnfractals::quat_raymarch::RaymarchOrbitParams {
+        target: (0.0, 0.0, 0.0), axis: (0.35, 1.0, 0.15), radius: recommended_orbit_radius(domain_radius, fov_deg, size, size),
+        turns: 1.0, phase0: 0.0, fov_y: fov_deg.to_radians(),
+    };
+    let mut mode = resolve_dag_gpu_mode(params.formula.prog, params.formula.warp, use_gpu);
+    let (shading, color_t) = render_dag_frame_with_mode(&mut mode, &params, &orbit.sample(orbit_t), size, size);
+    raymarch_frame_to_rgb(&shading, &color_t, params.max_iter, "lava", (0.03, 0.02, 0.06))
+}
+
+/// Sheet-view statistics over 3 orbit angles × 2 T phases at 112² (the sheet's own
+/// cameras), cached per genome: (smallest LIT fraction, mean GREY share of the lit
+/// pixels). Lit = luminance > 45/255. Grey = lit with saturation < 0.25.
+/// - Lit: the "empty crescent" winners are solid surfaces whose visible side is dark
+///   from most angles (sheet views lit 0.9–2.4% vs 4.6–8.1% for good ones, campaign
+///   c20261018_180500); from the single front camera they can look fine.
+/// - Grey: once dark fronts were penalised the GA drifted to chrome/silver balls
+///   (campaign c20261018_202426: grey share 0.75–0.92 vs ≤0.08 for the warm winners).
+///   Carl's ratings agree: the less grey one wins 57% (slice, 3025 pairs) / 64% (S3);
+///   mostly-grey (>0.6) slice genomes win 41%, a little grey (0.1–0.3) 60%.
+fn sheet_view_stats(genome: &Genome, use_gpu: bool) -> (f64, f64) {
+    static CACHE: std::sync::LazyLock<Memo<(f64, f64)>> = std::sync::LazyLock::new(Memo::new);
+    let key = genome.content_hash() ^ (genome.view_range.to_bits() as u64).rotate_left(29);
+    if let Some(v) = CACHE.get(key) { return v; }
+    let (mut worst_lit, mut grey_sum, mut n) = (1.0f64, 0.0f64, 0usize);
+    for &orbit_t in &[0.0, 1.0 / 3.0, 2.0 / 3.0] {
+        for &ph in &[0.0, 0.5] {
+            let rgb = render_view_rgb(genome, orbit_t, ph, 112, use_gpu);
+            let (mut lit, mut grey) = (0usize, 0usize);
+            for p in rgb.chunks_exact(3) {
+                let (r, g, b) = (p[0] as f64, p[1] as f64, p[2] as f64);
+                if 0.3 * r + 0.59 * g + 0.11 * b > 45.0 {
+                    lit += 1;
+                    let (mx, mn) = (r.max(g).max(b), r.min(g).min(b));
+                    if (mx - mn) / (mx + 1e-6) < 0.25 { grey += 1; }
+                }
+            }
+            worst_lit = worst_lit.min(lit as f64 / (112 * 112) as f64);
+            grey_sum += if lit > 0 { grey as f64 / lit as f64 } else { 0.0 };
+            n += 1;
+        }
+    }
+    let out = (worst_lit, grey_sum / n as f64);
+    CACHE.put(key, out);
+    out
+}
+
+fn front_cover(genome: &Genome, use_gpu: bool) -> f64 { sheet_view_stats(genome, use_gpu).0 }
+
+/// T-continuity: picture change for a tiny T step (1/200 turn) divided by the change for a
+/// big step (1/4 turn), averaged over 3 starting phases. Smooth motion → small ratio;
+/// jumpy/chaotic → near 1. Returns (ratio, big-step change); ratio = -1 when static.
+fn t_continuity(genome: &Genome, use_gpu: bool) -> (f64, f64) {
+    let d = |a: &[u8], b: &[u8]| a.iter().zip(b).map(|(x, y)| (*x as f64 - *y as f64).abs()).sum::<f64>() / (a.len() as f64 * 255.0);
+    let (mut small, mut big) = (0.0, 0.0);
+    for p0 in [0.0, 0.33, 0.66] {
+        let f0 = render_still_rgb(genome, p0, 150, 200, use_gpu);
+        small += d(&f0, &render_still_rgb(genome, p0 + 0.005, 150, 200, use_gpu));
+        big += d(&f0, &render_still_rgb(genome, p0 + 0.25, 150, 200, use_gpu));
+    }
+    if big / 3.0 < 0.002 { (-1.0, big / 3.0) } else { (small / big, big / 3.0) }
+}
+
+/// Raw six-RABC-plane statistics (see taste_analysis/planes/principles.md): each plane
+/// 120×120 over ±1.6 with the other two axes at 0, max_iter 60. Returns
+/// (boundary, bounded, detail, asym): bounded-set boundary pixels / all pixels,
+/// bounded fraction, mean |Laplacian| of the normalised log escape time, and the mean
+/// difference between the RA, RB, RC planes (0 when the set is symmetric under
+/// rotations mixing A, B, C). Cached per genome (the planes ignore collapse/range).
+fn plane_stats(genome: &Genome) -> [f64; 4] {
+    use rayon::prelude::*;
+    static CACHE: std::sync::LazyLock<Memo<[f64; 4]>> = std::sync::LazyLock::new(Memo::new);
+    let key = genome.content_hash();
+    if let Some(v) = CACHE.get(key) { return v; }
+    const N: usize = 120;
+    const MAXI: u32 = 60;
+    let formula = nnfractals::quat_dag::QuatDagFormula { prog: &genome.program, warp: &genome.warp, julia: genome.julia_mode, jc: (genome.julia_cre, genome.julia_cim), phoenix: (genome.phoenix_re, genome.phoenix_im) };
+    let bsq = (genome.bailout_radius as f64).powi(2);
+    let mut norm_planes: Vec<Vec<f64>> = Vec::with_capacity(6);
+    let (mut boundary, mut bounded, mut detail) = (0.0, 0.0, 0.0);
+    for &(i, j) in nnfractals::quat_planes::PLANES.iter() {
+        let t: Vec<f32> = (0..N * N).into_par_iter().map(|idx| {
+            let (x, y) = (idx % N, idx / N);
+            let mut p = [0.0f64; 4];
+            p[i] = -1.6 + 3.2 * (x as f64 + 0.5) / N as f64;
+            p[j] = 1.6 - 3.2 * (y as f64 + 0.5) / N as f64;
+            nnfractals::quat_dag::quat_dag_escape_de(&formula, nnfractals::quaternion::Quat::new(p[0], p[1], p[2], p[3]), MAXI, bsq).0
+        }).collect();
+        let b: Vec<bool> = t.iter().map(|v| *v >= MAXI as f32 - 0.5).collect();
+        let at = |x: usize, y: usize| b[y * N + x];
+        let mut edge = 0usize;
+        for y in 0..N { for x in 0..N {
+            if !at(x, y) { continue; }
+            // binary erosion with a cross, border counts as outside (scipy default)
+            let inner = x > 0 && y > 0 && x + 1 < N && y + 1 < N && at(x - 1, y) && at(x + 1, y) && at(x, y - 1) && at(x, y + 1);
+            if !inner { edge += 1; }
+        }}
+        boundary += edge as f64 / (N * N) as f64;
+        bounded += b.iter().filter(|v| **v).count() as f64 / (N * N) as f64;
+        let l: Vec<f64> = t.iter().map(|v| (v.max(0.0) as f64).ln_1p()).collect();
+        let (lo, hi) = l.iter().fold((f64::MAX, f64::MIN), |(a, c), v| (a.min(*v), c.max(*v)));
+        let e: Vec<f64> = l.iter().map(|v| (v - lo) / (hi - lo + 1e-9)).collect();
+        let g = |x: isize, y: isize| e[(y.clamp(0, N as isize - 1) as usize) * N + x.clamp(0, N as isize - 1) as usize];
+        let mut lap = 0.0;
+        for y in 0..N as isize { for x in 0..N as isize {
+            lap += (g(x - 1, y) + g(x + 1, y) + g(x, y - 1) + g(x, y + 1) - 4.0 * g(x, y)).abs();
+        }}
+        detail += lap / (N * N) as f64;
+        norm_planes.push(e);
+    }
+    let d = |a: &[f64], b: &[f64]| a.iter().zip(b).map(|(x, y)| (x - y).abs()).sum::<f64>() / a.len() as f64;
+    let asym = (d(&norm_planes[0], &norm_planes[1]) + d(&norm_planes[0], &norm_planes[2]) + d(&norm_planes[1], &norm_planes[2])) / 3.0;
+    let out = [boundary / 6.0, bounded / 6.0, detail / 6.0, asym];
+    CACHE.put(key, out);
+    out
+}
+
+/// Raw value of each named fitness term for one genome (the same dispatch the
+/// metric-driven GA uses), plus the full metrics when any term needed them.
+fn metric_term_values(genome: &Genome, names: &[String], probe_size: u32, use_gpu: bool) -> (Vec<f64>, Option<QuatFullMetrics>) {
+    let needs_full = names.iter().any(|name| name != "taste" && name != "image_entropy_band" && name != "image_motion" && !["image_fg_shuffle", "res_diff", "res_iou", "motion_ratio", "motion_step", "t_cont", "t_big", "t_cont_band", "front_cover", "front_cover_band", "grey_share", "grey_band"].contains(&name.as_str()) && !name.starts_with("planes_") && !STRUCTURAL_METRIC_NAMES.contains(&name.as_str()) && !ORGANIZATION_METRIC_NAMES.contains(&name.as_str()));
+    let needs_organization = names.iter().any(|name| ORGANIZATION_METRIC_NAMES.contains(&name.as_str()));
+    let full = if needs_full { Some(prof("full (score_genome_dag_full)", || score_genome_dag_full(genome, probe_size, use_gpu))) } else { None };
     let organization = if needs_organization {
         let formula = nnfractals::quat_dag::QuatDagFormula { prog: &genome.program, warp: &genome.warp, julia: genome.julia_mode, jc: (genome.julia_cre, genome.julia_cim), phoenix: (genome.phoenix_re, genome.phoenix_im) };
         let bailout_sq = (genome.bailout_radius as f64) * (genome.bailout_radius as f64);
-        Some(nnfractals::quat_organization::compute_organization_metrics(&formula, 1.6, 60, bailout_sq))
+        Some(prof("organization metrics", || nnfractals::quat_organization::compute_organization_metrics(&formula, 1.6, 60, bailout_sq)))
     } else {
         None
     };
+    let vals = names.iter().map(|name| prof(&format!("metric {name}"), || {
+        if name == "taste" { taste_score_for_genome(genome, use_gpu) } else if name == "image_entropy_band" { image_entropy_band(genome, use_gpu) } else if name == "image_motion" { image_motion(genome, use_gpu) } else if name == "image_fg_shuffle" { fg_shuffle_ratio(&render_still_rgb(genome, 0.0, 300, 400, use_gpu)) }
+        else if name == "res_diff" { resolution_stability(genome, use_gpu).0 } else if name == "res_iou" { resolution_stability(genome, use_gpu).1 }
+        else if name == "motion_ratio" { motion_coherence(genome, use_gpu).0 } else if name == "motion_step" { motion_coherence(genome, use_gpu).1 }
+        else if name == "front_cover" { front_cover(genome, use_gpu) }
+        else if name == "grey_share" { sheet_view_stats(genome, use_gpu).1 }
+        else if name == "grey_band" { 1.0 - ((sheet_view_stats(genome, use_gpu).1 - 0.3) / 0.4).clamp(0.0, 1.0) }
+        else if name == "front_cover_band" { (front_cover(genome, use_gpu) / 0.04).min(1.0) }
+        else if name == "planes_open" { 1.0 - (plane_stats(genome)[1] / 0.25).min(1.0) }
+        else if name == "planes_smooth" { let p = plane_stats(genome); 0.5 * (1.0 - (p[0] / 0.06).min(1.0)) + 0.5 * (1.0 - (p[2] / 0.3).min(1.0)) }
+        else if name == "planes_asym" { (plane_stats(genome)[3] / 0.1).min(1.0) }
+        else if name.starts_with("planes_raw_") { plane_stats(genome)[match &name[11..] { "boundary" => 0, "bounded" => 1, "detail" => 2, _ => 3 }] }
+        else if name == "t_cont_band" { t_cont_band(t_continuity(genome, use_gpu).0) } else if name == "t_cont" { t_continuity(genome, use_gpu).0 } else if name == "t_big" { t_continuity(genome, use_gpu).1 } else { lookup_metric(genome, name, full.as_ref(), organization.as_ref()) }
+    })).collect();
+    (vals, full)
+}
+
+fn score_individual_for_metric(ind: &mut QuatIndividual, spec: &[(String, f64)], probe_size: u32, use_gpu: bool) {
+    prof("simplify", || ind.simplify());
+    let genome = ind.as_genome();
+    // Staged evaluation: a cheap low-res gate before the expensive metrics (only when
+    // the objective is image-based). A failing genome gets a floor score.
+    if spec.iter().any(|(n, _)| n == "image_entropy_band" || n == "image_motion" || n == "t_cont_band") && !prof("image gate", || passes_image_gate(&genome, spec.iter().any(|(n, _)| n == "image_motion"), use_gpu)) {
+        ind.phenotype = [0.0; 6];
+        ind.geometric = -5.0;
+        ind.aesthetic = 0.0;
+        ind.metric_vec = vec![0.0; spec.len()];
+        return;
+    }
+    let names: Vec<String> = spec.iter().map(|(n, _)| n.clone()).collect();
+    let (raw_vals, full) = metric_term_values(&genome, &names, probe_size, use_gpu);
     if let Some(f) = &full {
         ind.phenotype = [f.breakdown.anisotropy, f.breakdown.coverage, f.breakdown.solidity, f.breakdown.shading_richness, f.breakdown.color_entropy, f.breakdown.silhouette_irregularity];
     } else {
         ind.phenotype = [0.0; 6];
     }
-    let raw_vals: Vec<f64> = spec.iter().map(|(name, _)| {
-        if name == "taste" { taste_score_for_genome(&genome, use_gpu) } else { lookup_metric(&genome, name, full.as_ref(), organization.as_ref()) }
-    }).collect();
     ind.geometric = spec.iter().zip(&raw_vals).map(|((_, w), v)| w * v).sum();
     ind.aesthetic = 0.0;
     ind.metric_vec = raw_vals;
+    if spec.iter().any(|(name, _)| name == "taste") {
+        if let Some(e) = LAST_EMBEDDING.lock().unwrap().take() {
+            EMBEDDINGS.lock().unwrap().insert(individual_key(ind), e);
+        }
+    }
 }
 
 fn finalize_fitness(population: &mut [QuatIndividual], quality_floor: f64, diversity_bonus_weight: f64, single_metric_mode: bool) {
@@ -3505,6 +4319,241 @@ fn generations_label(generations: usize) -> String {
     if generations == 0 { "\u{221e}".to_string() } else { generations.to_string() }
 }
 
+/// A fresh immigrant whose program follows `OP_WEIGHTS` (the tuning's per-op weights), with
+/// the same random dynamics (julia/phoenix/warp/bailout) a brand-new random genome gets.
+fn random_weighted_immigrant(rng: &mut rand::rngs::StdRng, max_depth: usize) -> Option<QuatIndividual> {
+    let w = (*nnfractals::quat_genome_ops::OP_WEIGHTS.lock().unwrap())?;
+    let program = nnfractals::quat_genome_ops::random_program_weighted(rng, nnfractals::quat_genome_ops::RANDOM_IMMIGRANT_NODES.load(std::sync::atomic::Ordering::Relaxed), max_depth, &w);
+    let mut g = Genome { program, ..Default::default() };
+    nnfractals::quat_genome_ops::randomize_dynamics_tuned(&mut g, rng);
+    Some(QuatIndividual::from_genome(&g))
+}
+
+/// Chance that an immigrant is a fresh weighted-random program instead of a pool genome.
+fn random_immigrant_frac() -> f64 {
+    f64::from_bits(nnfractals::quat_genome_ops::RANDOM_IMMIGRANT_FRAC.load(std::sync::atomic::Ordering::Relaxed)).clamp(0.0, 1.0)
+}
+
+/// Wall-clock limit for the quat GA (`--max-seconds`): (start, limit seconds). Checked once
+/// per generation next to `--stop-flat`, so a timed-out run still saves its genomes.
+static RUN_DEADLINE: std::sync::Mutex<Option<(std::time::Instant, f64)>> = std::sync::Mutex::new(None);
+
+/// `--profile`: wall time per scoring step (summed over threads, so steps overlap and nested
+/// steps such as a metric's renders are counted in both), printed when the run ends.
+static PROFILE_ON: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static PROF: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<String, (u64, f64)>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+fn prof<T>(label: &str, f: impl FnOnce() -> T) -> T {
+    if !PROFILE_ON.load(std::sync::atomic::Ordering::Relaxed) { return f(); }
+    let t = std::time::Instant::now();
+    let r = f();
+    let dt = t.elapsed().as_secs_f64();
+    let mut g = PROF.lock().unwrap();
+    let e = g.entry(label.to_string()).or_insert((0, 0.0));
+    e.0 += 1;
+    e.1 += dt;
+    r
+}
+
+fn print_profile() {
+    if !PROFILE_ON.load(std::sync::atomic::Ordering::Relaxed) { return; }
+    #[cfg(feature = "wgpu-backend")]
+    {
+        let (h, m) = nnfractals::render_gpu_raymarch_dag_codegen::pipeline_cache_stats();
+        eprintln!("[profile] shader pipeline cache: {h} hits, {m} misses");
+    }
+    let g = PROF.lock().unwrap();
+    let mut v: Vec<_> = g.iter().collect();
+    v.sort_by(|a, b| b.1 .1.partial_cmp(&a.1 .1).unwrap_or(std::cmp::Ordering::Equal));
+    eprintln!("[profile] step                              calls   total s   mean ms");
+    for (k, (n, s)) in v { eprintln!("[profile] {k:<32} {n:>7} {s:>9.1} {:>9.1}", s / *n as f64 * 1000.0); }
+}
+
+/// Small bounded memo for per-genome results, keyed by a content hash. The old single-entry caches
+/// lost their entry whenever another scoring thread stored a different genome in between.
+struct Memo<V>(std::sync::Mutex<std::collections::HashMap<u64, V>>);
+impl<V: Copy> Memo<V> {
+    fn new() -> Self { Memo(std::sync::Mutex::new(std::collections::HashMap::new())) }
+    fn get(&self, k: u64) -> Option<V> { self.0.lock().unwrap().get(&k).copied() }
+    fn put(&self, k: u64, v: V) {
+        let mut g = self.0.lock().unwrap();
+        if g.len() >= 512 { g.clear(); }
+        g.insert(k, v);
+    }
+}
+
+/// How many threads may score genomes at once (`quat-dag-evolve --workers N`; 0 = all cores).
+/// Changeable while the run goes: with `--control-file` a poller thread re-reads
+/// `{"workers": N}` from that file every second and updates this.
+static SCORE_WORKERS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(1);
+/// True once a control file is in use, so the threaded path is taken even while workers = 1
+/// (the user may raise it mid-run).
+static WORKERS_LIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn n_cores() -> usize { std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4) }
+
+fn set_score_workers(n: usize) {
+    let n = if n == 0 { n_cores() } else { n.min(n_cores()) };
+    SCORE_WORKERS.store(n.max(1), std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Poll `path` (`{"workers": N}`) once a second for the life of the process.
+/// The automatic thread-count tuner (`--auto-workers`, or `"auto": true` in the control file).
+static AUTOTUNE: std::sync::Mutex<Option<nnfractals::worker_tune::AutoTune>> = std::sync::Mutex::new(None);
+static TUNE_CLOCK: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+
+fn tune_now() -> f64 { TUNE_CLOCK.get_or_init(std::time::Instant::now).elapsed().as_secs_f64() }
+
+fn enable_autotune(on: bool) {
+    let mut g = AUTOTUNE.lock().unwrap();
+    if on && g.is_none() {
+        let t = nnfractals::worker_tune::AutoTune::new(SCORE_WORKERS.load(std::sync::atomic::Ordering::Relaxed), n_cores());
+        SCORE_WORKERS.store(t.current(), std::sync::atomic::Ordering::Relaxed);
+        *g = Some(t);
+        WORKERS_LIVE.store(true, std::sync::atomic::Ordering::Relaxed);
+        eprintln!("  [autotune] on, starting from {} workers", SCORE_WORKERS.load(std::sync::atomic::Ordering::Relaxed));
+    } else if !on && g.is_some() {
+        *g = None;
+        eprintln!("  [autotune] off, staying at {} workers", SCORE_WORKERS.load(std::sync::atomic::Ordering::Relaxed));
+    }
+}
+
+fn tune_batch_start() {
+    if let Some(t) = AUTOTUNE.lock().unwrap().as_mut() {
+        t.batch_start(tune_now());
+        SCORE_WORKERS.store(t.current(), std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+fn tune_item_done() {
+    let mut g = AUTOTUNE.lock().unwrap();
+    if let Some(t) = g.as_mut() {
+        if t.item_done(tune_now()) {
+            SCORE_WORKERS.store(t.current(), std::sync::atomic::Ordering::Relaxed);
+            if let Some((from, to, a, b)) = t.last_move.take() {
+                eprintln!("  [autotune] {from} -> {to} workers ({a:.2} -> {b:.2} genomes/s)");
+            }
+        }
+    }
+}
+
+fn tune_batch_end() {
+    if let Some(t) = AUTOTUNE.lock().unwrap().as_mut() { t.batch_end(); }
+}
+
+fn start_worker_control(path: String) {
+    WORKERS_LIVE.store(true, std::sync::atomic::Ordering::Relaxed);
+    std::thread::spawn(move || {
+        let mut last = String::new();
+        loop {
+            if let Ok(text) = std::fs::read_to_string(&path) {
+                if text != last {
+                    let v = serde_json::from_str::<serde_json::Value>(&text).ok();
+                    let auto = v.as_ref().and_then(|v| v.get("auto")?.as_bool());
+                    if let Some(n) = v.as_ref().and_then(|v| v.get("workers")?.as_u64()) {
+                        set_score_workers(n as usize);
+                        // A hand-set count restarts the automatic search from there.
+                        if let Some(t) = AUTOTUNE.lock().unwrap().as_mut() {
+                            t.set_base(SCORE_WORKERS.load(std::sync::atomic::Ordering::Relaxed));
+                            SCORE_WORKERS.store(t.current(), std::sync::atomic::Ordering::Relaxed);
+                        }
+                        eprintln!("  [workers] now {}", SCORE_WORKERS.load(std::sync::atomic::Ordering::Relaxed));
+                    }
+                    if let Some(a) = auto { enable_autotune(a); }
+                    last = text;
+                }
+            }
+            // Status for the GUI: what is running right now.
+            let base = AUTOTUNE.lock().unwrap().as_ref().map(|t| t.base());
+            let _ = std::fs::write(format!("{path}.now"), serde_json::json!({
+                "now": SCORE_WORKERS.load(std::sync::atomic::Ordering::Relaxed),
+                "auto": base.is_some(),
+                "settled": base,
+            }).to_string());
+            std::thread::sleep(std::time::Duration::from_secs(1));
+        }
+    });
+}
+
+/// Score every individual in `items` with `f`, on up to `SCORE_WORKERS` threads (the GPU renderers
+/// serialise themselves behind a lock, so the CPU-side metric work overlaps). A thread whose
+/// index is above the current worker count idles, so lowering the count takes effect at the
+/// next genome. Order of `items` is kept. Serial when `parallel_ok` is false or only one worker
+/// is allowed and no control file is in use.
+fn score_batch(items: &mut Vec<QuatIndividual>, parallel_ok: bool, f: &(dyn Fn(&mut QuatIndividual) + Sync)) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let n = items.len();
+    let live = WORKERS_LIVE.load(Relaxed);
+    if n < 2 || !parallel_ok || (SCORE_WORKERS.load(Relaxed) <= 1 && !live) {
+        for it in items.iter_mut() { f(it); }
+        return;
+    }
+    let slots: Vec<std::sync::Mutex<QuatIndividual>> = std::mem::take(items).into_iter().map(std::sync::Mutex::new).collect();
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    tune_batch_start();
+    std::thread::scope(|s| {
+        for k in 0..n_cores().min(n) {
+            let (slots, next) = (&slots, &next);
+            s.spawn(move || loop {
+                if k >= SCORE_WORKERS.load(Relaxed).max(1) {
+                    if next.load(Relaxed) >= n { break; }
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                    continue;
+                }
+                let i = next.fetch_add(1, Relaxed);
+                if i >= n { break; }
+                f(&mut slots[i].lock().unwrap());
+                tune_item_done();
+            });
+        }
+    });
+    tune_batch_end();
+    *items = slots.into_iter().map(|m| m.into_inner().unwrap()).collect();
+}
+
+/// Order-preserving parallel map on the scoring workers (same gating as `score_batch`): used for
+/// the seeding phase and the view-range scans, which are as render-heavy as scoring itself.
+fn par_map<T: Send, R: Send>(items: Vec<T>, f: &(dyn Fn(T) -> R + Sync)) -> Vec<R> {
+    use std::sync::atomic::Ordering::Relaxed;
+    let n = items.len();
+    if n < 2 || (SCORE_WORKERS.load(Relaxed) <= 1 && !WORKERS_LIVE.load(Relaxed)) {
+        return items.into_iter().map(f).collect();
+    }
+    let slots: Vec<std::sync::Mutex<Option<T>>> = items.into_iter().map(|t| std::sync::Mutex::new(Some(t))).collect();
+    let outs: Vec<std::sync::Mutex<Option<R>>> = (0..n).map(|_| std::sync::Mutex::new(None)).collect();
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    std::thread::scope(|s| {
+        for k in 0..n_cores().min(n) {
+            let (slots, outs, next) = (&slots, &outs, &next);
+            s.spawn(move || loop {
+                if k >= SCORE_WORKERS.load(Relaxed).max(1) {
+                    if next.load(Relaxed) >= n { break; }
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                    continue;
+                }
+                let i = next.fetch_add(1, Relaxed);
+                if i >= n { break; }
+                let t = slots[i].lock().unwrap().take().expect("each slot is taken once");
+                *outs[i].lock().unwrap() = Some(f(t));
+            });
+        }
+    });
+    outs.into_iter().map(|m| m.into_inner().unwrap().expect("every slot was processed")).collect()
+}
+
+/// `score_batch` for the GA's fitness setting: metric specs without the taste term run in
+/// parallel (the taste scorer keeps per-call global state), everything else stays serial.
+fn score_group(items: &mut Vec<QuatIndividual>, fitness_metric: &Option<Vec<(String, f64)>>, pref_model: Option<&nnfractals::quat_pref::QuatPrefModel>, probe_size: u32, use_gpu: bool) {
+    match fitness_metric {
+        Some(metric) => {
+            let parallel_ok = !metric.iter().any(|(n, _)| n == "taste");
+            score_batch(items, parallel_ok, &|ind| score_individual_for_metric(ind, metric, probe_size, use_gpu));
+        }
+        None => for ind in items.iter_mut() { score_individual(ind, pref_model, probe_size, use_gpu, 0.3); },
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn cmd_quat_dag_evolve(
     pool_dir: &str,
@@ -3520,6 +4569,10 @@ fn cmd_quat_dag_evolve(
     fitness_metric: Option<Vec<(String, f64)>>,
     predator_prey: bool,
     stagnation_gens: usize,
+    stop_flat: usize,
+    save_top: usize,
+    mix: (f64, f64),
+    embed_div: f64,
     pref_model_path: &str,
 ) {
     use rand::SeedableRng;
@@ -3584,8 +4637,11 @@ fn cmd_quat_dag_evolve(
     // either contact sheet, no quality cost). This run is a confirmation
     // sample at the settled config, not a further push — see the TL;DR
     // at the top of fractals_dag_quat/OVERNIGHT_LOG.md.
-    const IMMIGRANT_FRAC: f64 = 0.55;
-    const CROSSOVER_FRAC: f64 = 0.30;
+    // Defaults are the long-standing 0.55/0.30; `--immigrant-frac`/`--crossover-frac` override.
+    #[allow(non_snake_case)]
+    let IMMIGRANT_FRAC: f64 = mix.0;
+    #[allow(non_snake_case)]
+    let CROSSOVER_FRAC: f64 = mix.1;
 
     // Aesthetic component: Carl's own trained preference model
     // (quat_pref::QuatPrefModel — a linear fit over the ~30 quat_*
@@ -3639,17 +4695,51 @@ fn cmd_quat_dag_evolve(
 
     eprintln!("quat-dag-evolve: seeding population={population} from {pool_dir} ({} files available)", pool_files.len());
     let mut population_vec: Vec<QuatIndividual> = Vec::with_capacity(population);
-    for path in &pool_files {
-        if population_vec.len() >= population {
-            break;
+    // Every identity ever put into the population, so a clone (same
+    // simplified formula) is never scored or kept twice.
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // Which channel produced each identity, to report where the survivors come from.
+    let mut origin: std::collections::HashMap<String, &'static str> = std::collections::HashMap::new();
+    let (mut seed_dup, mut seed_empty) = (0usize, 0usize);
+    // Seeding in batches of exactly the places still open (so nothing overshoots): load+simplify
+    // in parallel, then the order-dependent dedup/collapse draw serially, then the render-heavy
+    // degeneracy check and view-range scan in parallel (`--workers`), then push in file order.
+    let mut cursor = 0usize;
+    while population_vec.len() < population && cursor < pool_files.len() {
+        let need = population - population_vec.len();
+        let end = (cursor + need).min(pool_files.len());
+        let batch: Vec<&PathBuf> = pool_files[cursor..end].iter().collect();
+        cursor = end;
+        let loaded: Vec<Option<QuatIndividual>> = par_map(batch, &|path| {
+            let g = io::load_genome(path).ok().filter(|g| !g.program.is_empty())?;
+            let mut ind = QuatIndividual::from_genome(&g);
+            ind.simplify();
+            Some(ind)
+        });
+        let mut fresh: Vec<(String, QuatIndividual)> = Vec::new();
+        for mut ind in loaded.into_iter().flatten() {
+            if auto_collapse_active() { ind.collapse = Some(random_collapse(&mut rng)); }
+            let key = individual_key(&ind);
+            if !seen.insert(key.clone()) { seed_dup += 1; continue; }
+            fresh.push((key, ind));
         }
-        if let Ok(g) = io::load_genome(path) {
-            if !g.program.is_empty() {
-                population_vec.push(QuatIndividual::from_genome(&g));
+        let scan = auto_range_active();
+        let old_phases = EVAL_PHASES.load(std::sync::atomic::Ordering::Relaxed);
+        if scan { EVAL_PHASES.store(old_phases.min(3), std::sync::atomic::Ordering::Relaxed); } // a scan scores at most 3 moments
+        let checked: Vec<(String, Option<QuatIndividual>)> = par_map(fresh, &|(key, mut ind)| {
+            if is_degenerate(&ind) { return (key, None); }
+            if scan { ind.view_range = scan_range_inner(&ind.as_genome(), use_gpu); }
+            (key, Some(ind))
+        });
+        if scan { EVAL_PHASES.store(old_phases, std::sync::atomic::Ordering::Relaxed); }
+        for (key, ind) in checked {
+            match ind {
+                None => seed_empty += 1,
+                Some(ind) => { origin.insert(key, "seed"); population_vec.push(ind); }
             }
         }
     }
-    eprintln!("  seeded {} individuals", population_vec.len());
+    eprintln!("  seeded {} individuals (skipped {seed_dup} duplicates, {seed_empty} near-empty)", population_vec.len());
 
     // Created up front (not just at the first checkpoint/final save) so
     // log_gen_stats can append gen-0's stats immediately — it used to
@@ -3660,18 +4750,14 @@ fn cmd_quat_dag_evolve(
 
     // Gen 0: score everyone (nothing inherited yet).
     let start = std::time::Instant::now();
-    for ind in population_vec.iter_mut() {
-        match &fitness_metric {
-            Some(metric) => score_individual_for_metric(ind, metric, probe_size, use_gpu),
-            None => score_individual(ind, pref_model.as_ref(), probe_size, use_gpu, 0.3),
-        }
-    }
+    score_group(&mut population_vec, &fitness_metric, pref_model.as_ref(), probe_size, use_gpu);
     finalize_fitness(&mut population_vec, QUALITY_FLOOR, DIVERSITY_BONUS_WEIGHT, fitness_metric.is_some());
     if let Some(best_pred) = apply_predator_pressure(&mut population_vec, &mut predators, &mut predator_rng) {
         eprintln!("  [predator] best fitness (corr. w/ commonness) = {best_pred:.3}");
     }
     population_vec.sort_by(|a, b| b.total.partial_cmp(&a.total).unwrap_or(std::cmp::Ordering::Equal));
     report_generation(0, &population_vec, start.elapsed().as_secs_f64());
+    eprintln!("{}", take_simplify_stats());
     print_top_pool(&population_vec, 5);
     let gen0_best_pred = predators.iter().map(|p| p.fitness).fold(f64::NEG_INFINITY, f64::max);
     log_gen_stats(out_dir, 0, &population_vec, start.elapsed().as_secs_f64(), (!predators.is_empty()).then_some(gen0_best_pred.max(0.0)), false);
@@ -3713,10 +4799,21 @@ fn cmd_quat_dag_evolve(
     // `CHECKPOINT_INTERVAL` above already guarantees at most 14 generations
     // of progress are ever at risk from an unceremonious kill.
     let mut gen_idx = 0usize;
+    // `--stop-flat N`: end the run once the mean score of the survivor
+    // elite has not risen by more than STAGNATION_EPSILON for N generations.
+    // (The mean, not the single best: a taste score saturates at 1.0 long
+    // before the rest of the elite catches up.) 0 = never stop early.
+    let elite_mean = |pop: &[QuatIndividual]| -> f64 {
+        let k = survivors.min(pop.len()).max(1);
+        pop.iter().take(k).map(|i| i.total).sum::<f64>() / k as f64
+    };
+    let mut elite_best = elite_mean(&population_vec);
+    let mut flat_gens = 0usize;
     loop {
         gen_idx += 1;
         if generations != 0 && gen_idx > generations { break; }
         let gen_start = std::time::Instant::now();
+        diverse_front(&mut population_vec, survivors, embed_div);
         let survivor_count = survivors.min(population_vec.len());
         let mut next_gen: Vec<QuatIndividual> = population_vec.drain(..survivor_count).collect();
 
@@ -3729,10 +4826,26 @@ fn cmd_quat_dag_evolve(
         // immigrants that just don't happen to be viable quaternion
         // formulas) rather than being generic noise.
         let mut channel_tally: std::collections::HashMap<&'static str, (u32, u32)> = std::collections::HashMap::new();
-        while next_gen.len() < population {
+        let (mut rej_dup, mut rej_empty, mut tries) = (0usize, 0usize, 0usize);
+        let max_tries = population * 30; // after this, stop filtering rather than loop forever
+        // Children are bred and filtered one by one (cheap, sequential rng) but scored together
+        // afterwards, in parallel (`--workers`). Nothing in the loop depends on a score.
+        let mut pending: Vec<QuatIndividual> = Vec::new();
+        let mut pending_src: Vec<&'static str> = Vec::new();
+        let mut pending_scan: Vec<bool> = Vec::new();
+        while next_gen.len() + pending.len() < population {
+            tries += 1;
             let roll: f64 = rng.random();
             let source: &'static str;
-            let mut child = if roll < IMMIGRANT_FRAC && !pool_files.is_empty() {
+            let rand_imm = if roll < IMMIGRANT_FRAC && (pool_files.is_empty() || rng.random_bool(random_immigrant_frac())) {
+                random_weighted_immigrant(&mut rng, mutation_strength.max_depth)
+            } else {
+                None
+            };
+            let mut child = if let Some(ind) = rand_imm {
+                source = "random";
+                ind
+            } else if roll < IMMIGRANT_FRAC && !pool_files.is_empty() {
                 source = "immigrant";
                 let path = &pool_files[rng.random_range(0..pool_files.len())];
                 match io::load_genome(path) {
@@ -3746,8 +4859,8 @@ fn cmd_quat_dag_evolve(
                 let parent_a = &next_gen[ia];
                 let parent_b = &next_gen[ib];
                 let program = match crossover_mode {
-                    CrossoverMode::Legacy => nnfractals::genome::crossover_program(&parent_a.program, &parent_b.program, &mut rng, 24),
-                    CrossoverMode::Subtree => nnfractals::quat_genome_ops::crossover_program_subtree(&parent_a.program, &parent_b.program, &mut rng, 24),
+                    CrossoverMode::Legacy => nnfractals::genome::crossover_program(&parent_a.program, &parent_b.program, &mut rng, nnfractals::quat_genome_ops::max_nodes()),
+                    CrossoverMode::Subtree => nnfractals::quat_genome_ops::crossover_program_subtree(&parent_a.program, &parent_b.program, &mut rng, nnfractals::quat_genome_ops::max_nodes()),
                 };
                 QuatIndividual {
                     program,
@@ -3756,6 +4869,8 @@ fn cmd_quat_dag_evolve(
                     jc: parent_a.jc,
                     phoenix: parent_a.phoenix,
                     bailout_radius: parent_a.bailout_radius,
+                    collapse: parent_a.collapse,
+                    view_range: parent_a.view_range,
                     geometric: 0.0, aesthetic: 0.0, diversity: 0.0, total: 0.0, phenotype: [0.0; 6], metric_vec: Vec::new(),
                     taste: 0.0, descriptors: [0.0; 3], hit_rate: 0.0,
                 }
@@ -3772,8 +4887,8 @@ fn cmd_quat_dag_evolve(
                 // `MutationStrength` reproduces the old hardcoded
                 // behavior exactly, so this is a strict superset, not a
                 // silent change, unless `--mutation-*` flags override it).
-                let p1 = nnfractals::quat_genome_ops::mutate_program_tuned(&parent.program, &mut rng, 24, mutation_strength.max_depth, &mutation_strength);
-                let program = nnfractals::quat_genome_ops::mutate_program_tuned(&p1, &mut rng, 24, mutation_strength.max_depth, &mutation_strength);
+                let p1 = nnfractals::quat_genome_ops::mutate_program_tuned(&parent.program, &mut rng, nnfractals::quat_genome_ops::max_nodes(), mutation_strength.max_depth, &mutation_strength);
+                let program = nnfractals::quat_genome_ops::mutate_program_tuned(&p1, &mut rng, nnfractals::quat_genome_ops::max_nodes(), mutation_strength.max_depth, &mutation_strength);
                 QuatIndividual {
                     program,
                     warp: parent.warp.clone(),
@@ -3781,14 +4896,46 @@ fn cmd_quat_dag_evolve(
                     jc: parent.jc,
                     phoenix: parent.phoenix,
                     bailout_radius: parent.bailout_radius,
+                    collapse: parent.collapse,
+                    view_range: parent.view_range,
                     geometric: 0.0, aesthetic: 0.0, diversity: 0.0, total: 0.0, phenotype: [0.0; 6], metric_vec: Vec::new(),
                     taste: 0.0, descriptors: [0.0; 3], hit_rate: 0.0,
                 }
             };
-            match &fitness_metric {
-                Some(metric) => score_individual_for_metric(&mut child, metric, probe_size, use_gpu),
-                None => score_individual(&mut child, pref_model.as_ref(), probe_size, use_gpu, 0.3),
+            child.simplify();
+            // Immigrants' view-range scans are render-heavy: deferred and done in parallel below.
+            let want_scan = auto_range_active() && (source == "immigrant" || source == "random");
+            if auto_range_active() && source == "mutation" && rng.random_bool(0.35) {
+                child.view_range = mutate_range(child.view_range, &mut rng);
             }
+            if auto_collapse_active() {
+                child.collapse = Some(match (source, child.collapse) {
+                    ("immigrant", _) | ("random", _) | (_, None) => random_collapse(&mut rng),
+                    (_, Some(c)) => if rng.random_bool(0.35) { mutate_collapse(c, &mut rng) } else { c },
+                });
+            }
+            let key = individual_key(&child);
+            if tries <= max_tries {
+                if !seen.insert(key.clone()) { rej_dup += 1; continue; }
+                if is_degenerate(&child) { rej_empty += 1; continue; }
+            }
+            origin.insert(key, source);
+            pending.push(child);
+            pending_src.push(source);
+            pending_scan.push(want_scan);
+        }
+        if pending_scan.iter().any(|&b| b) {
+            let old_phases = EVAL_PHASES.load(std::sync::atomic::Ordering::Relaxed);
+            EVAL_PHASES.store(old_phases.min(3), std::sync::atomic::Ordering::Relaxed);
+            let items: Vec<(QuatIndividual, bool)> = std::mem::take(&mut pending).into_iter().zip(pending_scan).collect();
+            pending = par_map(items, &|(mut c, scan)| {
+                if scan { c.view_range = scan_range_inner(&c.as_genome(), use_gpu); }
+                c
+            });
+            EVAL_PHASES.store(old_phases, std::sync::atomic::Ordering::Relaxed);
+        }
+        score_group(&mut pending, &fitness_metric, pref_model.as_ref(), probe_size, use_gpu);
+        for (child, source) in pending.into_iter().zip(pending_src) {
             let entry = channel_tally.entry(source).or_insert((0, 0));
             entry.0 += 1;
             if child.geometric <= 0.0 {
@@ -3801,11 +4948,21 @@ fn cmd_quat_dag_evolve(
             channels.sort_by_key(|(name, _)| *name);
             let parts: Vec<String> = channels.iter().map(|(name, (n, z))| format!("{name}={z}/{n}")).collect();
             eprintln!("  zero-geometric-score by channel: {}", parts.join(" "));
+            eprintln!("  rejected before scoring: {rej_dup} duplicates, {rej_empty} near-empty (of {tries} candidates)");
+            eprintln!("{}", take_simplify_stats());
         }
         finalize_fitness(&mut next_gen, QUALITY_FLOOR, DIVERSITY_BONUS_WEIGHT, fitness_metric.is_some());
         let best_pred = apply_predator_pressure(&mut next_gen, &mut predators, &mut predator_rng);
         next_gen.sort_by(|a, b| b.total.partial_cmp(&a.total).unwrap_or(std::cmp::Ordering::Equal));
         population_vec = next_gen;
+        {
+            let mut by: std::collections::BTreeMap<&str, usize> = std::collections::BTreeMap::new();
+            for ind in population_vec.iter().take(survivors) {
+                *by.entry(origin.get(&individual_key(ind)).copied().unwrap_or("?")).or_insert(0) += 1;
+            }
+            let parts: Vec<String> = by.iter().map(|(k, v)| format!("{k}={v}")).collect();
+            eprintln!("  top-{survivors} by origin: {}", parts.join(" "));
+        }
         report_generation(gen_idx, &population_vec, gen_start.elapsed().as_secs_f64());
         print_top_pool(&population_vec, 5);
         if let Some(best_pred) = best_pred {
@@ -3838,15 +4995,21 @@ fn cmd_quat_dag_evolve(
             let mut attempts = 0;
             while fresh.len() < population && attempts < population * 20 {
                 attempts += 1;
-                if pool_files.is_empty() {
-                    break;
-                }
-                let path = &pool_files[rng.random_range(0..pool_files.len())];
-                let Ok(g) = io::load_genome(path) else { continue };
-                if g.program.is_empty() {
-                    continue;
-                }
-                let mut ind = QuatIndividual::from_genome(&g);
+                let use_random = rng.random_bool(random_immigrant_frac());
+                let mut ind = match use_random.then(|| random_weighted_immigrant(&mut rng, mutation_strength.max_depth)).flatten() {
+                    Some(r) => r,
+                    None => {
+                        if pool_files.is_empty() {
+                            break;
+                        }
+                        let path = &pool_files[rng.random_range(0..pool_files.len())];
+                        let Ok(g) = io::load_genome(path) else { continue };
+                        if g.program.is_empty() {
+                            continue;
+                        }
+                        QuatIndividual::from_genome(&g)
+                    }
+                };
                 match &fitness_metric {
                     Some(metric) => score_individual_for_metric(&mut ind, metric, probe_size, use_gpu),
                     None => score_individual(&mut ind, pref_model.as_ref(), probe_size, use_gpu, 0.3),
@@ -3869,16 +5032,38 @@ fn cmd_quat_dag_evolve(
         }
         log_gen_stats(out_dir, gen_idx, &population_vec, gen_start.elapsed().as_secs_f64(), best_pred, stagnation_event);
 
+        let em = elite_mean(&population_vec);
+        if em > elite_best + STAGNATION_EPSILON {
+            elite_best = em;
+            flat_gens = 0;
+        } else {
+            flat_gens += 1;
+        }
+        if stop_flat > 0 && flat_gens >= stop_flat {
+            eprintln!("  [stop-flat] elite mean score has not risen in {flat_gens} generations (at {elite_best:.3}) — ending the run at gen {gen_idx}");
+            break;
+        }
+        if let Some((start, limit)) = *RUN_DEADLINE.lock().unwrap() {
+            if start.elapsed().as_secs_f64() >= limit {
+                eprintln!("  [max-seconds] {limit:.0}s wall-clock limit reached — ending the run at gen {gen_idx}");
+                break;
+            }
+        }
+
         if gen_idx % CHECKPOINT_INTERVAL == 0 && gen_idx != generations {
             let ckpt_start = std::time::Instant::now();
-            checkpoint_stems = save_quat_population(&population_vec, out_dir, &fitness_metric, gen_idx, probe_size, use_gpu, &mut rng2, &checkpoint_stems);
+            *SAVE_ORIGINS.lock().unwrap() = Some(origin.clone());
+            checkpoint_stems = save_quat_population(&saveable(&population_vec, save_top, embed_div), out_dir, &fitness_metric, gen_idx, probe_size, use_gpu, &mut rng2, &checkpoint_stems);
             write_contact_sheet(std::path::Path::new(out_dir), &checkpoint_stems);
             eprintln!("  [checkpoint] gen {gen_idx}/{}: saved {} genomes to {out_dir} in {:.0}s", generations_label(generations), checkpoint_stems.len(), ckpt_start.elapsed().as_secs_f64());
         }
     }
 
-    let final_stems = save_quat_population(&population_vec, out_dir, &fitness_metric, generations, probe_size, use_gpu, &mut rng2, &checkpoint_stems);
-    eprintln!("quat-dag-evolve: saved {} genomes + thumbnails to {out_dir}", population_vec.len());
+    let to_save = saveable(&population_vec, save_top, embed_div);
+    *SAVE_ORIGINS.lock().unwrap() = Some(origin.clone());
+    let final_stems = save_quat_population(&to_save, out_dir, &fitness_metric, generations, probe_size, use_gpu, &mut rng2, &checkpoint_stems);
+    eprintln!("quat-dag-evolve: saved {} genomes + thumbnails to {out_dir}", to_save.len());
+    print_profile();
     write_contact_sheet(std::path::Path::new(out_dir), &final_stems);
 }
 
@@ -3962,6 +5147,7 @@ fn cmd_quat_dag_evolve_map_elites(
         "gen 0: {:.0}s | seeded {seeded} candidates | archive: {}/{} cells ({:.0}% coverage) | mean quality={:.3} max quality={:.3}",
         start.elapsed().as_secs_f64(), archive.len(), nnfractals::quat_map_elites::N_BINS.pow(3), archive.coverage() * 100.0, archive.mean_quality(), archive.max_quality()
     );
+    eprintln!("{}", take_simplify_stats());
     log_map_elites_stats(out_dir, 0, &archive, start.elapsed().as_secs_f64(), false);
 
     const STAGNATION_EPSILON: f64 = 0.005;
@@ -3996,8 +5182,8 @@ fn cmd_quat_dag_evolve_map_elites(
                 let parent_a = parent_a.clone();
                 let Some(parent_b) = archive.sample_parent(&mut rng, gen_idx, RECENT_WINDOW) else { continue };
                 let program = match crossover_mode {
-                    CrossoverMode::Legacy => nnfractals::genome::crossover_program(&parent_a.program, &parent_b.program, &mut rng, 24),
-                    CrossoverMode::Subtree => nnfractals::quat_genome_ops::crossover_program_subtree(&parent_a.program, &parent_b.program, &mut rng, 24),
+                    CrossoverMode::Legacy => nnfractals::genome::crossover_program(&parent_a.program, &parent_b.program, &mut rng, nnfractals::quat_genome_ops::max_nodes()),
+                    CrossoverMode::Subtree => nnfractals::quat_genome_ops::crossover_program_subtree(&parent_a.program, &parent_b.program, &mut rng, nnfractals::quat_genome_ops::max_nodes()),
                 };
                 QuatIndividual {
                     program,
@@ -4006,13 +5192,15 @@ fn cmd_quat_dag_evolve_map_elites(
                     jc: parent_a.jc,
                     phoenix: parent_a.phoenix,
                     bailout_radius: parent_a.bailout_radius,
+                    collapse: parent_a.collapse,
+                    view_range: parent_a.view_range,
                     geometric: 0.0, aesthetic: 0.0, diversity: 0.0, total: 0.0, phenotype: [0.0; 6], metric_vec: Vec::new(),
                     taste: 0.0, descriptors: [0.0; 3], hit_rate: 0.0,
                 }
             } else {
                 let Some(parent) = archive.sample_parent(&mut rng, gen_idx, RECENT_WINDOW) else { continue };
-                let p1 = nnfractals::quat_genome_ops::mutate_program_tuned(&parent.program, &mut rng, 24, mutation_strength.max_depth, &mutation_strength);
-                let program = nnfractals::quat_genome_ops::mutate_program_tuned(&p1, &mut rng, 24, mutation_strength.max_depth, &mutation_strength);
+                let p1 = nnfractals::quat_genome_ops::mutate_program_tuned(&parent.program, &mut rng, nnfractals::quat_genome_ops::max_nodes(), mutation_strength.max_depth, &mutation_strength);
+                let program = nnfractals::quat_genome_ops::mutate_program_tuned(&p1, &mut rng, nnfractals::quat_genome_ops::max_nodes(), mutation_strength.max_depth, &mutation_strength);
                 QuatIndividual {
                     program,
                     warp: parent.warp.clone(),
@@ -4020,6 +5208,8 @@ fn cmd_quat_dag_evolve_map_elites(
                     jc: parent.jc,
                     phoenix: parent.phoenix,
                     bailout_radius: parent.bailout_radius,
+                    collapse: parent.collapse,
+                    view_range: parent.view_range,
                     geometric: 0.0, aesthetic: 0.0, diversity: 0.0, total: 0.0, phenotype: [0.0; 6], metric_vec: Vec::new(),
                     taste: 0.0, descriptors: [0.0; 3], hit_rate: 0.0,
                 }
@@ -4037,6 +5227,7 @@ fn cmd_quat_dag_evolve_map_elites(
             "gen {gen_idx}: {:.0}s | {inserted} candidates ({new_cells} new cells) | archive: {}/{} cells ({:.0}% coverage) | mean quality={:.3} max quality={:.3}",
             gen_start.elapsed().as_secs_f64(), archive.len(), nnfractals::quat_map_elites::N_BINS.pow(3), archive.coverage() * 100.0, archive.mean_quality(), archive.max_quality()
         );
+        eprintln!("{}", take_simplify_stats());
 
         // Stagnation (Phase 2b: measured on archive coverage + mean
         // quality, NEVER wipes the archive — unlike the scalar path's
@@ -4186,7 +5377,7 @@ fn write_map_elites_grid(out_dir: &std::path::Path, archive: &nnfractals::quat_m
 /// whether a retrain (Phase 3) has landed since the run started.
 fn log_map_elites_stats(out_dir: &str, gen_idx: usize, archive: &nnfractals::quat_map_elites::Archive<QuatIndividual>, secs: f64, stagnation_event: bool) {
     let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
-    let taste_mtime = std::fs::metadata("taste_model_quat.npz").ok().and_then(|m| m.modified().ok())
+    let taste_mtime = std::fs::metadata(nnfractals::quat_taste::model_npz_path()).ok().and_then(|m| m.modified().ok())
         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map(|d| d.as_secs());
     let taste_mtime_field = taste_mtime.map(|v| v.to_string()).unwrap_or_else(|| "null".to_string());
     let total_cells = nnfractals::quat_map_elites::N_BINS.pow(3);
@@ -4327,6 +5518,11 @@ fn cmd_taste_pairs(archive_dir: &str, out_dir: &str, n: usize) {
 /// checkpoint below — deleting the previous save first keeps `out_dir`
 /// always reflecting exactly the LATEST snapshot rather than
 /// accumulating every checkpoint's files forever.
+/// Origin label (seed / immigrant / mutation / crossover / ...) of each individual,
+/// handed to `save_quat_population` so metric runs record `origin=` in
+/// formula_readable (the Optuna campaign script skips unchanged seeds).
+static SAVE_ORIGINS: std::sync::Mutex<Option<std::collections::HashMap<String, &'static str>>> = std::sync::Mutex::new(None);
+
 #[allow(clippy::too_many_arguments)]
 fn save_quat_population(
     population_vec: &[QuatIndividual],
@@ -4356,7 +5552,8 @@ fn save_quat_population(
         g.formula_readable = match fitness_metric {
             Some(spec) => {
                 let spec_str: String = spec.iter().map(|(n, w)| format!("{n}:{w:.2}")).collect::<Vec<_>>().join(",");
-                format!("quat-dag-evolve gen={generations} fitness-metric=[{spec_str}] value={:.3}", ind.total)
+                let o = SAVE_ORIGINS.lock().unwrap().as_ref().and_then(|m| m.get(&individual_key(ind)).copied()).unwrap_or("?");
+                format!("quat-dag-evolve gen={generations} fitness-metric=[{spec_str}] value={:.3} origin={o}", ind.total)
             }
             None => format!(
                 "quat-dag-evolve gen={generations} geometric={:.3} aesthetic={:.3} diversity={:.3} total={:.3}",
@@ -4378,7 +5575,14 @@ fn save_quat_population(
         // from becoming unreadably long).
         let stem = match fitness_metric {
             Some(spec) => {
-                let names: String = spec.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>().join("+");
+                let mut names: String = spec.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>().join("+");
+                // Filesystems cap names at 255 bytes; leave room for the id and the
+                // longest thumbnail suffix ("_thumb_07.png").
+                if names.len() > 200 {
+                    let cut = (0..=200).rev().find(|&i| names.is_char_boundary(i)).unwrap_or(0);
+                    names.truncate(cut);
+                    names.push('~');
+                }
                 format!("{names}_{id:016x}")
             }
             None => format!("{id:016x}"),
@@ -4476,7 +5680,7 @@ const THUMB_ANIM_SIZE: u32 = 96;
 /// other quat-raymarch command already uses — no new render logic.
 fn render_genome_thumbnails(genome: &Genome, out_dir: &std::path::Path, stem: &str, use_gpu: bool) {
     let formula = nnfractals::quat_dag::QuatDagFormula { prog: &genome.program, warp: &genome.warp, julia: genome.julia_mode, jc: (genome.julia_cre, genome.julia_cim), phoenix: (genome.phoenix_re, genome.phoenix_im) };
-    let domain_radius = 1.6;
+    let (collapse_eff, domain_radius) = nnfractals::quat_collapse::view_setup(genome.collapse, genome.view_range);
     let fov_deg = 45.0;
     let bg_color = (0.03, 0.02, 0.06);
     let base_params = nnfractals::quat_dag::RaymarchDagParams {
@@ -4484,7 +5688,7 @@ fn render_genome_thumbnails(genome: &Genome, out_dir: &std::path::Path, stem: &s
         time_axis: nnfractals::quat_fractal::TimeAxis::C,
         time_val: 0.0,
         domain_radius,
-        box_bounds: None, axis_assignment: None, clip_plane: None, slide_iter: None, hide_above: None,
+        box_bounds: None, axis_assignment: None, clip_plane: None, slide_iter: None, hide_above: None, axis_remap: None, collapse: collapse_eff,
         max_iter: 50,
         bailout: genome.bailout_radius as f64,
         max_march_steps: 150,
@@ -4556,9 +5760,14 @@ const VIEW_SIZE: u32 = 224;
 /// `_thumb_00..07.png` sequence: those are one orbit turn at FIXED C
 /// (shape only, no C-sweep) and too small for SigLIP's 224×224 native
 /// input — resizing up would add no information, only blur.
+/// `quat-dag-thumbs --t-linear`: slice-family views at the scoring samples
+/// (-h, -h/2, 0, +h/2) instead of the rater's (-h, -h/3, +h/3, +h), whose ± pairs
+/// mirror each other for most genomes.
+static VIEW_T_LINEAR: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 fn render_genome_views(genome: &Genome, out_dir: &std::path::Path, stem: &str, use_gpu: bool) -> Vec<std::path::PathBuf> {
     let formula = nnfractals::quat_dag::QuatDagFormula { prog: &genome.program, warp: &genome.warp, julia: genome.julia_mode, jc: (genome.julia_cre, genome.julia_cim), phoenix: (genome.phoenix_re, genome.phoenix_im) };
-    let domain_radius = 1.6;
+    let (collapse_eff, domain_radius) = nnfractals::quat_collapse::view_setup(genome.collapse, genome.view_range);
     let fov_deg = 45.0;
     let bg_color = (0.03, 0.02, 0.06);
     let base_params = nnfractals::quat_dag::RaymarchDagParams {
@@ -4566,7 +5775,7 @@ fn render_genome_views(genome: &Genome, out_dir: &std::path::Path, stem: &str, u
         time_axis: nnfractals::quat_fractal::TimeAxis::C,
         time_val: 0.0,
         domain_radius,
-        box_bounds: None, axis_assignment: None, clip_plane: None, slide_iter: None, hide_above: None,
+        box_bounds: None, axis_assignment: None, clip_plane: None, slide_iter: None, hide_above: None, axis_remap: None, collapse: collapse_eff,
         max_iter: 50,
         bailout: genome.bailout_radius as f64,
         max_march_steps: 150,
@@ -4587,7 +5796,14 @@ fn render_genome_views(genome: &Genome, out_dir: &std::path::Path, stem: &str, u
         phase0: 0.0,
         fov_y: fov_deg.to_radians(),
     };
-    let c_values = nnfractals::quat_live_view::view_c_values(genome.bailout_radius as f64);
+    let method = nnfractals::quat_collapse::Collapse::effective(genome.collapse).method;
+    let mut c_values = nnfractals::quat_live_view::view_c_values_m(method, genome.bailout_radius as f64);
+    if VIEW_T_LINEAR.load(std::sync::atomic::Ordering::Relaxed) && !method.time_is_angle() {
+        // Same samples as scoring (quat_collapse::time_for_phase_m): -h, -h/2, 0, +h/2.
+        for (i, c) in c_values.iter_mut().enumerate() {
+            *c = nnfractals::quat_collapse::time_for_phase_m(method, genome.bailout_radius as f64, i as f64 / nnfractals::quat_live_view::VIEW_C_VALUES as f64);
+        }
+    }
     let mut paths = Vec::with_capacity(VIEW_ANGLES * VIEW_C_VALUES);
     let mut idx = 0usize;
     for a in 0..VIEW_ANGLES {
@@ -4901,7 +6117,7 @@ fn ga_opts_from(args: &[String]) -> nnfractals::time_ga::TimeGaOpts {
         generations: get_flag_or(args, "--gens", 8),
         finalists: get_flag_or(args, "--finalists", 6),
         max_channels: get_flag_or(args, "--channels", 2),
-        seed: get_flag_or(args, "--seed", 0u64),
+        seed: seed_flag(args),
         ..Default::default()
     };
     o.full.depths = get_flag_or(args, "--depths", o.full.depths);
@@ -5177,7 +6393,7 @@ fn cmd_time_ga(genome: &Genome, label: &str, out_dir: &Path, args: &[String]) {
         finalists: get_flag_or(args, "--finalists", 6),
         fps: get_flag_or(args, "--fps", 24),
         angle_coloring: args.iter().any(|a| a == "--angle-coloring"),
-        seed: get_flag_or(args, "--seed", 0u64),
+        seed: seed_flag(args),
         ..Default::default()
     };
     opts.full.depths = get_flag_or(args, "--depths", opts.full.depths);
@@ -5722,8 +6938,11 @@ fn cmd_score_mined_targets(mined_path: &Path) {
 }
 
 fn main() {
-    render_gpu::init_gpu();
-    if !render_gpu::gpu_available() {
+    nnfractals::quat_collapse::init_from_env();
+    // NN_NO_GPU=1: never touch the GPU (not even init's warm-up dispatch).
+    let no_gpu = std::env::var("NN_NO_GPU").is_ok_and(|v| v == "1");
+    if !no_gpu { render_gpu::init_gpu(); }
+    if !no_gpu && !render_gpu::gpu_available() {
         eprintln!("warning: no GPU adapter found — falling back to per-candidate CPU rendering (render_batch_dag's own fallback), much slower than intended.");
     }
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -6181,7 +7400,7 @@ fn main() {
                 .map(PathBuf::from)
                 .unwrap_or_else(|| formula_path.parent().unwrap_or(Path::new(".")).to_path_buf());
             let samples: usize = get_flag_or(&args, "--samples", 40);
-            let seed: u64 = get_flag_or(&args, "--seed", 0);
+            let seed: u64 = seed_flag(&args);
 
             let opts = time_explore::TimeExploreOpts {
                 probe_w: get_flag_or(&args, "--probe-w", 160),
@@ -6558,7 +7777,7 @@ fn main() {
                 time_axis,
                 time_val: get_flag_or(&args, "--c", 0.0),
                 domain_radius: get_flag_or(&args, "--domain-radius", 1.6),
-                box_bounds: None, axis_assignment: None, clip_plane: None, slide_iter: None, hide_above: None,
+                box_bounds: None, axis_assignment: None, clip_plane: None, slide_iter: None, hide_above: None, axis_remap: None, collapse: None,
                 max_iter: get_flag_or(&args, "--max-iter", 60),
                 bailout: get_flag_or(&args, "--bailout", genome.bailout_radius as f64),
                 max_march_steps: get_flag_or(&args, "--max-march-steps", 200),
@@ -6617,24 +7836,28 @@ fn main() {
                 jc: (genome.julia_cre, genome.julia_cim),
                 phoenix: (genome.phoenix_re, genome.phoenix_im),
             };
+            // The genome's own collapse (S3 etc.) and view range, as every thumbnail/sheet
+            // renders it; was hardcoded to a plain slice, so S3 genomes rendered wrong.
+            let (genome_collapse, genome_domain) = nnfractals::quat_collapse::view_setup(genome.collapse, genome.view_range);
+            let dom: f64 = get_flag_or(&args, "--domain-radius", genome_domain);
             let params = nnfractals::quat_dag::RaymarchDagParams {
                 formula: dag_formula,
                 time_axis,
                 time_val: c0,
-                domain_radius: get_flag_or(&args, "--domain-radius", 1.6),
-                box_bounds: None, axis_assignment: None, clip_plane: None, slide_iter: None, hide_above: None,
+                domain_radius: dom,
+                box_bounds: None, axis_assignment: None, clip_plane: None, slide_iter: None, hide_above: None, axis_remap: None, collapse: genome_collapse,
                 max_iter: get_flag_or(&args, "--max-iter", 60),
                 bailout: get_flag_or(&args, "--bailout", genome.bailout_radius as f64),
                 max_march_steps: get_flag_or(&args, "--max-march-steps", 200),
-                hit_epsilon: get_flag_or(&args, "--hit-eps", 1e-4 * get_flag_or(&args, "--domain-radius", 1.6)),
+                hit_epsilon: get_flag_or(&args, "--hit-eps", 1e-4 * dom),
                 step_safety: get_flag_or(&args, "--step-safety", 0.8),
                 light_dir: parse_vec3(get_flag(&args, "--light").unwrap_or("0.5,0.8,0.3")),
-                normal_eps: get_flag_or(&args, "--normal-eps", 1e-3 * get_flag_or(&args, "--domain-radius", 1.6)),
-                color_probe_offset: get_flag_or(&args, "--color-probe-offset", 1e-2 * get_flag_or(&args, "--domain-radius", 1.6)),
+                normal_eps: get_flag_or(&args, "--normal-eps", 1e-3 * dom),
+                color_probe_offset: get_flag_or(&args, "--color-probe-offset", 1e-2 * dom),
                 aa: get_flag_or(&args, "--aa", 1),
             };
             let fov_deg_for_orbit: f64 = get_flag_or(&args, "--fov-deg", 45.0);
-            let domain_radius_for_orbit: f64 = get_flag_or(&args, "--domain-radius", 1.6);
+            let domain_radius_for_orbit: f64 = dom;
             // Default --radius is now ASPECT-AWARE (see
             // recommended_orbit_radius's docs) — a fixed default like the
             // old "4.0" framed a square probe fine but left the object
@@ -6720,7 +7943,7 @@ fn main() {
             } else if let Some(pool_dir) = get_flag(&args, "--pool-dir") {
                 let sample_n: usize = get_flag_or(&args, "--sample", 500);
                 let top_k: usize = get_flag_or(&args, "--top", 20);
-                let seed: u64 = get_flag_or(&args, "--seed", 42);
+                let seed: u64 = seed_flag(&args);
                 let out_list = get_flag(&args, "--out-list").map(PathBuf::from);
 
                 let mut all_files: Vec<PathBuf> = std::fs::read_dir(pool_dir)
@@ -6784,6 +8007,78 @@ fn main() {
             } else {
                 panic!("quat-dag-score needs either --genome path.nn (score one) or --pool-dir DIR (score+rank a random sample)");
             }
+        }
+        Some("quat-metric-terms") => {
+            // Raw value of each fitness term (and the low-res blank/noise gate) for every genome in
+            // --dir, as CSV: lets recipes be compared offline on rated genomes.
+            let dir = get_flag(&args, "--dir").unwrap_or_else(|| panic!("quat-metric-terms needs --dir DIR"));
+            let terms: Vec<String> = get_flag(&args, "--terms").unwrap_or_else(|| panic!("quat-metric-terms needs --terms a,b,...")).split(',').map(|t| t.trim().to_string()).collect();
+            let use_gpu = args.iter().any(|a| a == "--gpu");
+            let probe_size: u32 = get_flag_or(&args, "--probe-size", 96);
+            let m = get_flag(&args, "--collapse").unwrap_or("s3");
+            let method = nnfractals::quat_collapse::Method::parse(m).unwrap_or_else(|| panic!("unknown --collapse {m:?}"));
+            nnfractals::quat_collapse::set(method);
+            if method.time_is_angle() {
+                COLLAPSE_EVAL.store(true, std::sync::atomic::Ordering::Relaxed);
+                EVAL_PHASES.store(get_flag_or(&args, "--phases", 3u32), std::sync::atomic::Ordering::Relaxed);
+            }
+            let mut files: Vec<PathBuf> = std::fs::read_dir(dir).unwrap_or_else(|e| panic!("failed to read --dir {dir:?}: {e}"))
+                .filter_map(|e| e.ok()).map(|e| e.path()).filter(|p| p.extension().and_then(|s| s.to_str()) == Some("nn")).collect();
+            files.sort();
+            let mut csv = format!("file,gate,{}\n", terms.join(","));
+            for (i, f) in files.iter().enumerate() {
+                let Ok(mut g) = io::load_genome(f) else { continue };
+                if g.program.is_empty() { continue; }
+                if g.collapse.is_none() { g.collapse = Some(nnfractals::quat_collapse::Collapse::of(method)); }
+                let gate = passes_image_gate(&g, false, use_gpu); // motion is its own column
+                let (vals, _) = metric_term_values(&g, &terms, probe_size, use_gpu);
+                csv.push_str(&format!("{},{},{}\n", f.file_name().unwrap().to_string_lossy(), gate as u8, vals.iter().map(|v| format!("{v:.6}")).collect::<Vec<_>>().join(",")));
+                eprint!("\r  {}/{}   ", i + 1, files.len());
+            }
+            eprintln!();
+            match get_flag(&args, "--out") { Some(o) => std::fs::write(o, csv).expect("write --out"), None => print!("{csv}") }
+        }
+        Some("quat-planes") => {
+            // The six RABC axis-pair slices (quat_planes.rs) of every genome in --dir: a
+            // labelled 6-tile PNG strip plus the raw escape times (6×size×size f32, little
+            // endian) for offline analysis. Raw 4D slices: no collapse, other axes at 0.
+            use rayon::prelude::*;
+            let dir = get_flag(&args, "--dir").unwrap_or_else(|| panic!("quat-planes needs --dir DIR"));
+            let out = PathBuf::from(get_flag(&args, "--out-dir").unwrap_or("explorer_out/quat_planes_batch"));
+            let size: u32 = get_flag_or(&args, "--size", 160);
+            let extent: f64 = get_flag_or(&args, "--extent", 1.6);
+            let max_iter: u32 = get_flag_or(&args, "--max-iter", 60);
+            std::fs::create_dir_all(&out).expect("create --out-dir");
+            let mut files: Vec<PathBuf> = std::fs::read_dir(dir).unwrap_or_else(|e| panic!("failed to read --dir {dir:?}: {e}"))
+                .filter_map(|e| e.ok()).map(|e| e.path()).filter(|p| p.extension().and_then(|s| s.to_str()) == Some("nn")).collect();
+            files.sort();
+            for (k, f) in files.iter().enumerate() {
+                let Ok(g) = io::load_genome(f) else { continue };
+                if g.program.is_empty() { continue; }
+                let formula = nnfractals::quat_dag::QuatDagFormula { prog: &g.program, warp: &g.warp, julia: g.julia_mode, jc: (g.julia_cre, g.julia_cim), phoenix: (g.phoenix_re, g.phoenix_im) };
+                let bailout_sq = (g.bailout_radius as f64).powi(2);
+                let n = size as usize;
+                let mut raw: Vec<u8> = Vec::with_capacity(6 * n * n * 4);
+                let mut strip = vec![0u8; 6 * n * n * 3];
+                for (pi, &axes) in nnfractals::quat_planes::PLANES.iter().enumerate() {
+                    let (i, j) = axes;
+                    let times: Vec<f32> = (0..n * n).into_par_iter().map(|idx| {
+                        let (x, y) = (idx % n, idx / n);
+                        let mut p = [0.0f64; 4];
+                        p[i] = -extent + 2.0 * extent * (x as f64 + 0.5) / n as f64;
+                        p[j] = extent - 2.0 * extent * (y as f64 + 0.5) / n as f64;
+                        nnfractals::quat_dag::quat_dag_escape_de(&formula, nnfractals::quaternion::Quat::new(p[0], p[1], p[2], p[3]), max_iter, bailout_sq).0
+                    }).collect();
+                    for t in &times { raw.extend_from_slice(&t.to_le_bytes()); }
+                    let rgb = nnfractals::colormap::apply_colormap_equalized(&times, max_iter, "lava");
+                    for y in 0..n { let dst = (y * 6 * n + pi * n) * 3; strip[dst..dst + n * 3].copy_from_slice(&rgb[y * n * 3..(y + 1) * n * 3]); }
+                }
+                let stem = f.file_stem().unwrap().to_string_lossy().to_string();
+                io::save_png(&strip, 6 * size, size, &out.join(format!("{stem}_planes.png"))).ok();
+                std::fs::write(out.join(format!("{stem}_planes.f32")), &raw).ok();
+                eprint!("\r  {}/{}   ", k + 1, files.len());
+            }
+            eprintln!();
         }
         Some("quat-dag-rescore") => {
             // Backfills every quat_* metric field (the original 6 +
@@ -6952,7 +8247,7 @@ fn main() {
             let generations: usize = get_flag_or(&args, "--generations", 25);
             let survivors: usize = get_flag_or(&args, "--survivors", 15);
             let probe_size: u32 = get_flag_or(&args, "--probe-size", 128);
-            let seed: u64 = get_flag_or(&args, "--seed", 1);
+            let seed: u64 = seed_flag(&args);
             let use_gpu = args.iter().any(|a| a == "--gpu");
             let crossover_mode = match get_flag(&args, "--crossover-mode").unwrap_or("legacy") {
                 "legacy" => CrossoverMode::Legacy,
@@ -6967,9 +8262,112 @@ fn main() {
                 max_depth: get_flag_or(&args, "--mutation-max-depth", default_strength.max_depth),
             };
             let fitness_metric = get_flag(&args, "--fitness-metric").map(parse_fitness_metric_spec);
+            // `--no-bulb`: mutation never splices in the generalised Mandelbulb op (with/without comparisons).
+            if args.iter().any(|a| a == "--no-bulb") {
+                nnfractals::quat_genome_ops::BULB_ENABLED.store(false, std::sync::atomic::Ordering::Relaxed);
+            }
+            // Operator probabilities (tuned per campaign by scripts/optuna_campaigns.py).
+            if let Some(v) = get_flag(&args, "--bulb-prob").and_then(|v| v.parse::<f64>().ok()) {
+                nnfractals::quat_genome_ops::BULB_SPLICE_PROB.store(v.to_bits(), std::sync::atomic::Ordering::Relaxed);
+            }
+            if let Some(v) = get_flag(&args, "--kbc-prob").and_then(|v| v.parse::<f64>().ok()) {
+                nnfractals::quat_genome_ops::KBC_SPLICE_PROB.store(v.to_bits(), std::sync::atomic::Ordering::Relaxed);
+            }
+            // Per-op selection weights (`name:weight,...`, names as in `formula::op::name`; ops
+            // not listed get weight 1). Replaces the independent bulb/kbc splice chances.
+            if let Some(v) = get_flag(&args, "--op-weights") {
+                use nnfractals::formula::op;
+                let mut w = [1.0f64; nnfractals::quat_genome_ops::N_WEIGHTS];
+                w[nnfractals::quat_genome_ops::KBC_MUL as usize] = 0.0; // splice-only; off unless listed
+                for part in v.split(',').filter(|x| !x.trim().is_empty()) {
+                    let (name, val) = part.split_once(':').unwrap_or_else(|| panic!("--op-weights: expected name:weight, got {part:?}"));
+                    let o = if name.trim() == "kbcmul" { nnfractals::quat_genome_ops::KBC_MUL } else {
+                        (0..op::N_OPS as u8).find(|&o| op::name(o) == name.trim()).unwrap_or_else(|| panic!("--op-weights: unknown op {name:?}"))
+                    };
+                    w[o as usize] = val.trim().parse().unwrap_or_else(|_| panic!("--op-weights: bad number in {part:?}"));
+                }
+                *nnfractals::quat_genome_ops::OP_WEIGHTS.lock().unwrap() = Some(w);
+            }
+            if let Some(v) = get_flag(&args, "--random-immigrant-frac").and_then(|v| v.parse::<f64>().ok()) {
+                nnfractals::quat_genome_ops::RANDOM_IMMIGRANT_FRAC.store(v.to_bits(), std::sync::atomic::Ordering::Relaxed);
+            }
+            if let Some(v) = get_flag(&args, "--gen-params") {
+                nnfractals::quat_genome_ops::set_gen_params(nnfractals::quat_genome_ops::parse_gen_params(&v).unwrap_or_else(|e| panic!("--gen-params: {e}")));
+            }
+            if let Some(v) = get_flag(&args, "--random-immigrant-nodes").and_then(|v| v.parse::<usize>().ok()) {
+                nnfractals::quat_genome_ops::RANDOM_IMMIGRANT_NODES.store(v.clamp(1, 24), std::sync::atomic::Ordering::Relaxed);
+            }
+            if let Some(v) = get_flag(&args, "--edit-weights") {
+                let w: Vec<f64> = v.split(',').map(|x| x.trim().parse().unwrap_or_else(|_| panic!("--edit-weights: bad number in {v:?}"))).collect();
+                assert_eq!(w.len(), 5, "--edit-weights takes 5 numbers: perturb,swap,rewire,grow,prune");
+                *nnfractals::quat_genome_ops::EDIT_WEIGHTS.lock().unwrap() = [w[0], w[1], w[2], w[3], w[4]];
+            }
+            // `--no-kbc`: mutation never splices in a B/C-part constant.
+            if args.iter().any(|a| a == "--no-kbc") {
+                nnfractals::quat_genome_ops::KBC_ENABLED.store(false, std::sync::atomic::Ordering::Relaxed);
+            }
+            if let Some(m) = get_flag(&args, "--collapse") {
+                // `auto`: every genome carries its own projection, evolved with the formula
+                // (candidates from --methods, default: the continuous-time family + offset/slab/tilt).
+                let auto = m == "auto";
+                if auto {
+                    let list = get_flag(&args, "--methods").unwrap_or("s3,isos3,spin,isospin,offset,slab,tilt");
+                    let ms: Vec<_> = list.split(',').map(|n| nnfractals::quat_collapse::Method::parse(n.trim()).unwrap_or_else(|| panic!("unknown method {n:?} in --methods"))).collect();
+                    eprintln!("collapse auto: candidates {:?}", ms.iter().map(|m| m.name()).collect::<Vec<_>>());
+                    *AUTO_METHODS.lock().unwrap() = ms;
+                }
+                let method = if auto { nnfractals::quat_collapse::Method::S3 } else {
+                    nnfractals::quat_collapse::Method::parse(m).unwrap_or_else(|| panic!("unknown --collapse {m:?} — slice|tilt|slab|offset|s3|proj3|spin|isospin|isos3|auto"))
+                };
+                let mut col = nnfractals::quat_collapse::Collapse::of(method);
+                col.rho = get_flag_or(&args, "--s3-rho", col.rho);
+                col.plane = get_flag_or(&args, "--s3-plane", col.plane);
+                nnfractals::quat_collapse::set_global(col);
+                COLLAPSE_EVAL.store(true, std::sync::atomic::Ordering::Relaxed);
+                EVAL_PHASES.store(get_flag_or(&args, "--eval-phases", 3u32), std::sync::atomic::Ordering::Relaxed);
+                SMOOTH_WEIGHT.store(get_flag_or(&args, "--smooth-weight", 0.0f64).to_bits(), std::sync::atomic::Ordering::Relaxed);
+                eprintln!("collapse method: {}", method.name());
+            }
+            if args.iter().any(|a| a == "--auto-range") {
+                AUTO_RANGE.store(true, std::sync::atomic::Ordering::Relaxed);
+                eprintln!("auto-range: seeds/immigrants are scanned for their best view range; it drifts with mutation");
+            }
             let predator_prey = args.iter().any(|a| a == "--predator-prey");
             let map_elites = args.iter().any(|a| a == "--map-elites");
             let stagnation_gens: usize = get_flag_or(&args, "--stagnation-gens", 25);
+            let stop_flat: usize = get_flag_or(&args, "--stop-flat", 0);
+            let max_seconds: f64 = get_flag_or(&args, "--max-seconds", 0.0);
+            // Scoring threads: --workers N (0 = all cores; default 1 = the old serial loop), and
+            // --control-file F to change it while running (`{"workers": N}`, polled every second).
+            set_score_workers(get_flag_or(&args, "--workers", 1usize));
+            #[cfg(feature = "wgpu-backend")]
+            if args.iter().any(|a| a == "--no-pipeline-cache") {
+                nnfractals::render_gpu_raymarch_dag_codegen::PIPE_CACHE_ENABLED.store(false, std::sync::atomic::Ordering::Relaxed);
+            }
+            if args.iter().any(|a| a == "--no-gate-interpreter") {
+                GATE_INTERPRETER.store(false, std::sync::atomic::Ordering::Relaxed);
+            }
+            match get_flag(&args, "--gpu-mode") {
+                Some("interpreter") => GPU_FORCE_INTERPRETER.store(true, std::sync::atomic::Ordering::Relaxed),
+                Some("auto") | Some("codegen") | None => {}
+                Some(other) => panic!("--gpu-mode: expected auto|codegen|interpreter, got {other:?}"),
+            }
+            if args.iter().any(|a| a == "--profile") {
+                PROFILE_ON.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+            if args.iter().any(|a| a == "--auto-workers") {
+                enable_autotune(true);
+            }
+            if let Some(f) = get_flag(&args, "--control-file") {
+                start_worker_control(f.to_string());
+            }
+            eprintln!("scoring workers: {} (of {} cores){}", SCORE_WORKERS.load(std::sync::atomic::Ordering::Relaxed), n_cores(), if WORKERS_LIVE.load(std::sync::atomic::Ordering::Relaxed) { ", live-adjustable" } else { "" });
+            if max_seconds > 0.0 {
+                *RUN_DEADLINE.lock().unwrap() = Some((std::time::Instant::now(), max_seconds));
+            }
+            let save_top: usize = get_flag_or(&args, "--save-top", 0);
+            let embed_div: f64 = get_flag_or(&args, "--embed-diversity", 0.0);
+            let mix: (f64, f64) = (get_flag_or(&args, "--immigrant-frac", 0.55), get_flag_or(&args, "--crossover-frac", 0.30));
             let pref_model_path = get_flag(&args, "--pref-model").unwrap_or("pref_model_quat.json");
             if map_elites && predator_prey {
                 panic!("--map-elites and --predator-prey are mutually exclusive — MAP-Elites' niches ARE the diversity mechanism, predator-prey pressure has nothing to act on");
@@ -6977,25 +8375,174 @@ fn main() {
             if map_elites {
                 cmd_quat_dag_evolve_map_elites(pool_dir, out_dir, population, generations, probe_size, use_gpu, seed, crossover_mode, mutation_strength, fitness_metric, stagnation_gens);
             } else {
-                cmd_quat_dag_evolve(pool_dir, out_dir, population, generations, survivors, probe_size, use_gpu, seed, crossover_mode, mutation_strength, fitness_metric, predator_prey, stagnation_gens, pref_model_path);
+                cmd_quat_dag_evolve(pool_dir, out_dir, population, generations, survivors, probe_size, use_gpu, seed, crossover_mode, mutation_strength, fitness_metric, predator_prey, stagnation_gens, stop_flat, save_top, mix, embed_div, pref_model_path);
             }
+            // Leave without running destructors: with the codegen and interpreter GPU paths both in
+            // use, dropping their two wgpu devices at process exit segfaulted on some runs, after
+            // everything had been saved. stderr is unbuffered and the outputs are already closed.
+            use std::io::Write;
+            let _ = std::io::stdout().flush();
+            let _ = std::io::stderr().flush();
+            // `_exit`, not `exit`: libc's exit also runs the Vulkan driver's atexit teardown.
+            #[cfg(unix)]
+            {
+                unsafe extern "C" { fn _exit(code: i32) -> !; }
+                unsafe { _exit(0) }
+            }
+            #[cfg(not(unix))]
+            std::process::exit(0);
         }
         Some("quat-dag-random") => {
             let out_dir = get_flag(&args, "--out-dir").unwrap_or("fractals_dag_quat");
             let count: usize = get_flag_or(&args, "--count", 200);
-            let seed: u64 = get_flag_or(&args, "--seed", 1);
+            let seed: u64 = seed_flag(&args);
             let use_gpu = args.iter().any(|a| a == "--gpu");
             cmd_quat_dag_random(out_dir, count, use_gpu, seed);
+        }
+        Some("range-scan") => {
+            // range-scan PATH... [--collapse s3|slice] [--phases N] [--gpu] [--out-dir D | --in-place]
+            // Finds each genome's best view range (see `scan_range`) and reports the taste
+            // gain over the old fixed range; writes it into a copy (--out-dir) or the file.
+            let mut files: Vec<std::path::PathBuf> = Vec::new();
+            let mut i = 1;
+            while i < args.len() {
+                if args[i] == "--in-place" || args[i] == "--gpu" { i += 1; continue; }
+                if args[i].starts_with("--") { i += 2; continue; }
+                let p = std::path::PathBuf::from(&args[i]);
+                if p.is_dir() {
+                    let mut v: Vec<_> = std::fs::read_dir(&p).unwrap().filter_map(|e| e.ok()).map(|e| e.path()).filter(|x| x.extension().map_or(false, |e| e == "nn")).collect();
+                    v.sort();
+                    files.extend(v);
+                } else { files.push(p); }
+                i += 1;
+            }
+            let use_gpu = args.iter().any(|a| a == "--gpu");
+            let in_place = args.iter().any(|a| a == "--in-place");
+            let out_dir = get_flag(&args, "--out-dir").map(std::path::PathBuf::from);
+            let m = get_flag(&args, "--collapse").unwrap_or("s3");
+            let method = nnfractals::quat_collapse::Method::parse(m).unwrap_or_else(|| panic!("unknown --collapse {m:?}"));
+            nnfractals::quat_collapse::set(method);
+            if method.time_is_angle() {
+                COLLAPSE_EVAL.store(true, std::sync::atomic::Ordering::Relaxed);
+                EVAL_PHASES.store(get_flag_or(&args, "--phases", 3u32), std::sync::atomic::Ordering::Relaxed);
+            }
+            if let Some(d) = &out_dir { std::fs::create_dir_all(d).ok(); }
+            println!("{:<26} {:>7} {:>9} {:>9}", "genome", "range", "taste@1", "taste@best");
+            let (mut sum_old, mut sum_new, mut n) = (0.0, 0.0, 0usize);
+            for f in &files {
+                let Ok(mut g) = io::load_genome(f) else { continue };
+                if g.program.is_empty() { continue; }
+                g.view_range = 0.0;
+                // The genome carries the projection its range was chosen under.
+                if g.collapse.is_none() { g.collapse = Some(nnfractals::quat_collapse::Collapse::of(method)); }
+                let old = taste_score_for_genome(&g, use_gpu);
+                let r = scan_range(&g, use_gpu);
+                g.view_range = r;
+                let new = taste_score_for_genome(&g, use_gpu);
+                println!("{:<26} {:>7.2} {:>9.3} {:>9.3}", f.file_stem().and_then(|s| s.to_str()).unwrap_or("?").chars().take(26).collect::<String>(), r, old, new);
+                sum_old += old; sum_new += new; n += 1;
+                if in_place { io::save_genome(&g, f).ok(); }
+                else if let Some(d) = &out_dir { io::save_genome(&g, &d.join(f.file_name().unwrap())).ok(); }
+            }
+            let n = n.max(1) as f64;
+            println!("MEAN taste: fixed range {:.3} -> scanned range {:.3}", sum_old / n, sum_new / n);
+        }
+        Some("collapse-compare") => {
+            // collapse-compare PATH... [--methods a,b,c] [--phases N] [--max N] [--smooth-weight w] [--out-dir D]
+            // Scores each genome under each projection with the taste model (the GA's own
+            // fitness: half mean, half worst of N moments, minus the flash penalty) and
+            // reports the best one per genome. With --out-dir, writes a copy of every
+            // genome carrying its best projection.
+            let mut files: Vec<std::path::PathBuf> = Vec::new();
+            let mut i = 1;
+            while i < args.len() {
+                if args[i].starts_with("--") { i += 2; continue; }
+                let p = std::path::PathBuf::from(&args[i]);
+                if p.is_dir() {
+                    let mut v: Vec<_> = std::fs::read_dir(&p).unwrap().filter_map(|e| e.ok()).map(|e| e.path()).filter(|x| x.extension().map_or(false, |e| e == "nn")).collect();
+                    v.sort();
+                    files.extend(v);
+                } else { files.push(p); }
+                i += 1;
+            }
+            let use_gpu = args.iter().any(|a| a == "--gpu");
+            let max: usize = get_flag_or(&args, "--max", files.len());
+            files.truncate(max);
+            let list = get_flag(&args, "--methods").unwrap_or("slice,tilt,slab,offset,s3,proj3,spin,isospin,isos3");
+            let methods: Vec<nnfractals::quat_collapse::Method> = list.split(',').map(|n| nnfractals::quat_collapse::Method::parse(n.trim()).unwrap_or_else(|| panic!("unknown method {n:?}"))).collect();
+            COLLAPSE_EVAL.store(true, std::sync::atomic::Ordering::Relaxed);
+            EVAL_PHASES.store(get_flag_or(&args, "--phases", 6u32), std::sync::atomic::Ordering::Relaxed);
+            SMOOTH_WEIGHT.store(get_flag_or(&args, "--smooth-weight", 0.2f64).to_bits(), std::sync::atomic::Ordering::Relaxed);
+            nnfractals::quat_collapse::set(nnfractals::quat_collapse::Method::S3); // taste model family
+            let out_dir = get_flag(&args, "--out-dir").map(std::path::PathBuf::from);
+            if let Some(d) = &out_dir { std::fs::create_dir_all(d).ok(); }
+            print!("{:<26}", "genome");
+            for m in &methods { print!(" {:>8}", m.name()); }
+            println!("  best");
+            let mut wins: std::collections::BTreeMap<&str, usize> = std::collections::BTreeMap::new();
+            let mut sums = vec![0.0f64; methods.len()];
+            for f in &files {
+                let Ok(mut g) = io::load_genome(f) else { continue };
+                if g.program.is_empty() { continue; }
+                let mut row = Vec::new();
+                for m in &methods {
+                    g.collapse = Some(nnfractals::quat_collapse::Collapse::of(*m));
+                    row.push(taste_score_for_genome(&g, use_gpu));
+                }
+                let bi = row.iter().enumerate().max_by(|a, b| a.1.partial_cmp(b.1).unwrap()).map(|x| x.0).unwrap();
+                print!("{:<26}", f.file_stem().and_then(|s| s.to_str()).unwrap_or("?").chars().take(26).collect::<String>());
+                for v in &row { print!(" {:>8.3}", v); }
+                println!("  {}", methods[bi].name());
+                for (k, v) in row.iter().enumerate() { sums[k] += v; }
+                *wins.entry(methods[bi].name()).or_insert(0) += 1;
+                if let Some(d) = &out_dir {
+                    g.collapse = Some(nnfractals::quat_collapse::Collapse::of(methods[bi]));
+                    io::save_genome(&g, &d.join(f.file_name().unwrap())).ok();
+                }
+            }
+            let n = files.len().max(1) as f64;
+            print!("{:<26}", "MEAN");
+            for v in &sums { print!(" {:>8.3}", v / n); }
+            println!();
+            println!("wins: {wins:?}");
+        }
+        Some("collapse-smooth") => {
+            let nn = args.get(1).filter(|a| !a.starts_with("--")).unwrap_or_else(|| panic!("collapse-smooth GENOME.nn --method M"));
+            let m = get_flag(&args, "--method").unwrap_or("s3");
+            let method = nnfractals::quat_collapse::Method::parse(m).unwrap_or_else(|| panic!("unknown --method {m:?}"));
+            let steps: Vec<usize> = get_flag(&args, "--steps").unwrap_or("8,20,40,80").split(',').filter_map(|x| x.trim().parse().ok()).collect();
+            let mut col = nnfractals::quat_collapse::Collapse::of(method);
+            col.rho = get_flag_or(&args, "--rho", col.rho);
+            col.plane = get_flag_or(&args, "--plane", col.plane);
+            if let Some(p) = get_flag(&args, "--pole") {
+                let v: Vec<f64> = p.split(',').filter_map(|x| x.trim().parse().ok()).collect();
+                if v.len() == 3 { col.pole = [v[0], v[1], v[2]]; }
+            }
+            cmd_collapse_smooth(std::path::Path::new(nn), col, get_flag_or(&args, "--size", 96u32), &steps);
+        }
+        Some("collapse-video") => {
+            let nn = args.get(1).filter(|a| !a.starts_with("--")).unwrap_or_else(|| panic!("collapse-video GENOME.nn --method M --out F.mp4"));
+            let m = get_flag(&args, "--method").unwrap_or("slice");
+            let method = nnfractals::quat_collapse::Method::parse(m).unwrap_or_else(|| panic!("unknown --method {m:?}"));
+            let out = get_flag(&args, "--out").unwrap_or("explorer_out/collapse.mp4");
+            cmd_collapse_video(std::path::Path::new(nn), method, std::path::Path::new(out), get_flag_or(&args, "--size", 1024u32), get_flag_or(&args, "--seconds", 10.0f64), get_flag_or(&args, "--fps", 10u32));
         }
         Some("quat-dag-thumbs") => {
             let dir = get_flag(&args, "--dir").unwrap_or_else(|| panic!("quat-dag-thumbs needs --dir DIR"));
             let use_gpu = args.iter().any(|a| a == "--gpu");
             let views = args.iter().any(|a| a == "--views");
+            if args.iter().any(|a| a == "--t-linear") { VIEW_T_LINEAR.store(true, std::sync::atomic::Ordering::Relaxed); }
+            if let Some(m) = get_flag(&args, "--collapse") {
+                nnfractals::quat_collapse::set(nnfractals::quat_collapse::Method::parse(m).unwrap_or_else(|| panic!("unknown --collapse {m:?}")));
+            }
+            // `--only FILE.nn`: redo just that genome (the rater does this after a range change).
+            let only = get_flag(&args, "--only").map(PathBuf::from);
             let files: Vec<PathBuf> = std::fs::read_dir(dir)
                 .unwrap_or_else(|e| panic!("failed to read --dir {dir:?}: {e}"))
                 .filter_map(|e| e.ok())
                 .map(|e| e.path())
                 .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("nn"))
+                .filter(|p| only.as_ref().map_or(true, |o| o.file_name() == p.file_name()))
                 .collect();
             eprintln!("quat-dag-thumbs: {} genomes in {dir} (views={views})", files.len());
             let start = std::time::Instant::now();
@@ -7022,7 +8569,7 @@ fn main() {
             // runs saved into the same --out-dir, filenames prefixed by
             // metric name) groups by metric instead of by random id/mtime.
             stems.sort();
-            write_contact_sheet(std::path::Path::new(dir), &stems);
+            if only.is_none() { write_contact_sheet(std::path::Path::new(dir), &stems); }
         }
         Some("quat-role-model-views") => {
             // Bulb power sweep + Mandelbox scale sweep + every other
@@ -7217,8 +8764,8 @@ fn main() {
             eprintln!("  nnfractals-explorer quat-raymarch-genome [out.png] --genome path.nn (a DAG-based genome — legacy 58-basis genomes aren't supported) [--c F (0.0)] [--time-axis r|a|b|c (c)] [--width N (960)] [--height N (960)] [--eye R,A,B (0,0,-4)] [--target R,A,B (0,0,0)] [--up R,A,B (0,1,0)] [--fov-deg F (50.0)] [--domain-radius F (1.6)] [--max-iter N (60)] [--bailout F (=genome's own bailout_radius)] [--max-march-steps N (200)] [--hit-eps F (=1e-4*domain-radius)] [--step-safety F (0.8 — analytic distance estimate, same default as quat-raymarch; see quat_dag.rs for the derivation)] [--light R,A,B (0.5,0.8,0.3)] [--normal-eps F (=1e-3*domain-radius)] [--colormap name (turbo)] [--bg-color R,G,B (0.03,0.02,0.06)] [--aa N (1)] [--gpu (dispatch the general WGSL DAG interpreter instead of CPU rayon — verified pixel-for-pixel against the CPU path in render_gpu_raymarch_dag's own tests; falls back to CPU if no GPU adapter is available)]");
             eprintln!("  nnfractals-explorer quat-raymarch-genome-video [out.mp4] --genome path.nn (a DAG-based genome) [--time-axis r|a|b|c (c)] [--c F (fixed, no pulse) | --c0/--c1 F (-0.6/0.6, sine pulse by default)] [--c-shape ramp|sine|cosine|triangle|sawtooth|pulse|orbit (sine)] [--c-freq F (1.5)] [--c-phase F (0.0)] [--frames N (90)] [--fps N (30)] [--width N (640)] [--height N (640)] [--target R,A,B (0,0,0)] [--axis R,A,B (0,1,0)] [--radius F (4.0)] [--turns F (1.0)] [--phase0 F (0.0)] [--fov-deg F (45.0)] [--domain-radius F (1.6)] [--max-iter N (60)] [--bailout F (=genome's own bailout_radius)] [--max-march-steps N (200)] [--hit-eps F (=1e-4*domain-radius)] [--step-safety F (0.8)] [--light R,A,B (0.5,0.8,0.3)] [--normal-eps F (=1e-3*domain-radius)] [--color-probe-offset F (=1e-2*domain-radius)] [--colormap name (lava)] [--bg-color R,G,B (0.03,0.02,0.06)] [--aa N (1)] [--gpu]");
             eprintln!("  nnfractals-explorer quat-formula-full-metrics [--formula name (bulb)] [--probe-size N (128)] [--gpu] [--out path.json (explorer_out/quat_formula_full_metrics.json)] — scores a classic hardcoded formula (not an evolved genome) across ALL 4 --time-axis choices (r/a/b/c), same probe camera/metric machinery as an evolved genome's own scoring, so the numbers are directly comparable to a .nn file's saved quat_* fields; writes one JSON object per axis plus an all-4-axes average");
-            eprintln!("  nnfractals-explorer quat-dag-score --genome path.nn (score ONE genome: anisotropy/coverage/solidity/shading_richness/color_entropy + weighted total, see quat_dag_fitness.rs) | --pool-dir DIR (score+rank a random SAMPLE of genomes in DIR) [--sample N (500)] [--seed N (42)] [--top N (20)] [--out-list path.csv (write the full ranked list)] [--probe-size N (96, square low-res probe renders)] [--gpu]");
-            eprintln!("  nnfractals-explorer quat-dag-evolve [--pool-dir DIR (fractals_dag, seeds the initial population)] [--out-dir DIR (fractals_dag_quat — deliberately separate, never writes into --pool-dir)] [--population N (40)] [--generations N (10), 0 = run forever — stop it (SIGTERM) yourself, e.g. from the launcher's \"generate forever\" supervisor] [--survivors N (12), elitist: carried over each generation unchanged] [--probe-size N (128)] [--seed N (1)] [--gpu] [--crossover-mode legacy|subtree (legacy)] [--mutation-min-edits N] [--mutation-max-edits N] [--mutation-const-scale F] [--mutation-max-depth N] [--fitness-metric SPEC] [--pref-model PATH (pref_model_quat.json)] — evolves the DAG genome's `program` (mutation/crossover, same as the 2D GA unless --crossover-mode subtree) selecting on a 50/50 blend of the geometric pre-filter (quat_dag_fitness) and Carl's own trained preference model (quat_pref::QuatPrefModel — scripts/train_pref_quat.py, a linear fit over the ~30 quat_* metrics from the browser's ⚖ Rate pairwise comparisons; falls back to geometric-only, NOT the generic 2D NIMA/TOPIQ/AP25 ensemble, if --pref-model isn't found), UNLESS --fitness-metric SPEC is set, which selects purely on SPEC instead — a bare metric name (any quat_dag_fitness/quat_dag_fitness's extended-metrics field, e.g. convexity/box_dim/opcode_diversity — structural names need no rendering at all, much faster), or a comma-separated weighted combo (e.g. \"silhouette_irregularity:1.0,shading_gradient:0.7,color_shading_corr:0.5\", fitness = weighted sum); every saved filename is prefixed with the metric name(s) used (see quat-dag-thumbs for static + animated thumbnails) and every genome gets all ~30 quat_* metric fields backfilled (see quat-dag-rescore to backfill an existing archive)");
+            eprintln!("  nnfractals-explorer quat-dag-score --genome path.nn (score ONE genome: anisotropy/coverage/solidity/shading_richness/color_entropy + weighted total, see quat_dag_fitness.rs) | --pool-dir DIR (score+rank a random SAMPLE of genomes in DIR) [--sample N (500)] [--seed N (random, logged)] [--top N (20)] [--out-list path.csv (write the full ranked list)] [--probe-size N (96, square low-res probe renders)] [--gpu]");
+            eprintln!("  nnfractals-explorer quat-dag-evolve [--pool-dir DIR (fractals_dag, seeds the initial population)] [--out-dir DIR (fractals_dag_quat — deliberately separate, never writes into --pool-dir)] [--population N (40)] [--generations N (10), 0 = run forever — stop it (SIGTERM) yourself, e.g. from the launcher's \"generate forever\" supervisor] [--survivors N (12), elitist: carried over each generation unchanged] [--probe-size N (128)] [--seed N (random, logged)] [--gpu] [--crossover-mode legacy|subtree (legacy)] [--mutation-min-edits N] [--mutation-max-edits N] [--mutation-const-scale F] [--mutation-max-depth N] [--fitness-metric SPEC] [--pref-model PATH (pref_model_quat.json)] — evolves the DAG genome's `program` (mutation/crossover, same as the 2D GA unless --crossover-mode subtree) selecting on a 50/50 blend of the geometric pre-filter (quat_dag_fitness) and Carl's own trained preference model (quat_pref::QuatPrefModel — scripts/train_pref_quat.py, a linear fit over the ~30 quat_* metrics from the browser's ⚖ Rate pairwise comparisons; falls back to geometric-only, NOT the generic 2D NIMA/TOPIQ/AP25 ensemble, if --pref-model isn't found), UNLESS --fitness-metric SPEC is set, which selects purely on SPEC instead — a bare metric name (any quat_dag_fitness/quat_dag_fitness's extended-metrics field, e.g. convexity/box_dim/opcode_diversity — structural names need no rendering at all, much faster), or a comma-separated weighted combo (e.g. \"silhouette_irregularity:1.0,shading_gradient:0.7,color_shading_corr:0.5\", fitness = weighted sum); every saved filename is prefixed with the metric name(s) used (see quat-dag-thumbs for static + animated thumbnails) and every genome gets all ~30 quat_* metric fields backfilled (see quat-dag-rescore to backfill an existing archive)");
             eprintln!("  nnfractals-explorer quat-dag-thumbs --dir DIR [--gpu] — (re)generates the static `{{stem}}.png` and animated `{{stem}}_thumb_00..07.png` thumbnail sequence (nnfractals-browser reads both) for every genome already in DIR, without touching the genomes themselves");
             eprintln!("  nnfractals-explorer quat-raymarch-video [out.mp4] [--formula name (bulb)] [--time-axis r|a|b|c (c)] [--c F (fixed value, no pulse — omit this and use --c0/--c1 instead for the default pulsing behavior)] [--c0 F (-0.6)] [--c1 F (0.6)] [--c-shape ramp|sine|cosine|triangle|sawtooth|pulse|orbit (sine — the time-axis value breathes within [c0,c1] as the camera orbits, NOT fixed like the single-frame quat-raymarch; pass --c-shape ramp for a one-way sweep instead, or --c alone for the old fixed-value behavior)] [--c-freq F (1.5 — cycles per clip; with the default --turns 1.0, this IS cycles per camera revolution)] [--c-phase F (0.0)] [--frames N (90)] [--fps N (30)] [--width N (640)] [--height N (640)] [--target R,A,B (0,0,0)] [--axis R,A,B (0,1,0)] [--radius F (4.0)] [--turns F (1.0)] [--phase0 F (0.0)] [--fov-deg F (45.0)] [--domain-radius F (1.6)] [--max-iter N (60)] [--bailout F (4.0)] [--max-march-steps N (200)] [--hit-eps F (=1e-4*domain-radius)] [--step-safety F (0.8)] [--light R,A,B (0.5,0.8,0.3)] [--normal-eps F (=1e-3*domain-radius)] [--color-probe-offset F (=1e-2*domain-radius)] [--colormap name (lava)] [--bg-color R,G,B (0.03,0.02,0.06)] [--aa N (1)] [--gpu (dispatch the WGSL compute shader instead of CPU rayon — verified pixel-for-pixel against the CPU path in render_gpu_raymarch's own tests; falls back to CPU if no GPU adapter is available)]");
             eprintln!("      voxelizes the quaternion fractal at a FIXED C (the time axis quat-mandelbrot animates) into an res^3 (R,A,B) field, extracts a surface with Naive Surface Nets, smooths it, decimates to ~target-tris, writes an STL.");
@@ -7229,5 +8776,71 @@ fn main() {
             eprintln!("      panzoom: [--origin R,A,B (0,0,0)] [--direction R,A,B (1,0,0)] [--distance F (1.0)] [--basis-u R,A,B (1,0,0)] [--basis-v R,A,B (0,1,0)] [--zoom0 F (1.0)] [--zoom1 F (4.0)] [--c0 F (0.0)] [--c1 F (0.0)]");
             std::process::exit(1);
         }
+    }
+}
+
+#[cfg(test)]
+mod knowledge_base_tests {
+    use super::*;
+    use rand::SeedableRng;
+
+    #[test]
+    fn fg_shuffle_flags_dotted_noise_on_a_dark_background() {
+        // 300x400 dark background with a disc; inside the disc either random dots or smooth rings.
+        let (w, h) = (300usize, 400usize);
+        let mut x: u64 = 12345;
+        let mut paint = |noise: bool| {
+            let mut rgb = vec![0u8; w * h * 3];
+            for (i, px) in rgb.chunks_exact_mut(3).enumerate() {
+                let (u, v) = ((i % w) as f64 - 150.0, (i / w) as f64 - 200.0);
+                let r = (u * u + v * v).sqrt();
+                let c = if r > 120.0 { [8u8, 5, 15] } else if noise {
+                    x ^= x << 13; x ^= x >> 7; x ^= x << 17;
+                    if x % 3 == 0 { [(x >> 8) as u8 | 128, (x >> 16) as u8 | 64, 20] } else { [0, 0, 0] }
+                } else { let t = ((r / 6.0).sin() * 0.5 + 0.5) * 255.0; [t as u8, (t * 0.6) as u8, 20] };
+                px.copy_from_slice(&c);
+            }
+            rgb
+        };
+        let (noise, rings) = (fg_shuffle_ratio(&paint(true)), fg_shuffle_ratio(&paint(false)));
+        assert!(noise > 0.85 && rings < 0.8, "noise {noise} rings {rings}");
+    }
+
+    #[test]
+    fn mutate_range_changes_the_value_and_stays_in_bounds() {
+        let mut rng = rand::rngs::StdRng::seed_from_u64(7);
+        let (lo, hi) = (nnfractals::quat_collapse::RANGE_MIN as f32, nnfractals::quat_collapse::RANGE_MAX as f32);
+        let mut changed = 0;
+        for _ in 0..200 {
+            let r = mutate_range(1.0, &mut rng);
+            assert!(r >= lo && r <= hi);
+            if (r - 1.0).abs() > 1e-6 { changed += 1; }
+        }
+        assert!(changed > 150, "the range mutation should almost always move the value ({changed}/200)");
+        // An unset range (0) starts from the default and moves too.
+        assert!((mutate_range(0.0, &mut rng) - 0.0).abs() > 1e-6);
+    }
+
+    #[test]
+    fn shuffle_ratio_separates_noise_structure_and_blank() {
+        let n = 4000usize;
+        let blank = vec![30u8; n * 3];
+        let mut x: u64 = 12345;
+        let noise: Vec<u8> = (0..n * 3).map(|_| { x ^= x << 13; x ^= x >> 7; x ^= x << 17; (x >> 24) as u8 }).collect();
+        let stripes: Vec<u8> = (0..n).flat_map(|i| { let v = if (i / 40) % 2 == 0 { 220u8 } else { 20 }; [v, v / 2, 10] }).collect();
+        let (rb, _) = compression_ratios(&blank);
+        let (rn, sn) = compression_ratios(&noise);
+        let (rs, ss) = compression_ratios(&stripes);
+        assert!(rb < 0.02, "a blank frame compresses to almost nothing ({rb})");
+        assert!(sn > 0.9 && rn > 0.5, "noise: ratio {rn}, shuffle ratio {sn}");
+        assert!(ss < 0.5, "structure compresses much better than its shuffled self ({ss}, plain {rs})");
+        assert_eq!(compression_ratios(&stripes), (rs, ss), "same picture, same shuffle");
+    }
+
+    #[test]
+    fn band_score_is_a_triangle() {
+        assert_eq!(band_score(0.0, 0.1), 0.0);
+        assert!((band_score(0.1, 0.1) - 1.0).abs() < 1e-12);
+        assert_eq!(band_score(0.25, 0.1), 0.0);
     }
 }

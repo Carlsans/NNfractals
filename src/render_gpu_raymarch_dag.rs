@@ -118,6 +118,7 @@ impl<'a> ParamsWriter<'a> {
 
 impl GpuRaymarchDagRenderer {
     async fn new(max_pixels: u64) -> Option<Self> {
+        if crate::gpu_disabled() { return None; }
         let inst = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
         let adapter = inst
             .request_adapter(&wgpu::RequestAdapterOptions {
@@ -353,7 +354,7 @@ mod tests {
             time_axis: TimeAxis::C,
             time_val: 0.0,
             domain_radius: 1.6,
-            box_bounds: None, axis_assignment: None, clip_plane: None, slide_iter: None, hide_above: None,
+            box_bounds: None, axis_assignment: None, clip_plane: None, slide_iter: None, hide_above: None, axis_remap: None, collapse: None,
             max_iter: 40,
             bailout: 4.0,
             max_march_steps: 200,

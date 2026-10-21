@@ -270,7 +270,7 @@ pub fn eval_program_dd(
         reg[i] = match node.op {
             Z     => (zx, zy),
             C     => (cx, cy),
-            CONST => (Dd::from_f64(node.kre as f64), Dd::from_f64(node.kim as f64)),
+            CONST | CONSTBC => (Dd::from_f64(node.kre as f64), Dd::from_f64(node.kim as f64)),
 
             // ── Polynomial / structural ──────────────────────────────────────
             SQR   => (ax*ax - ay*ay, (ax*ay) * 2.0),
@@ -291,6 +291,14 @@ pub fn eval_program_dd(
             ABSRE   => (ax.abs(), ay),
             ABSIM   => (ax, ay.abs()),
             NORMZ   => { let m=(ax*ax+ay*ay).sqrt()+eps; (ax/m, ay/m) },
+            BULB    => {
+                // hi-only (no DD correction): quat-GA op, not used by deep zooms.
+                let (x, y, px, py) = (ax.hi, ay.hi, bx.hi, by.hi);
+                let (nr, na) = (px.clamp(1.5, 10.0), py.clamp(1.0, 10.0));
+                let r = (x*x + y*y).sqrt().powf(nr);
+                let t = na * y.atan2(x);
+                (Dd::from_f64(r * t.cos()), Dd::from_f64(r * t.sin()))
+            },
 
             // ── Transcendentals — hi-only value + exact analytic-derivative
             // correction (dd_taylor_correct). These run once PER ITERATION,

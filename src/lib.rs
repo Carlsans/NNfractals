@@ -1,6 +1,8 @@
 pub mod config;
 pub mod dd;
 pub mod formula;
+pub mod formula_text;
+pub mod formula_simplify;
 pub mod time_program;
 pub mod genome;
 pub mod known_formulas;
@@ -34,6 +36,8 @@ pub mod quat_predator;
 pub mod quat_pref;
 pub mod quat_taste;
 pub mod quat_live_view;
+pub mod quat_planes;
+pub mod quat_collapse;
 pub mod quat_map_elites;
 pub mod anim_timeline;
 pub mod anim_persist;
@@ -65,6 +69,8 @@ pub mod render_gpu_raymarch_dag;
 pub mod render_gpu_raymarch_dag_codegen;
 #[cfg(feature = "wgpu-backend")]
 pub mod queue_runner;
+pub mod tuning;
+pub mod worker_tune;
 
 /// Derives the project root from the running binary's own location —
 /// `target/release/<bin>` (or `target/debug/<bin>`) sits exactly 2
@@ -146,6 +152,16 @@ pub fn is_quat_genome_path(path: &std::path::Path) -> bool {
             .to_str()
             .is_some_and(|s| s.starts_with("fractals_dag_quat") || s == "train_corpus_quat")
     })
+}
+
+/// Per-file version of [`is_quat_genome_path`] for folders that mix both
+/// kinds (the browser's `Starred/`): the folder name can't say which type a
+/// copied genome is, so also look for a `"quat_` field in the file itself.
+/// 2D genomes never serialize any `quat_*` field; quat genomes carry the
+/// structural metrics written by the quat GA.
+pub fn is_quat_genome_file(path: &std::path::Path) -> bool {
+    is_quat_genome_path(path)
+        || std::fs::read_to_string(path).is_ok_and(|t| t.contains("\"quat_"))
 }
 
 pub fn project_root() -> std::path::PathBuf {
@@ -238,4 +254,10 @@ mod python_bin_tests {
 
         std::fs::remove_dir_all(&dir).unwrap();
     }
+}
+
+/// `NN_NO_GPU=1`: never open a GPU adapter (CPU-only work while the GPU is in
+/// use elsewhere). Every adapter request checks this, so GPU tests skip too.
+pub fn gpu_disabled() -> bool {
+    std::env::var("NN_NO_GPU").is_ok_and(|v| v == "1")
 }

@@ -79,11 +79,25 @@ struct Params {
     // this control existed, and for every render's own probe pass.
     hide_above_enabled: u32,
     hide_above: f32,
+    // Per-axis stretch between marched (view) space and fractal space
+    // (RaymarchDagParams::axis_remap): fractal = off + sc * view.
+    // remap_enabled is 0 for every caller that doesn't set it.
+    remap_enabled: u32,
+    remap_sc_x: f32, remap_sc_y: f32, remap_sc_z: f32,
+    remap_off_x: f32, remap_off_y: f32, remap_off_z: f32,
+    // 4D->3D collapse method (quat_collapse::Method) and its parameters.
+    col_mode: u32,
+    col_p0: f32, col_p1: f32, col_p2: f32, col_p3: f32, col_p4: f32,
 }
 
 @group(0) @binding(0) var<uniform>             params         : Params;
 @group(0) @binding(1) var<storage, read_write> output_shading : array<f32>;
 @group(0) @binding(2) var<storage, read_write> output_color   : array<f32>;
+// DAG constants, uploaded per render instead of baked into the generated
+// code, so editing a constant (the anim viewer's live formula editor) needs
+// no shader rebuild. Entry i: .xy = program node i's (kre, kim), .zw = warp
+// node i's. 24 = formula::N_SLOTS.
+@group(0) @binding(3) var<uniform>             consts         : array<vec4<f32>, 24>;
 
 const EPS: f32 = 1e-9;
 
@@ -164,6 +178,31 @@ fn qnormz(q: Quat) -> Quat {
     return Quat(q.r/m, q.a/m, q.b/m, q.c/m);
 }
 
+// Generalised Mandelbulb power (op BULB) — mirrors quat_dag::qbulb exactly.
+fn safe_atan2(y: f32, x: f32) -> f32 {
+    if (abs(x) + abs(y) < 1e-30) { return 0.0; }
+    return atan2(y, x);
+}
+fn qbulb(q: Quat, p: Quat) -> Quat {
+    let nr = clamp(p.r, 1.5, 10.0);
+    let na = clamp(p.a, 1.0, 10.0);
+    let v = sqrt(q.a*q.a + q.b*q.b + q.c*q.c);
+    let rho = sqrt(q.r*q.r + v*v);
+    let t1 = na * safe_atan2(v, q.r) + p.b;
+    let t2 = na * safe_atan2(sqrt(q.a*q.a + q.b*q.b), q.c);
+    let ph = na * safe_atan2(q.b, q.a) + p.c;
+    let rn = pow(max(rho, 1e-30), nr);
+    let s1 = rn * sin(t1);
+    return Quat(rn * cos(t1), s1 * sin(t2) * cos(ph), s1 * sin(t2) * sin(ph), s1 * cos(t2));
+}
+fn qbulb_deriv(q: Quat, p: Quat, da: f32, db: f32) -> f32 {
+    let nr = clamp(p.r, 1.5, 10.0);
+    let na = clamp(p.a, 1.0, 10.0);
+    let rho = max(qnorm(q), 1e-30);
+    let rn = pow(rho, nr);
+    return max(nr, na) * pow(rho, nr - 1.0) * da + rn * (abs(log(rho)) + 1.0) * db;
+}
+
 // ── Specialized (codegen'd) DAG evaluators — one straight-line WGSL
 // statement per program node, program-order, no runtime loop or switch. ──
 
@@ -182,7 +221,13 @@ fn eval_main_deriv(z: Quat, c: Quat, dz: f32, dc: f32) -> ValDeriv {
 // mirrors TimeAxis::assemble exactly (0=R 1=A 2=B 3=C) — every caller
 // before the animation-viewer plan (quat_viewer.rs, the CLI) leaves
 // use_axis_perm at 0.
-fn assemble(x: f32, y: f32, z: f32, time_val: f32) -> Quat {
+fn assemble(vx: f32, vy: f32, vz: f32, time_val: f32) -> Quat {
+    var x = vx; var y = vy; var z = vz;
+    if (params.remap_enabled != 0u) {
+        x = params.remap_off_x + params.remap_sc_x * vx;
+        y = params.remap_off_y + params.remap_sc_y * vy;
+        z = params.remap_off_z + params.remap_sc_z * vz;
+    }
     if (params.use_axis_perm != 0u) {
         var vals = array<f32, 4>(0.0, 0.0, 0.0, 0.0);
         let axis_vals = array<f32, 4>(x, y, z, time_val);
@@ -232,6 +277,7 @@ fn quat_dag_escape_de(point: Quat) -> vec2f {
         pz = z;
         dz = dnext;
         z = next;
+        if (params.col_mode == 5u) { z.c = 0.0; }
 
         let ms = qnorm_sq(z);
         if (ms > params.bailout_sq) {
@@ -252,9 +298,106 @@ fn quat_dag_escape_de(point: Quat) -> vec2f {
 // Returns (escape_time, distance_estimate) — the escape time is needed at
 // the Slide Iteration gate in march_sample; estimate_normal below only
 // ever uses the distance-estimate half.
+fn rot2(a: f32, b: f32, ang: f32) -> vec2f {
+    let cs = cos(ang); let sn = sin(ang);
+    return vec2f(a*cs - b*sn, a*sn + b*cs);
+}
+
+// Isoclinic rotation of a 4D point by t (CPU twin: quat_collapse::iso_rotate).
+fn iso_rot(p: vec4f, plane: f32, t: f32) -> vec4f {
+    let s = sin(t); let c = cos(t);
+    if (plane < 0.5) {
+        return vec4f(p.x*c - p.w*s, p.y*c - p.z*s, p.y*s + p.z*c, p.x*s + p.w*c);
+    } else if (plane < 1.5) {
+        return vec4f(p.x*c - p.z*s, p.y*c - p.w*s, p.x*s + p.z*c, p.y*s + p.w*c);
+    }
+    return vec4f(p.x*c - p.y*s, p.x*s + p.y*c, p.z*c - p.w*s, p.z*s + p.w*c);
+}
+
+// One evaluation of the 4D set at view point p with time value t, through
+// the active collapse method's point mapping.
+fn de_one(p: vec3f, t: f32) -> vec2f {
+    var x = p.x; var y = p.y; var z = p.z; var w = t;
+    var lam: f32 = 1.0;
+    if (params.col_mode == 1u) {
+        let r1 = rot2(z, w, params.col_p0); z = r1.x; w = r1.y;
+        let r2 = rot2(x, w, params.col_p1); x = r2.x; w = r2.y;
+    } else if (params.col_mode == 6u) {
+        // Spin: the flat slice at distance col_p0, turned by t in the plane chosen by col_p1.
+        w = params.col_p0;
+        if (params.col_p1 < 0.5) {
+            let r = rot2(x, w, t); x = r.x; w = r.y;
+        } else if (params.col_p1 < 1.5) {
+            let r = rot2(y, w, t); y = r.x; w = r.y;
+        } else {
+            let r = rot2(z, w, t); z = r.x; w = r.y;
+        }
+    } else if (params.col_mode == 7u) {
+        // IsoSpin: the same slice, turned isoclinically.
+        let q = iso_rot(vec4f(x, y, z, params.col_p0), params.col_p1, t);
+        x = q.x; y = q.y; z = q.z; w = q.w;
+    } else if (params.col_mode == 8u) {
+        // IsoS3: the 3-sphere (as S3) with the isoclinic time rotation.
+        let rho = params.col_p0;
+        let s2 = x*x + y*y + z*z;
+        let k = 1.0 / (1.0 + s2);
+        var X = 2.0*rho*k*x; var Y = 2.0*rho*k*y; var Z = 2.0*rho*k*z;
+        var W = rho*(s2 - 1.0)*k;
+        let r0 = rot2(Z, W, params.col_p4); Z = r0.x; W = r0.y;
+        let r1 = rot2(Y, W, params.col_p3); Y = r1.x; W = r1.y;
+        let r2 = rot2(X, W, params.col_p2); X = r2.x; W = r2.y;
+        let q = iso_rot(vec4f(X, Y, Z, W), params.col_p1, t);
+        x = q.x; y = q.y; z = q.z; w = q.w;
+        lam = 2.0*rho*k;
+    } else if (params.col_mode == 4u) {
+        // 3-sphere: inverse stereographic projection, then the 4D pole tilts
+        // (col_p2 in xw, col_p3 in yw, col_p4 in zw) and the time rotation in the plane
+        // chosen by col_p1 (0 = xw, 1 = yw, 2 = zw).
+        let rho = params.col_p0;
+        let s2 = x*x + y*y + z*z;
+        let k = 1.0 / (1.0 + s2);
+        var X = 2.0*rho*k*x; var Y = 2.0*rho*k*y; var Z = 2.0*rho*k*z;
+        var W = rho*(s2 - 1.0)*k;
+        let r0 = rot2(Z, W, params.col_p4); Z = r0.x; W = r0.y;
+        let r1 = rot2(Y, W, params.col_p3); Y = r1.x; W = r1.y;
+        let r2 = rot2(X, W, params.col_p2); X = r2.x; W = r2.y;
+        if (params.col_p1 < 0.5) {
+            let r = rot2(X, W, t); X = r.x; W = r.y;
+        } else if (params.col_p1 < 1.5) {
+            let r = rot2(Y, W, t); Y = r.x; W = r.y;
+        } else {
+            let r = rot2(Z, W, t); Z = r.x; W = r.y;
+        }
+        x = X; y = Y; z = Z; w = W;
+        lam = 2.0*rho*k;
+    }
+    let q = assemble(x, y, z, w);
+    let r = quat_dag_escape_de(q);
+    return vec2f(r.x, r.y / lam);
+}
+
+// Returns (escape_time, distance_estimate) — the escape time is needed at
+// the Slide Iteration gate in march_sample; estimate_normal below only
+// ever uses the distance-estimate half.
 fn de_at(p: vec3f) -> vec2f {
-    let q = assemble(p.x, p.y, p.z, params.time_val);
-    return quat_dag_escape_de(q);
+    var r: vec2f;
+    if (params.col_mode == 2u) {
+        let h = params.col_p0;
+        r = de_one(p, params.time_val - h);
+        let b = de_one(p, params.time_val);
+        if (b.y < r.y) { r = b; }
+        let c = de_one(p, params.time_val + h);
+        if (c.y < r.y) { r = c; }
+    } else {
+        r = de_one(p, params.time_val);
+    }
+    if (params.col_mode == 3u) { r.y = r.y - params.col_p0; }
+    if (params.remap_enabled != 0u) {
+        // A view-space step of d moves at most d * max(scale) in fractal space.
+        let smax = max(max(params.remap_sc_x, params.remap_sc_y), max(params.remap_sc_z, 1e-12));
+        return vec2f(r.x, r.y / smax);
+    }
+    return r;
 }
 
 // Tetrahedral 4-tap normal estimate — same technique as raymarch.wgsl.
@@ -375,8 +518,7 @@ fn march_sample(u: f32, v: f32) -> vec2f {
     let shading = 0.15 + 0.85 * ndotl;
 
     let probe = hit_point + normal * params.color_probe_offset;
-    let probe_q = assemble(probe.x, probe.y, probe.z, params.time_val);
-    let color_et = quat_dag_escape_de(probe_q).x;
+    let color_et = de_at(probe).x;
 
     return vec2f(shading, color_et);
 }

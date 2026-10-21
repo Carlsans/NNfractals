@@ -182,7 +182,7 @@ fn eval_program(z: vec2f, c: vec2f, prog_base: u32) -> vec2f {
         switch o {
             case 0u  { r = z; }                                                   // Z
             case 1u  { r = c; }                                                   // C
-            case 2u  { r = vec2f(kre, kim); }                                     // CONST
+            case 2u, 22u { r = vec2f(kre, kim); }                                 // CONST, CONSTBC
             case 3u  { r = vec2f(av.x*av.x - av.y*av.y, 2.0*av.x*av.y); }         // SQR
             case 4u  { let a2=av.x*av.x; let b2=av.y*av.y; r = vec2f(av.x*(a2-3.0*b2), av.y*(3.0*a2-b2)); } // CUBE
             case 5u  { let a2=av.x*av.x; let b2=av.y*av.y; r = vec2f(a2*a2-6.0*a2*b2+b2*b2, 4.0*av.x*av.y*(a2-b2)); } // QUART
@@ -201,6 +201,7 @@ fn eval_program(z: vec2f, c: vec2f, prog_base: u32) -> vec2f {
             case 18u { r = av - bv; }                                             // SUB
             case 19u { r = cmul(av, bv); }                                        // MUL
             case 20u { r = cmul(av, cinv(bv)); }                                  // DIV
+            case 21u { let nr=clamp(bv.x,1.5,10.0); let na=clamp(bv.y,1.0,10.0); let m=pow(max(length(av),1e-30),nr); var t=0.0; if (abs(av.x)+abs(av.y) > 1e-30) { t = na*atan2(av.y, av.x); } r = vec2f(m*cos(t), m*sin(t)); } // BULB
             default  { r = vec2f(0.0, 0.0); }
         }
         reg[i] = r;

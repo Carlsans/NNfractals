@@ -18,7 +18,8 @@ use std::sync::mpsc;
 use std::thread;
 
 use eframe::egui;
-use nnfractals::formula::OpNode;
+use nnfractals::formula::{op, reachable_from_root, OpNode, N_SLOTS};
+use nnfractals::formula_text::{parse_program, program_to_text, ParseError};
 use nnfractals::quat_dag::QuatDagFormula;
 use nnfractals::render_gpu_raymarch_dag_codegen::CompiledDagPipeline;
 use nnfractals::anim_timeline::{
@@ -59,6 +60,37 @@ fn try_delegate(sock: &Path, path: &Path) -> bool {
 // `recommended_orbit_radius`/`characteristic_scale` live in
 // `nnfractals::anim_eval` — the batch CLI renderer needs them too.
 use nnfractals::anim_eval::{characteristic_scale, recommended_orbit_radius, manual_orbit_basis, FOV_DEG};
+
+/// A fresh timeline opens in the projection the genome was evolved under
+/// (`Genome::collapse`), or the process default (browser selector /
+/// `NN_COLLAPSE`) when the genome carries none. Angle-based projections get a
+/// one-turn T range, and the axes the GA scored them with (R,A,B -> X,Y,Z).
+fn apply_genome_projection(tl: &mut AnimationTimeline, genome_collapse: Option<nnfractals::quat_collapse::Collapse>, range: f32) {
+    use nnfractals::anim_timeline::{AxisBound, QuatPart, ViewerAxis};
+    // The genome's range factor: sphere radius under S3, view box under the legacy slice.
+    let (c, domain) = nnfractals::quat_collapse::view_setup(genome_collapse, range);
+    let c = nnfractals::quat_collapse::Collapse::effective(c);
+    // The GA scores and thumbnails every genome with R,A,B -> X,Y,Z and C as T. The
+    // timeline's own default (A,B,R) permutes the axes, which shows a different shape for
+    // anything not symmetric under the permutation (the bulb op is not: its pole is C).
+    if genome_collapse.is_some() {
+        let a = &mut tl.axis_assignment;
+        a.assign(ViewerAxis::X, QuatPart::R); a.assign(ViewerAxis::Y, QuatPart::A);
+        a.assign(ViewerAxis::Z, QuatPart::B); a.assign(ViewerAxis::T, QuatPart::C);
+    }
+    if c.method == nnfractals::quat_collapse::Method::Slice {
+        if range > 0.0 && (domain - nnfractals::quat_collapse::BASE_DOMAIN).abs() > 1e-6 {
+            let ax = AxisBound { min: -domain, max: domain };
+            tl.bounds.x = ax; tl.bounds.y = ax; tl.bounds.z = ax;
+        }
+        return;
+    }
+    tl.collapse = c;
+    if c.method.time_is_angle() {
+        tl.bounds.t = AxisBound { min: -std::f64::consts::PI, max: std::f64::consts::PI };
+    }
+    if !c.method.allows_axis_remap() { tl.equal_axis_scale = false; }
+}
 
 fn gpu_error_message() -> String {
     match nnfractals::render_gpu_raymarch_dag_codegen::last_gpu_init_error() {
@@ -473,6 +505,12 @@ fn audio_lane_row(
 /// across the clip's own span, "Rolled" (smoothstep-eased) or "Teleport"
 /// (an instant, non-eased jump at a chosen fraction of the clip).
 fn anim_param_mode_editor(ui: &mut egui::Ui, label: &str, param: &mut AnimParam, id_seed: impl std::hash::Hash + std::fmt::Debug) -> bool {
+    anim_param_mode_editor_ex(ui, label, param, id_seed, false)
+}
+
+/// `bounded` adds the "clip to boundary" checkbox on wave mode (only for params the evaluator
+/// can clip: Translation offset and Difference plane position).
+fn anim_param_mode_editor_ex(ui: &mut egui::Ui, label: &str, param: &mut AnimParam, id_seed: impl std::hash::Hash + std::fmt::Debug, bounded: bool) -> bool {
     let mut changed = false;
     #[derive(Copy, Clone, PartialEq)]
     enum Mode { Constant, Wave, Ramp }
@@ -491,7 +529,7 @@ fn anim_param_mode_editor(ui: &mut egui::Ui, label: &str, param: &mut AnimParam,
         if mode != prev_mode {
             match mode {
                 Mode::Constant => { param.drive = None; param.ramp = None; }
-                Mode::Wave => { param.drive = Some(Drive { shape: WaveShape::Sine, amp: 0.1, freq: 1.0, phase: 0.0 }); param.ramp = None; }
+                Mode::Wave => { param.drive = Some(Drive { shape: WaveShape::Sine, amp: 0.1, freq: 1.0, phase: 0.0, clip_to_bounds: false }); param.ramp = None; }
                 Mode::Ramp => { param.ramp = Some(Ramp { target: param.constant, style: RampStyle::Rolled }); param.drive = None; }
             }
             changed = true;
@@ -509,6 +547,10 @@ fn anim_param_mode_editor(ui: &mut egui::Ui, label: &str, param: &mut AnimParam,
             changed |= ui.add(egui::DragValue::new(&mut drive.amp).speed(0.01).prefix("amp ")).changed();
             changed |= ui.add(egui::DragValue::new(&mut drive.freq).speed(0.01).prefix("freq ")).changed();
             changed |= ui.add(egui::DragValue::new(&mut drive.phase).speed(0.01).prefix("phase ")).changed();
+            if bounded {
+                changed |= ui.checkbox(&mut drive.clip_to_bounds, "clip to boundary")
+                    .on_hover_text("Keep the animated value inside the axis bounds; the wave flattens at the edge instead of leaving the box.").changed();
+            }
         });
     }
     if let Some(ramp) = param.ramp.as_mut() {
@@ -580,6 +622,7 @@ fn default_render_width() -> u32 { 1080 }
 fn default_render_height() -> u32 { 1080 }
 fn default_render_fps() -> u32 { 30 }
 fn default_timeline_px_per_s() -> f32 { 60.0 }
+fn default_planes_size() -> (f32, f32) { (700.0, 560.0) }
 
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 struct AnimViewerPrefs {
@@ -611,6 +654,12 @@ struct AnimViewerPrefs {
     render_fps: u32,
     #[serde(default = "default_timeline_px_per_s")]
     timeline_px_per_s: f32,
+    /// Size of the ▦ Planes window, remembered across sessions.
+    #[serde(default = "default_planes_size")]
+    planes_size: (f32, f32),
+    /// Render window: also write a 9:16 Facebook-reel crop of each render.
+    #[serde(default)]
+    render_reel_crop: bool,
 }
 
 impl Default for AnimViewerPrefs {
@@ -622,6 +671,8 @@ impl Default for AnimViewerPrefs {
             render_out_dir: default_render_out_dir(),
             render_width: default_render_width(), render_height: default_render_height(), render_fps: default_render_fps(),
             timeline_px_per_s: default_timeline_px_per_s(),
+            planes_size: default_planes_size(),
+            render_reel_crop: false,
         }
     }
 }
@@ -647,8 +698,155 @@ fn viewer_prefs_path() -> PathBuf {
 /// shown in the side panel so a persistence checkpoint ("close, reopen,
 /// confirm the same settings load") can be visually confirmed without
 /// inspecting the JSON file directly.
+// ── Live formula editor ──────────────────────────────────────────────────
+//
+// Carl, 2026-10-09: "The user can modify in real time an existing formula
+// in the fractal viewer ... while being able to see what the change did in
+// the actual view." A text field (`formula_text`'s lossless syntax) and a
+// per-node panel edit the SAME `App.program`; whichever was touched last
+// regenerates the other. Edits stay in memory until "save as new", which
+// writes a sibling .nn — the loaded file is never overwritten.
+
+/// Every genome field the editor can change — exactly the ones `App`
+/// renders from. Compared against the loaded values for the "edited" badge,
+/// restored by Revert.
+#[derive(Clone, PartialEq)]
+struct FormulaFields {
+    program: Vec<OpNode>,
+    warp: Vec<OpNode>,
+    julia_mode: bool,
+    jc: (f32, f32),
+    phoenix: (f32, f32),
+    bailout_radius: f32,
+}
+
+/// How long a STRUCTURAL program edit must sit still before the shader is
+/// rebuilt. `CompiledDagPipeline` bakes the program's ops and wiring into
+/// WGSL, so such an edit is a full shader compile (~110-220 ms measured on
+/// corpus genomes); one per keystroke would stall the UI. Constants,
+/// julia/phoenix and bailout are uniforms and re-render immediately.
+const FORMULA_RECOMPILE_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(150);
+
+struct FormulaEditor {
+    open: bool,
+    text: String,
+    warp_text: String,
+    show_warp: bool,
+    text_error: Option<ParseError>,
+    warp_error: Option<ParseError>,
+    /// The formula as loaded (or as last saved) — what Revert restores.
+    original: FormulaFields,
+    /// A program/warp edit is waiting to be compiled at this instant.
+    recompile_at: Option<std::time::Instant>,
+    status: Option<Result<String, String>>,
+}
+
+impl FormulaEditor {
+    fn new(f: &FormulaFields) -> Self {
+        let mut e = FormulaEditor {
+            open: false,
+            text: String::new(),
+            warp_text: String::new(),
+            show_warp: false,
+            text_error: None,
+            warp_error: None,
+            original: f.clone(),
+            recompile_at: None,
+            status: None,
+        };
+        e.sync_text(f);
+        e
+    }
+
+    /// Rewrites both text fields from `f` and clears parse errors.
+    fn sync_text(&mut self, f: &FormulaFields) {
+        self.text = program_to_text(&f.program);
+        self.warp_text = if f.warp.is_empty() { String::new() } else { program_to_text(&f.warp) };
+        self.show_warp = !f.warp.is_empty();
+        self.text_error = None;
+        self.warp_error = None;
+    }
+}
+
+/// The offending line with a caret under the error column, in red.
+fn show_parse_error(ui: &mut egui::Ui, text: &str, err: &ParseError) {
+    let mut line_start = 0usize;
+    let mut line = "";
+    let mut col = err.pos;
+    for l in text.split('\n') {
+        let len = l.chars().count();
+        if err.pos <= line_start + len {
+            line = l;
+            col = err.pos - line_start;
+            break;
+        }
+        line_start += len + 1;
+    }
+    let red = egui::Color32::from_rgb(235, 110, 110);
+    if !line.is_empty() {
+        ui.label(egui::RichText::new(format!("{line}\n{}^", " ".repeat(col))).monospace().color(red));
+    }
+    ui.colored_label(red, format!("{} — view shows the last valid formula", err.msg));
+}
+
+/// `<dir>/<stem>_edit<N>.nn` for the first N not already taken. An
+/// existing `_edit<N>` suffix is stripped first, so editing an edit gives
+/// `foo_edit2.nn`, not `foo_edit1_edit1.nn`.
+fn next_edit_path(path: &Path) -> PathBuf {
+    let dir = path.parent().unwrap_or_else(|| Path::new("."));
+    let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("genome");
+    let base = match stem.rfind("_edit") {
+        Some(i) if stem[i + 5..].chars().all(|c| c.is_ascii_digit()) && i + 5 < stem.len() => &stem[..i],
+        _ => stem,
+    };
+    (1..)
+        .map(|n| dir.join(format!("{base}_edit{n}.nn")))
+        .find(|p| !p.exists())
+        .expect("unbounded range")
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum TimelineOrigin { LoadedFromDisk, NewlyCreated }
+
+// ── All-planes view: the six RABC axis-pair slices ───────────────────────
+/// End corner of a limit rectangle being dragged: with Shift held, forced
+/// to a square (side = the longer drag direction).
+fn plane_drag_end(a: egui::Pos2, b: egui::Pos2, square: bool) -> egui::Pos2 {
+    if !square { return b; }
+    let d = b - a;
+    let side = d.x.abs().max(d.y.abs());
+    egui::pos2(a.x + side * d.x.signum(), a.y + side * d.y.signum())
+}
+
+
+#[derive(Default)]
+struct PlanesPanel {
+    open: bool,
+    initialized: bool,
+    fixed: [f64; 4],
+    max_iter: u32,
+    hires_px: u32,
+    /// Window size (remembered in the prefs file) and its last on-screen rect.
+    size: (f32, f32),
+    rect: Option<egui::Rect>,
+    thumb_px: u32,
+    thumbs: Vec<Option<egui::TextureHandle>>,
+    thumb_key: String,
+    thumb_job: u64,
+    thumb_rx: Option<mpsc::Receiver<(u64, usize, u32, Vec<u8>)>>,
+    hires_rx: Option<mpsc::Receiver<Result<(PathBuf, u32, Vec<u8>), String>>>,
+    hires_busy: Option<String>,
+    hires_status: Option<Result<String, String>>,
+    hires_preview: Option<egui::TextureHandle>,
+    /// (tile, press origin, latest pointer) of the limit rectangle being drawn.
+    drag_last: Option<(usize, egui::Pos2, egui::Pos2)>,
+    /// Timeline as it was when a middle-button pan started (for one undo entry).
+    pan_before: Option<AnimationTimeline>,
+    /// Which button started the drag in progress (decided once, at its start).
+    drag_button: Option<egui::PointerButton>,
+    /// The current thumbnail job has delivered all six tiles.
+    thumb_done: bool,
+}
 
 struct App {
     genome_path: PathBuf,
@@ -659,6 +857,15 @@ struct App {
     jc: (f32, f32),
     phoenix: (f32, f32),
     bailout_radius: f32,
+    /// The whole genome as loaded (or as last saved by the formula editor):
+    /// "save as new" needs every field, not just the six rendered above.
+    loaded_genome: nnfractals::genome::Genome,
+    formula_editor: FormulaEditor,
+    planes: PlanesPanel,
+    /// A drag-value in the formula editor is being dragged this frame —
+    /// part of `is_interacting()`, so the live preview drops to preview
+    /// quality while a constant is swept.
+    formula_dragging: bool,
 
     timeline: AnimationTimeline,
     timeline_origin: TimelineOrigin,
@@ -731,6 +938,7 @@ struct App {
     render_out_dir: String,
     render_width: u32,
     render_height: u32,
+    render_reel_crop: bool,
     render_fps: u32,
     render_length_s: f64,
     render_status: Option<Result<String, String>>,
@@ -794,7 +1002,7 @@ impl App {
     /// of these for responsiveness; a settled view always renders at full
     /// `max_iter`/`aa`.
     fn is_interacting(&self) -> bool {
-        self.dragging || self.scrub_dragging || self.playing
+        self.dragging || self.scrub_dragging || self.playing || self.formula_dragging
     }
 
     fn undo(&mut self) {
@@ -839,6 +1047,7 @@ impl App {
                 let mut tl = AnimationTimeline::new(content_hash);
                 // A box-aware initial distance beats AnimationTimeline::new's
                 // generic constant — but only for a genuinely fresh timeline.
+                apply_genome_projection(&mut tl, g.collapse, g.view_range);
                 tl.camera_distance = recommended_orbit_radius(characteristic_scale(&tl.bounds), fov_deg, 640, 640);
                 // Save immediately so anim_settings/<hash>.json exists after
                 // the very first launch, before the user has touched anything.
@@ -856,6 +1065,15 @@ impl App {
         // own established gotcha).
         let timeline_before_this_frame = timeline.clone();
         let render_length_s = nnfractals::anim_timeline::wallclock_span(timeline.trim_end_s - timeline.trim_start_s, timeline.delta_t);
+        let loaded_genome = g.clone();
+        let formula_editor = FormulaEditor::new(&FormulaFields {
+            program: g.program.clone(),
+            warp: g.warp.clone(),
+            julia_mode: g.julia_mode,
+            jc: (g.julia_cre, g.julia_cim),
+            phoenix: (g.phoenix_re, g.phoenix_im),
+            bailout_radius: g.bailout_radius,
+        });
 
         Ok(App {
             genome_path: genome_path.to_path_buf(),
@@ -866,6 +1084,10 @@ impl App {
             jc: (g.julia_cre, g.julia_cim),
             phoenix: (g.phoenix_re, g.phoenix_im),
             bailout_radius: g.bailout_radius,
+            loaded_genome,
+            formula_editor,
+            planes: PlanesPanel { size: prefs.planes_size, open: std::env::var_os("NN_ANIM_OPEN_PLANES").is_some(), ..Default::default() },
+            formula_dragging: false,
             timeline,
             timeline_origin,
             pipeline,
@@ -895,6 +1117,7 @@ impl App {
             render_out_dir: prefs.render_out_dir.clone(),
             render_width: prefs.render_width,
             render_height: prefs.render_height,
+            render_reel_crop: prefs.render_reel_crop,
             render_fps: prefs.render_fps,
             render_length_s,
             render_status: None,
@@ -930,6 +1153,8 @@ impl App {
         if g.program.is_empty() {
             anyhow::bail!("{genome_path:?} has an empty DAG program (legacy 58-basis genome?) — the animation viewer only supports DAG-based genomes");
         }
+        let genome_collapse = g.collapse;
+        let genome_range = g.view_range;
         let pipeline = CompiledDagPipeline::compile(&g.program, &g.warp);
         self.gpu_error = if pipeline.is_none() { Some(gpu_error_message()) } else { None };
         self.pipeline = pipeline;
@@ -938,6 +1163,11 @@ impl App {
         // away from `g` first).
         let content_hash = g.content_hash();
         let fov_deg: f64 = 45.0;
+        // Unsaved formula edits belong to the genome being replaced; say so
+        // rather than dropping them silently.
+        let dropped_edits = self.formula_fields() != self.formula_editor.original;
+        let editor_open = self.formula_editor.open;
+        self.loaded_genome = g.clone();
         self.genome_label = genome_path.file_stem().and_then(|s| s.to_str()).unwrap_or("genome").to_string();
         self.genome_path = genome_path.to_path_buf();
         self.program = g.program;
@@ -946,11 +1176,17 @@ impl App {
         self.jc = (g.julia_cre, g.julia_cim);
         self.phoenix = (g.phoenix_re, g.phoenix_im);
         self.bailout_radius = g.bailout_radius;
+        self.formula_editor = FormulaEditor::new(&self.formula_fields());
+        self.formula_editor.open = editor_open;
+        if dropped_edits {
+            self.formula_editor.status = Some(Err("unsaved formula edits of the previous fractal were discarded".to_string()));
+        }
 
         let (mut timeline, timeline_origin) = match nnfractals::anim_persist::load_timeline(content_hash) {
             Some(tl) => (tl, TimelineOrigin::LoadedFromDisk),
             None => {
                 let mut tl = AnimationTimeline::new(content_hash);
+                apply_genome_projection(&mut tl, genome_collapse, genome_range);
                 tl.camera_distance = recommended_orbit_radius(characteristic_scale(&tl.bounds), fov_deg, 640, 640);
                 if let Err(e) = nnfractals::anim_persist::save_timeline(&tl) {
                     eprintln!("[anim-viewer] failed to save initial timeline: {e}");
@@ -987,6 +1223,346 @@ impl App {
         Ok(())
     }
 
+    fn formula_fields(&self) -> FormulaFields {
+        FormulaFields {
+            program: self.program.clone(),
+            warp: self.warp.clone(),
+            julia_mode: self.julia_mode,
+            jc: self.jc,
+            phoenix: self.phoenix,
+            bailout_radius: self.bailout_radius,
+        }
+    }
+
+    fn formula_edited(&self) -> bool {
+        self.formula_fields() != self.formula_editor.original
+    }
+
+    /// Rebuilds the codegen shader for the current program/warp. On failure
+    /// the previous pipeline stays (the view keeps showing the last formula
+    /// that compiled) and the reason goes to the top bar.
+    fn recompile_pipeline(&mut self) {
+        match CompiledDagPipeline::compile(&self.program, &self.warp) {
+            Some(p) => {
+                self.pipeline = Some(p);
+                self.gpu_error = None;
+            }
+            None => self.gpu_error = Some(gpu_error_message()),
+        }
+        self.formula_editor.recompile_at = None;
+        self.dirty = true;
+    }
+
+    fn revert_formula(&mut self) {
+        let f = self.formula_editor.original.clone();
+        self.program = f.program.clone();
+        self.warp = f.warp.clone();
+        self.julia_mode = f.julia_mode;
+        self.jc = f.jc;
+        self.phoenix = f.phoenix;
+        self.bailout_radius = f.bailout_radius;
+        self.formula_editor.sync_text(&f);
+        self.formula_editor.status = None;
+        self.recompile_pipeline();
+    }
+
+    /// Writes the edited formula to `<stem>_edit<N>.nn` beside the loaded
+    /// file and switches the viewer to it. The loaded file is never written.
+    ///
+    /// Only the formula and its framing carry over; every score/metric
+    /// field is left at its "not measured" default, because the scores of
+    /// the original formula say nothing about the edited one. The current
+    /// timeline is copied under the new genome's content hash so the camera,
+    /// bounds and clips come along when the file is reopened.
+    fn save_formula_as_new(&mut self) -> anyhow::Result<PathBuf> {
+        let src = &self.loaded_genome;
+        let mut g = nnfractals::genome::Genome {
+            program: self.program.clone(),
+            warp: self.warp.clone(),
+            julia_mode: self.julia_mode,
+            julia_cre: self.jc.0,
+            julia_cim: self.jc.1,
+            phoenix_re: self.phoenix.0,
+            phoenix_im: self.phoenix.1,
+            bailout_radius: self.bailout_radius,
+            time_mod: src.time_mod.clone(),
+            time_prog: src.time_prog.clone(),
+            view_cx: src.view_cx,
+            view_cy: src.view_cy,
+            view_zoom: src.view_zoom,
+            fractal_kind: src.fractal_kind.clone(),
+            novelty_cluster: -1,
+            id: rand::random(),
+            ..Default::default()
+        };
+        g.formula_readable = g.formula_expr();
+        let path = next_edit_path(&self.genome_path);
+        nnfractals::io::save_genome(&g, &path)?;
+
+        self.timeline.genome_content_hash = g.content_hash();
+        nnfractals::anim_persist::save_timeline(&self.timeline)?;
+        // Undo entries still carry the old hash; saving one of them would
+        // write it back under the original genome's file.
+        for tl in self.undo_stack.iter_mut().chain(self.redo_stack.iter_mut()) {
+            tl.genome_content_hash = self.timeline.genome_content_hash;
+        }
+        self.timeline_before_this_frame.genome_content_hash = self.timeline.genome_content_hash;
+
+        self.genome_label = path.file_stem().and_then(|s| s.to_str()).unwrap_or("genome").to_string();
+        self.genome_path = path.clone();
+        self.loaded_genome = g;
+        self.formula_editor.original = self.formula_fields();
+        Ok(path)
+    }
+
+    /// The formula editor panel. Program/warp edits schedule a debounced
+    /// shader rebuild; julia/phoenix/bailout edits re-render immediately.
+    fn show_formula_editor(&mut self, ui: &mut egui::Ui) {
+        let mut prog_changed_by_text = false;
+        let mut prog_changed_by_nodes = false;
+        let mut uniform_changed = false;
+        let mut drag_released = false;
+        let mut dragging = false;
+
+        ui.label(egui::RichText::new("z \u{2190} f(z, c)").strong())
+            .on_hover_text("ops: + - * / ^2 ^3 ^4 ^-1, numbers like 0.5 or 0.3i or (0.2+0.1i)\nfunctions: sin cos exp log tanh conj recip absfold absre absim normz, bulb(a, p), kbc(x, y) = constant (0,0,x,y)");
+        let resp = ui.add(
+            egui::TextEdit::multiline(&mut self.formula_editor.text)
+                .code_editor()
+                .desired_rows(2)
+                .desired_width(f32::INFINITY),
+        );
+        let text_focused = resp.has_focus();
+        if resp.changed() {
+            match parse_program(&self.formula_editor.text) {
+                Ok(p) => {
+                    self.formula_editor.text_error = None;
+                    if p != self.program {
+                        self.program = p;
+                        prog_changed_by_text = true;
+                    }
+                }
+                Err(e) => self.formula_editor.text_error = Some(e),
+            }
+        }
+        if let Some(e) = &self.formula_editor.text_error {
+            show_parse_error(ui, &self.formula_editor.text, e);
+        }
+
+        if self.formula_editor.show_warp {
+            ui.label(egui::RichText::new("warp: c \u{2190} w(pixel)").strong())
+                .on_hover_text("Applied once to the pixel before iterating; z and c both read the pixel. Empty = no warp.");
+            let resp = ui.add(
+                egui::TextEdit::multiline(&mut self.formula_editor.warp_text)
+                    .code_editor()
+                    .desired_rows(1)
+                    .desired_width(f32::INFINITY),
+            );
+            if resp.changed() {
+                let parsed = if self.formula_editor.warp_text.trim().is_empty() {
+                    Ok(Vec::new())
+                } else {
+                    parse_program(&self.formula_editor.warp_text)
+                };
+                match parsed {
+                    Ok(w) => {
+                        self.formula_editor.warp_error = None;
+                        if w != self.warp {
+                            self.warp = w;
+                            prog_changed_by_text = true;
+                        }
+                    }
+                    Err(e) => self.formula_editor.warp_error = Some(e),
+                }
+            }
+            if let Some(e) = &self.formula_editor.warp_error {
+                show_parse_error(ui, &self.formula_editor.warp_text, e);
+            }
+        } else if ui.small_button("+ warp").clicked() {
+            self.formula_editor.show_warp = true;
+        }
+
+        // ── Node panel ──
+        let n = self.program.len();
+        egui::CollapsingHeader::new(format!("Nodes ({n}/{N_SLOTS})"))
+            .id_salt("formula_nodes")
+            .default_open(true)
+            .show(ui, |ui| {
+                let live = reachable_from_root(&self.program);
+                let prog = &mut self.program;
+                let mut delete: Option<usize> = None;
+                for i in 0..n {
+                    // A node can be deleted only when nothing reads it.
+                    let referenced = prog.iter().enumerate().skip(i + 1).any(|(_, m)| {
+                        let ar = op::arity(m.op);
+                        (ar >= 1 && m.a as usize == i) || (ar >= 2 && m.b as usize == i)
+                    });
+                    ui.horizontal(|ui| {
+                        let name = if i + 1 == n { "root".to_string() } else { format!("#{i}") };
+                        let mut tag = egui::RichText::new(format!("{name:>4}")).monospace();
+                        if !live[i] {
+                            tag = tag.weak();
+                        }
+                        ui.label(tag).on_hover_text(if live[i] {
+                            program_to_text(&prog[..=i])
+                        } else {
+                            format!("{}\n(unused: the root never reads this node)", program_to_text(&prog[..=i]))
+                        });
+
+                        let mut o = prog[i].op;
+                        egui::ComboBox::from_id_salt(("formula_op", i))
+                            .width(72.0)
+                            .selected_text(op::name(o))
+                            .show_ui(ui, |ui| {
+                                for k in 0..op::N_OPS as u8 {
+                                    ui.selectable_value(&mut o, k, op::name(k));
+                                }
+                            });
+                        if o != prog[i].op {
+                            prog[i].op = o;
+                            prog_changed_by_nodes = true;
+                        }
+
+                        let arity = op::arity(o);
+                        for slot in 0..arity {
+                            let cur = if slot == 0 { prog[i].a } else { prog[i].b } as usize;
+                            let mut pick = cur;
+                            let shown = if cur < i { format!("#{cur}") } else { "0".to_string() };
+                            egui::ComboBox::from_id_salt(("formula_operand", i, slot))
+                                .width(44.0)
+                                .selected_text(shown)
+                                .show_ui(ui, |ui| {
+                                    for j in 0..i {
+                                        ui.selectable_value(&mut pick, j, format!("#{j} {}", op::name(prog[j].op)));
+                                    }
+                                });
+                            if pick != cur {
+                                if slot == 0 { prog[i].a = pick as u8 } else { prog[i].b = pick as u8 }
+                                prog_changed_by_nodes = true;
+                            }
+                        }
+
+                        if o == op::CONST {
+                            let node = &mut prog[i];
+                            for v in [&mut node.kre, &mut node.kim] {
+                                let r = ui.add(egui::DragValue::new(v).speed(0.001).max_decimals(6));
+                                prog_changed_by_nodes |= r.changed();
+                                dragging |= r.dragged();
+                                drag_released |= r.drag_stopped();
+                            }
+                            ui.label("i");
+                        }
+
+                        if n > 1 && ui.add_enabled(!referenced, egui::Button::new("\u{2715}").small())
+                            .on_hover_text("delete node (only when no other node reads it)")
+                            .clicked()
+                        {
+                            delete = Some(i);
+                        }
+                    });
+                }
+                if let Some(d) = delete {
+                    prog.remove(d);
+                    for m in prog.iter_mut().skip(d) {
+                        if m.a as usize > d { m.a -= 1; }
+                        if m.b as usize > d { m.b -= 1; }
+                    }
+                    prog_changed_by_nodes = true;
+                }
+                if ui.add_enabled(n < N_SLOTS, egui::Button::new("+ node"))
+                    .on_hover_text("insert a constant 0 just before the root; wire it in with the root's operand pickers")
+                    .clicked()
+                {
+                    // Inserting directly before the root shifts only the
+                    // root itself, and no node reads the root, so no
+                    // operand needs renumbering.
+                    prog.insert(n.saturating_sub(1), OpNode { op: op::CONST, a: 0, b: 0, kre: 0.0, kim: 0.0 });
+                    prog_changed_by_nodes = true;
+                }
+            });
+
+        // ── Uniform parameters (no shader rebuild) ──
+        let mut drag = |ui: &mut egui::Ui, v: &mut f32, speed: f64| {
+            let r = ui.add(egui::DragValue::new(v).speed(speed).max_decimals(6));
+            dragging |= r.dragged();
+            drag_released |= r.drag_stopped();
+            r.changed()
+        };
+        ui.horizontal(|ui| {
+            uniform_changed |= ui.checkbox(&mut self.julia_mode, "julia").changed();
+            if self.julia_mode {
+                uniform_changed |= drag(ui, &mut self.jc.0, 0.001);
+                uniform_changed |= drag(ui, &mut self.jc.1, 0.001);
+                ui.label("i");
+            }
+        });
+        ui.horizontal(|ui| {
+            ui.label("phoenix");
+            uniform_changed |= drag(ui, &mut self.phoenix.0, 0.001);
+            uniform_changed |= drag(ui, &mut self.phoenix.1, 0.001);
+            ui.label("i");
+        });
+        ui.horizontal(|ui| {
+            ui.label("bailout");
+            let before = self.bailout_radius;
+            uniform_changed |= drag(ui, &mut self.bailout_radius, 0.02);
+            if !(self.bailout_radius > 0.01) {
+                self.bailout_radius = before.max(0.01);
+            }
+        });
+
+        let edited = self.formula_edited();
+        ui.horizontal(|ui| {
+            if ui.add_enabled(edited, egui::Button::new("revert")).clicked() {
+                self.revert_formula();
+            }
+            if ui.add_enabled(edited, egui::Button::new("save as new")).on_hover_text("writes <name>_edit<N>.nn next to the loaded file; the loaded file is not changed").clicked() {
+                self.formula_editor.status = Some(
+                    self.save_formula_as_new()
+                        .map(|p| format!("saved {}", p.display()))
+                        .map_err(|e| format!("save failed: {e}")),
+                );
+            }
+            if self.formula_edited() {
+                ui.colored_label(egui::Color32::from_rgb(230, 180, 80), "\u{25cf} edited");
+            }
+        });
+        match &self.formula_editor.status {
+            Some(Ok(msg)) => { ui.colored_label(egui::Color32::from_rgb(120, 200, 120), msg); }
+            Some(Err(e)) => { ui.colored_label(egui::Color32::RED, e); }
+            None => {}
+        }
+
+        self.formula_dragging = dragging;
+        if prog_changed_by_nodes && !text_focused {
+            self.formula_editor.text = program_to_text(&self.program);
+            self.formula_editor.text_error = None;
+        }
+        if prog_changed_by_text || prog_changed_by_nodes {
+            // Constants are a uniform: a constants-only edit renders with
+            // the current pipeline right away. Anything structural needs a
+            // new shader (~110-220 ms measured), so it waits for the debounce.
+            let reusable = self.pipeline.as_ref().is_some_and(|p| p.same_structure(&self.program, &self.warp));
+            if reusable {
+                self.formula_editor.recompile_at = None;
+                self.dirty = true;
+            } else {
+                self.formula_editor.recompile_at = Some(std::time::Instant::now() + FORMULA_RECOMPILE_DEBOUNCE);
+            }
+            self.formula_editor.status = None;
+        }
+        if drag_released && self.formula_editor.recompile_at.is_some() {
+            self.formula_editor.recompile_at = Some(std::time::Instant::now());
+        }
+        if uniform_changed {
+            self.dirty = true;
+            self.formula_editor.status = None;
+        }
+        if drag_released {
+            self.dirty = true; // one final full-quality render
+        }
+    }
+
     fn save_prefs(&self) {
         let prefs = AnimViewerPrefs {
             colormap: self.colormap.clone(),
@@ -1001,6 +1577,8 @@ impl App {
             render_height: self.render_height,
             render_fps: self.render_fps,
             timeline_px_per_s: self.timeline_px_per_s,
+            planes_size: self.planes.size,
+            render_reel_crop: self.render_reel_crop,
         };
         prefs.save(&viewer_prefs_path());
     }
@@ -1251,7 +1829,7 @@ impl App {
                             changed |= ui.add(egui::DragValue::new(&mut degrees_per_second.constant).speed(0.1)).changed();
                         });
                     }
-                    Effect::Translation { offset } => { changed |= anim_param_mode_editor(ui, "offset", offset, (r, "translation")); }
+                    Effect::Translation { offset } => { changed |= anim_param_mode_editor_ex(ui, "offset", offset, (r, "translation"), true); }
                     Effect::Scale { factor } => { changed |= anim_param_mode_editor(ui, "factor", factor, (r, "scale")); }
                     Effect::Difference { .. } => { ui.colored_label(egui::Color32::RED, "internal error: Difference on an axis track"); }
                     Effect::FixedDifference { .. } => { ui.colored_label(egui::Color32::RED, "internal error: FixedDifference on an axis track"); }
@@ -1269,9 +1847,9 @@ impl App {
                 });
                 if let Effect::Difference { pos, normal } = &mut clip.effect {
                     ui.label("position:");
-                    changed |= anim_param_mode_editor(ui, "x", &mut pos[0], (r, "pos_x"));
-                    changed |= anim_param_mode_editor(ui, "y", &mut pos[1], (r, "pos_y"));
-                    changed |= anim_param_mode_editor(ui, "z", &mut pos[2], (r, "pos_z"));
+                    changed |= anim_param_mode_editor_ex(ui, "x", &mut pos[0], (r, "pos_x"), true);
+                    changed |= anim_param_mode_editor_ex(ui, "y", &mut pos[1], (r, "pos_y"), true);
+                    changed |= anim_param_mode_editor_ex(ui, "z", &mut pos[2], (r, "pos_z"), true);
                     ui.label("normal (which side is removed):");
                     changed |= anim_param_mode_editor(ui, "x", &mut normal[0], (r, "norm_x"));
                     changed |= anim_param_mode_editor(ui, "y", &mut normal[1], (r, "norm_y"));
@@ -1505,7 +2083,7 @@ impl App {
     }
 
     /// Replaces `self.timeline` with the named profile's saved settings —
-    /// everything except which genome it belongs to, which must stay the
+    /// everything except the view setup (see below) and which genome it belongs to, which must stay the
     /// CURRENTLY LOADED genome's own hash (a profile's own stored hash is
     /// always 0, see `anim_profile::save_profile` — applying it verbatim
     /// would silently corrupt a different genome's persisted settings the
@@ -1521,7 +2099,13 @@ impl App {
         };
         let mut tl = profile.timeline;
         tl.genome_content_hash = self.timeline.genome_content_hash;
-        tl.t_value = tl.t_value.clamp(tl.bounds.t.min, tl.bounds.t.max);
+        // A profile carries the animations only: the view setup (axis assignment, bounds
+        // incl. T, equal-axis cube, 4D→3D collapse, the T base value) stays the loaded genome's.
+        tl.axis_assignment = self.timeline.axis_assignment;
+        tl.bounds = self.timeline.bounds;
+        tl.equal_axis_scale = self.timeline.equal_axis_scale;
+        tl.collapse = self.timeline.collapse.clone();
+        tl.t_value = self.timeline.t_value;
         self.timeline = tl;
         ensure_audio_peaks(&mut self.timeline);
         self.selected_clip = None;
@@ -1625,6 +2209,557 @@ impl App {
     /// only shows the resolved length (read-only) plus a convenience
     /// "length" field that back-solves the trim END (trim START and
     /// delta_t stay fixed), so length/trim/fps never disagree.
+    /// "4D \u{2192} 3D collapse": which way the 4D set is shown in 3D, and its
+    /// parameters. Uniform-only, so changing it never recompiles anything.
+    fn show_collapse_section(&mut self, ui: &mut egui::Ui) {
+        use nnfractals::quat_collapse::{Method, ALL};
+        let mut c = self.timeline.collapse;
+        let before = c;
+        ui.horizontal(|ui| {
+            ui.label("4D \u{2192} 3D");
+            egui::ComboBox::from_id_salt("collapse_method").selected_text(c.method.name()).show_ui(ui, |ui| {
+                // Only the offered methods, plus whatever this timeline already uses.
+                for m in ALL.into_iter().filter(|m| nnfractals::quat_collapse::OFFERED.contains(m) || *m == before.method) {
+                    let tip = m.describe();
+                    ui.selectable_value(&mut c.method, m, m.name()).on_hover_text(tip);
+                }
+            });
+        });
+        match c.method {
+            Method::Spin | Method::IsoSpin => {
+                ui.horizontal(|ui| {
+                    ui.label("slice distance");
+                    ui.add(egui::DragValue::new(&mut c.rho).speed(0.01).range(-4.0..=4.0))
+                        .on_hover_text("How far the flat slice sits from the centre of the 4D turn. 0 = the slice passes through the centre.");
+                    ui.label("turn plane");
+                    egui::ComboBox::from_id_salt("collapse_plane_spin").selected_text(["x\u{2013}w", "y\u{2013}w", "z\u{2013}w"][c.plane.min(2) as usize]).show_ui(ui, |ui| {
+                        for (i, n) in ["x\u{2013}w", "y\u{2013}w", "z\u{2013}w"].iter().enumerate() {
+                            ui.selectable_value(&mut c.plane, i as u8, *n);
+                        }
+                    });
+                });
+                ui.label("Time (T) is a rotation angle in radians; \u{b1}\u{3c0} is a full turn.");
+            }
+            Method::S3 | Method::IsoS3 => {
+                ui.horizontal(|ui| {
+                    ui.label("radius");
+                    ui.add(egui::DragValue::new(&mut c.rho).speed(0.01).range(0.05..=6.0));
+                    ui.label("time rotates");
+                    egui::ComboBox::from_id_salt("collapse_plane").selected_text(["x\u{2013}w", "y\u{2013}w", "z\u{2013}w"][c.plane.min(2) as usize]).show_ui(ui, |ui| {
+                        for (i, n) in ["x\u{2013}w", "y\u{2013}w", "z\u{2013}w"].iter().enumerate() {
+                            ui.selectable_value(&mut c.plane, i as u8, *n);
+                        }
+                    });
+                });
+                ui.horizontal(|ui| {
+                    ui.label("pole tilt xw/yw/zw");
+                    for a in c.pole.iter_mut() { ui.add(egui::DragValue::new(a).speed(0.01).suffix(" rad")); }
+                    if ui.small_button("0").on_hover_text("Reset the projection point").clicked() { c.pole = [0.0; 3]; }
+                });
+                ui.label("Time (T) is a rotation angle in radians; \u{b1}\u{3c0} is a full turn.");
+                use nnfractals::anim_timeline::{QuatPart, ViewerAxis};
+                let a = self.timeline.axis_assignment;
+                let ga = a.part_of(ViewerAxis::X) == QuatPart::R && a.part_of(ViewerAxis::Y) == QuatPart::A
+                    && a.part_of(ViewerAxis::Z) == QuatPart::B && a.part_of(ViewerAxis::T) == QuatPart::C;
+                if ui.add_enabled(!ga, egui::Button::new("axes as the GA / rating view (R,A,B\u{2192}X,Y,Z)"))
+                    .on_hover_text("The S3 GA and the rating browser place R,A,B on X,Y,Z. The viewer's default \
+                                     (A,B,R) shows the same object turned, so the same fractal looks different. \
+                                     This sets the GA's orientation.")
+                    .clicked()
+                {
+                    let aa = &mut self.timeline.axis_assignment;
+                    aa.assign(ViewerAxis::X, QuatPart::R); aa.assign(ViewerAxis::Y, QuatPart::A);
+                    aa.assign(ViewerAxis::Z, QuatPart::B); aa.assign(ViewerAxis::T, QuatPart::C);
+                    self.dirty = true;
+                    self.commit_timeline();
+                }
+            }
+            Method::Tilt => {
+                ui.horizontal(|ui| {
+                    ui.label("tilt z\u{2013}t / x\u{2013}t");
+                    ui.add(egui::DragValue::new(&mut c.tilt.0).speed(0.01).suffix(" rad"));
+                    ui.add(egui::DragValue::new(&mut c.tilt.1).speed(0.01).suffix(" rad"));
+                });
+            }
+            Method::Slab => {
+                ui.horizontal(|ui| { ui.label("half thickness"); ui.add(egui::DragValue::new(&mut c.slab_half).speed(0.005).range(0.0..=2.0)); });
+            }
+            Method::Offset => {
+                ui.horizontal(|ui| { ui.label("inflate by"); ui.add(egui::DragValue::new(&mut c.offset).speed(0.002).range(-0.5..=0.5)); });
+            }
+            _ => {}
+        }
+        if c != before {
+            if c.method.time_is_angle() && !before.method.time_is_angle() {
+                // A rotation angle needs about a turn of room, not the +-1.6 of a C value.
+                let d = nnfractals::anim_timeline::BoundingBox::default();
+                if self.timeline.bounds.t == d.t {
+                    self.timeline.bounds.t = nnfractals::anim_timeline::AxisBound { min: -std::f64::consts::PI, max: std::f64::consts::PI };
+                }
+                self.timeline.equal_axis_scale = false;
+            }
+            self.timeline.collapse = c;
+            self.dirty = true;
+            self.commit_timeline();
+        }
+    }
+
+    /// What plane `k` shows: the square that covers the current limits of its
+    /// two axes — `(per-component centres, half-width)`. Limits are the single
+    /// source of truth, so drawing/zooming limits re-frames and re-renders it.
+    fn plane_view(&self, k: usize) -> ([f64; 4], f64) {
+        use nnfractals::quat_planes::PLANES;
+        let col = self.timeline.collapse;
+        if col.method.is_sphere() {
+            // The sphere is the subject here; limits are a visible cap on it.
+            return ([0.0; 4], col.rho.max(0.2) * 1.3);
+        }
+        let (i, j) = PLANES[k];
+        let (lu, lv) = (self.limit_of(i), self.limit_of(j));
+        let mut center = [0.0; 4];
+        center[i] = (lu.min + lu.max) * 0.5;
+        center[j] = (lv.min + lv.max) * 0.5;
+        let half = ((lu.max - lu.min).abs() * 0.5).max((lv.max - lv.min).abs() * 0.5).max(1e-9);
+        (center, half * 1.08) // a little margin so the yellow outline stays visible
+    }
+
+    /// Limits of quaternion component `i` (0..4 = R,A,B,C): the bounds of
+    /// whichever viewer axis currently carries it.
+    fn limit_of(&self, i: usize) -> nnfractals::anim_timeline::AxisBound {
+        use nnfractals::anim_timeline::ViewerAxis;
+        let b = &self.timeline.bounds;
+        match self.timeline.axis_assignment.axis_of(Self::part(i)) {
+            ViewerAxis::X => b.x, ViewerAxis::Y => b.y, ViewerAxis::Z => b.z, ViewerAxis::T => b.t,
+        }
+    }
+
+    fn set_limit(&mut self, i: usize, min: f64, max: f64) {
+        use nnfractals::anim_timeline::{AxisBound, ViewerAxis};
+        let nb = AxisBound { min, max };
+        let ax = self.timeline.axis_assignment.axis_of(Self::part(i));
+        let b = &mut self.timeline.bounds;
+        match ax { ViewerAxis::X => b.x = nb, ViewerAxis::Y => b.y = nb, ViewerAxis::Z => b.z = nb, ViewerAxis::T => b.t = nb }
+    }
+
+    fn part(i: usize) -> nnfractals::anim_timeline::QuatPart {
+        use nnfractals::anim_timeline::QuatPart::*;
+        [R, A, B, C][i]
+    }
+
+    /// After the limits changed: same follow-up as the bounds dialog
+    /// (undoable via the timeline commit).
+    fn limits_changed(&mut self) {
+        self.timeline.t_value = self.timeline.t_value.clamp(self.timeline.bounds.t.min, self.timeline.bounds.t.max);
+        self.reframe_camera_to_bounds();
+        self.dirty = true;
+        self.commit_timeline();
+    }
+
+    /// "▦ Planes" window: thumbnails of all six RABC planes of the current
+    /// formula; clicking one renders it at the chosen resolution to a PNG.
+    fn show_planes_window(&mut self, ctx: &egui::Context) {
+        use nnfractals::quat_planes::{plane_name, render_plane, PlaneSpec, PLANES, AXIS_NAMES};
+        if !self.planes.initialized {
+            // Fixed axes start at 0, except the viewer's time axis, which
+            // starts at the playhead's value so the planes match the 3D view.
+            let formula = QuatDagFormula { prog: &self.program, warp: &self.warp, julia: self.julia_mode, jc: self.jc, phoenix: self.phoenix };
+            let (params, _) = nnfractals::anim_eval::build_frame_params(
+                &self.timeline, formula, self.playhead_s, self.bailout_radius as f64,
+                nnfractals::anim_eval::RenderQuality { max_iter: 1, aa: 1 },
+            );
+            use nnfractals::quat_fractal::TimeAxis;
+            let ti = match params.time_axis { TimeAxis::R => 0, TimeAxis::A => 1, TimeAxis::B => 2, TimeAxis::C => 3 };
+            self.planes.fixed = [0.0; 4];
+            if !self.timeline.collapse.method.time_is_angle() {
+                self.planes.fixed[ti] = params.time_val;
+            }
+            self.planes.thumb_px = 192;
+            self.planes.max_iter = self.max_iter.max(60);
+            self.planes.hires_px = 2048;
+            self.planes.thumbs = (0..6).map(|_| None).collect();
+            self.planes.initialized = true;
+        }
+        let spec_for = |app: &App, k: usize| PlaneSpec {
+            axes: PLANES[k],
+            fixed: app.planes.fixed,
+            center: app.plane_view(k).0,
+            extent: app.plane_view(k).1,
+            max_iter: app.planes.max_iter,
+            bailout: app.bailout_radius as f64,
+            colormap: app.colormap.clone(),
+        };
+
+        let s3 = self.timeline.collapse.method.is_sphere();
+        // S3: the rotation angle at the playhead, for the visible-arc overlay.
+        let s3_time = if s3 {
+            let formula = QuatDagFormula { prog: &self.program, warp: &self.warp, julia: self.julia_mode, jc: self.jc, phoenix: self.phoenix };
+            nnfractals::anim_eval::build_frame_params(&self.timeline, formula, self.playhead_s, self.bailout_radius as f64,
+                nnfractals::anim_eval::RenderQuality { max_iter: 1, aa: 1 }).0.time_val
+        } else { 0.0 };
+        // Re-render the thumbnails whenever anything they depend on changed.
+        let key = format!(
+            "{:?}|{:?}|{}|{:?}|{:?}|{}|{}|{:?}|{:?}|{:?}|{}|{}",
+            self.program, self.warp, self.julia_mode, self.jc, self.phoenix,
+            self.bailout_radius, self.colormap, self.planes.fixed,
+            // The cap size (S3) doesn't change the slices, so don't re-render for it.
+            if s3 { None } else { Some(self.timeline.bounds) }, self.timeline.axis_assignment,
+            self.planes.max_iter, self.planes.thumb_px,
+        );
+        let key = format!("{key}|{}", if s3 { format!("{:.4}", self.timeline.collapse.rho) } else { String::new() });
+        // While the mouse is down (panning/drawing) don't pile up render jobs:
+        // start a new one only when the previous has finished.
+        let can_spawn = self.planes.thumb_rx.is_none() || self.planes.thumb_done || !ctx.input(|i| i.pointer.any_down());
+        if key != self.planes.thumb_key && can_spawn {
+            self.planes.thumb_key = key;
+            self.planes.thumb_job += 1;
+            self.planes.thumb_done = false;
+            let job = self.planes.thumb_job;
+            let (tx, rx) = mpsc::channel();
+            self.planes.thumb_rx = Some(rx);
+            let (prog, warp) = (self.program.clone(), self.warp.clone());
+            let (julia, jc, phoenix) = (self.julia_mode, self.jc, self.phoenix);
+            let specs: Vec<PlaneSpec> = (0..6).map(|k| spec_for(self, k)).collect();
+            let px = self.planes.thumb_px;
+            thread::spawn(move || {
+                let f = QuatDagFormula { prog: &prog, warp: &warp, julia, jc, phoenix };
+                for (k, spec) in specs.iter().enumerate() {
+                    if tx.send((job, k, px, render_plane(&f, spec, px))).is_err() {
+                        return; // superseded by a newer job
+                    }
+                }
+            });
+        }
+        if let Some(rx) = &self.planes.thumb_rx {
+            loop {
+                let (job, k, px, rgb) = match rx.try_recv() {
+                    Ok(m) => m,
+                    Err(mpsc::TryRecvError::Empty) => break,
+                    Err(mpsc::TryRecvError::Disconnected) => { self.planes.thumb_done = true; break; }
+                };
+                if job == self.planes.thumb_job {
+                    let n = px as usize;
+                    self.planes.thumbs[k] = Some(ctx.load_texture(
+                        format!("plane_{k}"), egui::ColorImage::from_rgb([n, n], &rgb), egui::TextureOptions::LINEAR));
+                }
+            }
+        }
+        if let Some(rx) = &self.planes.hires_rx {
+            if let Ok(res) = rx.try_recv() {
+                self.planes.hires_busy = None;
+                match res {
+                    Ok((path, n, preview)) => {
+                        let n = n as usize;
+                        self.planes.hires_preview = Some(ctx.load_texture(
+                            "plane_hires", egui::ColorImage::from_rgb([n, n], &preview), egui::TextureOptions::LINEAR));
+                        self.planes.hires_status = Some(Ok(format!("saved {}", path.display())));
+                    }
+                    Err(e) => self.planes.hires_status = Some(Err(e)),
+                }
+                self.planes.hires_rx = None;
+            }
+        }
+
+        let mut open = self.planes.open;
+        let mut clicked: Option<usize> = None;
+        let mut new_limits: Option<(usize, (f64, f64), (f64, f64))> = None;
+        let mut reset_limits = false;
+        let mut zoom_limits: Option<(usize, (f64, f64), (f64, f64))> = None;
+        let mut pan_limits: Option<(usize, (f64, f64), (f64, f64))> = None;
+        let mut pan_done = false;
+        let mut s3_rotate: Option<(usize, f64)> = None; // (pole index 0..3, radians)
+        let mut s3_cap: Option<f64> = None; // factor on the visible cap
+        let mut s3_commit = false; // a rotate-drag just ended
+        let mut inner_size = egui::Vec2::ZERO;
+        let win = egui::Window::new("\u{25a6} Planes").open(&mut open).resizable(true)
+            .default_size([self.planes.size.0, self.planes.size.1]).show(ctx, |ui| {
+            inner_size = ui.max_rect().size();
+            ui.horizontal_wrapped(|ui| {
+                for (i, name) in AXIS_NAMES.iter().enumerate() {
+                    ui.label(format!("{name} ="));
+                    ui.add(egui::DragValue::new(&mut self.planes.fixed[i]).speed(0.01));
+                }
+                ui.label("(held fixed where an axis is not in the plane)");
+            });
+            ui.horizontal(|ui| {
+                ui.label("iterations");
+                ui.add(egui::DragValue::new(&mut self.planes.max_iter).range(5..=5000));
+                ui.separator();
+                ui.label("click a plane to render it at");
+                ui.add(egui::DragValue::new(&mut self.planes.hires_px).range(64..=16384).suffix(" px"));
+            });
+            ui.horizontal(|ui| {
+                if s3 {
+                    ui.label("S3: the circle is the 3-sphere on this slice (green = visible in the 3D view). Drag a tile to rotate the view in that plane; wheel = visible cap size.");
+                } else {
+                    ui.label("Drag on a plane to set the fractal's limits on its two axes (yellow = current limits).");
+                }
+                if ui.button("reset limits").clicked() { reset_limits = true; }
+            });
+            ui.add_space(4.0);
+            // Tiles fill the window: three columns, two rows, minus room
+            // for the status row underneath.
+            let avail = ui.available_size();
+            let side = ((avail.x - 24.0) / 3.0).min((avail.y - 150.0) / 2.0 - 22.0).clamp(96.0, 900.0);
+            let want_px = ((side * ctx.pixels_per_point()).ceil() as u32).div_ceil(32) * 32;
+            self.planes.thumb_px = want_px.clamp(128, 512);
+            egui::Grid::new("planes_grid").spacing([8.0, 8.0]).show(ui, |ui| {
+                for k in 0..6 {
+                    ui.vertical(|ui| {
+                        let busy = self.planes.hires_busy.is_some();
+                        match &self.planes.thumbs[k] {
+                            Some(t) => {
+                                let r = ui.add(
+                                    egui::Image::new(egui::load::SizedTexture::new(t.id(), egui::vec2(side, side)))
+                                        .sense(egui::Sense::click_and_drag()),
+                                ).on_hover_text(if s3 {
+                                    "Click: render this plane at full resolution\nDrag: rotate the 3D view in this plane (needs the time axis in the plane)\nWheel: grow/shrink the visible cap"
+                                } else {
+                                    "Click: render this plane at full resolution\nDrag: draw the new limits (hold Shift for a square)\nMiddle-drag: pan the limits\nWheel: grow/shrink the limits"
+                                });
+                                if r.clicked() && !busy { clicked = Some(k); }
+                                let (pi, pj) = PLANES[k];
+                                // The tile always shows this plane's current limits (see
+                                // `plane_view`). The wheel over it grows/shrinks those limits
+                                // about the point under the cursor, which re-renders the slice.
+                                let ((cu, cv), ext) = { let (c, e) = self.plane_view(k); ((c[pi], c[pj]), e) };
+                                // Decide the button once, when the drag starts, instead of
+                                // re-testing which buttons are down on every frame.
+                                if r.drag_started() {
+                                    let (mid, pri) = ui.input(|i| (i.pointer.middle_down(), i.pointer.primary_down()));
+                                    self.planes.drag_button = Some(if mid { egui::PointerButton::Middle } else { egui::PointerButton::Primary });
+                                    eprintln!("[planes] drag start on tile {k}: primary={pri} middle={mid}");
+                                }
+                                let btn = self.planes.drag_button;
+                                // Middle-button drag pans the limits (the picture follows the cursor).
+                                if !s3 && r.drag_started() && btn == Some(egui::PointerButton::Middle) {
+                                    self.planes.pan_before = Some(self.timeline.clone());
+                                }
+                                if !s3 && r.dragged() && btn == Some(egui::PointerButton::Middle) {
+                                    let d = r.drag_delta();
+                                    let du = -(d.x / r.rect.width()) as f64 * 2.0 * ext;
+                                    let dv = (d.y / r.rect.height()) as f64 * 2.0 * ext;
+                                    let (lu, lv) = (self.limit_of(pi), self.limit_of(pj));
+                                    pan_limits = Some((k, (lu.min + du, lu.max + du), (lv.min + dv, lv.max + dv)));
+                                }
+                                if !s3 && r.drag_stopped() && btn == Some(egui::PointerButton::Middle) {
+                                    pan_done = true;
+                                }
+                                if r.hovered() {
+                                    let scroll = ui.input(|i| i.smooth_scroll_delta.y);
+                                    if s3 && scroll != 0.0 {
+                                        s3_cap = Some((1.0 - scroll as f64 * 0.002).clamp(0.5, 2.0));
+                                    } else if let (true, Some(pos)) = (scroll != 0.0, r.hover_pos()) {
+                                        let (fx, fy) = (((pos.x - r.rect.left()) / r.rect.width()) as f64, ((pos.y - r.rect.top()) / r.rect.height()) as f64);
+                                        let (u0, v0) = (cu - ext + 2.0 * ext * fx, cv + ext - 2.0 * ext * fy);
+                                        let f = (1.0 - scroll as f64 * 0.002).clamp(0.5, 2.0);
+                                        let (lu, lv) = (self.limit_of(pi), self.limit_of(pj));
+                                        let scale = |lo: f64, hi: f64, at: f64| (at - (at - lo) * f, at + (hi - at) * f);
+                                        zoom_limits = Some((k, scale(lu.min, lu.max, u0), scale(lv.min, lv.max, v0)));
+                                    }
+                                }
+                                let to_px = |u: f64, v: f64| egui::pos2(
+                                    r.rect.left() + ((u - cu + ext) / (2.0 * ext)) as f32 * r.rect.width(),
+                                    r.rect.top() + ((cv + ext - v) / (2.0 * ext)) as f32 * r.rect.height(),
+                                );
+                                let paint = ui.painter_at(r.rect);
+                                let outline = |rect: egui::Rect, col: egui::Color32| {
+                                    let st = egui::Stroke::new(1.5, col);
+                                    let (a, b, c, d) = (rect.left_top(), rect.right_top(), rect.right_bottom(), rect.left_bottom());
+                                    for (p, q) in [(a, b), (b, c), (c, d), (d, a)] { paint.line_segment([p, q], st); }
+                                };
+                                // Current limits of this plane's two axes.
+                                let (lu, lv) = (self.limit_of(pi), self.limit_of(pj));
+                                if !s3 {
+                                    outline(egui::Rect::from_two_pos(to_px(lu.min, lv.min), to_px(lu.max, lv.max)),
+                                            egui::Color32::from_rgb(240, 210, 60));
+                                }
+                                if s3 {
+                                    // Where the 3-sphere cuts this slice, and which part of it the
+                                    // current 3D view shows.
+                                    let col = self.timeline.collapse;
+                                    let others: Vec<usize> = (0..4).filter(|m| *m != pi && *m != pj).collect();
+                                    let r2 = col.rho * col.rho - self.planes.fixed[others[0]].powi(2) - self.planes.fixed[others[1]].powi(2);
+                                    if r2 > 1e-9 {
+                                        let rad = r2.sqrt();
+                                        let ax_idx = |m: usize| match self.timeline.axis_assignment.axis_of(Self::part(m)) {
+                                            nnfractals::anim_timeline::ViewerAxis::X => 0, nnfractals::anim_timeline::ViewerAxis::Y => 1,
+                                            nnfractals::anim_timeline::ViewerAxis::Z => 2, nnfractals::anim_timeline::ViewerAxis::T => 3,
+                                        };
+                                        let b = self.timeline.bounds;
+                                        let visible = |phi: f64| -> bool {
+                                            let mut q = self.planes.fixed;
+                                            q[pi] = rad * phi.cos();
+                                            q[pj] = rad * phi.sin();
+                                            let mut pv = [0.0; 4];
+                                            for m in 0..4 { pv[ax_idx(m)] = q[m]; }
+                                            match col.s3_view_coords(pv, s3_time) {
+                                                Some((x, y, z)) => x >= b.x.min && x <= b.x.max && y >= b.y.min && y <= b.y.max && z >= b.z.min && z <= b.z.max,
+                                                None => false,
+                                            }
+                                        };
+                                        let n = 180;
+                                        for s in 0..n {
+                                            let (p0, p1) = (std::f64::consts::TAU * s as f64 / n as f64, std::f64::consts::TAU * (s + 1) as f64 / n as f64);
+                                            let vis = visible((p0 + p1) * 0.5);
+                                            let st = if vis { egui::Stroke::new(3.0, egui::Color32::from_rgb(80, 230, 120)) } else { egui::Stroke::new(1.0, egui::Color32::from_gray(150)) };
+                                            paint.line_segment([to_px(rad * p0.cos(), rad * p0.sin()), to_px(rad * p1.cos(), rad * p1.sin())], st);
+                                        }
+                                    }
+                                    // Drag = rotate the view in this plane. Only planes that contain the
+                                    // time (w) axis change the picture; the others just spin it.
+                                    if r.dragged() && btn == Some(egui::PointerButton::Primary) {
+                                        if let Some(cur) = r.interact_pointer_pos() {
+                                            let prev = cur - r.drag_delta();
+                                            let c0 = r.rect.center();
+                                            let ang = |p: egui::Pos2| ((c0.y - p.y) as f64).atan2((p.x - c0.x) as f64);
+                                            let mut d = ang(cur) - ang(prev);
+                                            if d > std::f64::consts::PI { d -= std::f64::consts::TAU; }
+                                            if d < -std::f64::consts::PI { d += std::f64::consts::TAU; }
+                                            use nnfractals::anim_timeline::ViewerAxis as VA;
+                                            let (ai, aj) = (self.timeline.axis_assignment.axis_of(Self::part(pi)), self.timeline.axis_assignment.axis_of(Self::part(pj)));
+                                            let pole = |a: VA| match a { VA::X => Some(0usize), VA::Y => Some(1), VA::Z => Some(2), VA::T => None };
+                                            match (ai, aj) {
+                                                (a, VA::T) => if let Some(ix) = pole(a) { s3_rotate = Some((ix, d)); },
+                                                (VA::T, a) => if let Some(ix) = pole(a) { s3_rotate = Some((ix, -d)); },
+                                                _ => {}
+                                            }
+                                        }
+                                    }
+                                }
+                                if !s3 && r.dragged() && btn == Some(egui::PointerButton::Primary) {
+                                    let origin = ui.input(|i| i.pointer.press_origin());
+                                    if let (Some(a), Some(b)) = (origin, r.interact_pointer_pos()) {
+                                        let b = plane_drag_end(a, b, ui.input(|i| i.modifiers.shift));
+                                        let rect = egui::Rect::from_two_pos(a, b).intersect(r.rect);
+                                        outline(rect, egui::Color32::WHITE);
+                                        self.planes.drag_last = Some((k, a, b));
+                                    }
+                                }
+                                if !s3 && r.drag_stopped() && btn == Some(egui::PointerButton::Primary) {
+                                    if let Some((dk, a, b)) = self.planes.drag_last.take() {
+                                        if dk == k && (a - b).abs().max_elem() >= 4.0 {
+                                            let from_px = |p: egui::Pos2| (
+                                                (cu - ext + 2.0 * ext * ((p.x - r.rect.left()) / r.rect.width()) as f64).clamp(cu - ext, cu + ext),
+                                                (cv + ext - 2.0 * ext * ((p.y - r.rect.top()) / r.rect.height()) as f64).clamp(cv - ext, cv + ext),
+                                            );
+                                            let (pa, pb) = (from_px(a), from_px(b));
+                                            new_limits = Some((k, (pa.0.min(pb.0), pa.0.max(pb.0)), (pa.1.min(pb.1), pa.1.max(pb.1))));
+                                        }
+                                    }
+                                }
+                                if s3 && r.drag_stopped() { s3_commit = true; }
+                                if r.drag_stopped() { self.planes.drag_button = None; }
+                            }
+                            None => { ui.allocate_space(egui::vec2(side, side)); ui.spinner(); }
+                        }
+                        let (i, j) = PLANES[k];
+                        ui.label(format!("{}  ({} \u{2192}, {} \u{2191})", plane_name(PLANES[k]), AXIS_NAMES[i], AXIS_NAMES[j]));
+                    });
+                    if k % 3 == 2 { ui.end_row(); }
+                }
+            });
+            ui.horizontal(|ui| {
+                if let Some(t) = &self.planes.hires_preview {
+                    ui.add(egui::Image::new(egui::load::SizedTexture::new(t.id(), egui::vec2(110.0, 110.0))));
+                }
+                ui.vertical(|ui| {
+                    if let Some(name) = &self.planes.hires_busy {
+                        ui.horizontal(|ui| { ui.spinner(); ui.label(format!("rendering {name}\u{2026}")); });
+                    }
+                    match &self.planes.hires_status {
+                        Some(Ok(m)) => { ui.label(m); }
+                        Some(Err(e)) => { ui.colored_label(egui::Color32::RED, e); }
+                        None => {}
+                    }
+                });
+            });
+        });
+        self.planes.open = open;
+        // Remember the window size (saved once the user lets go of the edge).
+        if let Some(w) = &win {
+            self.planes.rect = Some(w.response.rect);
+            // Content size, not the outer frame, so the saved value doesn't
+            // grow by the frame width on every restart.
+            let sz = inner_size;
+            let changed = (sz.x - self.planes.size.0).abs() > 2.0 || (sz.y - self.planes.size.1).abs() > 2.0;
+            if changed && sz.x > 100.0 && sz.y > 100.0 && !ctx.input(|i| i.pointer.any_down()) {
+                self.planes.size = (sz.x, sz.y);
+                self.save_prefs();
+            }
+        }
+
+        if let Some((k, u, v)) = new_limits.or(zoom_limits) {
+            let (pi, pj) = PLANES[k];
+            self.set_limit(pi, u.0, u.1);
+            self.set_limit(pj, v.0, v.1);
+            self.limits_changed();
+        }
+        if let Some((k, u, v)) = pan_limits {
+            let (pi, pj) = PLANES[k];
+            self.set_limit(pi, u.0, u.1);
+            self.set_limit(pj, v.0, v.1);
+            self.dirty = true; // live; committed once when the drag ends
+        }
+        if pan_done {
+            if let Some(before) = self.planes.pan_before.take() {
+                self.timeline.t_value = self.timeline.t_value.clamp(self.timeline.bounds.t.min, self.timeline.bounds.t.max);
+                self.commit_timeline_from(before);
+            }
+        }
+        if let Some((ix, d)) = s3_rotate {
+            self.timeline.collapse.pole[ix] += d;
+            self.dirty = true;
+        }
+        if let Some(f) = s3_cap {
+            let b = &mut self.timeline.bounds;
+            for ax in [&mut b.x, &mut b.y, &mut b.z] {
+                let h = ((ax.max - ax.min) * 0.5).abs().max(1e-6) * f;
+                let c = (ax.max + ax.min) * 0.5;
+                *ax = nnfractals::anim_timeline::AxisBound { min: c - h, max: c + h };
+            }
+            self.dirty = true;
+            s3_commit = true;
+        }
+        if s3_commit { self.commit_timeline(); }
+        if reset_limits {
+            self.timeline.bounds = nnfractals::anim_timeline::BoundingBox::default();
+            if s3 {
+                self.timeline.bounds.t = nnfractals::anim_timeline::AxisBound { min: -std::f64::consts::PI, max: std::f64::consts::PI };
+            }
+            self.limits_changed();
+        }
+
+        if let Some(k) = clicked {
+            let spec = spec_for(self, k);
+            let px = self.planes.hires_px;
+            let name = plane_name(PLANES[k]);
+            let dir = nnfractals::project_root().join("explorer_out/quat_planes");
+            let path = dir.join(format!("{}_plane_{}_{}px_w{:.4}.png", self.genome_label, name, px, self.plane_view(k).1));
+            let (prog, warp) = (self.program.clone(), self.warp.clone());
+            let (julia, jc, phoenix) = (self.julia_mode, self.jc, self.phoenix);
+            let (tx, rx) = mpsc::channel();
+            self.planes.hires_rx = Some(rx);
+            self.planes.hires_busy = Some(format!("{name} at {px}px"));
+            self.planes.hires_status = None;
+            thread::spawn(move || {
+                let f = QuatDagFormula { prog: &prog, warp: &warp, julia, jc, phoenix };
+                let rgb = render_plane(&f, &spec, px);
+                let res = (|| -> Result<(PathBuf, u32, Vec<u8>), String> {
+                    std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+                    image::save_buffer(&path, &rgb, px, px, image::ColorType::Rgb8)
+                        .map_err(|e| format!("{}: {e}", path.display()))?;
+                    let img = image::RgbImage::from_raw(px, px, rgb).ok_or("bad buffer")?;
+                    let small = image::imageops::thumbnail(&img, 512.min(px), 512.min(px));
+                    Ok((path.clone(), small.width(), small.into_raw()))
+                })();
+                let _ = tx.send(res);
+            });
+        }
+        if self.planes.hires_busy.is_some() || self.planes.thumb_rx.is_some() {
+            ctx.request_repaint_after(std::time::Duration::from_millis(100));
+        }
+    }
+
     fn show_render_window(&mut self, ctx: &egui::Context) {
         let mut open = self.render_window_open;
         egui::Window::new("Render animation").open(&mut open).show(ctx, |ui| {
@@ -1633,6 +2768,18 @@ impl App {
                 ui.add(egui::DragValue::new(&mut self.render_width).range(64..=7680));
                 ui.label("x");
                 ui.add(egui::DragValue::new(&mut self.render_height).range(64..=7680));
+            });
+            ui.horizontal(|ui| {
+                if ui.checkbox(&mut self.render_reel_crop, "Facebook reel (crop 9:16)")
+                    .on_hover_text("Also writes <name>_reel.mp4: the centre 9:16 part of the render, cut out at native pixel size (cropped, not scaled). Render big (e.g. 3840x2160) and the reel keeps that detail. The full render is kept too.")
+                    .changed()
+                {
+                    self.save_prefs();
+                }
+                if self.render_reel_crop {
+                    let (cw, ch) = nnfractals::video_export::reel_crop_dims(self.render_width, self.render_height);
+                    ui.label(format!("\u{2192} {cw}\u{d7}{ch}"));
+                }
             });
             ui.horizontal(|ui| {
                 ui.label("fps:");
@@ -1660,8 +2807,15 @@ impl App {
                     self.save_prefs();
                 }
             });
+            let unsaved_formula = self.formula_edited();
+            if unsaved_formula {
+                ui.colored_label(
+                    egui::Color32::from_rgb(230, 180, 80),
+                    "The formula has unsaved edits. The queue renders the .nn file on disk, so save the edited formula first (Edit formula \u{2192} save as new).",
+                );
+            }
             ui.horizontal(|ui| {
-                if ui.button("Add to queue").clicked() {
+                if ui.add_enabled(!unsaved_formula, egui::Button::new("Add to queue")).clicked() {
                     let quat_spec = nnfractals::video_export::QuatRenderSpec {
                         mode: "timeline".to_string(),
                         width: self.render_width,
@@ -1673,6 +2827,7 @@ impl App {
                         timeline: Some(self.timeline.clone()),
                         trim_start_s: self.timeline.trim_start_s,
                         trim_end_s: self.timeline.trim_end_s,
+                        reel_crop: self.render_reel_crop,
                         ..Default::default()
                     };
                     let spec = nnfractals::video_export::QueueSpec {
@@ -1890,13 +3045,27 @@ impl eframe::App for App {
             ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
         }
 
+        // Debounced shader rebuild after a formula edit (see
+        // FORMULA_RECOMPILE_DEBOUNCE).
+        if let Some(at) = self.formula_editor.recompile_at {
+            let now = std::time::Instant::now();
+            if now >= at {
+                self.recompile_pipeline();
+            } else {
+                ctx.request_repaint_after(at - now);
+            }
+        }
+
         // The state BEFORE any of this frame's edits — whichever control
         // calls commit_timeline() this frame pushes this exact snapshot as
         // the undo entry (see commit_timeline's doc comment).
         self.timeline_before_this_frame = self.timeline.clone();
 
+        // Not while a text field has focus: Ctrl+Z there is the text box's
+        // own undo (the formula editor especially), not a timeline undo.
+        let typing = ctx.egui_wants_keyboard_input();
         let (undo_pressed, redo_pressed) = ui.input(|i| {
-            let z_pressed = i.key_pressed(egui::Key::Z);
+            let z_pressed = i.key_pressed(egui::Key::Z) && !typing;
             let undo = z_pressed && i.modifiers.ctrl && !i.modifiers.shift;
             let redo = z_pressed && i.modifiers.ctrl && i.modifiers.shift;
             (undo, redo)
@@ -1975,8 +3144,18 @@ impl eframe::App for App {
         }
 
         egui::Panel::top("anim_top_bar").show(ui, |ui| {
-            ui.horizontal(|ui| {
-                ui.heading(&self.genome_label);
+            // `horizontal_wrapped`: on a narrow window the buttons go to a second row
+            // instead of running off the right edge.
+            ui.horizontal_wrapped(|ui| {
+                // Genome names can be very long (the metric-tagged loop winners are ~150
+                // characters); an unbounded heading used to push every button after it
+                // off-screen. Cap it at 35% of the bar, ellipsise, full name on hover.
+                let title_w = (ui.available_width() * 0.35).max(160.0);
+                ui.scope(|ui| {
+                    ui.set_max_width(title_w);
+                    ui.add(egui::Label::new(egui::RichText::new(&self.genome_label).heading()).truncate())
+                        .on_hover_text(&self.genome_label);
+                });
                 if ui.add_enabled(!self.undo_stack.is_empty(), egui::Button::new("\u{21b6} undo")).clicked() {
                     self.undo();
                 }
@@ -1984,6 +3163,12 @@ impl eframe::App for App {
                     self.redo();
                 }
                 ui.label("(Ctrl+Z / Ctrl+Shift+Z, Delete to remove a selected clip)");
+                ui.separator();
+                let label = if self.formula_edited() { "\u{270e} Edit formula \u{25cf}" } else { "\u{270e} Edit formula" };
+                ui.toggle_value(&mut self.formula_editor.open, label)
+                    .on_hover_text("Edit the formula live; the view updates as you type or drag a constant");
+                ui.toggle_value(&mut self.planes.open, "\u{25a6} Planes")
+                    .on_hover_text("All six RABC planes (RA, RB, RC, AB, AC, BC) as flat slices; click one to render it at any resolution");
                 if let Some(err) = &self.gpu_error {
                     ui.colored_label(egui::Color32::RED, err);
                 }
@@ -2053,6 +3238,11 @@ impl eframe::App for App {
 
         egui::Panel::left("anim_left_panel").default_size(240.0).min_size(200.0).resizable(true).show(ui, |ui| {
             egui::ScrollArea::vertical().show(ui, |ui| {
+                if self.formula_editor.open {
+                    ui.heading("Formula");
+                    self.show_formula_editor(ui);
+                    ui.separator();
+                }
                 ui.label("Drag to orbit. Scroll to zoom. Middle-drag to pan the origin.");
                 ui.separator();
 
@@ -2091,6 +3281,9 @@ impl eframe::App for App {
                 if axis_changed {
                     self.commit_timeline();
                 }
+                ui.separator();
+
+                self.show_collapse_section(ui);
                 ui.separator();
 
                 ui.label("Bounding box");
@@ -2138,6 +3331,13 @@ impl eframe::App for App {
                         bounds_changed = true;
                     }
                     self.show_bbox_quick_set(ui);
+                    let remap_ok = self.timeline.collapse.method.allows_axis_remap();
+                    if ui.add_enabled(remap_ok, egui::Checkbox::new(&mut self.timeline.equal_axis_scale, "equal scale"))
+                        .on_hover_text("Give X, Y and Z the same room on screen even when their ranges differ (a thin axis is stretched). Not available for tilt / S3, which mix the axes.")
+                        .changed()
+                    {
+                        bounds_changed = true;
+                    }
                     // Carl, 2026-09-23: "add a go to bounds option in the
                     // animator. For all axis or for one only" — this is
                     // the "all axis" affordance; the per-row "→bounds"
@@ -2418,7 +3618,10 @@ impl eframe::App for App {
                             }
                         }
                     }
-                    let scroll = ui.input(|i| i.smooth_scroll_delta.y);
+                    // The wheel belongs to the ▦ Planes window when the pointer is over it.
+                    let over_planes = self.planes.open && self.planes.rect
+                        .is_some_and(|r| ui.input(|i| i.pointer.latest_pos()).is_some_and(|p| r.contains(p)));
+                    let scroll = if over_planes { 0.0 } else { ui.input(|i| i.smooth_scroll_delta.y) };
                     if scroll.abs() > 0.0 {
                         self.timeline.camera_distance = (self.timeline.camera_distance * (1.0 - scroll as f64 * 0.002)).clamp(1.7, 40.0);
                         self.commit_timeline();
@@ -2433,6 +3636,9 @@ impl eframe::App for App {
 
         if self.render_window_open {
             self.show_render_window(&ctx);
+        }
+        if self.planes.open {
+            self.show_planes_window(&ctx);
         }
         if self.bbox_dialog_open {
             self.show_bbox_dialog(&ctx);

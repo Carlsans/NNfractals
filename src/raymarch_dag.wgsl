@@ -125,6 +125,31 @@ fn qnormz(q: Quat) -> Quat {
     return Quat(q.r/m, q.a/m, q.b/m, q.c/m);
 }
 
+// Generalised Mandelbulb power (op BULB) — mirrors quat_dag::qbulb exactly.
+fn safe_atan2(y: f32, x: f32) -> f32 {
+    if (abs(x) + abs(y) < 1e-30) { return 0.0; }
+    return atan2(y, x);
+}
+fn qbulb(q: Quat, p: Quat) -> Quat {
+    let nr = clamp(p.r, 1.5, 10.0);
+    let na = clamp(p.a, 1.0, 10.0);
+    let v = sqrt(q.a*q.a + q.b*q.b + q.c*q.c);
+    let rho = sqrt(q.r*q.r + v*v);
+    let t1 = na * safe_atan2(v, q.r) + p.b;
+    let t2 = na * safe_atan2(sqrt(q.a*q.a + q.b*q.b), q.c);
+    let ph = na * safe_atan2(q.b, q.a) + p.c;
+    let rn = pow(max(rho, 1e-30), nr);
+    let s1 = rn * sin(t1);
+    return Quat(rn * cos(t1), s1 * sin(t2) * cos(ph), s1 * sin(t2) * sin(ph), s1 * cos(t2));
+}
+fn qbulb_deriv(q: Quat, p: Quat, da: f32, db: f32) -> f32 {
+    let nr = clamp(p.r, 1.5, 10.0);
+    let na = clamp(p.a, 1.0, 10.0);
+    let rho = max(qnorm(q), 1e-30);
+    let rn = pow(rho, nr);
+    return max(nr, na) * pow(rho, nr - 1.0) * da + rn * (abs(log(rho)) + 1.0) * db;
+}
+
 // ── DAG evaluators — mirror quat_dag.rs's eval_program_quat /
 // eval_program_quat_deriv register-VMs exactly, opcode for opcode. ──
 
@@ -145,6 +170,7 @@ fn eval_warp(point: Quat) -> Quat {
             case 0u: { val = point; }       // Z (warp reads point for both z and c)
             case 1u: { val = point; }       // C
             case 2u: { val = Quat(node.kre, node.kim, 0.0, 0.0); }
+            case 22u: { val = Quat(0.0, 0.0, node.kre, node.kim); }
             case 3u: { val = qmul(a, a); }
             case 4u: { val = qmul(qmul(a, a), a); }
             case 5u: { let sq = qmul(a, a); val = qmul(sq, sq); }
@@ -163,6 +189,7 @@ fn eval_warp(point: Quat) -> Quat {
             case 18u: { val = qsub(a, b); }
             case 19u: { val = qmul(a, b); }
             case 20u: { val = qmul(a, qrecip(b)); }
+            case 21u: { val = qbulb(a, b); }
             default: { val = Quat(0.0, 0.0, 0.0, 0.0); }
         }
         reg[i] = val;
@@ -195,6 +222,7 @@ fn eval_main_deriv(z: Quat, c: Quat, dz: f32, dc: f32) -> ValDeriv {
             case 0u: { val = z; dval = dz; }
             case 1u: { val = c; dval = dc; }
             case 2u: { val = Quat(node.kre, node.kim, 0.0, 0.0); dval = 0.0; }
+            case 22u: { val = Quat(0.0, 0.0, node.kre, node.kim); dval = 0.0; }
             case 3u: { val = qmul(a, a); dval = 2.0 * na * da; }
             case 4u: { val = qmul(qmul(a, a), a); dval = 3.0 * na * na * da; }
             case 5u: { let sq = qmul(a, a); val = qmul(sq, sq); dval = 4.0 * na*na*na * da; }
@@ -218,6 +246,7 @@ fn eval_main_deriv(z: Quat, c: Quat, dz: f32, dc: f32) -> ValDeriv {
                 val = qmul(a, rb);
                 dval = da / (nb + EPS) + na * d_rb;
             }
+            case 21u: { val = qbulb(a, b); dval = qbulb_deriv(a, b, da, db); }
             default: { val = Quat(0.0, 0.0, 0.0, 0.0); dval = 0.0; }
         }
         reg[i] = val;

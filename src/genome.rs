@@ -41,6 +41,8 @@ impl FormulaTerm {
     }
 }
 
+fn is_zero_f32(v: &f32) -> bool { *v == 0.0 }
+
 /// A fractal genome: the formula is evolved DIRECTLY as a sparse set of weighted
 /// basis terms (no transformer/latent indirection). z_new = Σ coeffᵢ · φ_basisᵢ(z, c).
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -170,6 +172,19 @@ pub struct Genome {
     /// `TimeMod` is `Copy`, which a `Vec<OpNode>` would take away from every
     /// site that holds one.
     #[serde(default)] pub time_prog: Vec<crate::time_program::TimeProgram>,
+    /// Quaternion genomes: the 4D→3D projection this formula was evolved and
+    /// scored under (`quat_collapse`). `None` = the process default (plain
+    /// slice unless `NN_COLLAPSE`/the browser selector says otherwise). The
+    /// animation viewer opens a genome with no saved timeline in this projection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub collapse: Option<crate::quat_collapse::Collapse>,
+    /// Quaternion genomes: how far out the previews look, as a factor on the
+    /// default range (0 = unset = 1). Under S3 it scales the sphere radius
+    /// (which scale of the 4D set sits on the sphere); under the legacy slice
+    /// it scales the view domain. Chosen by `explorer range-scan`, evolved by
+    /// the GA, used by thumbnails, the rater and a fresh viewer timeline.
+    #[serde(default, skip_serializing_if = "is_zero_f32")]
+    pub view_range: f32,
     pub id: u64,
     #[serde(default)]
     pub view_cx: f32,
@@ -1194,6 +1209,7 @@ pub(crate) fn render_node_with(
         op::Z       => z_label.into(),
         op::C       => c_label.into(),
         op::CONST   => fmt_c(n.kre, n.kim),
+        op::CONSTBC => format!("kbc({:.2}, {:.2})", n.kre, n.kim),
         op::SQR     => format!("({})²", ra()),
         op::CUBE    => format!("({})³", ra()),
         op::QUART   => format!("({})⁴", ra()),
@@ -1212,6 +1228,7 @@ pub(crate) fn render_node_with(
         op::SUB     => format!("({} - {})", ra(), rb()),
         op::MUL     => format!("{}·{}", ra(), rb()),
         op::DIV     => format!("({} / {})", ra(), rb()),
+        op::BULB    => format!("bulb({}, {})", ra(), rb()),
         _           => "?".into(),
     }
 }
@@ -1228,6 +1245,11 @@ pub(crate) const UNARY_OPS: [u8; 14] = [
     op::TANH, op::CONJ, op::ABSFOLD, op::ABSRE, op::ABSIM, op::NORMZ,
 ];
 pub(crate) const BINARY_OPS: [u8; 4] = [op::ADD, op::SUB, op::MUL, op::DIV];
+
+/// Relative chance of each combiner (ADD, SUB, MUL, DIV) `crossover_program` puts on top of
+/// the two parents. Uniform unless the quaternion GA sets it (`--gen-params comb_*`); the 2D
+/// GA never does.
+pub static COMBINER_WEIGHTS: std::sync::Mutex<[f64; 4]> = std::sync::Mutex::new([1.0; 4]);
 // Rare/transcendental ops that produce unusual fractals — biased in via "exotic".
 const EXOTIC_OPS: [u8; 6] = [op::SIN, op::EXP, op::RECIP, op::NORMZ, op::ABSFOLD, op::LOG];
 
@@ -1369,7 +1391,16 @@ pub fn crossover_program(a: &[OpNode], b: &[OpNode], rng: &mut impl Rng, max_nod
         child.push(m);
     }
     let root_b = (child.len() - 1) as u8;
-    let opc = BINARY_OPS[rng.random_range(0..BINARY_OPS.len())];
+    let opc = {
+        let w = *COMBINER_WEIGHTS.lock().unwrap();
+        let total: f64 = w.iter().map(|x| x.max(0.0)).sum();
+        if total <= 0.0 { BINARY_OPS[rng.random_range(0..BINARY_OPS.len())] } else {
+            let mut r = rng.random::<f64>() * total;
+            let mut k = 3;
+            for (i, x) in w.iter().enumerate() { let x = x.max(0.0); if r < x { k = i; break; } r -= x; }
+            BINARY_OPS[k]
+        }
+    };
     child.push(OpNode { op: opc, a: root_a, b: root_b, kre: 0.0, kim: 0.0 });
     child
 }

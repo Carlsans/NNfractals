@@ -142,6 +142,7 @@ pub fn eval_program_quat(prog: &[OpNode], z: Quat, c: Quat) -> Quat {
             op::Z => z,
             op::C => c,
             op::CONST => Quat::new(node.kre as f64, node.kim as f64, 0.0, 0.0),
+            op::CONSTBC => Quat::new(0.0, 0.0, node.kre as f64, node.kim as f64),
             op::SQR => a.mul(a),
             op::CUBE => a.mul(a).mul(a),
             op::QUART => {
@@ -163,10 +164,38 @@ pub fn eval_program_quat(prog: &[OpNode], z: Quat, c: Quat) -> Quat {
             op::SUB => a.sub(b),
             op::MUL => a.mul(b),
             op::DIV => a.mul(qrecip(b)),
+            op::BULB => qbulb(a, b),
             _ => Quat::ZERO,
         };
     }
     reg[n - 1]
+}
+
+/// Generalised Mandelbulb power (`op::BULB`): `p.r` = radial power (1.5–10),
+/// `p.a` = angular multiplier (1–10), `p.b`/`p.c` = rotation offsets on the polar
+/// angle / azimuth. With p = (n, n, 0, 0) this is exactly `QuatFormula::Bulb`'s step
+/// at power n. Mirrored by `qbulb` in both raymarch WGSL files.
+pub fn qbulb(q: Quat, p: Quat) -> Quat {
+    let at2 = |y: f64, x: f64| if x.abs() + y.abs() < 1e-30 { 0.0 } else { y.atan2(x) };
+    let nr = p.r.clamp(1.5, 10.0);
+    let na = p.a.clamp(1.0, 10.0);
+    let v = (q.a * q.a + q.b * q.b + q.c * q.c).sqrt();
+    let rho = (q.r * q.r + v * v).sqrt();
+    let t1 = na * at2(v, q.r) + p.b;
+    let t2 = na * at2((q.a * q.a + q.b * q.b).sqrt(), q.c);
+    let ph = na * at2(q.b, q.a) + p.c;
+    let rn = rho.max(1e-30).powf(nr);
+    let s1 = rn * t1.sin();
+    Quat::new(rn * t1.cos(), s1 * t2.sin() * ph.cos(), s1 * t2.sin() * ph.sin(), s1 * t2.cos())
+}
+
+/// Distance-estimate derivative bound for `qbulb`: the Mandelbulb's n·ρ^(n-1)·da with
+/// n = max(radial, angular), plus the parameter input's contribution.
+fn qbulb_deriv(q: Quat, p: Quat, da: f64, db: f64) -> f64 {
+    let nr = p.r.clamp(1.5, 10.0);
+    let na = p.a.clamp(1.0, 10.0);
+    let rho = q.norm_sq().sqrt().max(1e-30);
+    nr.max(na) * rho.powf(nr - 1.0) * da + rho.powf(nr) * (rho.ln().abs() + 1.0) * db
 }
 
 /// A GA-evolved genome's rendering-relevant fields, borrowed rather than
@@ -272,6 +301,12 @@ pub fn anisotropy_score(f: &QuatDagFormula, max_iter: u32, bailout_sq: f64) -> f
 }
 
 pub fn quat_dag_escape_de(f: &QuatDagFormula, point: Quat, max_iter: u32, bailout_sq: f64) -> (f32, f64) {
+    quat_dag_escape_de_mode(f, point, max_iter, bailout_sq, false)
+}
+
+/// `quat_dag_escape_de`; with `zero_c` the orbit's C component is zeroed
+/// after every step (`Method::Proj3`: an orbit confined to R,A,B).
+pub fn quat_dag_escape_de_mode(f: &QuatDagFormula, point: Quat, max_iter: u32, bailout_sq: f64, zero_c: bool) -> (f32, f64) {
     let warped = if f.warp.is_empty() { point } else { eval_program_quat(f.warp, point, point) };
     // (z, c, dz/dpoint, dc/dpoint) — see the doc comment above: whichever
     // of z0/c is the warped point gets derivative ≈1 (the warp-derivative
@@ -294,6 +329,7 @@ pub fn quat_dag_escape_de(f: &QuatDagFormula, point: Quat, max_iter: u32, bailou
         pz = z;
         dz = dnext;
         z = next;
+        if zero_c { z.c = 0.0; }
 
         let ms = z.norm_sq();
         if ms > bailout_sq {
@@ -340,6 +376,7 @@ fn eval_program_quat_deriv(prog: &[OpNode], z: Quat, c: Quat, dz: f64, dc: f64) 
             op::Z => (z, dz),
             op::C => (c, dc),
             op::CONST => (Quat::new(node.kre as f64, node.kim as f64, 0.0, 0.0), 0.0),
+            op::CONSTBC => (Quat::new(0.0, 0.0, node.kre as f64, node.kim as f64), 0.0),
             op::SQR => (a.mul(a), 2.0 * na * da),
             op::CUBE => (a.mul(a).mul(a), 3.0 * na * na * da),
             op::QUART => {
@@ -373,6 +410,7 @@ fn eval_program_quat_deriv(prog: &[OpNode], z: Quat, c: Quat, dz: f64, dc: f64) 
                 let d_rb = db / (nb * nb + EPS); // |d(b⁻¹)| = |db|/|b|²
                 (a.mul(rb), da / (nb + EPS) + na * d_rb)
             }
+            op::BULB => (qbulb(a, b), qbulb_deriv(a, b, da, db)),
             _ => (Quat::ZERO, 0.0),
         };
         reg[i] = val;
@@ -410,6 +448,17 @@ pub struct RaymarchDagParams<'a> {
     /// before this plan) preserves `time_axis`'s exact fixed-order
     /// assembly.
     pub axis_assignment: Option<AxisAssignment>,
+    /// Per-axis stretch between the marched ("view") space and fractal
+    /// space: `fractal = offset + scale * view`, given as `(scale, offset)`
+    /// for the three spatial axes. Lets the viewer show boxes whose axes
+    /// have very different ranges at equal size on screen. The distance
+    /// estimate is divided by the largest scale so steps stay conservative.
+    /// `None` = view space IS fractal space (every caller before this).
+    #[allow(clippy::type_complexity)]
+    pub axis_remap: Option<(Vec3, Vec3)>,
+    /// How the 4D set is collapsed to this 3D view (see `quat_collapse`).
+    /// `None` = the process-wide default (normally the plain slice).
+    pub collapse: Option<crate::quat_collapse::Collapse>,
     /// An orientable half-space cutaway (animation-viewer plan, Phase 6) —
     /// `(pos, normal)`. The ray is clipped to the half-space
     /// `dot(point - pos, normal) >= 0`, i.e. the far side of the plane
@@ -460,16 +509,56 @@ pub struct RaymarchDagParams<'a> {
 /// via `p.axis_assignment` when given, else `p.time_axis`'s fixed-order
 /// scheme — see `RaymarchDagParams::axis_assignment`'s doc comment.
 fn assemble_point(p: &RaymarchDagParams, point: Vec3) -> Quat {
+    assemble_point_t(p, point, p.time_val)
+}
+
+fn assemble_point_t(p: &RaymarchDagParams, point: Vec3, time_val: f64) -> Quat {
+    let point = match p.axis_remap {
+        Some((sc, off)) => (off.0 + sc.0 * point.0, off.1 + sc.1 * point.1, off.2 + sc.2 * point.2),
+        None => point,
+    };
     match &p.axis_assignment {
-        Some(a) => a.assemble(point.0, point.1, point.2, p.time_val),
-        None => p.time_axis.assemble(point, p.time_val),
+        Some(a) => a.assemble(point.0, point.1, point.2, time_val),
+        None => p.time_axis.assemble(point, time_val),
     }
 }
 
-fn de_at(p: &RaymarchDagParams, point: Vec3) -> f64 {
+/// `(escape_time, distance_estimate)` at a view-space point through the
+/// render's collapse method — the CPU twin of the shader's `de_at`.
+fn eval_collapsed(p: &RaymarchDagParams, point: Vec3) -> (f32, f64) {
+    use crate::quat_collapse::{Collapse, Method};
+    let c = Collapse::effective(p.collapse);
     let bailout_sq = p.bailout * p.bailout;
-    let q = assemble_point(p, point);
-    quat_dag_escape_de(&p.formula, q, p.max_iter, bailout_sq).1
+    let one = |t: f64| -> (f32, f64) {
+        let (v4, lam) = c.map_point(point, t);
+        let q = assemble_point_t(p, (v4[0], v4[1], v4[2]), v4[3]);
+        let (et, de) = quat_dag_escape_de_mode(&p.formula, q, p.max_iter, bailout_sq, c.method == Method::Proj3);
+        (et, de / lam)
+    };
+    let mut r = match c.method {
+        Method::Slab => {
+            let mut best = one(p.time_val - c.slab_half);
+            for dt in [0.0, c.slab_half] {
+                let o = one(p.time_val + dt);
+                if o.1 < best.1 { best = o; }
+            }
+            best
+        }
+        _ => one(p.time_val),
+    };
+    if c.method == Method::Offset { r.1 -= c.offset; }
+    r.1 /= remap_max_scale(p);
+    r
+}
+
+fn de_at(p: &RaymarchDagParams, point: Vec3) -> f64 {
+    eval_collapsed(p, point).1
+}
+
+/// Largest per-axis stretch of `axis_remap` (1 without one): a step of `d`
+/// in view space moves at most `d * this` in fractal space.
+fn remap_max_scale(p: &RaymarchDagParams) -> f64 {
+    p.axis_remap.map_or(1.0, |(sc, _)| sc.0.max(sc.1).max(sc.2).max(1e-12))
 }
 
 /// Tetrahedral 4-tap normal estimate — same technique and same outward-
@@ -530,7 +619,6 @@ fn march_ray(p: &RaymarchDagParams, eye: Vec3, dir: Vec3) -> Option<(Vec3, Vec3,
         None => ray_sphere(eye, dir, p.domain_radius)?,
     };
     let (t0, t1) = apply_clip_plane(t0, t1, eye, dir, p.clip_plane)?;
-    let bailout_sq = p.bailout * p.bailout;
     let hit_eps = p.hit_epsilon.max(1e-9);
     let min_step = (p.domain_radius * 1e-6).max(1e-9);
     let mut t = t0;
@@ -539,8 +627,7 @@ fn march_ray(p: &RaymarchDagParams, eye: Vec3, dir: Vec3) -> Option<(Vec3, Vec3,
             return None;
         }
         let point = add(eye, scale(dir, t));
-        let q = assemble_point(p, point);
-        let (et, de) = quat_dag_escape_de(&p.formula, q, p.max_iter, bailout_sq);
+        let (et, de) = eval_collapsed(p, point);
         // Slide Iteration: a point in the hidden band, or (hide_above) at
         // or past a resolved escape-time cutoff, is never accepted as a
         // hit, even when its DE is small enough — the real DE still
@@ -551,8 +638,7 @@ fn march_ray(p: &RaymarchDagParams, eye: Vec3, dir: Vec3) -> Option<(Vec3, Vec3,
         if de < hit_eps && !in_band && !above_cutoff {
             let normal = estimate_normal(p, point);
             let probe = add(point, scale(normal, p.color_probe_offset));
-            let probe_q = assemble_point(p, probe);
-            let (color_et, _) = quat_dag_escape_de(&p.formula, probe_q, p.max_iter, bailout_sq);
+            let color_et = eval_collapsed(p, probe).0;
             return Some((point, normal, color_et));
         }
         t += (de * p.step_safety).max(min_step);
@@ -602,6 +688,51 @@ pub fn render_raymarch_dag_frame(p: &RaymarchDagParams, cam: &RaymarchCamera, wi
 mod tests {
     use super::*;
     use crate::formula::eval_program as eval_program_2d;
+
+    #[test]
+    fn kbc_breaks_the_b_c_interchange_symmetry() {
+        // z² + c is unchanged by negating the B and C parts (a rotation fixing R, A);
+        // adding kbc(0.3, 0.2) is not.
+        let base = [
+            OpNode { op: op::Z, a: 0, b: 0, kre: 0.0, kim: 0.0 },
+            OpNode { op: op::C, a: 0, b: 0, kre: 0.0, kim: 0.0 },
+            OpNode { op: op::SQR, a: 0, b: 0, kre: 0.0, kim: 0.0 },
+            OpNode { op: op::ADD, a: 2, b: 1, kre: 0.0, kim: 0.0 },
+        ];
+        let mut with = base.to_vec();
+        with.push(OpNode { op: op::CONSTBC, a: 0, b: 0, kre: 0.3, kim: 0.2 });
+        with.push(OpNode { op: op::ADD, a: 3, b: 4, kre: 0.0, kim: 0.0 });
+        let flip = |q: Quat| Quat::new(q.r, q.a, -q.b, -q.c);
+        let (z, c) = (Quat::new(0.2, -0.3, 0.4, 0.1), Quat::new(-0.1, 0.25, -0.2, 0.3));
+        let (p, q) = (eval_program_quat(&base, z, c), eval_program_quat(&base, flip(z), flip(c)));
+        assert!((flip(p).sub(q)).norm_sq() < 1e-20, "z²+c should commute with the flip");
+        let (p, q) = (eval_program_quat(&with, z, c), eval_program_quat(&with, flip(z), flip(c)));
+        assert!((flip(p).sub(q)).norm_sq() > 1e-4, "kbc must break it");
+        assert_eq!(eval_program_quat(&with[4..5], z, c), Quat::new(0.0, 0.0, 0.3f32 as f64, 0.2f32 as f64));
+    }
+
+    #[test]
+    fn bulb_8_plus_c_is_the_mandelbulb() {
+        // bulb(z, 8+8i) + c must equal QuatFormula::Bulb's power-8 step + c.
+        let prog = [
+            OpNode { op: op::Z, a: 0, b: 0, kre: 0.0, kim: 0.0 },
+            OpNode { op: op::C, a: 0, b: 0, kre: 0.0, kim: 0.0 },
+            OpNode { op: op::CONST, a: 0, b: 0, kre: 8.0, kim: 8.0 },
+            OpNode { op: op::BULB, a: 0, b: 2, kre: 0.0, kim: 0.0 },
+            OpNode { op: op::ADD, a: 3, b: 1, kre: 0.0, kim: 0.0 },
+        ];
+        for &(z, c) in &[
+            (Quat::new(0.3, -0.4, 0.5, 0.2), Quat::new(-0.2, 0.1, 0.3, -0.4)),
+            (Quat::new(-0.7, 0.2, -0.1, 0.6), Quat::new(0.05, -0.3, 0.2, 0.1)),
+            (Quat::new(0.0, 0.0, 0.9, 0.0), Quat::new(0.4, 0.0, 0.0, 0.2)),
+        ] {
+            let got = eval_program_quat(&prog, z, c);
+            let want = crate::quat_fractal::QuatFormula::Bulb.step(z).add(c);
+            for (g, w) in [(got.r, want.r), (got.a, want.a), (got.b, want.b), (got.c, want.c)] {
+                assert!((g - w).abs() < 1e-9 * (1.0 + w.abs()), "got {got:?} want {want:?}");
+            }
+        }
+    }
 
     fn q2(re: f64, im: f64) -> Quat {
         Quat::new(re, im, 0.0, 0.0)
@@ -874,7 +1005,7 @@ mod tests {
             axis_assignment: None,
             clip_plane: None,
             slide_iter: None,
-            hide_above: None,
+            hide_above: None, axis_remap: None, collapse: None,
             max_iter: 60,
             bailout: 4.0,
             max_march_steps: 200,
@@ -910,6 +1041,28 @@ mod tests {
         p.box_bounds = Some(((0.0, -1.6, -1.6), (0.0, 1.6, 1.6)));
         let offset_hit = march_ray(&p, (0.5, 0.0, -5.0), normalize((0.0, 0.0, 1.0)));
         assert!(offset_hit.is_none(), "a ray off the flattened X=0 plane must miss a box with zero X extent, regardless of the formula");
+    }
+
+    #[test]
+    fn axis_remap_stretches_view_space_onto_the_fractal_range() {
+        // View cube [-1.6,1.6]^3 mapped onto x in [0.1,0.2] etc.: the view
+        // point (0,0,0) must land on the offset, and the identity remap
+        // must behave exactly like no remap.
+        let mut p = base_dag_params();
+        p.axis_remap = Some(((0.05, 1.0, 1.0), (0.15, 0.0, 0.0)));
+        let q = assemble_point(&p, (0.0, 0.0, 0.0));
+        let q_default = assemble_point(&base_dag_params(), (0.15, 0.0, 0.0));
+        assert_eq!((q.r, q.a, q.b, q.c), (q_default.r, q_default.a, q_default.b, q_default.c));
+        let mut ident = base_dag_params();
+        ident.axis_remap = Some(((1.0, 1.0, 1.0), (0.0, 0.0, 0.0)));
+        let pt = (0.3, -0.2, 0.7);
+        assert_eq!(de_at(&ident, pt), de_at(&base_dag_params(), pt));
+        // Steps are divided by the largest scale, so a 4x stretch quarters them.
+        let mut wide = base_dag_params();
+        wide.axis_remap = Some(((4.0, 1.0, 1.0), (0.0, 0.0, 0.0)));
+        let d4 = de_at(&wide, (0.1, 0.0, 0.0));
+        let d1 = quat_dag_escape_de(&wide.formula, assemble_point(&wide, (0.1, 0.0, 0.0)), wide.max_iter, wide.bailout * wide.bailout).1;
+        assert!((d4 - d1 / 4.0).abs() < 1e-12);
     }
 
     #[test]
@@ -1150,4 +1303,63 @@ mod tests {
         let still_without = march_ray(&p, eye, dir);
         assert_eq!(without, still_without, "hide_above=None must never hide a surface");
     }
+
+    #[test]
+    fn collapse_s3_points_lie_on_the_sphere_for_every_plane_and_pole() {
+        use crate::quat_collapse::{Collapse, Method};
+        for plane in 0..3u8 {
+            let c = Collapse { method: Method::S3, rho: 1.3, plane, pole: [0.4, -0.7, 0.2], ..Collapse::default() };
+            for v in [(0.0, 0.0, 0.0), (0.5, -0.2, 0.9), (3.0, 1.0, -2.0)] {
+                for t in [0.0, 0.7, 2.9] {
+                    let (p4, lam) = c.map_point(v, t);
+                    let n = p4.iter().map(|x| x * x).sum::<f64>().sqrt();
+                    assert!((n - 1.3).abs() < 1e-12, "plane {plane}: |P|={n}");
+                    assert!(lam > 0.0);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn collapse_s3_view_coords_invert_the_mapping() {
+        use crate::quat_collapse::{Collapse, Method};
+        for plane in 0..3u8 {
+            let c = Collapse { method: Method::S3, rho: 0.9, plane, pole: [0.3, -0.5, 0.8], ..Collapse::default() };
+            for v in [(0.2, 0.1, -0.4), (1.1, -0.7, 0.3)] {
+                let (p4, _) = c.map_point(v, 1.3);
+                let back = c.s3_view_coords(p4, 1.3).expect("not at the pole");
+                assert!((back.0 - v.0).abs() < 1e-9 && (back.1 - v.1).abs() < 1e-9 && (back.2 - v.2).abs() < 1e-9, "plane {plane}: {back:?} vs {v:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn collapse_variants_relate_to_the_plain_slice() {
+        use crate::quat_collapse::{Collapse, Method};
+        let base = base_dag_params();
+        let pt = (0.3, -0.2, 0.5);
+        let plain = de_at(&base, pt);
+        let mut slab = base_dag_params();
+        slab.collapse = Some(Collapse::of(Method::Slab));
+        assert!(de_at(&slab, pt) <= plain + 1e-12, "slab is a union: never farther than the slice");
+        let mut off = base_dag_params();
+        off.collapse = Some(Collapse::of(Method::Offset));
+        assert!((de_at(&off, pt) - (plain - Collapse::default().offset)).abs() < 1e-12);
+        let mut explicit = base_dag_params();
+        explicit.collapse = Some(Collapse::of(Method::Slice));
+        assert_eq!(de_at(&explicit, pt), plain);
+    }
+
+    #[test]
+    fn collapse_s3_renders_a_nonempty_image_on_the_cpu() {
+        use crate::quat_collapse::{Collapse, Method};
+        let mut p = base_dag_params();
+        p.collapse = Some(Collapse::of(Method::S3));
+        p.time_val = 0.8;
+        let cam = RaymarchCamera { eye: (0.0, 0.0, -4.0), target: (0.0, 0.0, 0.0), up_hint: (0.0, 1.0, 0.0), fov_y: 0.8 };
+        let (shading, _) = render_raymarch_dag_frame(&p, &cam, 40, 40);
+        let lit = shading.iter().filter(|v| **v > 0.0).count();
+        assert!(lit > 20 && lit < 40 * 40, "lit pixels: {lit}");
+    }
+
 }

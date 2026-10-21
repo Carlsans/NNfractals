@@ -2190,6 +2190,40 @@ pub struct QuatRenderSpec {
     pub trim_start_s: f64,
     #[serde(default)]
     pub trim_end_s: f64,
+    /// After rendering, also write a Facebook-reel version: the centre
+    /// 9:16 region of the frame, cut out at native pixel size (see
+    /// [`reel_crop_dims`]) — cropped, never scaled.
+    #[serde(default)]
+    pub reel_crop: bool,
+}
+
+/// Size of the largest centred 9:16 region that fits a `w`×`h` frame, with
+/// both sides even (yuv420 needs that) and the ratio exactly 9:16. Pixels
+/// are cut out, not rescaled: a 3840×2160 render gives 1206×2144.
+pub fn reel_crop_dims(w: u32, h: u32) -> (u32, u32) {
+    let m = (w / 9).min(h / 16) & !1; // multiple of 2, so 9m and 16m are both even
+    (9 * m, 16 * m)
+}
+
+/// Crops `input` (video or image) to its centred 9:16 region with ffmpeg
+/// and writes `output`. No scaling; the video is re-encoded (a crop can't
+/// be done by stream copy) and any audio is copied as is.
+pub fn crop_to_reel(input: &Path, output: &Path, w: u32, h: u32) -> Result<(), String> {
+    let (cw, ch) = reel_crop_dims(w, h);
+    if cw == 0 || ch == 0 {
+        return Err(format!("{w}x{h} is too small to crop a 9:16 reel from"));
+    }
+    let filter = format!("crop={cw}:{ch}:{}:{}", (w - cw) / 2, (h - ch) / 2);
+    let is_image = input.extension().is_some_and(|e| e.eq_ignore_ascii_case("png"));
+    let mut cmd = std::process::Command::new("ffmpeg");
+    cmd.args(["-y", "-v", "error", "-i"]).arg(input).args(["-vf", &filter]);
+    if !is_image {
+        cmd.args(["-c:v", "libx264", "-crf", "16", "-preset", "slow", "-pix_fmt", "yuv420p", "-c:a", "copy", "-movflags", "+faststart"]);
+    }
+    let out = cmd.arg(output).output().map_err(|e| format!("could not run ffmpeg: {e}"))?;
+    if out.status.success() { Ok(()) } else {
+        Err(format!("ffmpeg crop failed: {}", String::from_utf8_lossy(&out.stderr).trim()))
+    }
 }
 
 /// Everything a caller must decide to queue one export.
@@ -3399,5 +3433,22 @@ mod refactor_parity_harness {
         let done = rx.try_iter().any(|m| matches!(m, VideoMsg::Done(_)));
         assert!(done, "reference export failed");
         assert!(out.exists(), "no file written");
+    }
+}
+
+#[cfg(test)]
+mod reel_tests {
+    use super::reel_crop_dims;
+
+    #[test]
+    fn reel_dims_are_exact_9_16_and_even() {
+        assert_eq!(reel_crop_dims(3840, 2160), (1206, 2144));
+        assert_eq!(reel_crop_dims(1920, 1080), (594, 1056));
+        assert_eq!(reel_crop_dims(2160, 3840), (2160, 3840)); // already 9:16
+        for (w, h) in [(2160, 2160), (1080, 1920), (7680, 4320), (1000, 5000)] {
+            let (cw, ch) = reel_crop_dims(w, h);
+            assert!(cw <= w && ch <= h && cw % 2 == 0 && ch % 2 == 0 && cw * 16 == ch * 9, "{w}x{h} -> {cw}x{ch}");
+        }
+        assert_eq!(reel_crop_dims(100, 100), (54, 96));
     }
 }

@@ -381,6 +381,7 @@ mod gpu_dag_tests {
 
 impl GpuRenderer {
     async fn new(max_g: u32, max_w: u32, max_h: u32) -> Option<Self> {
+        if crate::gpu_disabled() { return None; }
         let inst = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
         let adapter = inst.request_adapter(&wgpu::RequestAdapterOptions {
             power_preference: wgpu::PowerPreference::HighPerformance,

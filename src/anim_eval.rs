@@ -12,7 +12,7 @@
 //! hand-kept-in-sync literals. Everything the animation viewer renders —
 //! live or batched — now goes through exactly one function.
 
-use crate::anim_timeline::{accumulated_angle, evaluate_axis_track, evaluate_difference, evaluate_slide_iteration, AnimationTimeline, AxisBound, BoundingBox};
+use crate::anim_timeline::{accumulated_angle, evaluate_axis_track, evaluate_axis_track_bounded, evaluate_difference_bounded, evaluate_slide_iteration, AnimationTimeline, AxisBound, BoundingBox};
 use crate::orient::OrientQuat;
 use crate::quat_dag::{QuatDagFormula, RaymarchDagParams};
 use crate::quat_fractal::TimeAxis;
@@ -164,7 +164,7 @@ pub fn camera_orientation(timeline: &AnimationTimeline, t: f64) -> OrientQuat {
 pub fn effective_box_and_pivot(timeline: &AnimationTimeline, t: f64) -> ((f64, f64, f64), (f64, f64, f64), (f64, f64, f64), f64) {
     let b = &timeline.bounds;
     let axis = |bound: &AxisBound, track: &crate::anim_timeline::AxisTimeline| -> (f64, f64, f64) {
-        let contrib = evaluate_axis_track(track, t);
+        let contrib = evaluate_axis_track_bounded(track, t, Some(bound));
         let center = (bound.min + bound.max) * 0.5 + contrib.translation;
         let half = (bound.max - bound.min) * 0.5 * contrib.scale;
         (center - half, center + half, center)
@@ -201,6 +201,20 @@ pub fn build_frame_params<'a>(
     quality: RenderQuality,
 ) -> (RaymarchDagParams<'a>, RaymarchCamera) {
     let (box_min, box_max, pivot, domain_radius) = effective_box_and_pivot(timeline, t);
+    // "Equal axis scale": march in a cube of the largest half-extent and map
+    // each axis back to its own range, so a thin axis is stretched to the
+    // same size on screen as a wide one.
+    // The remap is a slice-family feature: a tilted or spherical collapse
+    // mixes the axes, so a per-axis stretch would be meaningless.
+    let remap_ok = timeline.collapse.method.allows_axis_remap();
+    let (box_min, box_max, pivot, axis_remap) = if timeline.equal_axis_scale && remap_ok {
+        let h = domain_radius;
+        let half = |lo: f64, hi: f64| ((hi - lo) * 0.5).abs().max(1e-9);
+        let scale = (half(box_min.0, box_max.0) / h, half(box_min.1, box_max.1) / h, half(box_min.2, box_max.2) / h);
+        ((-h, -h, -h), (h, h, h), (0.0, 0.0, 0.0), Some((scale, pivot)))
+    } else {
+        (box_min, box_max, pivot, None)
+    };
     let t_track_offset = evaluate_axis_track(&timeline.t_track, t).translation;
     let time_val = timeline.t_value + t_track_offset;
     let orientation = camera_orientation(timeline, t);
@@ -213,7 +227,7 @@ pub fn build_frame_params<'a>(
     // Computed AFTER `cam`: a `CameraFixed` plane needs this frame's actual
     // eye/target/up_hint to resolve into world space — see
     // `crate::anim_timeline::DifferencePlane`'s doc comment.
-    let clip_plane = evaluate_difference(&timeline.effects_lanes, t).map(|d| match d {
+    let clip_plane = evaluate_difference_bounded(&timeline.effects_lanes, t, Some(&timeline.bounds)).map(|d| match d {
         crate::anim_timeline::DifferencePlane::WorldFixed { pos, normal } =>
             ((pos[0], pos[1], pos[2]), (normal[0], normal[1], normal[2])),
         crate::anim_timeline::DifferencePlane::CameraFixed { camera_offset, normal } => {
@@ -250,7 +264,7 @@ pub fn build_frame_params<'a>(
         // `percentile_escape_time_cutoff` below. This function only ever
         // builds params from timeline state, never renders, so it has no
         // distribution to resolve a cutoff from yet.
-        hide_above: None,
+        hide_above: None, axis_remap, collapse: Some(timeline.collapse),
         max_iter: quality.max_iter,
         bailout: bailout_radius,
         max_march_steps: 200,
@@ -311,6 +325,35 @@ mod tests {
 
     fn formula() -> QuatDagFormula<'static> {
         QuatDagFormula { prog: &MANDEL_PROG, warp: &[], julia: false, jc: (0.0, 0.0), phoenix: (0.0, 0.0) }
+    }
+
+    #[test]
+    fn s3_collapse_reaches_the_params_and_disables_the_axis_remap() {
+        use crate::quat_collapse::{Collapse, Method};
+        let mut tl = AnimationTimeline::new(0);
+        tl.equal_axis_scale = true;
+        tl.bounds.x = crate::anim_timeline::AxisBound { min: -0.1, max: 0.1 };
+        tl.collapse = Collapse::of(Method::S3);
+        let (params, _) = build_frame_params(&tl, formula(), 0.0, 4.0, RenderQuality { max_iter: 40, aa: 1 });
+        assert_eq!(params.collapse.map(|c| c.method), Some(Method::S3));
+        assert!(params.axis_remap.is_none(), "S3 mixes axes: no per-axis stretch");
+        tl.collapse = Collapse::of(Method::Slice);
+        let (params, _) = build_frame_params(&tl, formula(), 0.0, 4.0, RenderQuality { max_iter: 40, aa: 1 });
+        assert!(params.axis_remap.is_some(), "the plain slice keeps equal-scale");
+    }
+
+    #[test]
+    fn collapse_survives_a_timeline_roundtrip_and_old_files_default_to_slice() {
+        use crate::quat_collapse::{Collapse, Method};
+        let mut tl = AnimationTimeline::new(7);
+        tl.collapse = Collapse { method: Method::S3, rho: 1.4, plane: 2, pole: [0.1, 0.2, 0.3], ..Collapse::default() };
+        let json = serde_json::to_string(&tl).unwrap();
+        let back: AnimationTimeline = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.collapse, tl.collapse);
+        let mut v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        v.as_object_mut().unwrap().remove("collapse");
+        let old: AnimationTimeline = serde_json::from_value(v).unwrap();
+        assert_eq!(old.collapse.method, Method::Slice);
     }
 
     #[test]
@@ -504,11 +547,11 @@ mod tests {
         let y_amp = 0.25;
         let freq = 0.1; // period = 10s
         let x_track = AxisTimeline { clips: vec![EffectClip {
-            effect: Effect::Translation { offset: AnimParam { constant: 0.0, drive: Some(Drive { shape: WaveShape::Sine, amp: x_amp, freq, phase: 0.0 }), ramp: None } },
+            effect: Effect::Translation { offset: AnimParam { constant: 0.0, drive: Some(Drive { shape: WaveShape::Sine, amp: x_amp, freq, phase: 0.0, clip_to_bounds: false }), ramp: None } },
             start_s: 0.0, end_s: 10.0, label: String::new(),
         }] };
         let y_track = AxisTimeline { clips: vec![EffectClip {
-            effect: Effect::Translation { offset: AnimParam { constant: 0.0, drive: Some(Drive { shape: WaveShape::Sine, amp: y_amp, freq, phase: 0.25 }), ramp: None } },
+            effect: Effect::Translation { offset: AnimParam { constant: 0.0, drive: Some(Drive { shape: WaveShape::Sine, amp: y_amp, freq, phase: 0.25, clip_to_bounds: false }), ramp: None } },
             start_s: 0.0, end_s: 10.0, label: String::new(),
         }] };
 

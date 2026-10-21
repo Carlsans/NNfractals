@@ -535,6 +535,14 @@ fn process_quat_queue_item(
             nn_path.display()
         ));
     }
+    if q.reel_crop {
+        // The full-size render is kept next to the reel.
+        let stem = out_path.file_stem().and_then(|s| s.to_str()).unwrap_or("render").to_string();
+        let reel_path = out_path.with_file_name(format!("{stem}_reel.{ext}"));
+        crate::video_export::crop_to_reel(&out_path, &reel_path, q.width, q.height)
+            .map_err(|e| format!("render finished ({}) but the reel crop failed: {e}", out_path.display()))?;
+        return Ok(reel_path.display().to_string());
+    }
     Ok(out_path.display().to_string())
 }
 

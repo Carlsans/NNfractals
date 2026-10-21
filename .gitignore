@@ -120,3 +120,5 @@ role_model_centroids.npz
 embed_cache/
 quat_taste_sidecar.log
 train_taste_quat.log
+/tunings/
+/campaigns/

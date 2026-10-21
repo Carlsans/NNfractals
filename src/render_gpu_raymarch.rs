@@ -109,6 +109,7 @@ impl<'a> ParamsWriter<'a> {
 
 impl GpuRaymarchRenderer {
     async fn new(max_pixels: u64) -> Option<Self> {
+        if crate::gpu_disabled() { return None; }
         let inst = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
         let adapter = inst
             .request_adapter(&wgpu::RequestAdapterOptions {
