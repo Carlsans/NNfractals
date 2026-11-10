@@ -24,6 +24,85 @@ use nnfractals::queue_runner::{
 };
 use nnfractals::video_export::{load_queue, queue_dir, save_queue, QueueItem, QueueStatus};
 
+// ── Persistent log ───────────────────────────────────────────────────────
+//
+// This window is launched from the desktop, where its stderr goes nowhere.
+// 2026-11-10 it had to be killed after sitting idle for ~7 h with every item
+// Done, and left no trace at all. Everything worth knowing after the fact
+// (items started/finished, panics with a backtrace, UI-thread stalls, exit)
+// is appended to `video_queue/queue-gui.log` instead (rotated at 5 MB).
+
+fn log_path() -> PathBuf { queue_dir().join("queue-gui.log") }
+
+fn local_timestamp() -> String {
+    // SAFETY: time()/localtime_r() only write into the local `tm` we pass.
+    unsafe {
+        let t = libc::time(std::ptr::null_mut());
+        let mut tm: libc::tm = std::mem::zeroed();
+        libc::localtime_r(&t, &mut tm);
+        format!("{:04}-{:02}-{:02} {:02}:{:02}:{:02}", tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday, tm.tm_hour, tm.tm_min, tm.tm_sec)
+    }
+}
+
+fn qlog(msg: &str) {
+    use std::io::Write as _;
+    let path = log_path();
+    if std::fs::metadata(&path).is_ok_and(|m| m.len() > 5_000_000) {
+        let _ = std::fs::rename(&path, path.with_extension("log.old"));
+    }
+    eprintln!("[queue] {msg}");
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+        let _ = writeln!(f, "[{}] {msg}", local_timestamp());
+    }
+}
+
+/// Panics on any thread (the processing thread included, which would otherwise
+/// die silently and leave the window looking alive but never rendering again)
+/// are logged with a backtrace before the default hook runs.
+fn install_panic_log() {
+    let default = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let thread = thread::current().name().unwrap_or("unnamed").to_string();
+        qlog(&format!("PANIC in thread '{thread}': {info}\n{}", std::backtrace::Backtrace::force_capture()));
+        default(info);
+    }));
+}
+
+/// Milliseconds since the epoch of the last UI frame — read by `spawn_ui_watchdog`.
+static UI_LAST_FRAME_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+const UI_STALL_MS: u64 = 30_000;
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
+}
+
+/// Logs UI-thread stalls: the window asks for a frame at least every 2 s (200 ms
+/// while working), so 30 s without one is a freeze, or the window is hidden and
+/// the compositor stopped sending frame callbacks; the log says which by whether
+/// it recovers when shown. Armed while idle too: the 2026-11-10 freeze was idle.
+fn spawn_ui_watchdog() {
+    thread::Builder::new().name("ui-watchdog".into()).spawn(|| {
+        let mut episode: Option<u64> = None;
+        loop {
+            thread::sleep(std::time::Duration::from_secs(5));
+            let last = UI_LAST_FRAME_MS.load(Ordering::Relaxed);
+            let age = now_ms().saturating_sub(last);
+            match episode {
+                None if last != 0 && age >= UI_STALL_MS => {
+                    qlog(&format!("UI thread: no frame for {:.0}s (frozen, or window hidden)", age as f64 / 1000.0));
+                    episode = Some(last);
+                }
+                Some(start) if start != last => {
+                    qlog(&format!("UI thread drawing again (episode lasted ~{:.0}s)", (now_ms().saturating_sub(start)) as f64 / 1000.0));
+                    episode = None;
+                }
+                Some(_) if age % 600_000 < 5_000 => qlog(&format!("UI thread still without a frame: {:.0} min", age as f64 / 60_000.0)),
+                _ => {}
+            }
+        }
+    }).ok();
+}
+
 // ── Small utilities (moved from viewer.rs — this window owns the "job
 // finished" notifications now, the viewer no longer produces a video
 // directly) ──────────────────────────────────────────────────────────────
@@ -129,7 +208,8 @@ fn focused_window_is_animator() -> Option<bool> {
 /// comment for why `RENDER_CONTROL` alone can't reach it).
 fn pause_render(current_pid: &Arc<Mutex<Option<u32>>>) {
     nnfractals::video_export::RENDER_CONTROL.set_paused(true);
-    if let Some(pid) = *current_pid.lock().unwrap() {
+    let pid = *current_pid.lock().unwrap(); // not held while `kill` runs
+    if let Some(pid) = pid {
         let _ = std::process::Command::new("kill").args(["-STOP", &pid.to_string()]).status();
     }
 }
@@ -138,7 +218,8 @@ fn pause_render(current_pid: &Arc<Mutex<Option<u32>>>) {
 /// never stopped (or has already exited) is a harmless no-op either way.
 fn resume_render(current_pid: &Arc<Mutex<Option<u32>>>) {
     nnfractals::video_export::RENDER_CONTROL.set_paused(false);
-    if let Some(pid) = *current_pid.lock().unwrap() {
+    let pid = *current_pid.lock().unwrap(); // not held while `kill` runs
+    if let Some(pid) = pid {
         let _ = std::process::Command::new("kill").args(["-CONT", &pid.to_string()]).status();
     }
 }
@@ -273,7 +354,7 @@ fn spawn_processing_thread(
     hold: Arc<Mutex<Option<HoldWindow>>>,
     ctx: egui::Context,
 ) {
-    thread::spawn(move || loop {
+    let spawned = thread::Builder::new().name("processing".into()).spawn(move || loop {
         if !running.load(Ordering::SeqCst) {
             thread::sleep(std::time::Duration::from_millis(300));
             continue;
@@ -281,7 +362,14 @@ fn spawn_processing_thread(
         // Checked only before STARTING an item, never during one: a render
         // that runs past the window finishes rather than being abandoned
         // half-encoded.
-        if let Some(w) = *hold.lock().unwrap() {
+        // Copy the setting out first: in an `if let` the MutexGuard lives for
+        // the whole block, so the 20 s sleep below used to HOLD this lock, and
+        // the loop re-took it within nanoseconds. The UI reads it every frame
+        // to show "open"/"waiting", so from the end of the hold window (07:00)
+        // the window starved on it forever. Frozen, unresponsive window found
+        // 2026-11-10 after an overnight 23:00→07:00 hold.
+        let hold_now = *hold.lock().unwrap();
+        if let Some(w) = hold_now {
             if !w.contains(now_minute_of_day()) {
                 thread::sleep(std::time::Duration::from_secs(20));
                 continue;
@@ -309,6 +397,7 @@ fn spawn_processing_thread(
 
         items[idx].status = QueueStatus::Processing;
         save_queue(&items);
+        qlog(&format!("start item {} ({}, {}x{})", items[idx].id, items[idx].genome_label, items[idx].width, items[idx].height));
         *current_id.lock().unwrap() = Some(items[idx].id.clone());
         ctx.request_repaint();
 
@@ -329,6 +418,11 @@ fn spawn_processing_thread(
         // Pending item — so a cancelled item is now REMOVED outright
         // instead of landing on Failed.
         let was_cancelled = cancelling.swap(false, Ordering::SeqCst);
+        match (&result, was_cancelled) {
+            (_, true) => qlog(&format!("item {} cancelled", item.id)),
+            (Ok(out), _) => qlog(&format!("item {} done -> {out}", item.id)),
+            (Err(e), _) => qlog(&format!("item {} FAILED: {}", item.id, e.lines().next().unwrap_or(""))),
+        }
 
         let mut items = load_queue();
         if was_cancelled {
@@ -356,6 +450,9 @@ fn spawn_processing_thread(
         play_completion_sound();
         ctx.request_repaint();
     });
+    if let Err(e) = spawned {
+        qlog(&format!("could not start the processing thread: {e}"));
+    }
 }
 
 // ── App ───────────────────────────────────────────────────────────────────
@@ -559,6 +656,7 @@ impl eframe::App for App {
     /// forever (it would just sit there, indistinguishable from a genuine
     /// hang, with nothing left running to SIGCONT it back).
     fn on_exit(&mut self) {
+        qlog("window closed");
         if self.auto_paused.load(Ordering::SeqCst) {
             resume_render(&self.current_pid);
         }
@@ -566,6 +664,7 @@ impl eframe::App for App {
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+        UI_LAST_FRAME_MS.store(now_ms(), Ordering::Relaxed);
         while self.wake_rx.try_recv().is_ok() {
             self.reload();
             ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
@@ -933,8 +1032,17 @@ impl eframe::App for App {
         });
 
         // Keep repainting while something is actively happening so the
-        // progress readout and status stay live.
-        if running { ctx.request_repaint_after(std::time::Duration::from_millis(200)); }
+        // progress readout and status stay live. With nothing pending or
+        // rendering, drop to one frame per POLL_INTERVAL (enough to pick up a
+        // newly queued item via `reload`): `running` stays true after the
+        // last item finishes, and this window used to redraw 5×/s for hours
+        // while idle (it was found wedged after ~7 h of exactly that).
+        let busy = running && (current_id.is_some() || self.items.iter().any(|it| it.status == QueueStatus::Pending));
+        if busy {
+            ctx.request_repaint_after(std::time::Duration::from_millis(200));
+        } else {
+            ctx.request_repaint_after(POLL_INTERVAL);
+        }
     }
 }
 
@@ -945,6 +1053,19 @@ fn main() -> anyhow::Result<()> {
         return Ok(());
     }
     let _ = std::fs::remove_file(&sock_path);
+    install_panic_log();
+    qlog(&format!("started (pid {}, binary {})", std::process::id(),
+        std::env::current_exe().ok().and_then(|p| std::fs::metadata(p).ok()).and_then(|m| m.modified().ok())
+            .map(|t| format!("{:?}", t)).unwrap_or_else(|| "?".into())));
+    // Opt-in, as in nnfractals-viewer: let an unprivileged watcher attach to read
+    // stacks during a freeze (Yama ptrace_scope=1 otherwise allows only
+    // ancestors, and killing the window destroys the evidence).
+    if std::env::var_os("NNFRACTALS_ALLOW_PTRACE").is_some() {
+        // SAFETY: PR_SET_PTRACER passes no pointers; it only relaxes who may attach.
+        unsafe { libc::prctl(libc::PR_SET_PTRACER, libc::PR_SET_PTRACER_ANY); }
+        qlog("ptrace attach allowed (NNFRACTALS_ALLOW_PTRACE)");
+    }
+    spawn_ui_watchdog();
     let (wake_tx, wake_rx) = mpsc::channel::<()>();
     let _sock_guard = match UnixListener::bind(&sock_path) {
         Ok(listener) => {
