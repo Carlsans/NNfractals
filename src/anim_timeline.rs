@@ -494,6 +494,147 @@ pub struct AnimationTimeline {
     /// stored here.
     #[serde(default)]
     pub hide_top_percentile: f64,
+    /// Escape-count zones picked on the ▦ Planes tiles: the 3D view shows
+    /// only those zones (see `ZoneFilter`).
+    #[serde(default)]
+    pub zone: ZoneFilter,
+}
+
+/// `ZoneFilter::bands` entry for points that never escape (the set's interior).
+pub const ZONE_INTERIOR: u32 = u32::MAX;
+
+/// "Show only these escape counts" — clicked on the ▦ Planes tiles. Band `n`
+/// holds the points whose (smooth) escape time is in `[n, n+1)`, i.e. one
+/// colour shell of the slices. With picks, the 3D view renders the region
+/// of the picked bands as solid and drops everything else, so the shells
+/// that normally wrap the inside are gone (`quat_dag::ZoneParams`).
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct ZoneFilter {
+    /// Picked bands (escape counts), sorted; `ZONE_INTERIOR` = never escapes.
+    #[serde(default)]
+    pub bands: Vec<u32>,
+    /// Also keep everything deeper than the shallowest picked band (its
+    /// whole inside, interior included).
+    #[serde(default)]
+    pub include_inside: bool,
+    /// Picks kept but not applied.
+    #[serde(default)]
+    pub disabled: bool,
+    /// Speckle filter, in percent of the box diagonal: a zone point is drawn
+    /// only when the zone carries on along its surface for about this far
+    /// around it (`quat_dag::speck_test`), so the scattered specks of a
+    /// chaotic escape field drop out. 0 = off.
+    #[serde(default)]
+    pub speckle_pct: f64,
+    /// Iteration count the picks were classified with (the Planes window's).
+    /// A zone render uses it, so the 3D view shows exactly what the tiles
+    /// highlight: "interior" and the deepest bands depend on it. 0 = the
+    /// render's own count (timelines saved before this field).
+    #[serde(default)]
+    pub max_iter: u32,
+    /// Zones taken back out of what the picks keep (clicked away in the 3D
+    /// view): the surface you click is the outermost kept zone on that ray,
+    /// so hiding it shows what lies behind. Only applies while there are picks.
+    #[serde(default)]
+    pub hidden: Vec<u32>,
+}
+
+impl ZoneFilter {
+    /// The escape times of band `b` (`ZONE_INTERIOR` = never escaping within
+    /// `max_iter`). Band 0 also holds the few slightly negative smooth escape
+    /// times of points that leave at once (`band_of` puts them there).
+    pub fn band_range(b: u32, max_iter: u32) -> Option<(f64, f64)> {
+        use crate::quat_dag::ZONE_INF;
+        let m = max_iter as f64;
+        if b == ZONE_INTERIOR { Some((m, ZONE_INF)) }
+        else if b >= max_iter { None }
+        else if b == 0 { Some((-ZONE_INF, 1.0)) }
+        else { Some((b as f64, b as f64 + 1.0)) }
+    }
+
+    /// Hides `band` (or shows it again when it is already hidden).
+    pub fn toggle_hidden(&mut self, band: u32) {
+        match self.hidden.binary_search(&band) {
+            Ok(i) => { self.hidden.remove(i); }
+            Err(i) => self.hidden.insert(i, band),
+        }
+    }
+    /// The iteration count a zone render uses (`fallback` = the render's own).
+    pub fn render_iter(&self, fallback: u32) -> u32 {
+        if self.max_iter > 0 { self.max_iter } else { fallback }
+    }
+
+    /// The kept escape times as render parameters: the merged ranges, cut down
+    /// to what the GPU holds (`quat_dag::ZoneParams::from_ranges`). Build it
+    /// once and call `contains` per point.
+    pub fn params(&self, max_iter: u32) -> crate::quat_dag::ZoneParams {
+        crate::quat_dag::ZoneParams::from_ranges(&self.ranges(max_iter), 1.0)
+    }
+
+    /// Bands that are drawn although not picked: more separate runs of picks
+    /// than `quat_dag::ZONE_MAX_RANGES` get their closest gaps filled.
+    pub fn filled_bands(&self, max_iter: u32) -> Vec<u32> {
+        let raw = self.ranges(max_iter);
+        if raw.len() <= crate::quat_dag::ZONE_MAX_RANGES {
+            return Vec::new();
+        }
+        let z = self.params(max_iter);
+        (0..max_iter).filter(|&b| {
+            let mid = b as f64 + 0.5;
+            z.contains(mid) && !raw.iter().any(|&(lo, hi)| mid >= lo && mid < hi)
+        }).collect()
+    }
+    pub fn active(&self) -> bool {
+        !self.disabled && !self.bands.is_empty()
+    }
+
+    /// The band an escape time falls in, for a render with `max_iter` iterations.
+    pub fn band_of(et: f64, max_iter: u32) -> u32 {
+        if et >= max_iter as f64 { ZONE_INTERIOR } else { et.max(0.0).floor() as u32 }
+    }
+
+    pub fn band_label(b: u32) -> String {
+        if b == ZONE_INTERIOR { "interior".into() } else { b.to_string() }
+    }
+
+    /// Adds `band`, or removes it when it is already picked.
+    pub fn toggle(&mut self, band: u32) {
+        match self.bands.binary_search(&band) {
+            Ok(i) => { self.bands.remove(i); }
+            Err(i) => self.bands.insert(i, band),
+        }
+    }
+
+    /// Whether a point with escape time `et` (out of `max_iter`) is shown. For
+    /// many points, build `params` once instead.
+    pub fn keeps(&self, et: f64, max_iter: u32) -> bool {
+        self.params(max_iter).contains(et)
+    }
+
+    /// The kept escape times as half-open ranges for a render with
+    /// `max_iter` iterations (a never-escaping point has escape time
+    /// `max_iter`). Bands at or past `max_iter` cannot occur there and drop
+    /// out; the upper end of "everything inside" is `quat_dag::ZONE_INF`.
+    pub fn ranges(&self, max_iter: u32) -> Vec<(f64, f64)> {
+        use crate::quat_dag::ZONE_INF;
+        let mut r: Vec<(f64, f64)> = self.bands.iter().filter_map(|&b| Self::band_range(b, max_iter)).collect();
+        if self.include_inside {
+            if let Some(lo) = r.iter().map(|x| x.0).reduce(f64::min) { r.push((lo, ZONE_INF)); }
+        }
+        let mut kept = crate::quat_dag::merge_ranges(r);
+        // Take the hidden bands back out.
+        for (lo, hi) in self.hidden.iter().filter_map(|&b| Self::band_range(b, max_iter)) {
+            kept = kept.into_iter().flat_map(|(a, b)| {
+                if hi <= a || lo >= b { vec![(a, b)] } else {
+                    let mut v = Vec::new();
+                    if a < lo { v.push((a, lo)); }
+                    if hi < b { v.push((hi, b)); }
+                    v
+                }
+            }).collect();
+        }
+        kept
+    }
 }
 
 fn default_camera_pitch() -> f64 { 0.25 }
@@ -527,6 +668,7 @@ impl AnimationTimeline {
             camera_distance: default_camera_distance(),
             camera_pivot_offset: (0.0, 0.0, 0.0),
             hide_top_percentile: 0.0,
+            zone: ZoneFilter::default(),
         }
     }
 
@@ -790,6 +932,79 @@ pub fn resolve_audio_clip_for_render(clip: &AudioClip, trim_start_s: f64, trim_e
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn zone_filter_bands_become_escape_time_ranges() {
+        use crate::quat_dag::ZONE_INF;
+        let mut z = ZoneFilter::default();
+        assert!(!z.active());
+        z.toggle(7);
+        z.toggle(3);
+        z.toggle(4);
+        z.toggle(ZONE_INTERIOR);
+        assert_eq!(z.bands, vec![3, 4, 7, ZONE_INTERIOR]);
+        assert_eq!(z.ranges(40), vec![(3.0, 5.0), (7.0, 8.0), (40.0, ZONE_INF)]);
+        // A band the render's iteration count cannot reach drops out.
+        assert_eq!(z.ranges(6), vec![(3.0, 5.0), (6.0, ZONE_INF)]);
+        z.toggle(4);
+        z.include_inside = true;
+        assert_eq!(z.ranges(40), vec![(3.0, ZONE_INF)]);
+        assert!(z.keeps(39.5, 40) && z.keeps(40.0, 40) && !z.keeps(2.9, 40));
+        assert_eq!(ZoneFilter::band_of(7.8, 40), 7);
+        assert_eq!(ZoneFilter::band_of(40.0, 40), ZONE_INTERIOR);
+        z.disabled = true;
+        assert!(!z.active());
+    }
+
+    #[test]
+    fn hidden_zones_come_out_of_the_kept_ones() {
+        use crate::quat_dag::ZONE_INF;
+        let mut z = ZoneFilter::default();
+        z.toggle(1);
+        z.include_inside = true;
+        assert_eq!(z.ranges(40), vec![(1.0, ZONE_INF)]);
+        z.toggle_hidden(3);
+        z.toggle_hidden(ZONE_INTERIOR);
+        assert_eq!(z.ranges(40), vec![(1.0, 3.0), (4.0, 40.0)]);
+        assert!(z.keeps(2.5, 40) && !z.keeps(3.5, 40) && z.keeps(4.0, 40) && !z.keeps(40.0, 40));
+        z.toggle_hidden(3);
+        assert_eq!(z.ranges(40), vec![(1.0, 40.0)], "hiding again shows it again");
+        // Band 0 includes the slightly negative escape times band_of puts there.
+        let mut o = ZoneFilter::default();
+        o.toggle(0);
+        assert!(o.keeps(-0.2, 40) && o.keeps(0.5, 40) && !o.keeps(1.0, 40));
+        // Hidden bands alone keep nothing: they only cut picks.
+        let mut h = ZoneFilter::default();
+        h.toggle_hidden(5);
+        assert!(h.ranges(40).is_empty() && !h.active());
+    }
+
+    #[test]
+    fn many_separate_picks_fill_their_closest_gaps_and_say_so() {
+        let mut z = ZoneFilter::default();
+        for b in [2, 4, 6, 8, 10, 12, 14, 16, ZONE_INTERIOR] { z.toggle(b); }
+        assert_eq!(z.ranges(40).len(), 9, "nine separate runs");
+        let p = z.params(40);
+        assert_eq!(p.n, crate::quat_dag::ZONE_MAX_RANGES);
+        for b in [2u32, 16] { assert!(p.contains(b as f64 + 0.5)); }
+        assert!(p.contains(45.0), "the interior pick is still drawn");
+        let filled = z.filled_bands(40);
+        assert_eq!(filled.len(), 1, "one gap filled: {filled:?}");
+        assert!(z.keeps(filled[0] as f64 + 0.5, 40), "tiles show the filled band like the 3D view does");
+        z.toggle(16);
+        assert!(z.filled_bands(40).is_empty());
+        assert_eq!(z.render_iter(40), 40, "no recorded count: the render's own");
+        z.max_iter = 60;
+        assert_eq!(z.render_iter(40), 60);
+    }
+
+    #[test]
+    fn a_timeline_saved_before_zones_loads_with_no_zone() {
+        let mut v = serde_json::to_value(AnimationTimeline::new(1)).unwrap();
+        v.as_object_mut().unwrap().remove("zone");
+        let t: AnimationTimeline = serde_json::from_value(v).unwrap();
+        assert_eq!(t.zone, ZoneFilter::default());
+    }
 
     fn clip(effect: Effect, start_s: f64, end_s: f64) -> EffectClip {
         EffectClip { effect, start_s, end_s, label: String::new() }

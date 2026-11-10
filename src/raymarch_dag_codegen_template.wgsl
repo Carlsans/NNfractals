@@ -88,6 +88,20 @@ struct Params {
     // 4D->3D collapse method (quat_collapse::Method) and its parameters.
     col_mode: u32,
     col_p0: f32, col_p1: f32, col_p2: f32, col_p3: f32, col_p4: f32,
+    // Zone filter (RaymarchDagParams::zone, Slide/hide already taken out):
+    // solid where the escape time is in one of zone_n ranges
+    // [zone_lo_i, zone_hi_i). zone_enabled is 0 for every caller without one.
+    zone_enabled: u32,
+    zone_n: u32,
+    zone_max_step: f32,
+    zone_min_step: f32,
+    zone_de_trust: f32,
+    zone_lo0: f32, zone_lo1: f32, zone_lo2: f32, zone_lo3: f32,
+    zone_lo4: f32, zone_lo5: f32, zone_lo6: f32, zone_lo7: f32,
+    zone_hi0: f32, zone_hi1: f32, zone_hi2: f32, zone_hi3: f32,
+    zone_hi4: f32, zone_hi5: f32, zone_hi6: f32, zone_hi7: f32,
+    zone_speckle_len: f32,
+    pixel_lod: f32, solid_interior: u32,
 }
 
 @group(0) @binding(0) var<uniform>             params         : Params;
@@ -100,6 +114,10 @@ struct Params {
 @group(0) @binding(3) var<uniform>             consts         : array<vec4<f32>, 24>;
 
 const EPS: f32 = 1e-9;
+const ZONE_BISECT: u32 = 10u; // quat_dag::ZONE_BISECT
+const ZONE_SPECKLE_SAMPLES: u32 = 6u; // quat_dag::ZONE_SPECKLE_*
+const ZONE_SPECKLE_DEPTH: u32 = 5u;
+const ZONE_SPECKLE_NEED: u32 = 5u;
 
 // ── Quaternion helpers — mirror quat_dag.rs's q*/formula.rs's c* exactly ──
 struct Quat { r: f32, a: f32, b: f32, c: f32 }
@@ -412,6 +430,170 @@ fn estimate_normal(p: vec3f) -> vec3f {
     return normalize(g);
 }
 
+// ── Zone filter — mirrors quat_dag.rs's ZoneParams / march_zone ──────────
+fn zone_lo(i: u32) -> f32 {
+    switch i {
+        case 0u: { return params.zone_lo0; }
+        case 1u: { return params.zone_lo1; }
+        case 2u: { return params.zone_lo2; }
+        case 3u: { return params.zone_lo3; }
+        case 4u: { return params.zone_lo4; }
+        case 5u: { return params.zone_lo5; }
+        case 6u: { return params.zone_lo6; }
+        default: { return params.zone_lo7; }
+    }
+}
+fn zone_hi(i: u32) -> f32 {
+    switch i {
+        case 0u: { return params.zone_hi0; }
+        case 1u: { return params.zone_hi1; }
+        case 2u: { return params.zone_hi2; }
+        case 3u: { return params.zone_hi3; }
+        case 4u: { return params.zone_hi4; }
+        case 5u: { return params.zone_hi5; }
+        case 6u: { return params.zone_hi6; }
+        default: { return params.zone_hi7; }
+    }
+}
+fn zone_contains(et: f32) -> bool {
+    for (var i: u32 = 0u; i < params.zone_n; i = i + 1u) {
+        if (et >= zone_lo(i) && et < zone_hi(i)) { return true; }
+    }
+    return false;
+}
+// ZoneParams::step_bound: de * (1 - 2^-gap), gap = escape-time distance to
+// the nearest range end; max_step where there is no usable estimate.
+fn zone_step(et: f32, de: f32) -> f32 {
+    if (et >= f32(params.max_iter) || !(de > 0.0) || de > 3.0e38 || params.zone_de_trust <= 0.0) {
+        return params.zone_max_step;
+    }
+    var gap: f32 = 3.4e38;
+    for (var i: u32 = 0u; i < params.zone_n; i = i + 1u) {
+        let lo = zone_lo(i);
+        let hi = zone_hi(i);
+        if (lo < 1.0e38) { gap = min(gap, abs(et - lo)); }
+        if (hi < 1.0e38) { gap = min(gap, abs(et - hi)); }
+    }
+    if (gap >= 3.0e38) { return params.zone_max_step; }
+    return min(params.zone_de_trust * de * (1.0 - exp2(-gap)), params.zone_max_step);
+}
+// Escape-time gradient turned to face the camera (zone_normal on the CPU).
+fn zone_normal(p: vec3f, dir: vec3f) -> vec3f {
+    let eps = max(params.normal_eps, 1e-6);
+    let k0 = vec3f(1.0, -1.0, -1.0);
+    let k1 = vec3f(-1.0, -1.0, 1.0);
+    let k2 = vec3f(-1.0, 1.0, -1.0);
+    let k3 = vec3f(1.0, 1.0, 1.0);
+    let cap = f32(params.max_iter);
+    let g = k0 * min(de_at(p + k0*eps).x, cap) + k1 * min(de_at(p + k1*eps).x, cap)
+          + k2 * min(de_at(p + k2*eps).x, cap) + k3 * min(de_at(p + k3*eps).x, cap);
+    var n: vec3f;
+    if (length(g) > 1e-9) {
+        n = normalize(g);
+    } else {
+        n = estimate_normal(p);
+        if (!(dot(n, n) > 0.5)) { n = -dir; }
+    }
+    if (dot(n, dir) > 0.0) { n = -n; }
+    return n;
+}
+fn zone_shade(n: vec3f, et: f32) -> vec2f {
+    let light = normalize(vec3f(params.light_x, params.light_y, params.light_z));
+    return vec2f(0.15 + 0.85 * max(dot(n, light), 0.0), et);
+}
+// speck_test on the CPU: a hit counts only when the zone carries on along its
+// own surface. ZONE_SPECKLE_SAMPLES probes sit speckle_len/2 from the hit in the
+// plane perpendicular to the surface normal n and look across the surface
+// (ZONE_SPECKLE_DEPTH points over +-speckle_len/2 along n); a probe meets the
+// zone when a point is in it or the escape time runs monotonically across a
+// whole range (a shell thinner than the point spacing). ZONE_SPECKLE_NEED must.
+fn zone_probe_crosses(e: array<f32, 5>) -> bool {
+    var up = true;
+    var down = true;
+    for (var j: u32 = 1u; j < ZONE_SPECKLE_DEPTH; j = j + 1u) {
+        if (e[j] < e[j - 1u]) { up = false; }
+        if (e[j] > e[j - 1u]) { down = false; }
+    }
+    if (!(up || down)) { return false; }
+    let lo = min(e[0], e[ZONE_SPECKLE_DEPTH - 1u]);
+    let hi = max(e[0], e[ZONE_SPECKLE_DEPTH - 1u]);
+    for (var i: u32 = 0u; i < params.zone_n; i = i + 1u) {
+        if (lo < zone_lo(i) && hi >= zone_hi(i)) { return true; }
+    }
+    return false;
+}
+fn zone_solid_behind(hit: vec3f, n_in: vec3f) -> bool {
+    if (params.zone_speckle_len <= 0.0) { return true; }
+    var n = vec3f(0.0, 0.0, 1.0);
+    if (dot(n_in, n_in) > 1e-12) { n = normalize(n_in); }
+    var helper = vec3f(0.0, 1.0, 0.0);
+    if (abs(n.x) < 0.9) { helper = vec3f(1.0, 0.0, 0.0); }
+    let u = normalize(cross(n, helper));
+    let v = cross(n, u);
+    let r = 0.5 * params.zone_speckle_len;
+    var met: u32 = 0u;
+    for (var k: u32 = 0u; k < ZONE_SPECKLE_SAMPLES; k = k + 1u) {
+        if (met >= ZONE_SPECKLE_NEED || met + (ZONE_SPECKLE_SAMPLES - k) < ZONE_SPECKLE_NEED) { break; }
+        let a = 6.283185307 * f32(k) / f32(ZONE_SPECKLE_SAMPLES);
+        let base = hit + u * (r * cos(a)) + v * (r * sin(a));
+        var e: array<f32, 5>;
+        var inside = false;
+        for (var j: u32 = 0u; j < ZONE_SPECKLE_DEPTH; j = j + 1u) {
+            let s = r * (2.0 * f32(j) / f32(ZONE_SPECKLE_DEPTH - 1u) - 1.0);
+            e[j] = de_at(base + n * s).x;
+            if (zone_contains(e[j])) { inside = true; break; }
+        }
+        if (inside || zone_probe_crosses(e)) { met = met + 1u; }
+    }
+    return met >= ZONE_SPECKLE_NEED;
+}
+
+fn march_zone(eye: vec3f, dir: vec3f, t0: f32, t1: f32, entry_n: vec3f, has_entry: bool) -> vec2f {
+    if (params.zone_n == 0u) { return vec2f(0.0, 0.0); }
+    let min_step = max(max(params.zone_min_step, params.hit_epsilon), 1e-9);
+    var t = t0;
+    var prev = t0;
+    for (var i: u32 = 0u; i < params.max_march_steps; i = i + 1u) {
+        let p = eye + dir * t;
+        let r = de_at(p);
+        if (zone_contains(r.x)) {
+            var th = t;
+            if (i != 0u) {
+                var a = prev;
+                var b = t;
+                for (var k: u32 = 0u; k < ZONE_BISECT; k = k + 1u) {
+                    let m = 0.5 * (a + b);
+                    let em = de_at(eye + dir * m).x;
+                    if (zone_contains(em)) { b = m; } else { a = m; }
+                }
+                th = b;
+            }
+            // The hit's normal first: the speck test probes along its surface.
+            let hp = eye + dir * th;
+            var n = -dir;
+            var et_hit = r.x;
+            if (i == 0u) {
+                if (has_entry) { n = entry_n; if (dot(n, dir) > 0.0) { n = -n; } }
+            } else {
+                n = zone_normal(hp, dir);
+                et_hit = de_at(hp).x;
+            }
+            if (zone_solid_behind(hp, n)) {
+                return zone_shade(n, et_hit);
+            }
+            // A speck: march on from halfway through the tested stretch.
+            prev = th + 0.5 * params.zone_speckle_len;
+            t = prev;
+            if (t >= t1) { break; }
+            continue;
+        }
+        if (t >= t1) { break; }
+        prev = t;
+        t = min(t + max(zone_step(r.x, r.y) * params.step_safety, min_step), t1);
+    }
+    return vec2f(0.0, 0.0);
+}
+
 fn march_sample(u: f32, v: f32) -> vec2f {
     let forward = vec3f(params.fwd_x, params.fwd_y, params.fwd_z);
     let right   = vec3f(params.right_x, params.right_y, params.right_z);
@@ -421,6 +603,10 @@ fn march_sample(u: f32, v: f32) -> vec2f {
 
     var t0: f32;
     var t1: f32;
+    // Outward normal of the surface the ray enters through (box face, sphere
+    // or clip plane) — the lighting of a zone's flat cut there.
+    var entry_n = vec3f(0.0, 0.0, 0.0);
+    var has_entry = false;
     if (params.use_box != 0u) {
         // Slab method — mirrors quat_raymarch::ray_box exactly.
         let dir_a = array<f32, 3>(dir.x, dir.y, dir.z);
@@ -430,6 +616,7 @@ fn march_sample(u: f32, v: f32) -> vec2f {
         var tn: f32 = 0.0;
         var tf: f32 = 3.4e38;
         var missed = false;
+        var entry_axis: u32 = 3u; // 3 = the eye is inside the box
         for (var axis: u32 = 0u; axis < 3u; axis = axis + 1u) {
             let d = dir_a[axis];
             let e = eye_a[axis];
@@ -442,7 +629,7 @@ fn march_sample(u: f32, v: f32) -> vec2f {
                 var ta = (lo - e) * inv;
                 var tb = (hi - e) * inv;
                 if (ta > tb) { let tmp = ta; ta = tb; tb = tmp; }
-                tn = max(tn, ta);
+                if (ta > tn) { tn = ta; entry_axis = axis; }
                 tf = min(tf, tb);
                 if (tn > tf) { missed = true; }
             }
@@ -450,6 +637,12 @@ fn march_sample(u: f32, v: f32) -> vec2f {
         if (missed) { return vec2f(0.0, 0.0); }
         t0 = max(tn, 0.0);
         t1 = tf;
+        if (entry_axis < 3u && tn > 0.0) {
+            var n = array<f32, 3>(0.0, 0.0, 0.0);
+            n[entry_axis] = select(1.0, -1.0, dir_a[entry_axis] > 0.0);
+            entry_n = vec3f(n[0], n[1], n[2]);
+            has_entry = true;
+        }
     } else {
         let a = dot(dir, dir);
         let b = 2.0 * dot(eye, dir);
@@ -462,6 +655,7 @@ fn march_sample(u: f32, v: f32) -> vec2f {
         if (tt1 < 0.0) { return vec2f(0.0, 0.0); }
         t0 = max(tt0, 0.0);
         t1 = tt1;
+        if (tt0 > 0.0) { entry_n = normalize(eye + dir * tt0); has_entry = true; }
     }
 
     // Orientable difference/cutaway clip plane (Phase 6) — narrows [t0,t1]
@@ -475,7 +669,7 @@ fn march_sample(u: f32, v: f32) -> vec2f {
         let denom = dot(dir, clip_n);
         if (denom > 1e-6) {
             let t_plane = dot(clip_pos - eye, clip_n) / denom;
-            t0 = max(t0, t_plane);
+            if (t_plane > t0) { t0 = t_plane; entry_n = normalize(clip_n); has_entry = true; }
         } else if (denom < -1e-6) {
             let t_plane = dot(clip_pos - eye, clip_n) / denom;
             t1 = min(t1, t_plane);
@@ -485,11 +679,31 @@ fn march_sample(u: f32, v: f32) -> vec2f {
         if (t0 > t1) { return vec2f(0.0, 0.0); }
     }
 
+    if (params.zone_enabled != 0u) {
+        return march_zone(eye, dir, t0, t1, entry_n, has_entry);
+    }
+
     let hit_eps = max(params.hit_epsilon, 1e-9);
     let min_step = max(params.domain_radius * 1e-6, 1e-9);
+    // RaymarchDagParams::pixel_lod: one pixel's width per unit of distance.
+    let pixel = 2.0 * params.half_h / f32(params.height);
     var t = t0;
+    var prev = t0;
     var hit = false;
+    var interior_hit = false;
+    var started_inside = false;
     var hit_point = vec3f(0.0, 0.0, 0.0);
+    let cap = f32(params.max_iter);
+    // quat_dag::SOLID_STEP_DIVISIONS: with solid_interior no step exceeds the
+    // region's diagonal / 128 (an overstated distance estimate jumped the set).
+    var step_cap: f32 = 3.4e38;
+    if (params.solid_interior != 0u) {
+        var extent = 2.0 * params.domain_radius;
+        if (params.use_box != 0u) {
+            extent = length(vec3f(params.box_max_x - params.box_min_x, params.box_max_y - params.box_min_y, params.box_max_z - params.box_min_z));
+        }
+        step_cap = extent / 128.0;
+    }
     for (var i: u32 = 0u; i < params.max_march_steps; i = i + 1u) {
         if (t > t1) { break; }
         let p = eye + dir * t;
@@ -503,16 +717,43 @@ fn march_sample(u: f32, v: f32) -> vec2f {
         // efficient.
         let in_band = params.slide_iter_enabled != 0u && et >= params.slide_iter_min && et < params.slide_iter_max;
         let above_cutoff = params.hide_above_enabled != 0u && et >= params.hide_above;
-        if (de < hit_eps && !in_band && !above_cutoff) {
+        // RaymarchDagParams::solid_interior: a ray stepping into the set stops,
+        // the surface bisected back to the last point outside.
+        if (params.solid_interior != 0u && et >= cap && !in_band && !above_cutoff) {
+            var a = prev;
+            var b = t;
+            if (i != 0u) {
+                for (var k: u32 = 0u; k < ZONE_BISECT; k = k + 1u) {
+                    let m = 0.5 * (a + b);
+                    if (de_at(eye + dir * m).x >= cap) { b = m; } else { a = m; }
+                }
+            }
+            hit = true;
+            interior_hit = true;
+            started_inside = i == 0u;
+            hit_point = eye + dir * b;
+            break;
+        }
+        if (de < max(hit_eps, params.pixel_lod * pixel * t) && !in_band && !above_cutoff) {
             hit = true;
             hit_point = p;
             break;
         }
-        t = t + max(de * params.step_safety, min_step);
+        prev = t;
+        t = t + min(max(de * params.step_safety, min_step), step_cap);
     }
     if (!hit) { return vec2f(0.0, 0.0); }
 
-    let normal = estimate_normal(hit_point);
+    var normal = estimate_normal(hit_point);
+    if (interior_hit) {
+        if (started_inside) {
+            // Started inside the set: the flat cut of the entry face (box, sphere, clip plane).
+            normal = -dir;
+            if (has_entry) { normal = entry_n; if (dot(normal, dir) > 0.0) { normal = -normal; } }
+        } else {
+            normal = zone_normal(hit_point, dir);
+        }
+    }
     let light = normalize(vec3f(params.light_x, params.light_y, params.light_z));
     let ndotl = max(dot(normal, light), 0.0);
     let shading = 0.15 + 0.85 * ndotl;

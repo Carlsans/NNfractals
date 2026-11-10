@@ -44,7 +44,7 @@ const TEMPLATE: &str = include_str!("raymarch_dag_codegen_template.wgsl");
 /// Slide Iteration effect (enabled flag + min + max) plus 2 for the
 /// "hide top N%" resolved cutoff (enabled flag + value) plus 7 for the
 /// per-axis remap (enabled flag + scale xyz + offset xyz).
-const PARAMS_BYTES: u64 = 72 * 4;
+const PARAMS_BYTES: u64 = 96 * 4;
 /// The `consts` uniform: one vec4 per DAG slot (program kre/kim, warp kre/kim).
 const CONSTS_BYTES: u64 = (N_SLOTS as u64) * 16;
 const WG: u32 = 8;
@@ -551,6 +551,19 @@ impl CompiledDagPipeline {
             let (cm, cp) = crate::quat_collapse::Collapse::effective(params.collapse).uniform_words();
             w.u32(cm);
             w.f32(cp[0]); w.f32(cp[1]); w.f32(cp[2]); w.f32(cp[3]); w.f32(cp[4]);
+            // Zone filter, with Slide Iteration / hide_above taken out.
+            let zone = crate::quat_dag::effective_zone(params);
+            w.u32(zone.is_some() as u32);
+            let z = zone.unwrap_or(crate::quat_dag::ZoneParams::from_ranges(&[], 1.0));
+            w.u32(z.n as u32);
+            w.f32(z.max_step);
+            w.f32(z.min_step);
+            w.f32(z.de_trust);
+            for i in 0..crate::quat_dag::ZONE_MAX_RANGES { w.f32(z.ranges[i].0); }
+            for i in 0..crate::quat_dag::ZONE_MAX_RANGES { w.f32(z.ranges[i].1); }
+            w.f32(z.speckle_len);
+            w.f32(params.pixel_lod);
+            w.u32(params.solid_interior as u32);
         }
         queue.write_buffer(&self.params_buf, 0, &pb);
         queue.write_buffer(&self.consts_buf, 0, &consts_bytes(params.formula.prog, params.formula.warp));
@@ -621,11 +634,11 @@ mod tests {
             time_axis: TimeAxis::C,
             time_val: 0.0,
             domain_radius: 1.6,
-            box_bounds: None, axis_assignment: None, clip_plane: None, slide_iter: None, hide_above: None, axis_remap: None, collapse: None,
+            box_bounds: None, axis_assignment: None, clip_plane: None, slide_iter: None, hide_above: None, zone: None, axis_remap: None, collapse: None,
             max_iter: 40,
             bailout: 4.0,
             max_march_steps: 200,
-            hit_epsilon: 1.6 * 1e-4,
+            hit_epsilon: 1.6 * 1e-4, pixel_lod: 0.0, solid_interior: false,
             step_safety: 0.8,
             light_dir: (0.5, 0.8, 0.3),
             normal_eps: 1.6 * 1e-3,
@@ -864,6 +877,56 @@ mod tests {
         params.box_bounds = Some(((-0.3, -0.3, -0.3), (0.3, 0.3, 0.3)));
         params.hide_above = Some(params.max_iter as f64);
         assert_matches_cpu(&prog, &[], params, 64, 64);
+    }
+
+    /// Zone filter: the shader's march_zone (bounded steps, bisection, entry-face
+    /// cut, escape-time-gradient normal) against the CPU's, for a single band,
+    /// a band plus everything inside, and a zone with the clip plane cutting it.
+    #[test]
+    fn codegen_matches_cpu_with_zone_filter() {
+        use crate::quat_dag::{ZoneParams, ZONE_INF};
+        let prog = [
+            OpNode { op: op::Z, a: 0, b: 0, kre: 0.0, kim: 0.0 },
+            OpNode { op: op::C, a: 0, b: 0, kre: 0.0, kim: 0.0 },
+            OpNode { op: op::SQR, a: 0, b: 0, kre: 0.0, kim: 0.0 },
+            OpNode { op: op::ADD, a: 2, b: 1, kre: 0.0, kim: 0.0 },
+        ];
+        for (ranges, clip, speckle) in [
+            (vec![(6.0, 7.0)], false, 0.0),
+            (vec![(4.0, ZONE_INF)], false, 0.0),
+            (vec![(3.0, 4.0), (40.0, ZONE_INF)], true, 0.0),
+            (vec![(5.0, 6.0), (9.0, ZONE_INF)], false, 0.08),
+        ] {
+            let mut params = base_params(&prog, &[]);
+            params.box_bounds = Some(((-1.6, -1.6, -1.6), (1.6, 1.6, 1.6)));
+            let mut z = ZoneParams::from_ranges(&ranges, 3.2 * 1.732 / 256.0);
+            z.speckle_len = speckle;
+            params.zone = Some(z);
+            params.max_march_steps = 640;
+            if clip { params.clip_plane = Some(((0.0, 0.0, 0.0), (0.3, 0.2, 1.0))); }
+            assert_matches_cpu(&prog, &[], params, 64, 64);
+        }
+    }
+
+    #[test]
+    fn codegen_matches_cpu_with_pixel_lod() {
+        // A far camera, so the half-pixel hit test is what stops most rays.
+        let prog = [
+            OpNode { op: op::Z, a: 0, b: 0, kre: 0.0, kim: 0.0 },
+            OpNode { op: op::C, a: 0, b: 0, kre: 0.0, kim: 0.0 },
+            OpNode { op: op::SQR, a: 0, b: 0, kre: 0.0, kim: 0.0 },
+            OpNode { op: op::ADD, a: 2, b: 1, kre: 0.0, kim: 0.0 },
+        ];
+        let mut params = base_params(&prog, &[]);
+        params.box_bounds = Some(((-1.6, -1.6, -1.6), (1.6, 1.6, 1.6)));
+        params.pixel_lod = 0.5;
+        assert_matches_cpu(&prog, &[], params, 48, 48);
+        // The viewer's settings: an opaque set with capped steps.
+        params.solid_interior = true;
+        params.max_march_steps = 400;
+        assert_matches_cpu(&prog, &[], params, 48, 48);
+        params.step_safety = 40.0; // an overstated estimate: the cap and the bisection do the work
+        assert_matches_cpu(&prog, &[], params, 48, 48);
     }
 
     #[test]

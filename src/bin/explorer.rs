@@ -997,9 +997,9 @@ fn cmd_collapse_video(nn: &std::path::Path, method: nnfractals::quat_collapse::M
     let mk_params = |time_val: f64| nnfractals::quat_dag::RaymarchDagParams {
         formula: nnfractals::quat_dag::QuatDagFormula { prog: &genome.program, warp: &genome.warp, julia: genome.julia_mode, jc: (genome.julia_cre, genome.julia_cim), phoenix: (genome.phoenix_re, genome.phoenix_im) },
         time_axis: nnfractals::quat_fractal::TimeAxis::C, time_val, domain_radius,
-        box_bounds: None, axis_assignment: None, clip_plane: None, slide_iter: None, hide_above: None, axis_remap: None, collapse: None,
-        max_iter: 80, bailout, max_march_steps: 200,
-        hit_epsilon: domain_radius * 1e-4, step_safety: 0.8, light_dir: (0.5, 0.8, 0.3),
+        box_bounds: None, axis_assignment: None, clip_plane: None, slide_iter: None, hide_above: None, zone: None, axis_remap: None, collapse: None,
+        max_iter: 80, bailout, max_march_steps: march_steps(200),
+        hit_epsilon: domain_radius * 1e-4, pixel_lod: 0.0, solid_interior: solid_march(), step_safety: 0.8, light_dir: (0.5, 0.8, 0.3),
         normal_eps: domain_radius * 1e-3, color_probe_offset: domain_radius * 1e-2, aa: 1,
     };
     let mut mode = resolve_dag_gpu_mode(&genome.program, &genome.warp, true);
@@ -1079,9 +1079,9 @@ fn cmd_collapse_smooth(nn: &std::path::Path, collapse: nnfractals::quat_collapse
                 formula: nnfractals::quat_dag::QuatDagFormula { prog: &genome.program, warp: &genome.warp, julia: genome.julia_mode, jc: (genome.julia_cre, genome.julia_cim), phoenix: (genome.phoenix_re, genome.phoenix_im) },
                 time_axis: nnfractals::quat_fractal::TimeAxis::C,
                 time_val: nnfractals::quat_collapse::time_for_phase(bailout, i as f64 / n as f64), domain_radius,
-                box_bounds: None, axis_assignment: None, clip_plane: None, slide_iter: None, hide_above: None, axis_remap: None, collapse: Some(collapse),
-                max_iter: 50, bailout, max_march_steps: 150,
-                hit_epsilon: domain_radius * 1e-4, step_safety: 0.8, light_dir: (0.5, 0.8, 0.3),
+                box_bounds: None, axis_assignment: None, clip_plane: None, slide_iter: None, hide_above: None, zone: None, axis_remap: None, collapse: Some(collapse),
+                max_iter: 50, bailout, max_march_steps: march_steps(150),
+                hit_epsilon: domain_radius * 1e-4, pixel_lod: 0.0, solid_interior: solid_march(), step_safety: 0.8, light_dir: (0.5, 0.8, 0.3),
                 normal_eps: domain_radius * 1e-3, color_probe_offset: domain_radius * 1e-2, aa: 1,
             };
             let (sh, ct) = render_dag_frame_with_mode(&mut mode, &params, &cam, size, size);
@@ -2510,11 +2510,11 @@ fn score_genome_dag(genome: &Genome, probe_size: u32, use_gpu: bool) -> nnfracta
         time_axis: nnfractals::quat_fractal::TimeAxis::C,
         time_val: 0.0,
         domain_radius,
-        box_bounds: None, axis_assignment: None, clip_plane: None, slide_iter: None, hide_above: None, axis_remap: None, collapse: collapse_eff,
+        box_bounds: None, axis_assignment: None, clip_plane: None, slide_iter: None, hide_above: None, zone: None, axis_remap: None, collapse: collapse_eff,
         max_iter: 60,
         bailout: genome.bailout_radius as f64,
-        max_march_steps: 150,
-        hit_epsilon: domain_radius * 1e-4,
+        max_march_steps: march_steps(150),
+        hit_epsilon: domain_radius * 1e-4, pixel_lod: 0.0, solid_interior: solid_march(),
         step_safety: 0.8,
         light_dir: (0.5, 0.8, 0.3),
         normal_eps: domain_radius * 1e-3,
@@ -2582,11 +2582,11 @@ fn score_genome_dag_full(genome: &Genome, probe_size: u32, use_gpu: bool) -> Qua
         time_axis: nnfractals::quat_fractal::TimeAxis::C,
         time_val: 0.0,
         domain_radius,
-        box_bounds: None, axis_assignment: None, clip_plane: None, slide_iter: None, hide_above: None, axis_remap: None, collapse: collapse_eff,
+        box_bounds: None, axis_assignment: None, clip_plane: None, slide_iter: None, hide_above: None, zone: None, axis_remap: None, collapse: collapse_eff,
         max_iter: 60,
         bailout: genome.bailout_radius as f64,
-        max_march_steps: 150,
-        hit_epsilon: domain_radius * 1e-4,
+        max_march_steps: march_steps(150),
+        hit_epsilon: domain_radius * 1e-4, pixel_lod: 0.0, solid_interior: solid_march(),
         step_safety: 0.8,
         light_dir: (0.5, 0.8, 0.3),
         normal_eps: domain_radius * 1e-3,
@@ -3324,16 +3324,14 @@ const COMPRESSION_OVERSHOOT_PENALTY: f64 = 5.0;
 /// sane, comparable range for a small handful of terms; it doesn't need
 /// to be renormalized back to [0,1] itself, since only ranking/sorting
 /// ever reads it).
+///
+/// Shares `fitness_recipe::parse_spec` with the launcher, so what the
+/// launcher accepts is exactly what runs (empty parts from a stray comma are
+/// skipped; an unknown term stops the run at once with its name).
 fn parse_fitness_metric_spec(s: &str) -> Vec<(String, f64)> {
-    s.split(',')
-        .map(|term| {
-            let term = term.trim();
-            match term.split_once(':') {
-                Some((name, w)) => (name.trim().to_string(), w.trim().parse::<f64>().unwrap_or_else(|_| panic!("bad weight in --fitness-metric term {term:?} — expected name:weight"))),
-                None => (term.to_string(), 1.0),
-            }
-        })
-        .collect()
+    let terms = nnfractals::fitness_recipe::parse_spec(s).unwrap_or_else(|e| panic!("--fitness-metric {s:?}: {e}"));
+    assert!(!terms.is_empty(), "--fitness-metric {s:?} has no term");
+    terms.into_iter().map(|t| (t.name, t.weight)).collect()
 }
 
 /// Looks up ONE named metric's raw value from an already-computed
@@ -3444,9 +3442,9 @@ fn render_still_rgb_ex(genome: &Genome, phase: f64, w: u32, h: u32, use_gpu: boo
     let fov_deg = 45.0;
     let params = nnfractals::quat_dag::RaymarchDagParams {
         formula, time_axis: nnfractals::quat_fractal::TimeAxis::C, time_val, domain_radius,
-        box_bounds: None, axis_assignment: None, clip_plane: None, slide_iter: None, hide_above: None, axis_remap: None, collapse: collapse_eff,
-        max_iter: 50, bailout: genome.bailout_radius as f64, max_march_steps: 150,
-        hit_epsilon: domain_radius * 1e-4, step_safety: 0.8, light_dir: (0.5, 0.8, 0.3),
+        box_bounds: None, axis_assignment: None, clip_plane: None, slide_iter: None, hide_above: None, zone: None, axis_remap: None, collapse: collapse_eff,
+        max_iter: 50, bailout: genome.bailout_radius as f64, max_march_steps: march_steps(150),
+        hit_epsilon: domain_radius * 1e-4, pixel_lod: 0.0, solid_interior: solid_march(), step_safety: 0.8, light_dir: (0.5, 0.8, 0.3),
         normal_eps: domain_radius * 1e-3, color_probe_offset: domain_radius * 1e-2, aa: 1,
     };
     let radius = recommended_orbit_radius(domain_radius, fov_deg, w, h);
@@ -3617,9 +3615,9 @@ fn taste_score_for_genome(genome: &Genome, use_gpu: bool) -> f64 {
         let bg_color = (0.03, 0.02, 0.06);
         let params = nnfractals::quat_dag::RaymarchDagParams {
             formula, time_axis: nnfractals::quat_fractal::TimeAxis::C, time_val, domain_radius,
-            box_bounds: None, axis_assignment: None, clip_plane: None, slide_iter: None, hide_above: None, axis_remap: None, collapse: collapse_eff,
-            max_iter: 50, bailout: genome.bailout_radius as f64, max_march_steps: 150,
-            hit_epsilon: domain_radius * 1e-4, step_safety: 0.8, light_dir: (0.5, 0.8, 0.3),
+            box_bounds: None, axis_assignment: None, clip_plane: None, slide_iter: None, hide_above: None, zone: None, axis_remap: None, collapse: collapse_eff,
+            max_iter: 50, bailout: genome.bailout_radius as f64, max_march_steps: march_steps(150),
+            hit_epsilon: domain_radius * 1e-4, pixel_lod: 0.0, solid_interior: solid_march(), step_safety: 0.8, light_dir: (0.5, 0.8, 0.3),
             normal_eps: domain_radius * 1e-3, color_probe_offset: domain_radius * 1e-2, aa: 1,
         };
         let (w, h) = (300u32, 400u32);
@@ -3673,6 +3671,15 @@ fn taste_score_for_genome(genome: &Genome, use_gpu: bool) -> f64 {
     total
 }
 
+/// `--legacy-march`: the march from before 2026-11-04, whose distance-estimate
+/// steps could jump clean over parts of the set (which parts depended on the
+/// view), to reproduce scores of older runs. Default: the set is opaque and
+/// steps are capped (`RaymarchDagParams::solid_interior`).
+static LEGACY_MARCH: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+fn solid_march() -> bool { !LEGACY_MARCH.load(std::sync::atomic::Ordering::Relaxed) }
+/// A render's step budget, plus what capped steps need to cross the region.
+fn march_steps(base: u32) -> u32 { if solid_march() { base + nnfractals::quat_dag::SOLID_EXTRA_STEPS } else { base } }
+
 /// Log-spaced range factors tried by the range scan.
 const RANGE_CANDIDATES: [f64; 8] = [0.2, 0.33, 0.55, 0.9, 1.5, 2.5, 4.2, 7.0];
 
@@ -3706,9 +3713,9 @@ fn scan_range_inner(genome: &Genome, use_gpu: bool) -> f32 {
         for &tv in &times {
             let params = nnfractals::quat_dag::RaymarchDagParams {
                 formula, time_axis: nnfractals::quat_fractal::TimeAxis::C, time_val: tv, domain_radius,
-                box_bounds: None, axis_assignment: None, clip_plane: None, slide_iter: None, hide_above: None, axis_remap: None, collapse: col,
-                max_iter: 40, bailout: genome.bailout_radius as f64, max_march_steps: 120,
-                hit_epsilon: domain_radius * 1e-4, step_safety: 0.8, light_dir: (0.5, 0.8, 0.3),
+                box_bounds: None, axis_assignment: None, clip_plane: None, slide_iter: None, hide_above: None, zone: None, axis_remap: None, collapse: col,
+                max_iter: 40, bailout: genome.bailout_radius as f64, max_march_steps: march_steps(120),
+                hit_epsilon: domain_radius * 1e-4, pixel_lod: 0.0, solid_interior: solid_march(), step_safety: 0.8, light_dir: (0.5, 0.8, 0.3),
                 normal_eps: domain_radius * 1e-3, color_probe_offset: domain_radius * 1e-2, aa: 1,
             };
             let (shading, color_t) = render_dag_frame_with_mode(&mut mode, &params, &cam, w, h);
@@ -4008,9 +4015,9 @@ fn render_view_rgb(genome: &Genome, orbit_t: f64, phase: f64, size: u32, use_gpu
     let params = nnfractals::quat_dag::RaymarchDagParams {
         formula, time_axis: nnfractals::quat_fractal::TimeAxis::C,
         time_val: nnfractals::quat_collapse::time_for_phase_m(method, genome.bailout_radius as f64, phase), domain_radius,
-        box_bounds: None, axis_assignment: None, clip_plane: None, slide_iter: None, hide_above: None, axis_remap: None, collapse: collapse_eff,
-        max_iter: 50, bailout: genome.bailout_radius as f64, max_march_steps: 150,
-        hit_epsilon: domain_radius * 1e-4, step_safety: 0.8, light_dir: (0.5, 0.8, 0.3),
+        box_bounds: None, axis_assignment: None, clip_plane: None, slide_iter: None, hide_above: None, zone: None, axis_remap: None, collapse: collapse_eff,
+        max_iter: 50, bailout: genome.bailout_radius as f64, max_march_steps: march_steps(150),
+        hit_epsilon: domain_radius * 1e-4, pixel_lod: 0.0, solid_interior: solid_march(), step_safety: 0.8, light_dir: (0.5, 0.8, 0.3),
         normal_eps: domain_radius * 1e-3, color_probe_offset: domain_radius * 1e-2, aa: 1,
     };
     let orbit = nnfractals::quat_raymarch::RaymarchOrbitParams {
@@ -4129,10 +4136,13 @@ fn plane_stats(genome: &Genome) -> [f64; 4] {
     out
 }
 
+/// Terms with their own render pass (stills, sheet views, taste), not the full sweep.
+const SPECIAL_TERM_NAMES: [&str; 15] = ["taste", "image_entropy_band", "image_motion", "image_fg_shuffle", "res_diff", "res_iou", "motion_ratio", "motion_step", "t_cont", "t_big", "t_cont_band", "front_cover", "front_cover_band", "grey_share", "grey_band"];
+
 /// Raw value of each named fitness term for one genome (the same dispatch the
 /// metric-driven GA uses), plus the full metrics when any term needed them.
 fn metric_term_values(genome: &Genome, names: &[String], probe_size: u32, use_gpu: bool) -> (Vec<f64>, Option<QuatFullMetrics>) {
-    let needs_full = names.iter().any(|name| name != "taste" && name != "image_entropy_band" && name != "image_motion" && !["image_fg_shuffle", "res_diff", "res_iou", "motion_ratio", "motion_step", "t_cont", "t_big", "t_cont_band", "front_cover", "front_cover_band", "grey_share", "grey_band"].contains(&name.as_str()) && !name.starts_with("planes_") && !STRUCTURAL_METRIC_NAMES.contains(&name.as_str()) && !ORGANIZATION_METRIC_NAMES.contains(&name.as_str()));
+    let needs_full = names.iter().any(|name| !SPECIAL_TERM_NAMES.contains(&name.as_str()) && !name.starts_with("planes_") && !STRUCTURAL_METRIC_NAMES.contains(&name.as_str()) && !ORGANIZATION_METRIC_NAMES.contains(&name.as_str()));
     let needs_organization = names.iter().any(|name| ORGANIZATION_METRIC_NAMES.contains(&name.as_str()));
     let full = if needs_full { Some(prof("full (score_genome_dag_full)", || score_genome_dag_full(genome, probe_size, use_gpu))) } else { None };
     let organization = if needs_organization {
@@ -4491,11 +4501,13 @@ fn score_batch(items: &mut Vec<QuatIndividual>, parallel_ok: bool, f: &(dyn Fn(&
     }
     let slots: Vec<std::sync::Mutex<QuatIndividual>> = std::mem::take(items).into_iter().map(std::sync::Mutex::new).collect();
     let next = std::sync::atomic::AtomicUsize::new(0);
+    let failed = WorkerFailure::default();
     tune_batch_start();
     std::thread::scope(|s| {
         for k in 0..n_cores().min(n) {
-            let (slots, next) = (&slots, &next);
+            let (slots, next, failed) = (&slots, &next, &failed);
             s.spawn(move || loop {
+                if failed.happened() { break; }
                 if k >= SCORE_WORKERS.load(Relaxed).max(1) {
                     if next.load(Relaxed) >= n { break; }
                     std::thread::sleep(std::time::Duration::from_millis(100));
@@ -4503,13 +4515,46 @@ fn score_batch(items: &mut Vec<QuatIndividual>, parallel_ok: bool, f: &(dyn Fn(&
                 }
                 let i = next.fetch_add(1, Relaxed);
                 if i >= n { break; }
-                f(&mut slots[i].lock().unwrap());
+                if !failed.run(|| f(&mut slots[i].lock().unwrap())) { break; }
                 tune_item_done();
             });
         }
     });
+    failed.resume();
     tune_batch_end();
     *items = slots.into_iter().map(|m| m.into_inner().unwrap()).collect();
+}
+
+/// The first panic of a scoring worker. Without it, a worker that panicked left
+/// the idle workers (those above the live worker count) waiting forever for the
+/// batch to finish, and the run hung instead of failing.
+#[derive(Default)]
+struct WorkerFailure {
+    hit: std::sync::atomic::AtomicBool,
+    payload: std::sync::Mutex<Option<Box<dyn std::any::Any + Send>>>,
+}
+
+impl WorkerFailure {
+    fn happened(&self) -> bool { self.hit.load(std::sync::atomic::Ordering::Relaxed) }
+
+    /// Run `f`; on a panic record it (the first one) and return false.
+    fn run(&self, f: impl FnOnce()) -> bool {
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
+            Ok(()) => true,
+            Err(e) => {
+                self.hit.store(true, std::sync::atomic::Ordering::Relaxed);
+                self.payload.lock().unwrap_or_else(|p| p.into_inner()).get_or_insert(e);
+                false
+            }
+        }
+    }
+
+    /// Re-raise the recorded panic on the calling thread (after the workers stopped).
+    fn resume(self) {
+        if let Some(e) = self.payload.into_inner().unwrap_or_else(|p| p.into_inner()) {
+            std::panic::resume_unwind(e);
+        }
+    }
 }
 
 /// Order-preserving parallel map on the scoring workers (same gating as `score_batch`): used for
@@ -4523,10 +4568,12 @@ fn par_map<T: Send, R: Send>(items: Vec<T>, f: &(dyn Fn(T) -> R + Sync)) -> Vec<
     let slots: Vec<std::sync::Mutex<Option<T>>> = items.into_iter().map(|t| std::sync::Mutex::new(Some(t))).collect();
     let outs: Vec<std::sync::Mutex<Option<R>>> = (0..n).map(|_| std::sync::Mutex::new(None)).collect();
     let next = std::sync::atomic::AtomicUsize::new(0);
+    let failed = WorkerFailure::default();
     std::thread::scope(|s| {
         for k in 0..n_cores().min(n) {
-            let (slots, outs, next) = (&slots, &outs, &next);
+            let (slots, outs, next, failed) = (&slots, &outs, &next, &failed);
             s.spawn(move || loop {
+                if failed.happened() { break; }
                 if k >= SCORE_WORKERS.load(Relaxed).max(1) {
                     if next.load(Relaxed) >= n { break; }
                     std::thread::sleep(std::time::Duration::from_millis(100));
@@ -4535,10 +4582,11 @@ fn par_map<T: Send, R: Send>(items: Vec<T>, f: &(dyn Fn(T) -> R + Sync)) -> Vec<
                 let i = next.fetch_add(1, Relaxed);
                 if i >= n { break; }
                 let t = slots[i].lock().unwrap().take().expect("each slot is taken once");
-                *outs[i].lock().unwrap() = Some(f(t));
+                if !failed.run(|| *outs[i].lock().unwrap() = Some(f(t))) { break; }
             });
         }
     });
+    failed.resume();
     outs.into_iter().map(|m| m.into_inner().unwrap().expect("every slot was processed")).collect()
 }
 
@@ -4651,7 +4699,8 @@ fn cmd_quat_dag_evolve(
     // the aesthetic scorer unless it is one I trained myself." Loaded once
     // up front (cheap: a few hundred bytes of JSON) rather than per
     // individual.
-    let pref_model = nnfractals::quat_pref::QuatPrefModel::load(std::path::Path::new(pref_model_path));
+    // Only the default blend reads it: with --fitness-metric the recipe is the whole score.
+    let pref_model = if fitness_metric.is_none() { nnfractals::quat_pref::QuatPrefModel::load(std::path::Path::new(pref_model_path)) } else { None };
 
     // Carl: "I also want to know what is the fitness method used at the
     // moment" — printed once, up front, since it's fixed for the whole
@@ -5688,11 +5737,11 @@ fn render_genome_thumbnails(genome: &Genome, out_dir: &std::path::Path, stem: &s
         time_axis: nnfractals::quat_fractal::TimeAxis::C,
         time_val: 0.0,
         domain_radius,
-        box_bounds: None, axis_assignment: None, clip_plane: None, slide_iter: None, hide_above: None, axis_remap: None, collapse: collapse_eff,
+        box_bounds: None, axis_assignment: None, clip_plane: None, slide_iter: None, hide_above: None, zone: None, axis_remap: None, collapse: collapse_eff,
         max_iter: 50,
         bailout: genome.bailout_radius as f64,
-        max_march_steps: 150,
-        hit_epsilon: domain_radius * 1e-4,
+        max_march_steps: march_steps(150),
+        hit_epsilon: domain_radius * 1e-4, pixel_lod: 0.0, solid_interior: solid_march(),
         step_safety: 0.8,
         light_dir: (0.5, 0.8, 0.3),
         normal_eps: domain_radius * 1e-3,
@@ -5775,11 +5824,11 @@ fn render_genome_views(genome: &Genome, out_dir: &std::path::Path, stem: &str, u
         time_axis: nnfractals::quat_fractal::TimeAxis::C,
         time_val: 0.0,
         domain_radius,
-        box_bounds: None, axis_assignment: None, clip_plane: None, slide_iter: None, hide_above: None, axis_remap: None, collapse: collapse_eff,
+        box_bounds: None, axis_assignment: None, clip_plane: None, slide_iter: None, hide_above: None, zone: None, axis_remap: None, collapse: collapse_eff,
         max_iter: 50,
         bailout: genome.bailout_radius as f64,
-        max_march_steps: 150,
-        hit_epsilon: domain_radius * 1e-4,
+        max_march_steps: march_steps(150),
+        hit_epsilon: domain_radius * 1e-4, pixel_lod: 0.0, solid_interior: solid_march(),
         step_safety: 0.8,
         light_dir: (0.5, 0.8, 0.3),
         normal_eps: domain_radius * 1e-3,
@@ -6941,11 +6990,18 @@ fn main() {
     nnfractals::quat_collapse::init_from_env();
     // NN_NO_GPU=1: never touch the GPU (not even init's warm-up dispatch).
     let no_gpu = std::env::var("NN_NO_GPU").is_ok_and(|v| v == "1");
-    if !no_gpu { render_gpu::init_gpu(); }
-    if !no_gpu && !render_gpu::gpu_available() {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.iter().any(|a| a == "--legacy-march") {
+        LEGACY_MARCH.store(true, std::sync::atomic::Ordering::Relaxed);
+        eprintln!("legacy march: rays may jump over parts of the set (renders as before 2026-11-04)");
+    }
+    // The 2D fractal renderer (its own wgpu device, pipeline and warm-up dispatch) is never
+    // used by the quaternion GA subcommands, which open their own raymarcher devices lazily.
+    let quat_only = matches!(args.first().map(String::as_str), Some("quat-dag-evolve" | "quat-metric-terms"));
+    if !no_gpu && !quat_only { render_gpu::init_gpu(); }
+    if !no_gpu && !quat_only && !render_gpu::gpu_available() {
         eprintln!("warning: no GPU adapter found — falling back to per-candidate CPU rendering (render_batch_dag's own fallback), much slower than intended.");
     }
-    let args: Vec<String> = std::env::args().skip(1).collect();
     // Positional-only view: every subcommand below mixes positional args
     // with `--flag value` pairs, and plain `args.get(N)` doesn't know to
     // stop at the first flag — omit a trailing positional and jump
@@ -7777,11 +7833,11 @@ fn main() {
                 time_axis,
                 time_val: get_flag_or(&args, "--c", 0.0),
                 domain_radius: get_flag_or(&args, "--domain-radius", 1.6),
-                box_bounds: None, axis_assignment: None, clip_plane: None, slide_iter: None, hide_above: None, axis_remap: None, collapse: None,
+                box_bounds: None, axis_assignment: None, clip_plane: None, slide_iter: None, hide_above: None, zone: None, axis_remap: None, collapse: None,
                 max_iter: get_flag_or(&args, "--max-iter", 60),
                 bailout: get_flag_or(&args, "--bailout", genome.bailout_radius as f64),
-                max_march_steps: get_flag_or(&args, "--max-march-steps", 200),
-                hit_epsilon: get_flag_or(&args, "--hit-eps", 1e-4 * get_flag_or(&args, "--domain-radius", 1.6)),
+                max_march_steps: march_steps(get_flag_or(&args, "--max-march-steps", 200)),
+                hit_epsilon: get_flag_or(&args, "--hit-eps", 1e-4 * get_flag_or(&args, "--domain-radius", 1.6)), pixel_lod: 0.0, solid_interior: solid_march(),
                 step_safety: get_flag_or(&args, "--step-safety", 0.8),
                 light_dir: parse_vec3(get_flag(&args, "--light").unwrap_or("0.5,0.8,0.3")),
                 normal_eps: get_flag_or(&args, "--normal-eps", 1e-3 * get_flag_or(&args, "--domain-radius", 1.6)),
@@ -7845,11 +7901,11 @@ fn main() {
                 time_axis,
                 time_val: c0,
                 domain_radius: dom,
-                box_bounds: None, axis_assignment: None, clip_plane: None, slide_iter: None, hide_above: None, axis_remap: None, collapse: genome_collapse,
+                box_bounds: None, axis_assignment: None, clip_plane: None, slide_iter: None, hide_above: None, zone: None, axis_remap: None, collapse: genome_collapse,
                 max_iter: get_flag_or(&args, "--max-iter", 60),
                 bailout: get_flag_or(&args, "--bailout", genome.bailout_radius as f64),
-                max_march_steps: get_flag_or(&args, "--max-march-steps", 200),
-                hit_epsilon: get_flag_or(&args, "--hit-eps", 1e-4 * dom),
+                max_march_steps: march_steps(get_flag_or(&args, "--max-march-steps", 200)),
+                hit_epsilon: get_flag_or(&args, "--hit-eps", 1e-4 * dom), pixel_lod: 0.0, solid_interior: solid_march(),
                 step_safety: get_flag_or(&args, "--step-safety", 0.8),
                 light_dir: parse_vec3(get_flag(&args, "--light").unwrap_or("0.5,0.8,0.3")),
                 normal_eps: get_flag_or(&args, "--normal-eps", 1e-3 * dom),
@@ -8012,7 +8068,8 @@ fn main() {
             // Raw value of each fitness term (and the low-res blank/noise gate) for every genome in
             // --dir, as CSV: lets recipes be compared offline on rated genomes.
             let dir = get_flag(&args, "--dir").unwrap_or_else(|| panic!("quat-metric-terms needs --dir DIR"));
-            let terms: Vec<String> = get_flag(&args, "--terms").unwrap_or_else(|| panic!("quat-metric-terms needs --terms a,b,...")).split(',').map(|t| t.trim().to_string()).collect();
+            let terms: Vec<String> = get_flag(&args, "--terms").unwrap_or_else(|| panic!("quat-metric-terms needs --terms a,b,...")).split(',').map(|t| t.trim().to_string()).filter(|t| !t.is_empty()).collect();
+            let ga_gate = args.iter().any(|a| a == "--ga-gate");
             let use_gpu = args.iter().any(|a| a == "--gpu");
             let probe_size: u32 = get_flag_or(&args, "--probe-size", 96);
             let m = get_flag(&args, "--collapse").unwrap_or("s3");
@@ -8025,12 +8082,24 @@ fn main() {
             let mut files: Vec<PathBuf> = std::fs::read_dir(dir).unwrap_or_else(|e| panic!("failed to read --dir {dir:?}: {e}"))
                 .filter_map(|e| e.ok()).map(|e| e.path()).filter(|p| p.extension().and_then(|s| s.to_str()) == Some("nn")).collect();
             files.sort();
+            // --limit N: score a random sample of N genomes (the launcher's recipe preview).
+            if let Some(limit) = get_flag(&args, "--limit").and_then(|v| v.parse::<usize>().ok()) {
+                if files.len() > limit {
+                    use rand::SeedableRng;
+                    let mut rng = rand::rngs::StdRng::seed_from_u64(seed_flag(&args));
+                    files.shuffle(&mut rng);
+                    files.truncate(limit);
+                    files.sort();
+                }
+            }
             let mut csv = format!("file,gate,{}\n", terms.join(","));
             for (i, f) in files.iter().enumerate() {
                 let Ok(mut g) = io::load_genome(f) else { continue };
                 if g.program.is_empty() { continue; }
                 if g.collapse.is_none() { g.collapse = Some(nnfractals::quat_collapse::Collapse::of(method)); }
-                let gate = passes_image_gate(&g, false, use_gpu); // motion is its own column
+                // --ga-gate: the gate exactly as the GA applies it to this term list (it also
+                // rejects T-inert genomes when image_motion is a term); else motion is its own column.
+                let gate = passes_image_gate(&g, ga_gate && terms.iter().any(|t| t == "image_motion"), use_gpu);
                 let (vals, _) = metric_term_values(&g, &terms, probe_size, use_gpu);
                 csv.push_str(&format!("{},{},{}\n", f.file_name().unwrap().to_string_lossy(), gate as u8, vals.iter().map(|v| format!("{v:.6}")).collect::<Vec<_>>().join(",")));
                 eprint!("\r  {}/{}   ", i + 1, files.len());
@@ -8329,8 +8398,14 @@ fn main() {
                 eprintln!("collapse method: {}", method.name());
             }
             if args.iter().any(|a| a == "--auto-range") {
-                AUTO_RANGE.store(true, std::sync::atomic::Ordering::Relaxed);
-                eprintln!("auto-range: seeds/immigrants are scanned for their best view range; it drifts with mutation");
+                // The range only changes rendered pictures; a recipe with no rendered term
+                // would start the taste model (the scan's judge) for nothing.
+                if fitness_metric.as_ref().is_some_and(|spec| !nnfractals::fitness_recipe::needs_render(spec)) {
+                    eprintln!("auto-range: skipped — no term of the fitness recipe renders, so the view range cannot change a score");
+                } else {
+                    AUTO_RANGE.store(true, std::sync::atomic::Ordering::Relaxed);
+                    eprintln!("auto-range: seeds/immigrants are scanned for their best view range; it drifts with mutation");
+                }
             }
             let predator_prey = args.iter().any(|a| a == "--predator-prey");
             let map_elites = args.iter().any(|a| a == "--map-elites");
@@ -8842,5 +8917,66 @@ mod knowledge_base_tests {
         assert_eq!(band_score(0.0, 0.1), 0.0);
         assert!((band_score(0.1, 0.1) - 1.0).abs() < 1e-12);
         assert_eq!(band_score(0.25, 0.1), 0.0);
+    }
+}
+
+#[cfg(test)]
+mod recipe_catalog_tests {
+    use super::*;
+    use nnfractals::fitness_recipe::{info, Pass, CATALOG};
+
+    /// `lookup_metric`'s full-sweep names (the match arms).
+    const FULL_SWEEP_TERM_NAMES: [&str; 25] = [
+        "anisotropy", "coverage", "solidity", "shading_richness", "color_entropy", "silhouette_irregularity", "box_dim", "lacunarity",
+        "convexity", "isoperimetric", "bilateral_symmetry", "centroid_offset", "largest_component_frac", "shading_gradient",
+        "shading_skewness", "specular_fraction", "crevice_fraction", "color_gradient", "color_shading_corr", "color_band_autocorr",
+        "color_range_utilization", "cross_view_iou", "cross_view_coverage_delta", "c_sensitivity", "c_coverage_range",
+    ];
+    const PLANE_TERM_NAMES: [&str; 7] = ["planes_open", "planes_smooth", "planes_asym", "planes_raw_boundary", "planes_raw_bounded", "planes_raw_detail", "planes_raw_asym"];
+
+    #[test]
+    fn a_panicking_scoring_worker_fails_the_batch_instead_of_hanging_it() {
+        // Two live workers, the rest idle: both live ones panic at once. The
+        // batch must end (with that panic) rather than leave the idle ones waiting.
+        set_score_workers(2);
+        let items: Vec<u32> = (0..40).collect();
+        let started = std::time::Instant::now();
+        let r = std::panic::catch_unwind(|| par_map(items, &|x: u32| -> u32 { if x < 4 { panic!("scoring bug on {x}") } x }));
+        assert!(r.is_err(), "the panic reaches the caller");
+        assert!(started.elapsed() < std::time::Duration::from_secs(10), "no hang");
+        set_score_workers(1);
+    }
+
+    #[test]
+    fn the_fitness_spec_parser_skips_stray_commas_and_names_bad_terms() {
+        assert_eq!(parse_fitness_metric_spec(",taste:1,, grey_band:0.5,"), vec![("taste".to_string(), 1.0), ("grey_band".to_string(), 0.5)]);
+        assert_eq!(parse_fitness_metric_spec("convexity"), vec![("convexity".to_string(), 1.0)]);
+        let err = std::panic::catch_unwind(|| parse_fitness_metric_spec("taste,nonsense:1")).unwrap_err();
+        let msg = err.downcast_ref::<String>().cloned().unwrap_or_default();
+        assert!(msg.contains("nonsense"), "{msg}");
+        assert!(std::panic::catch_unwind(|| parse_fitness_metric_spec(" , ")).is_err(), "an empty spec is refused");
+    }
+
+    #[test]
+    fn the_recipe_catalog_lists_exactly_the_terms_the_ga_accepts() {
+        let full = QuatFullMetrics {
+            breakdown: Default::default(), extended: Default::default(), cross_view_iou: 0.0, cross_view_coverage_delta: 0.0,
+            c_sensitivity: 0.0, c_coverage_range: 0.0, node_count: 0.0, opcode_diversity: 0.0, max_depth: 0.0, warp_node_count: 0.0, warp_opcode_diversity: 0.0,
+        };
+        let org = nnfractals::quat_organization::OrganizationMetrics::default();
+        let g = Genome::default();
+        for n in FULL_SWEEP_TERM_NAMES.iter().chain(&STRUCTURAL_METRIC_NAMES).chain(&ORGANIZATION_METRIC_NAMES) {
+            lookup_metric(&g, n, Some(&full), Some(&org)); // panics on a name the GA does not know
+        }
+        let known: Vec<&str> = FULL_SWEEP_TERM_NAMES.iter().chain(&STRUCTURAL_METRIC_NAMES).chain(&ORGANIZATION_METRIC_NAMES)
+            .chain(&SPECIAL_TERM_NAMES).chain(&PLANE_TERM_NAMES).copied().collect();
+        for n in &known { assert!(info(n).is_some(), "{n} is accepted by the GA but missing from the recipe catalog"); }
+        for t in CATALOG {
+            assert!(known.contains(&t.name), "catalog term {} is not accepted by the GA", t.name);
+            // The catalog's "renders" must agree with what metric_term_values actually does.
+            let renders = SPECIAL_TERM_NAMES.contains(&t.name) || FULL_SWEEP_TERM_NAMES.contains(&t.name);
+            assert_eq!(t.pass.renders(), renders, "{}: catalog pass {:?}", t.name, t.pass);
+            if FULL_SWEEP_TERM_NAMES.contains(&t.name) { assert_eq!(t.pass, Pass::Probe, "{}", t.name); }
+        }
     }
 }

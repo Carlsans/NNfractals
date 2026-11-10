@@ -57,6 +57,64 @@ fn try_delegate(sock: &Path, path: &Path) -> bool {
     s.read_exact(&mut ack).is_ok()
 }
 
+/// Mouse-wheel range of the camera distance for a box: from just outside the
+/// box (as the old fixed 1.7 was for the default ±1.6 box) to 25 box
+/// half-widths away (the old 40 was 25 half-widths of the default box).
+/// Mouse-wheel camera distance range. The near end lets the camera fly well
+/// inside the box: with a big box (limits zoomed out to fit the whole
+/// fractal) the old near end of 1.06 × the half-size stopped it far away.
+fn wheel_distance_limits(bounds: &nnfractals::anim_timeline::BoundingBox) -> (f64, f64) {
+    let s = characteristic_scale(bounds);
+    (0.002 * s, 25.0 * s)
+}
+
+/// One finished slice preview: (job, size, rgb, escape times, iterations, ms).
+type SliceResult = (u64, u32, Vec<u8>, Vec<f32>, u32, f64);
+
+/// ✂ Slice window: a flat 2D cut through the 3D view (`nnfractals::view_slice`).
+struct SlicePanel {
+    open: bool,
+    spec: nnfractals::view_slice::SliceSpec,
+    coloring: nnfractals::view_slice::SliceColoring,
+    /// Size of the live (cheap) preview, and of the saved render.
+    preview_px: u32,
+    hires_px: u32,
+    /// Iterations of the slice (0 = not chosen yet: the 3D view's).
+    iter: u32,
+    /// Draw the slice's square in the 3D view / cut the 3D view at the slice.
+    outline: bool,
+    cut_3d: bool,
+    tex: Option<egui::TextureHandle>,
+    /// The shown preview's escape times, for the readout under the pointer.
+    times: Option<(u32, Vec<f32>, u32)>,
+    last_ms: f64,
+    /// What the shown (or in-flight) preview was made from.
+    key: String,
+    job: u64,
+    rx: Option<mpsc::Receiver<SliceResult>>,
+    hires_rx: Option<mpsc::Receiver<Result<PathBuf, String>>>,
+    hires_busy: Option<String>,
+    status: Option<Result<String, String>>,
+}
+
+impl Default for SlicePanel {
+    fn default() -> Self {
+        SlicePanel {
+            open: false, spec: Default::default(), coloring: Default::default(), preview_px: 256, hires_px: 4096, iter: 0,
+            outline: true, cut_3d: false, tex: None, times: None, last_ms: 0.0, key: String::new(), job: 0,
+            rx: None, hires_rx: None, hires_busy: None, status: None,
+        }
+    }
+}
+
+/// The last rendered 3D frame's per-pixel data, to read the zone under the pointer.
+struct LastFrame {
+    size: u32,
+    shading: Vec<f32>,
+    color: Vec<f32>,
+    max_iter: u32,
+}
+
 // `recommended_orbit_radius`/`characteristic_scale` live in
 // `nnfractals::anim_eval` — the batch CLI renderer needs them too.
 use nnfractals::anim_eval::{characteristic_scale, recommended_orbit_radius, manual_orbit_basis, FOV_DEG};
@@ -660,7 +718,13 @@ struct AnimViewerPrefs {
     /// Render window: also write a 9:16 Facebook-reel crop of each render.
     #[serde(default)]
     render_reel_crop: bool,
+    /// ▦ Planes: a click on a tile picks its escape-count zone (else it
+    /// renders the tile at full resolution).
+    #[serde(default = "default_true")]
+    planes_click_picks: bool,
 }
+
+fn default_true() -> bool { true }
 
 impl Default for AnimViewerPrefs {
     fn default() -> Self {
@@ -673,6 +737,7 @@ impl Default for AnimViewerPrefs {
             timeline_px_per_s: default_timeline_px_per_s(),
             planes_size: default_planes_size(),
             render_reel_crop: false,
+            planes_click_picks: true,
         }
     }
 }
@@ -833,7 +898,14 @@ struct PlanesPanel {
     thumbs: Vec<Option<egui::TextureHandle>>,
     thumb_key: String,
     thumb_job: u64,
-    thumb_rx: Option<mpsc::Receiver<(u64, usize, u32, Vec<u8>)>>,
+    thumb_rx: Option<mpsc::Receiver<(u64, usize, u32, Vec<u8>, Vec<f32>)>>,
+    /// Per tile: (px, colours, escape times) of the last finished thumbnail —
+    /// kept so a zone pick can re-dim the tiles without re-rendering them.
+    tiles: Vec<Option<(u32, Vec<u8>, Vec<f32>)>>,
+    /// The zone the tile textures were last dimmed for.
+    tiles_zone: Option<nnfractals::anim_timeline::ZoneFilter>,
+    /// A click on a tile picks a zone (true) or renders it at full resolution.
+    click_picks: bool,
     hires_rx: Option<mpsc::Receiver<Result<(PathBuf, u32, Vec<u8>), String>>>,
     hires_busy: Option<String>,
     hires_status: Option<Result<String, String>>,
@@ -862,6 +934,7 @@ struct App {
     loaded_genome: nnfractals::genome::Genome,
     formula_editor: FormulaEditor,
     planes: PlanesPanel,
+    slice: SlicePanel,
     /// A drag-value in the formula editor is being dragged this frame —
     /// part of `is_interacting()`, so the live preview drops to preview
     /// quality while a constant is swept.
@@ -922,6 +995,11 @@ struct App {
     dirty: bool,
     last_render_ms: f64,
     last_hit_frac: f32,
+    last_frame: Option<LastFrame>,
+    /// Estimated time of a full-resolution frame (decides the lower-resolution drag).
+    full_frame_ms: f64,
+    /// A click on the 3D view hides the zone under the pointer.
+    click_hides: bool,
     dragging: bool,
     /// The camera `render()` most recently used — stashed so the
     /// orbit/pan-drag overlay (pivot marker + camera-position readout,
@@ -1086,7 +1164,8 @@ impl App {
             bailout_radius: g.bailout_radius,
             loaded_genome,
             formula_editor,
-            planes: PlanesPanel { size: prefs.planes_size, open: std::env::var_os("NN_ANIM_OPEN_PLANES").is_some(), ..Default::default() },
+            planes: PlanesPanel { size: prefs.planes_size, click_picks: prefs.planes_click_picks, open: std::env::var_os("NN_ANIM_OPEN_PLANES").is_some(), ..Default::default() },
+            slice: SlicePanel::default(),
             formula_dragging: false,
             timeline,
             timeline_origin,
@@ -1111,6 +1190,9 @@ impl App {
             dirty: true,
             last_render_ms: 0.0,
             last_hit_frac: 0.0,
+            last_frame: None,
+            full_frame_ms: 0.0,
+            click_hides: false,
             dragging: false,
             last_cam: None,
             render_window_open: false,
@@ -1579,6 +1661,7 @@ impl App {
             timeline_px_per_s: self.timeline_px_per_s,
             planes_size: self.planes.size,
             render_reel_crop: self.render_reel_crop,
+            planes_click_picks: self.planes.click_picks,
         };
         prefs.save(&viewer_prefs_path());
     }
@@ -2106,6 +2189,15 @@ impl App {
         tl.equal_axis_scale = self.timeline.equal_axis_scale;
         tl.collapse = self.timeline.collapse.clone();
         tl.t_value = self.timeline.t_value;
+        // So does the camera (it is framed for this genome's box: the profile's
+        // distance and pan were for its own box, and could put the eye inside
+        // this one), and the per-formula zone picks and hide-top cutoff.
+        tl.camera_yaw = self.timeline.camera_yaw;
+        tl.camera_pitch = self.timeline.camera_pitch;
+        tl.camera_distance = self.timeline.camera_distance;
+        tl.camera_pivot_offset = self.timeline.camera_pivot_offset;
+        tl.zone = self.timeline.zone.clone();
+        tl.hide_top_percentile = self.timeline.hide_top_percentile;
         self.timeline = tl;
         ensure_audio_peaks(&mut self.timeline);
         self.selected_clip = None;
@@ -2375,8 +2467,13 @@ impl App {
             }
             self.planes.thumb_px = 192;
             self.planes.max_iter = self.max_iter.max(60);
+            // Existing picks were classified with their own count: show that.
+            if !self.timeline.zone.bands.is_empty() && self.timeline.zone.max_iter > 0 {
+                self.planes.max_iter = self.timeline.zone.max_iter;
+            }
             self.planes.hires_px = 2048;
             self.planes.thumbs = (0..6).map(|_| None).collect();
+            self.planes.tiles = (0..6).map(|_| None).collect();
             self.planes.initialized = true;
         }
         let spec_for = |app: &App, k: usize| PlaneSpec {
@@ -2387,6 +2484,7 @@ impl App {
             max_iter: app.planes.max_iter,
             bailout: app.bailout_radius as f64,
             colormap: app.colormap.clone(),
+            zero_c: app.timeline.collapse.method == nnfractals::quat_collapse::Method::Proj3,
         };
 
         let s3 = self.timeline.collapse.method.is_sphere();
@@ -2398,12 +2496,13 @@ impl App {
         } else { 0.0 };
         // Re-render the thumbnails whenever anything they depend on changed.
         let key = format!(
-            "{:?}|{:?}|{}|{:?}|{:?}|{}|{}|{:?}|{:?}|{:?}|{}|{}",
+            "{:?}|{:?}|{}|{:?}|{:?}|{}|{}|{:?}|{:?}|{:?}|{}|{}|{}",
             self.program, self.warp, self.julia_mode, self.jc, self.phoenix,
             self.bailout_radius, self.colormap, self.planes.fixed,
             // The cap size (S3) doesn't change the slices, so don't re-render for it.
             if s3 { None } else { Some(self.timeline.bounds) }, self.timeline.axis_assignment,
             self.planes.max_iter, self.planes.thumb_px,
+            self.timeline.collapse.method == nnfractals::quat_collapse::Method::Proj3,
         );
         let key = format!("{key}|{}", if s3 { format!("{:.4}", self.timeline.collapse.rho) } else { String::new() });
         // While the mouse is down (panning/drawing) don't pile up render jobs:
@@ -2423,25 +2522,58 @@ impl App {
             thread::spawn(move || {
                 let f = QuatDagFormula { prog: &prog, warp: &warp, julia, jc, phoenix };
                 for (k, spec) in specs.iter().enumerate() {
-                    if tx.send((job, k, px, render_plane(&f, spec, px))).is_err() {
+                    let times = nnfractals::quat_planes::plane_escape_times(&f, spec, px);
+                    let rgb = nnfractals::colormap::apply_colormap_equalized(&times, spec.max_iter, &spec.colormap);
+                    if tx.send((job, k, px, rgb, times)).is_err() {
                         return; // superseded by a newer job
                     }
                 }
             });
         }
+        let zone_now = self.timeline.zone.clone();
+        let plane_iter = self.planes.max_iter;
+        // The speckle depth in tile pixels (a speck that thin across is dropped).
+        let speckle_world = {
+            let b = &self.timeline.bounds;
+            let (dx, dy, dz) = (b.x.max - b.x.min, b.y.max - b.y.min, b.z.max - b.z.min);
+            (dx * dx + dy * dy + dz * dz).sqrt() * zone_now.speckle_pct / 100.0
+        };
+        let plane_ext: Vec<f64> = (0..6).map(|k| self.plane_view(k).1).collect();
+        // The kept ranges, built once (the same ones the 3D zone render uses).
+        let keep = zone_now.params(plane_iter);
+        let upload = |ctx: &egui::Context, k: usize, px: u32, rgb: &[u8], times: &[f32]| {
+            let n = px as usize;
+            // The picks show on the tiles even while the 3D filter is switched off.
+            let shown = if !zone_now.bands.is_empty() {
+                let kept: Vec<bool> = times.iter().map(|&t| keep.contains(t as f64)).collect();
+                let r = (speckle_world / (2.0 * plane_ext[k]) * n as f64 * 0.5).round() as usize;
+                nnfractals::quat_planes::dim_unkept_mask(rgb, &nnfractals::quat_planes::despeckle_mask(&kept, n, r.min(n / 4)))
+            } else {
+                rgb.to_vec()
+            };
+            ctx.load_texture(format!("plane_{k}"), egui::ColorImage::from_rgb([n, n], &shown), egui::TextureOptions::LINEAR)
+        };
         if let Some(rx) = &self.planes.thumb_rx {
             loop {
-                let (job, k, px, rgb) = match rx.try_recv() {
+                let (job, k, px, rgb, times) = match rx.try_recv() {
                     Ok(m) => m,
                     Err(mpsc::TryRecvError::Empty) => break,
                     Err(mpsc::TryRecvError::Disconnected) => { self.planes.thumb_done = true; break; }
                 };
                 if job == self.planes.thumb_job {
-                    let n = px as usize;
-                    self.planes.thumbs[k] = Some(ctx.load_texture(
-                        format!("plane_{k}"), egui::ColorImage::from_rgb([n, n], &rgb), egui::TextureOptions::LINEAR));
+                    self.planes.thumbs[k] = Some(upload(ctx, k, px, &rgb, &times));
+                    self.planes.tiles[k] = Some((px, rgb, times));
                 }
             }
+        }
+        // A pick changed which zones are kept: re-dim the finished tiles.
+        if self.planes.tiles_zone.as_ref() != Some(&zone_now) {
+            for k in 0..self.planes.tiles.len() {
+                if let Some((px, rgb, times)) = &self.planes.tiles[k] {
+                    self.planes.thumbs[k] = Some(upload(ctx, k, *px, rgb, times));
+                }
+            }
+            self.planes.tiles_zone = Some(zone_now.clone());
         }
         if let Some(rx) = &self.planes.hires_rx {
             if let Ok(res) = rx.try_recv() {
@@ -2461,9 +2593,14 @@ impl App {
 
         let mut open = self.planes.open;
         let mut clicked: Option<usize> = None;
+        let mut pick: Option<u32> = None; // escape band clicked on a tile
+        let mut hover_band: Option<(usize, f32)> = None; // (tile, escape time) under the pointer
+        let mut new_zone: Option<nnfractals::anim_timeline::ZoneFilter> = None;
         let mut new_limits: Option<(usize, (f64, f64), (f64, f64))> = None;
         let mut reset_limits = false;
         let mut zoom_limits: Option<(usize, (f64, f64), (f64, f64))> = None;
+        // Ctrl+wheel over a tile: (tile, its two axes' values under the cursor, factor).
+        let mut zoom_all: Option<(usize, f64, f64, f64)> = None;
         let mut pan_limits: Option<(usize, (f64, f64), (f64, f64))> = None;
         let mut pan_done = false;
         let mut s3_rotate: Option<(usize, f64)> = None; // (pole index 0..3, radians)
@@ -2482,19 +2619,97 @@ impl App {
             });
             ui.horizontal(|ui| {
                 ui.label("iterations");
-                ui.add(egui::DragValue::new(&mut self.planes.max_iter).range(5..=5000));
+                ui.add(egui::DragValue::new(&mut self.planes.max_iter).range(5..=5000))
+                    .on_hover_text("Escape iterations of the tiles. Zone picks are classified with this count, and the 3D view renders picked zones with it too, so both always agree.");
                 ui.separator();
-                ui.label("click a plane to render it at");
+                ui.label(if self.planes.click_picks { "full-res render size (click mode \u{1f5bc} below)" } else { "click a plane to render it at" });
                 ui.add(egui::DragValue::new(&mut self.planes.hires_px).range(64..=16384).suffix(" px"));
             });
             ui.horizontal(|ui| {
                 if s3 {
                     ui.label("S3: the circle is the 3-sphere on this slice (green = visible in the 3D view). Drag a tile to rotate the view in that plane; wheel = visible cap size.");
                 } else {
-                    ui.label("Drag on a plane to set the fractal's limits on its two axes (yellow = current limits).");
+                    ui.label("Drag on a plane to set the fractal's limits on its two axes (yellow = current limits). Wheel zooms one plane, Ctrl+wheel all of them.");
                 }
                 if ui.button("reset limits").clicked() { reset_limits = true; }
             });
+            ui.horizontal_wrapped(|ui| {
+                ui.label("Click:");
+                let before = self.planes.click_picks;
+                ui.selectable_value(&mut self.planes.click_picks, true, "\u{1f3af} pick zone")
+                    .on_hover_text("A click on a tile picks the escape-count zone (one colour shell) under the pointer. Click a picked zone again to drop it. Picks from any tile add up.");
+                ui.selectable_value(&mut self.planes.click_picks, false, "\u{1f5bc} full-res render")
+                    .on_hover_text("A click on a tile renders that plane at the resolution set above and saves it as a PNG.");
+                if self.planes.click_picks != before { self.save_prefs(); }
+            });
+            {
+                use nnfractals::anim_timeline::ZONE_INTERIOR;
+                let mut z = self.timeline.zone.clone();
+                // The picks follow the tiles' iteration count (band numbers keep
+                // their meaning; "interior" and the deepest bands move with it).
+                if !z.bands.is_empty() && z.max_iter != self.planes.max_iter {
+                    z.max_iter = self.planes.max_iter;
+                }
+                ui.horizontal_wrapped(|ui| {
+                    let mut on = !z.disabled;
+                    ui.checkbox(&mut on, "3D shows only the picked zones")
+                        .on_hover_text("On: the 3D view draws the region whose escape count is one of the picked zones as solid and leaves everything else out, so the outer shells no longer hide what is inside them. Off keeps the picks without applying them.");
+                    z.disabled = !on;
+                    if z.bands.is_empty() {
+                        ui.weak("(nothing picked yet: click a colour on a tile)");
+                    }
+                    let mut drop: Option<u32> = None;
+                    for &b in &z.bands {
+                        let txt = if b == ZONE_INTERIOR { "interior \u{2715}".to_string() } else { format!("{b} \u{2715}") };
+                        if ui.small_button(txt).on_hover_text(if b == ZONE_INTERIOR {
+                            "The points that never escape (the set itself). Click to drop this pick.".to_string()
+                        } else {
+                            format!("Escape count {b}: the points whose escape time is between {b} and {}. Click to drop this pick.", b + 1)
+                        }).clicked() { drop = Some(b); }
+                    }
+                    if let Some(b) = drop { z.toggle(b); }
+                    let mut unhide: Option<u32> = None;
+                    if !z.hidden.is_empty() {
+                        ui.weak("hidden in 3D:");
+                        for &b in &z.hidden {
+                            if ui.small_button(format!("{} \u{2715}", nnfractals::anim_timeline::ZoneFilter::band_label(b))).on_hover_text("Hidden by a click in the 3D view (greyed on the tiles). Click to show it again.").clicked() { unhide = Some(b); }
+                        }
+                    }
+                    if let Some(b) = unhide { z.toggle_hidden(b); }
+                    ui.checkbox(&mut z.include_inside, "+ everything inside")
+                        .on_hover_text("Also keep every zone deeper than the shallowest pick (higher escape counts and the interior): the solid that the picked shell wraps. Where that solid reaches the box limits it is cut flat, and the cut face shows the slice colours.");
+                    if !z.bands.is_empty() && ui.button("clear").clicked() { z.bands.clear(); }
+                });
+                ui.horizontal(|ui| {
+                    ui.add(egui::Slider::new(&mut z.speckle_pct, 0.0..=5.0).step_by(0.05).suffix(" %").text("speckle filter"))
+                        .on_hover_text("Drops the scattered specks a chaotic escape field breaks a zone into. A zone point is drawn only when the zone carries on along its own surface around it: 5 of 6 short probes placed this far away (in percent of the box diagonal) in the plane of the surface, each looking across it, must meet the zone too. Specks smaller than that vanish and the ray goes on to whatever they were hiding; shells and bodies, even thin ones seen edge-on, carry on along their surface and stay. Also previewed on the tiles. 0 = off. Try 0.5 %; larger values also remove small genuine pieces.");
+                });
+                if !z.bands.is_empty() && z.ranges(self.planes.max_iter).iter().any(|&(lo, hi)| lo <= 0.0 && hi >= nnfractals::quat_dag::ZONE_INF) {
+                    ui.colored_label(egui::Color32::from_rgb(240, 170, 60),
+                        "these picks keep every zone (zone 0 is the outermost, and \"+ everything inside\" adds all deeper ones), so nothing is left out: drop zone 0 or untick \"+ everything inside\"");
+                } else if z.disabled && !z.bands.is_empty() {
+                    ui.weak("the 3D filter is off: the tiles show the picks, the 3D view shows everything");
+                }
+                let iter = self.planes.max_iter;
+                let too_deep: Vec<String> = z.bands.iter().filter(|&&b| b != ZONE_INTERIOR && b >= iter).map(|b| b.to_string()).collect();
+                if !too_deep.is_empty() {
+                    ui.colored_label(egui::Color32::from_rgb(240, 170, 60), format!(
+                        "zone {} needs more than the {iter} iterations above, so it cannot occur and is not drawn (tiles or 3D): raise \"iterations\"",
+                        too_deep.join(", ")));
+                }
+                let filled = z.filled_bands(iter);
+                if !filled.is_empty() {
+                    let names: Vec<String> = filled.iter().map(|b| b.to_string()).collect();
+                    ui.colored_label(egui::Color32::from_rgb(240, 170, 60), format!(
+                        "more than {} separate runs of picks: the closest gaps are filled to fit, so zone {} is drawn too (tiles and 3D). Pick neighbouring zones to need fewer runs.",
+                        nnfractals::quat_dag::ZONE_MAX_RANGES, names.join(", ")));
+                }
+                if !z.bands.is_empty() && self.timeline.collapse.method == nnfractals::quat_collapse::Method::Slab {
+                    ui.colored_label(egui::Color32::from_rgb(240, 170, 60),
+                        "slab projection: each 3D point takes the escape time of the nearest of three T slices, so its zones differ from these single slices; picks are only approximate here");
+                }
+                if z != self.timeline.zone { new_zone = Some(z); }
+            }
             ui.add_space(4.0);
             // Tiles fill the window: three columns, two rows, minus room
             // for the status row underneath.
@@ -2511,12 +2726,36 @@ impl App {
                                 let r = ui.add(
                                     egui::Image::new(egui::load::SizedTexture::new(t.id(), egui::vec2(side, side)))
                                         .sense(egui::Sense::click_and_drag()),
-                                ).on_hover_text(if s3 {
-                                    "Click: render this plane at full resolution\nDrag: rotate the 3D view in this plane (needs the time axis in the plane)\nWheel: grow/shrink the visible cap"
+                                ).on_hover_text(format!("{}\n{}", if self.planes.click_picks {
+                                    "Click: pick (or un-pick) the escape-count zone under the pointer; the 3D view then shows only the picked zones"
                                 } else {
-                                    "Click: render this plane at full resolution\nDrag: draw the new limits (hold Shift for a square)\nMiddle-drag: pan the limits\nWheel: grow/shrink the limits"
-                                });
-                                if r.clicked() && !busy { clicked = Some(k); }
+                                    "Click: render this plane at full resolution"
+                                }, if s3 {
+                                    "Drag: rotate the 3D view in this plane (needs the time axis in the plane)\nWheel: grow/shrink the visible cap"
+                                } else {
+                                    "Drag: draw the new limits (hold Shift for a square)\nMiddle-drag: pan the limits\nWheel: grow/shrink this plane's limits\nCtrl+wheel: grow/shrink every plane at once"
+                                }));
+                                // Escape time under the pointer, from the finished thumbnail.
+                                let et_at = |pos: egui::Pos2| -> Option<f32> {
+                                    let (px, _, times) = self.planes.tiles[k].as_ref()?;
+                                    let n = *px as usize;
+                                    let x = (((pos.x - r.rect.left()) / r.rect.width()) * n as f32).floor();
+                                    let y = (((pos.y - r.rect.top()) / r.rect.height()) * n as f32).floor();
+                                    if x < 0.0 || y < 0.0 || x >= n as f32 || y >= n as f32 { return None; }
+                                    times.get(y as usize * n + x as usize).copied()
+                                };
+                                if let Some(et) = r.hover_pos().and_then(et_at) {
+                                    hover_band = Some((k, et));
+                                }
+                                if r.clicked() {
+                                    if self.planes.click_picks {
+                                        if let Some(et) = r.interact_pointer_pos().and_then(et_at) {
+                                            pick = Some(nnfractals::anim_timeline::ZoneFilter::band_of(et as f64, self.planes.max_iter));
+                                        }
+                                    } else if !busy {
+                                        clicked = Some(k);
+                                    }
+                                }
                                 let (pi, pj) = PLANES[k];
                                 // The tile always shows this plane's current limits (see
                                 // `plane_view`). The wheel over it grows/shrinks those limits
@@ -2546,7 +2785,15 @@ impl App {
                                 }
                                 if r.hovered() {
                                     let scroll = ui.input(|i| i.smooth_scroll_delta.y);
-                                    if s3 && scroll != 0.0 {
+                                    // Ctrl+wheel arrives as a zoom factor (egui's ctrl-scroll zoom), not a scroll.
+                                    let (ctrl, zoom) = ui.input(|i| (i.modifiers.ctrl || i.modifiers.command, i.zoom_delta()));
+                                    let ctrl_f = if !ctrl { None } else if zoom != 1.0 { Some(1.0 / zoom as f64) } else if scroll != 0.0 { Some(1.0 - scroll as f64 * 0.002) } else { None };
+                                    if let (false, Some(f), Some(pos)) = (s3, ctrl_f, r.hover_pos()) {
+                                        let (fx, fy) = (((pos.x - r.rect.left()) / r.rect.width()) as f64, ((pos.y - r.rect.top()) / r.rect.height()) as f64);
+                                        zoom_all = Some((k, cu - ext + 2.0 * ext * fx, cv + ext - 2.0 * ext * fy, f.clamp(0.5, 2.0)));
+                                    } else if ctrl_f.is_some() && s3 {
+                                        s3_cap = ctrl_f.map(|f| f.clamp(0.5, 2.0));
+                                    } else if s3 && scroll != 0.0 {
                                         s3_cap = Some((1.0 - scroll as f64 * 0.002).clamp(0.5, 2.0));
                                     } else if let (true, Some(pos)) = (scroll != 0.0, r.hover_pos()) {
                                         let (fx, fy) = (((pos.x - r.rect.left()) / r.rect.width()) as f64, ((pos.y - r.rect.top()) / r.rect.height()) as f64);
@@ -2659,6 +2906,17 @@ impl App {
                 }
             });
             ui.horizontal(|ui| {
+                match hover_band {
+                    Some((k, et)) => {
+                        let b = nnfractals::anim_timeline::ZoneFilter::band_of(et as f64, self.planes.max_iter);
+                        let picked = self.timeline.zone.bands.contains(&b);
+                        ui.label(format!("{}: zone {} (escape time {:.2}){}", plane_name(PLANES[k]),
+                            nnfractals::anim_timeline::ZoneFilter::band_label(b), et, if picked { " \u{2014} picked" } else { "" }));
+                    }
+                    None => { ui.weak("hover a tile to see its zone"); }
+                }
+            });
+            ui.horizontal(|ui| {
                 if let Some(t) = &self.planes.hires_preview {
                     ui.add(egui::Image::new(egui::load::SizedTexture::new(t.id(), egui::vec2(110.0, 110.0))));
                 }
@@ -2688,6 +2946,35 @@ impl App {
             }
         }
 
+        // A tile click (handled after the zone row was drawn) toggles its band.
+        let new_zone = match pick {
+            Some(b) => {
+                let mut z = new_zone.unwrap_or_else(|| self.timeline.zone.clone());
+                // A zone hidden in the 3D view is shown again by clicking it on a tile.
+                if z.hidden.contains(&b) { z.toggle_hidden(b); } else { z.toggle(b); }
+                z.max_iter = self.planes.max_iter;
+                // A new pick is meant to be seen: switch the filter on.
+                if z.bands.contains(&b) { z.disabled = false; }
+                Some(z)
+            }
+            None => new_zone,
+        };
+        if let Some(z) = new_zone {
+            self.timeline.zone = z;
+            self.dirty = true;
+            self.commit_timeline();
+        }
+        if let Some((k, u0, v0, f)) = zoom_all {
+            // All four axes, so every plane zooms: the hovered tile's two axes about
+            // the point under the cursor (it stays put there), the others about their centres.
+            let (pi, pj) = PLANES[k];
+            for i in 0..4 {
+                let l = self.limit_of(i);
+                let at = if i == pi { u0 } else if i == pj { v0 } else { (l.min + l.max) * 0.5 };
+                self.set_limit(i, at - (at - l.min) * f, at + (l.max - at) * f);
+            }
+            self.limits_changed();
+        }
         if let Some((k, u, v)) = new_limits.or(zoom_limits) {
             let (pi, pj) = PLANES[k];
             self.set_limit(pi, u.0, u.1);
@@ -2757,6 +3044,191 @@ impl App {
         }
         if self.planes.hires_busy.is_some() || self.planes.thumb_rx.is_some() {
             ctx.request_repaint_after(std::time::Duration::from_millis(100));
+        }
+    }
+
+    /// The slice's square in view space for the current frame (box, T, projection).
+    fn slice_frame(&self) -> Option<(nnfractals::view_slice::SliceFrame, nnfractals::quat_raymarch::RaymarchCamera)> {
+        let formula = QuatDagFormula { prog: &self.program, warp: &self.warp, julia: self.julia_mode, jc: self.jc, phoenix: self.phoenix };
+        let (params, cam) = nnfractals::anim_eval::build_frame_params(&self.timeline, formula, self.playhead_s, self.bailout_radius as f64,
+            nnfractals::anim_eval::RenderQuality { max_iter: 1, aa: 1 });
+        let (bmin, bmax) = params.box_bounds?;
+        Some((self.slice.spec.frame(bmin, bmax), cam))
+    }
+
+    /// A slice render on a background thread: builds the frame params exactly as
+    /// the 3D view does, samples the plane and colours it.
+    fn spawn_slice(&self, n: u32) -> mpsc::Receiver<(Vec<u8>, Vec<f32>, u32, f64)> {
+        let (tl, prog, warp) = (self.timeline.clone(), self.program.clone(), self.warp.clone());
+        let (julia, jc, phoenix, bail, t) = (self.julia_mode, self.jc, self.phoenix, self.bailout_radius as f64, self.playhead_s);
+        let (spec, coloring, cmap) = (self.slice.spec, self.slice.coloring, self.colormap.clone());
+        let iter = if self.slice.iter > 0 { self.slice.iter } else { self.max_iter };
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            let started = std::time::Instant::now();
+            let formula = QuatDagFormula { prog: &prog, warp: &warp, julia, jc, phoenix };
+            let (params, _) = nnfractals::anim_eval::build_frame_params(&tl, formula, t, bail, nnfractals::anim_eval::RenderQuality { max_iter: iter, aa: 1 });
+            let Some((bmin, bmax)) = params.box_bounds else { return };
+            let frame = spec.frame(bmin, bmax);
+            let times = nnfractals::view_slice::slice_escape_times(&params, &frame, n);
+            let rgb = nnfractals::view_slice::colorize(&times, params.max_iter, coloring, &cmap);
+            let _ = tx.send((rgb, times, params.max_iter, started.elapsed().as_secs_f64() * 1000.0));
+        });
+        rx
+    }
+
+    fn show_slice_window(&mut self, ctx: &egui::Context) {
+        use nnfractals::view_slice::{BasePlane, SliceColoring};
+        if !self.slice.open { return; }
+        if self.slice.iter == 0 { self.slice.iter = self.max_iter.max(20); }
+        // A finished preview.
+        if let Some(rx) = &self.slice.rx {
+            if let Ok((job, n, rgb, times, iter, ms)) = rx.try_recv() {
+                if job == self.slice.job {
+                    let sz = [n as usize, n as usize];
+                    self.slice.tex = Some(ctx.load_texture("slice_preview", egui::ColorImage::from_rgb(sz, &rgb), egui::TextureOptions::NEAREST));
+                    self.slice.times = Some((n, times, iter));
+                    self.slice.last_ms = ms;
+                }
+                self.slice.rx = None;
+            }
+        }
+        if let Some(rx) = &self.slice.hires_rx {
+            if let Ok(res) = rx.try_recv() {
+                self.slice.hires_busy = None;
+                self.slice.status = Some(res.map(|p| format!("saved {}", p.display())));
+                self.slice.hires_rx = None;
+            }
+        }
+        // Start a new preview when anything it depends on changed (one at a time:
+        // the newest settings win, nothing piles up while a slider is dragged).
+        let key = format!("{:?}|{:?}|{}|{}|{}|{:?}|{:?}|{:?}|{:?}|{}|{:?}|{:?}|{}|{}|{}",
+            self.slice.spec, self.slice.coloring, self.slice.preview_px, self.slice.iter, self.colormap,
+            self.timeline.bounds, self.timeline.axis_assignment, self.timeline.collapse, self.timeline.equal_axis_scale, self.playhead_s,
+            self.program, self.warp, self.julia_mode, self.bailout_radius, self.timeline.t_value);
+        if key != self.slice.key && self.slice.rx.is_none() {
+            self.slice.key = key;
+            self.slice.job += 1;
+            let job = self.slice.job;
+            let n = self.slice.preview_px;
+            let inner = self.spawn_slice(n);
+            let (tx, rx) = mpsc::channel();
+            thread::spawn(move || {
+                if let Ok((rgb, times, iter, ms)) = inner.recv() { let _ = tx.send((job, n, rgb, times, iter, ms)); }
+            });
+            self.slice.rx = Some(rx);
+        }
+        let before = self.slice.spec;
+        let mut open = self.slice.open;
+        let mut save = false;
+        egui::Window::new("\u{2702} Slice").open(&mut open).resizable(true).default_width(470.0).show(ctx, |ui| {
+            let sp = &mut self.slice.spec;
+            ui.horizontal(|ui| {
+                ui.label("plane");
+                for b in BasePlane::ALL {
+                    if ui.selectable_label(sp.base == b, b.label()).on_hover_text("The 3D view's own axes: the plane starts through the box centre and the controls below tilt, spin and move it.").clicked() {
+                        sp.base = b;
+                    }
+                }
+                if ui.button("reset").on_hover_text("Untilted, through the centre, covering the box").clicked() {
+                    *sp = nnfractals::view_slice::SliceSpec { base: sp.base, ..Default::default() };
+                }
+            });
+            ui.add(egui::Slider::new(&mut sp.tilt_right, -90.0..=90.0).suffix("°").text("tilt ↕ (about its right axis)"));
+            ui.add(egui::Slider::new(&mut sp.tilt_up, -90.0..=90.0).suffix("°").text("tilt ↔ (about its up axis)"));
+            ui.add(egui::Slider::new(&mut sp.spin, -180.0..=180.0).suffix("°").text("spin (in its own plane)"));
+            ui.add(egui::Slider::new(&mut sp.offset, -1.0..=1.0).text("position (along its normal, in box half-sizes)"));
+            ui.add(egui::Slider::new(&mut sp.zoom, 0.1..=20.0).logarithmic(true).text("zoom (1 = covers the box)"));
+            ui.horizontal(|ui| {
+                ui.label("colouring");
+                for c in SliceColoring::ALL {
+                    ui.selectable_value(&mut self.slice.coloring, c, c.label()).on_hover_text(match c {
+                        SliceColoring::Colours => "The viewer's colour map, equalised like the Planes tiles",
+                        SliceColoring::Grey => "Escape time in grey",
+                        SliceColoring::BlackWhite => "Black where the point never escapes (the fractal itself), white everywhere else",
+                    });
+                }
+                ui.label("iterations");
+                ui.add(egui::DragValue::new(&mut self.slice.iter).range(5..=5000));
+            });
+            // The preview: drag to tilt, wheel to zoom.
+            let side = ui.available_width().clamp(200.0, 520.0);
+            match &self.slice.tex {
+                Some(t) => {
+                    let r = ui.add(egui::Image::new(egui::load::SizedTexture::new(t.id(), egui::vec2(side, side))).sense(egui::Sense::click_and_drag()));
+                    if r.dragged() {
+                        let d = r.drag_delta();
+                        self.slice.spec.tilt_up = (self.slice.spec.tilt_up + d.x as f64 * 0.3).clamp(-90.0, 90.0);
+                        self.slice.spec.tilt_right = (self.slice.spec.tilt_right - d.y as f64 * 0.3).clamp(-90.0, 90.0);
+                    }
+                    if r.hovered() {
+                        let scroll = ui.input(|i| i.smooth_scroll_delta.y);
+                        if scroll != 0.0 { self.slice.spec.zoom = (self.slice.spec.zoom * (1.0 + scroll as f64 * 0.002)).clamp(0.1, 20.0); }
+                    }
+                    let readout = r.hover_pos().and_then(|pos| {
+                        let (n, times, iter) = self.slice.times.as_ref()?;
+                        let x = ((pos.x - r.rect.left()) / r.rect.width() * *n as f32) as usize;
+                        let y = ((pos.y - r.rect.top()) / r.rect.height() * *n as f32) as usize;
+                        let et = *times.get(y.min(*n as usize - 1) * *n as usize + x.min(*n as usize - 1))?;
+                        Some(if et >= *iter as f32 { "inside the set (never escapes)".to_string() } else { format!("escape time {et:.2} (zone {})", et.max(0.0).floor() as u32) })
+                    });
+                    ui.label(egui::RichText::new(readout.unwrap_or_else(|| "drag the picture to tilt the plane, wheel to zoom".into())).small().weak());
+                }
+                None => { ui.add_sized([side, side], egui::Label::new("rendering…")); }
+            }
+            ui.horizontal(|ui| {
+                ui.label("preview");
+                for px in [128u32, 256, 384, 512] {
+                    ui.selectable_value(&mut self.slice.preview_px, px, format!("{px}"));
+                }
+                ui.weak(format!("{:.0} ms{}", self.slice.last_ms, if self.slice.rx.is_some() { " · rendering" } else { "" }));
+            });
+            ui.horizontal(|ui| {
+                ui.label("hi-res");
+                ui.add(egui::DragValue::new(&mut self.slice.hires_px).range(256..=8192).suffix(" px"));
+                if ui.add_enabled(self.slice.hires_busy.is_none(), egui::Button::new("\u{1f4be} Render PNG")).on_hover_text("Renders the slice at this size in the background and saves it in explorer_out/slices/").clicked() {
+                    save = true;
+                }
+                if let Some(b) = &self.slice.hires_busy { ui.weak(format!("rendering {b}…")); }
+            });
+            match &self.slice.status {
+                Some(Ok(m)) => { ui.colored_label(egui::Color32::from_rgb(120, 200, 120), m); }
+                Some(Err(e)) => { ui.colored_label(egui::Color32::RED, e); }
+                None => {}
+            }
+            ui.horizontal(|ui| {
+                ui.checkbox(&mut self.slice.outline, "outline in the 3D view");
+                if ui.checkbox(&mut self.slice.cut_3d, "cut the 3D view here")
+                    .on_hover_text("The 3D view drops everything on the camera's side of the slice, so the cut face shows the slice in place (overrides a difference plane while on).").changed() {
+                    self.dirty = true;
+                }
+            });
+        });
+        self.slice.open = open;
+        if !open && self.slice.cut_3d { self.dirty = true; }
+        if self.slice.spec != before && self.slice.cut_3d { self.dirty = true; }
+        if save {
+            let n = self.slice.hires_px;
+            let sp = self.slice.spec;
+            let name = format!("{}_slice_{}_t{:.0}_{:.0}_s{:.0}_o{:.2}_z{:.2}_{}px{}.png", self.genome_label, sp.base.label(), sp.tilt_right, sp.tilt_up, sp.spin, sp.offset, sp.zoom, n,
+                match self.slice.coloring { SliceColoring::Colours => "", SliceColoring::Grey => "_grey", SliceColoring::BlackWhite => "_bw" });
+            let path = nnfractals::project_root().join("explorer_out/slices").join(name);
+            let inner = self.spawn_slice(n);
+            let (tx, rx) = mpsc::channel();
+            thread::spawn(move || {
+                let res = inner.recv().map_err(|_| "the slice render failed".to_string()).and_then(|(rgb, _, _, _)| {
+                    if let Some(d) = path.parent() { std::fs::create_dir_all(d).map_err(|e| format!("{}: {e}", d.display()))?; }
+                    image::save_buffer(&path, &rgb, n, n, image::ColorType::Rgb8).map_err(|e| format!("{}: {e}", path.display()))?;
+                    Ok(path)
+                });
+                let _ = tx.send(res);
+            });
+            self.slice.hires_rx = Some(rx);
+            self.slice.hires_busy = Some(format!("{n}×{n}"));
+            self.slice.status = None;
+        }
+        if self.slice.rx.is_some() || self.slice.hires_busy.is_some() {
+            ctx.request_repaint_after(std::time::Duration::from_millis(60));
         }
     }
 
@@ -2866,7 +3338,18 @@ impl App {
     fn render(&mut self, ctx: &egui::Context) {
         // Preview-quality carve-out (confirmed plan answer #7): drop
         // quality while actively interacting, full quality once settled.
-        let (max_iter, aa) = if self.is_interacting() { (self.preview_max_iter, self.preview_aa) } else { (self.max_iter, self.aa) };
+        let interacting = self.is_interacting();
+        let (max_iter, aa) = if interacting { (self.preview_max_iter, self.preview_aa) } else { (self.max_iter, self.aa) };
+        // Picked zones are escape counts: fewer iterations would change which
+        // escape times exist, so a zone render keeps its count
+        // (`build_frame_params` uses the picks' own) and saves time while
+        // interacting with half the resolution instead (a quarter of the rays).
+        // Any slow frame (over 80 ms) gets the same while dragging, so rotating
+        // stays fluid.
+        let zone_on = self.timeline.zone.active();
+        let max_iter = if zone_on { self.max_iter } else { max_iter };
+        let slow = self.full_frame_ms > 80.0;
+        let size = if interacting && (zone_on || slow) { (self.render_size / 2).max(128) } else { self.render_size };
         let Some(pipeline) = self.pipeline.as_mut() else { return };
         let formula = QuatDagFormula { prog: &self.program, warp: &self.warp, julia: self.julia_mode, jc: self.jc, phoenix: self.phoenix };
         let (params, cam) = nnfractals::anim_eval::build_frame_params(
@@ -2874,8 +3357,20 @@ impl App {
             nnfractals::anim_eval::RenderQuality { max_iter, aa },
         );
         self.last_cam = Some(cam);
+        // ✂ Slice "cut the 3D view here": drop the camera's side of the slice.
+        let mut params = params;
+        if self.slice.open && self.slice.cut_3d {
+            if let Some((bmin, bmax)) = params.box_bounds {
+                let f = self.slice.spec.frame(bmin, bmax);
+                let to_eye = (cam.eye.0 - f.center.0, cam.eye.1 - f.center.1, cam.eye.2 - f.center.2);
+                let facing = to_eye.0 * f.normal.0 + to_eye.1 * f.normal.1 + to_eye.2 * f.normal.2 > 0.0;
+                let n = if facing { (-f.normal.0, -f.normal.1, -f.normal.2) } else { f.normal };
+                params.clip_plane = Some((f.center, n));
+            }
+        }
         let start = std::time::Instant::now();
-        let (mut shading, mut color_t) = pipeline.render(&params, &cam, self.render_size, self.render_size);
+        let max_iter = params.max_iter;
+        let (mut shading, mut color_t) = pipeline.render(&params, &cam, size, size);
         // "hide top N%": the cutoff can only be known AFTER seeing this
         // frame's own escape-time distribution, so this is a genuine
         // second render — see `percentile_escape_time_cutoff`'s doc
@@ -2885,12 +3380,14 @@ impl App {
             if let Some(cutoff) = nnfractals::anim_eval::percentile_escape_time_cutoff(&shading, &color_t, max_iter, fraction) {
                 let mut params_hidden = params;
                 params_hidden.hide_above = Some(cutoff);
-                let (shading2, color_t2) = pipeline.render(&params_hidden, &cam, self.render_size, self.render_size);
+                let (shading2, color_t2) = pipeline.render(&params_hidden, &cam, size, size);
                 shading = shading2;
                 color_t = color_t2;
             }
         }
         self.last_render_ms = start.elapsed().as_secs_f64() * 1000.0;
+        // What a full-resolution frame costs (a half-size frame is a quarter of the rays).
+        self.full_frame_ms = self.last_render_ms * (self.render_size as f64 / size.max(1) as f64).powi(2);
 
         let hits = shading.iter().filter(|&&v| v > 0.0).count();
         self.last_hit_frac = hits as f32 / shading.len().max(1) as f32;
@@ -2910,12 +3407,12 @@ impl App {
                 rgb[i * 3 + 2] = (rgb_bytes[i * 3 + 2] as f32 * v).clamp(0.0, 255.0) as u8;
             }
         }
-        let size = [self.render_size as usize, self.render_size as usize];
-        let color_image = egui::ColorImage::from_rgb(size, &rgb);
+        let color_image = egui::ColorImage::from_rgb([size as usize, size as usize], &rgb);
         match self.texture.as_mut() {
             Some(t) => t.set(color_image, egui::TextureOptions::LINEAR),
             None => self.texture = Some(ctx.load_texture("anim_view", color_image, egui::TextureOptions::LINEAR)),
         }
+        self.last_frame = Some(LastFrame { size, shading, color: color_t, max_iter });
         self.dirty = false;
     }
 
@@ -3169,6 +3666,8 @@ impl eframe::App for App {
                     .on_hover_text("Edit the formula live; the view updates as you type or drag a constant");
                 ui.toggle_value(&mut self.planes.open, "\u{25a6} Planes")
                     .on_hover_text("All six RABC planes (RA, RB, RC, AB, AC, BC) as flat slices; click one to render it at any resolution");
+                ui.toggle_value(&mut self.slice.open, "\u{2702} Slice")
+                    .on_hover_text("A flat 2D image through the 3D view on its X/Y/Z planes, at any tilt: a cheap live preview to try angles, then a hi-res PNG (colours, grey, or black & white)");
                 if let Some(err) = &self.gpu_error {
                     ui.colored_label(egui::Color32::RED, err);
                 }
@@ -3406,6 +3905,48 @@ impl eframe::App for App {
                     self.timeline.camera_pivot_offset = (0.0, 0.0, 0.0);
                     self.commit_timeline();
                 }
+                if !self.timeline.zone.bands.is_empty() {
+                    ui.horizontal(|ui| {
+                        let mut on = !self.timeline.zone.disabled;
+                        let names: Vec<String> = self.timeline.zone.bands.iter().map(|&b| nnfractals::anim_timeline::ZoneFilter::band_label(b)).collect();
+                        if ui.checkbox(&mut on, format!("only zones {}{}", names.join(", "), if self.timeline.zone.include_inside { " + inside" } else { "" }))
+                            .on_hover_text("Zones picked on the \u{25a6} Planes tiles: the 3D view shows only these escape counts. Edit them in the Planes window.").changed() {
+                            self.timeline.zone.disabled = !on;
+                            self.commit_timeline();
+                        }
+                        if self.timeline.zone.active() && self.timeline.zone.max_iter > 0 && self.timeline.zone.max_iter != self.max_iter {
+                            ui.weak(format!("(renders with the picks' {} iterations)", self.timeline.zone.max_iter))
+                                .on_hover_text("Picked zones are escape counts classified on the Planes tiles; the 3D view uses the same iteration count so it shows exactly what they highlight. Change it with \"iterations\" in the Planes window.");
+                        }
+                    });
+                }
+                // Hiding zones by clicking them in the 3D view.
+                ui.horizontal_wrapped(|ui| {
+                    ui.toggle_value(&mut self.click_hides, "\u{2702} click 3D hides zone")
+                        .on_hover_text("While on, a click on the 3D view hides the zone (escape count) of the surface under the pointer: in zone mode that surface is the outermost kept zone along the ray, so hiding it shows what lies behind. Click a hidden chip to bring it back; Ctrl+Z undoes. The zone under the pointer is shown at the bottom of the view.");
+                    if self.timeline.zone.bands.is_empty() {
+                        if ui.small_button("start: all but the outer zone").on_hover_text("Turns zone mode on keeping every zone except the outermost (zone 0, the dark region all around), i.e. zone 1 + everything inside. Then click surfaces to hide their zones.").clicked() {
+                            let z = &mut self.timeline.zone;
+                            z.bands = vec![1];
+                            z.include_inside = true;
+                            z.disabled = false;
+                            z.max_iter = if self.planes.initialized { self.planes.max_iter } else { self.max_iter };
+                            self.click_hides = true;
+                            self.commit_timeline();
+                        }
+                    }
+                    let mut show: Option<u32> = None;
+                    if !self.timeline.zone.hidden.is_empty() {
+                        ui.weak("hidden:");
+                        for &b in &self.timeline.zone.hidden {
+                            if ui.small_button(format!("{} \u{2715}", nnfractals::anim_timeline::ZoneFilter::band_label(b))).on_hover_text("Show this zone again").clicked() { show = Some(b); }
+                        }
+                    }
+                    if let Some(b) = show {
+                        self.timeline.zone.toggle_hidden(b);
+                        self.commit_timeline();
+                    }
+                });
                 let mut hide_pct = self.timeline.hide_top_percentile;
                 if ui.add(egui::Slider::new(&mut hide_pct, 0.0..=50.0).text("hide top % (the white/gray shell)")).changed() {
                     self.timeline.hide_top_percentile = hide_pct;
@@ -3479,8 +4020,62 @@ impl eframe::App for App {
                 ui.centered_and_justified(|ui| {
                     let resp = ui.add(
                         egui::Image::new(egui::load::SizedTexture::new(tex_id, egui::vec2(side, side)))
-                            .sense(egui::Sense::drag()),
+                            .sense(egui::Sense::click_and_drag()),
                     );
+                    // The zone under a point of the view, from the last frame (in zone
+                    // mode the colour of a hit IS the escape time of that surface).
+                    let zone_at = |pos: egui::Pos2| -> Option<(u32, f32)> {
+                        let f = self.last_frame.as_ref()?;
+                        let n = f.size as usize;
+                        let x = ((pos.x - resp.rect.left()) / resp.rect.width() * n as f32).floor();
+                        let y = ((pos.y - resp.rect.top()) / resp.rect.height() * n as f32).floor();
+                        if x < 0.0 || y < 0.0 || x >= n as f32 || y >= n as f32 { return None; }
+                        let i = y as usize * n + x as usize;
+                        if f.shading.get(i).copied().unwrap_or(0.0) <= 0.0 { return None; }
+                        let et = f.color[i];
+                        Some((nnfractals::anim_timeline::ZoneFilter::band_of(et as f64, f.max_iter), et))
+                    };
+                    // ✂ Slice: where the slice is, drawn over the view.
+                    if self.slice.open && self.slice.outline {
+                        if let Some((f, cam)) = self.slice_frame() {
+                            let rect = resp.rect;
+                            let painter = ui.painter_at(rect);
+                            let stroke = egui::Stroke::new(1.5, egui::Color32::from_rgb(120, 220, 255));
+                            let to_screen = |p: (f64, f64, f64)| nnfractals::anim_eval::project_to_screen_ndc(&cam, p, 1.0)
+                                .map(|(x, y)| egui::pos2(rect.center().x + x as f32 * rect.width() * 0.5, rect.center().y - y as f32 * rect.height() * 0.5));
+                            // Each edge in short pieces, so the part in front of the camera
+                            // still shows when the camera is inside the box.
+                            let c = f.corners();
+                            for k in 0..4 {
+                                let (a, b) = (c[k], c[(k + 1) % 4]);
+                                let at = |s: f64| (a.0 + (b.0 - a.0) * s, a.1 + (b.1 - a.1) * s, a.2 + (b.2 - a.2) * s);
+                                let mut prev = to_screen(a);
+                                for i in 1..=48 {
+                                    let cur = to_screen(at(i as f64 / 48.0));
+                                    if let (Some(p0), Some(p1)) = (prev, cur) { painter.line_segment([p0, p1], stroke); }
+                                    prev = cur;
+                                }
+                            }
+                        }
+                    }
+                    if self.click_hides {
+                        let zones_on = self.timeline.zone.active();
+                        let hover = resp.hover_pos().map(|p| zone_at(p));
+                        let text = match (zones_on, hover) {
+                            (false, _) => "zones are off: pick some first (main panel or \u{25a6} Planes)".to_string(),
+                            (true, Some(Some((b, et)))) => format!("zone {} (escape time {et:.2}) \u{2014} click hides it", nnfractals::anim_timeline::ZoneFilter::band_label(b)),
+                            (true, Some(None)) => "background".to_string(),
+                            (true, None) => "click a surface to hide its zone".to_string(),
+                        };
+                        ui.painter().text(resp.rect.left_bottom() + egui::vec2(8.0, -8.0), egui::Align2::LEFT_BOTTOM, text,
+                            egui::FontId::proportional(14.0), egui::Color32::from_rgb(255, 230, 120));
+                        if resp.clicked() && zones_on {
+                            if let Some(Some((b, _))) = resp.interact_pointer_pos().map(|p| zone_at(p)) {
+                                self.timeline.zone.toggle_hidden(b);
+                                self.commit_timeline();
+                            }
+                        }
+                    }
                     if resp.dragged() {
                         self.dragging = true;
                         let delta = resp.drag_delta();
@@ -3623,7 +4218,10 @@ impl eframe::App for App {
                         .is_some_and(|r| ui.input(|i| i.pointer.latest_pos()).is_some_and(|p| r.contains(p)));
                     let scroll = if over_planes { 0.0 } else { ui.input(|i| i.smooth_scroll_delta.y) };
                     if scroll.abs() > 0.0 {
-                        self.timeline.camera_distance = (self.timeline.camera_distance * (1.0 - scroll as f64 * 0.002)).clamp(1.7, 40.0);
+                        // Limits follow the box: a fixed 1.7..40 kept the camera inside a box
+                        // drawn bigger than that, so the fractal could never be seen whole.
+                        let (lo, hi) = wheel_distance_limits(&self.timeline.bounds);
+                        self.timeline.camera_distance = (self.timeline.camera_distance * (1.0 - scroll as f64 * 0.002)).clamp(lo.min(self.timeline.camera_distance), hi.max(self.timeline.camera_distance));
                         self.commit_timeline();
                     }
                 });
@@ -3640,6 +4238,7 @@ impl eframe::App for App {
         if self.planes.open {
             self.show_planes_window(&ctx);
         }
+        self.show_slice_window(&ctx);
         if self.bbox_dialog_open {
             self.show_bbox_dialog(&ctx);
         }

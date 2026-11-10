@@ -358,7 +358,18 @@ pub struct RunRecord {
     /// "generations", "stop-flat", "max-seconds", "watchdog" or "failed".
     pub stop_reason: String,
     pub stem: Option<String>,
+    /// The `--fitness-metric` the run was scored with.
+    #[serde(default)]
+    pub spec: String,
+    /// `RENDERER_VERSION` the run was scored with (0 = before it was recorded).
+    #[serde(default)]
+    pub renderer: u32,
 }
+
+/// Version of the explorer's 3D renderer, recorded per campaign run. 2 = the
+/// set is opaque and march steps are capped (2026-11-04); before, rays could
+/// jump over parts of the shape, so scores of the two are not comparable.
+pub const RENDERER_VERSION: u32 = 2;
 
 /// On-disk campaign: the editable run settings travel with the GUI's `QuatEvoPrefs`;
 /// here only the tuning, optimizer and history are stored.
@@ -367,10 +378,16 @@ pub struct Campaign {
     pub name: String,
     pub tuning: Tuning,
     pub runs: Vec<RunRecord>,
+    /// The fitness recipe the campaign scores with (set by its first run). Trial values of
+    /// different recipes are not comparable, so the GUI warns when the settings differ.
+    #[serde(default)]
+    pub recipe_spec: String,
+    #[serde(default)]
+    pub recipe_name: String,
 }
 
 impl Campaign {
-    pub fn new(name: &str, tuning: Tuning) -> Campaign { Campaign { name: name.into(), tuning, runs: Vec::new() } }
+    pub fn new(name: &str, tuning: Tuning) -> Campaign { Campaign { name: name.into(), tuning, runs: Vec::new(), recipe_spec: String::new(), recipe_name: String::new() } }
     pub fn dir(root: &Path, name: &str) -> PathBuf { root.join(CAMPAIGNS_DIR).join(sanitize(name)) }
     pub fn file(root: &Path, name: &str) -> PathBuf { Self::dir(root, name).join("campaign.json") }
 

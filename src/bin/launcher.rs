@@ -25,6 +25,8 @@ use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
 
 #[path = "../launcher_tuning.rs"]
 mod launcher_tuning;
+#[path = "../launcher_recipe.rs"]
+mod launcher_recipe;
 
 use nnfractals::config::Config;
 use nnfractals::fitness_profile::{self, FieldSpec, FitnessProfile, Group, Sign, FIELDS};
@@ -375,6 +377,12 @@ fn discover_pools(root: &Path) -> Vec<String> {
 /// bytes, so every nnfractals binary is matched by PREFIX
 /// (`name.starts_with(..)`), not equality — "nnfractals-anim-viewer"
 /// reports as "nnfractals-anim".
+/// Process kinds the Evolve section's Stop button ends.
+fn stopped_by_evolution_stop(kind: &str) -> bool { kind == "evolution" || kind == "scorer" }
+
+/// Process kinds the Quaternion Evolution section's Stop button ends.
+fn stopped_by_quat_stop(kind: &str) -> bool { kind == "explorer:quat-dag-evolve" }
+
 fn classify_proc(name: &str, cmd: &[String]) -> Option<String> {
     if name == "nnfractals" {
         return Some("evolution".to_string());
@@ -593,6 +601,10 @@ struct QuatEvoPrefs {
     /// Let the explorer hunt for the best thread count itself (`--auto-workers`), starting from `workers`.
     #[serde(default)]
     auto_workers: bool,
+    /// Name of the fitness recipe last applied (`fitness_recipe`); the settings may have
+    /// been edited since (the pickers show "modified").
+    #[serde(default)]
+    recipe: String,
 }
 
 fn d_workers() -> usize { 4 }
@@ -649,6 +661,7 @@ impl Default for QuatEvoPrefs {
             max_minutes: 0.0,
             workers: d_workers(),
             auto_workers: false,
+            recipe: String::new(),
         }
     }
 }
@@ -713,6 +726,8 @@ struct App {
 
     /// GA tunings + Optuna campaigns window (`launcher_tuning.rs`).
     tuning_ui: launcher_tuning::TuningUi,
+    /// Fitness-recipe builder window (`launcher_recipe.rs`).
+    recipe_ui: launcher_recipe::RecipeUi,
 
     // ── Fitness profiles ──────────────────────────────────────────────────
     show_fitness: bool,
@@ -764,17 +779,32 @@ fn build_quat_evolve_args(e: &QuatEvoPrefs, out_dir: &str, seed: u64, generation
         args.push("subtree".into());
     }
     let collapsed = e.collapse != "slice";
+    // What the run will score with, so flags the recipe cannot use stay off the command
+    // line (and the modules behind them unstarted): see `fitness_recipe::Recipe::modules`.
+    let spec_text = e.fitness_metric.trim();
+    let effective_spec: Option<&str> = if !spec_text.is_empty() { Some(spec_text) }
+        else if collapsed && e.mode != QuatEvoMode::MapElites { Some("taste") } else { None };
+    let parsed: Option<Vec<(String, f64)>> = effective_spec.and_then(|s| nnfractals::fitness_recipe::parse_spec(s).ok())
+        .map(|v| v.into_iter().map(|t| (t.name, t.weight)).collect());
+    // An unparsable spec keeps every flag (the explorer reports the bad term itself).
+    let uses_taste = match (&effective_spec, &parsed) {
+        (Some(_), Some(p)) => nnfractals::fitness_recipe::uses_taste(p),
+        (Some(_), None) => true,
+        (None, _) => e.mode == QuatEvoMode::MapElites,
+    };
+    let renders = parsed.as_ref().is_none_or(|p| nnfractals::fitness_recipe::needs_render(p));
     if collapsed {
         args.push("--collapse".into());
         args.push(e.collapse.clone());
         args.push("--eval-phases".into());
         args.push(e.eval_phases.to_string());
-        if e.smooth_weight > 0.0 {
+        if e.smooth_weight > 0.0 && uses_taste {
             args.push("--smooth-weight".into());
             args.push(e.smooth_weight.to_string());
         }
     }
-    if e.embed_diversity > 0.0 {
+    // Look diversity needs the taste term's embeddings (and MAP-Elites ignores it).
+    if e.embed_diversity > 0.0 && uses_taste && e.mode != QuatEvoMode::MapElites {
         args.push("--embed-diversity".into());
         args.push(e.embed_diversity.to_string());
     }
@@ -784,7 +814,7 @@ fn build_quat_evolve_args(e: &QuatEvoPrefs, out_dir: &str, seed: u64, generation
         args.push("--crossover-frac".into());
         args.push(e.crossover_frac.to_string());
     }
-    if e.auto_range {
+    if e.auto_range && renders {
         args.push("--auto-range".into());
     }
     if e.save_top > 0 {
@@ -821,7 +851,8 @@ fn build_quat_evolve_args(e: &QuatEvoPrefs, out_dir: &str, seed: u64, generation
     // passing it in MapElites mode would be silently ignored by the CLI,
     // but omitting it here keeps the actually-launched command line an
     // honest reflection of what's in effect.
-    if e.mode != QuatEvoMode::MapElites && !e.pref_model.trim().is_empty() {
+    // Only the default blend (no recipe) reads the old preference model.
+    if e.mode != QuatEvoMode::MapElites && effective_spec.is_none() && !e.pref_model.trim().is_empty() {
         args.push("--pref-model".into());
         args.push(e.pref_model.clone());
     }
@@ -882,6 +913,7 @@ impl App {
         let known_folders = discover_pools(&root);
         let quat_taste_stats = QuatTasteStats::load(&root.join("taste_model_quat.json"));
         let quat_evo = prefs.quat_evo.clone();
+        let recipe_ui = launcher_recipe::RecipeUi::new(&quat_evo, &root);
         let rescore_folder = known_folders
             .iter()
             .find(|d| d.as_str() == "fractals_1")
@@ -917,6 +949,7 @@ impl App {
             dedup_confirm: false,
             prefs_path,
             tuning_ui: launcher_tuning::TuningUi::new(&project_root()),
+            recipe_ui,
 
             show_fitness: false,
             fp_profiles: Vec::new(),
@@ -1259,7 +1292,7 @@ impl App {
     /// active viewer window or an in-flight render out from under him).
     fn stop_evolution(&mut self) {
         self.refresh_procs();
-        let in_scope = |r: &&ProcRow| r.kind == "evolution" || r.kind == "scorer";
+        let in_scope = |r: &&ProcRow| stopped_by_evolution_stop(&r.kind);
         let pids: Vec<u32> = self.procs.iter().filter(in_scope).map(|r| r.pid).collect();
         if pids.is_empty() {
             self.status = "no evolution / scorer processes to stop".into();
@@ -1465,7 +1498,7 @@ impl App {
             h.stop.store(true, Ordering::Relaxed);
         }
         self.refresh_procs();
-        let in_scope = |r: &&ProcRow| r.kind == "explorer:quat-dag-evolve";
+        let in_scope = |r: &&ProcRow| stopped_by_quat_stop(&r.kind);
         let pids: Vec<u32> = self.procs.iter().filter(in_scope).map(|r| r.pid).collect();
         if pids.is_empty() && forever.is_none() {
             self.status = "no quat evolution process running".into();
@@ -1984,7 +2017,7 @@ impl eframe::App for App {
         {
             let ga_running = self.quat_evolve_running_count() > 0 || self.quat_forever.is_some();
             let was_open = self.tuning_ui.open;
-            let action = self.tuning_ui.show(&ctx, &self.root, &mut self.quat_evo, ga_running);
+            let action = self.tuning_ui.show(&ctx, &self.root, &mut self.quat_evo, &mut self.recipe_ui, ga_running);
             if was_open && !self.tuning_ui.open {
                 self.save_quat_evo_prefs();
             }
@@ -1992,12 +2025,16 @@ impl eframe::App for App {
                 self.save_quat_evo_prefs();
                 self.launch_quat_args(args);
             }
+            let was_open = self.recipe_ui.open;
+            if self.recipe_ui.show(&ctx, &self.root, &mut self.quat_evo) || (was_open && !self.recipe_ui.open) {
+                self.save_quat_evo_prefs();
+            }
         }
 
         // While a job OR a "generate forever" supervisor runs, repaint
         // frequently for smooth progress; otherwise just keep the resource
         // monitor ticking.
-        if self.job.running || self.quat_forever.is_some() || self.tuning_ui.busy() {
+        if self.job.running || self.quat_forever.is_some() || self.tuning_ui.busy() || self.recipe_ui.busy() {
             ui.ctx().request_repaint_after(Duration::from_millis(250));
         } else {
             ui.ctx().request_repaint_after(Duration::from_secs(60));
@@ -2220,6 +2257,7 @@ impl eframe::App for App {
                         ui.label("Pool dir:");
                         ui.add(egui::TextEdit::singleline(&mut self.quat_evo.pool_dir).desired_width(160.0))
                             .on_hover_text("Seeds the initial population from this folder's existing genomes.");
+                        launcher_tuning::folder_picker_button(ui, "evo_pool", &mut self.quat_evo.pool_dir, &project_root());
                     });
                     ui.horizontal(|ui| {
                         ui.label("Stagnation gens:");
@@ -2244,15 +2282,19 @@ impl eframe::App for App {
                         ui.add(egui::DragValue::new(&mut self.quat_evo.stop_flat).range(0..=500))
                             .on_hover_text("0 = off. Ends the run when the elite mean has not risen by 0.005 for this many generations.");
                     });
+                    let root = self.root.clone();
+                    if launcher_recipe::picker(ui, "main_recipe", &root, &mut self.quat_evo, &mut self.recipe_ui) {
+                        self.save_quat_evo_prefs();
+                    }
                     ui.horizontal(|ui| {
-                        ui.label("Fitness metric override:");
+                        ui.label("as text:");
                         ui.add(egui::TextEdit::singleline(&mut self.quat_evo.fitness_metric).desired_width(260.0))
                     })
                     .inner
-                    .on_hover_text("Empty = the default geometric+taste blend. A bare metric name \
+                    .on_hover_text("The recipe's --fitness-metric value. Empty = the default geometric+taste blend. A bare metric name \
                                      (e.g. convexity, box_dim) or a weighted combo \
                                      (\"silhouette_irregularity:1.0,shading_gradient:0.7\") selects \
-                                     purely on that instead.");
+                                     purely on that instead. The ✏ Recipe builder explains every term.");
                     if self.quat_evo.mode != QuatEvoMode::MapElites {
                         ui.horizontal(|ui| {
                             ui.label("Pref model:");
@@ -2687,7 +2729,7 @@ mod fitness_ui_tests {
 
 #[cfg(test)]
 mod proc_matching_tests {
-    use super::classify_proc;
+    use super::{classify_proc, stopped_by_evolution_stop, stopped_by_quat_stop};
 
     fn cmd(parts: &[&str]) -> Vec<String> {
         parts.iter().map(|s| s.to_string()).collect()
@@ -2726,12 +2768,17 @@ mod proc_matching_tests {
 
     #[test]
     fn the_gui_binaries_are_not_stopped() {
-        // Stop must never take out the launcher, viewer, queue or browser —
-        // their names all start with "nnfractals-".
-        for n in ["nnfractals-launcher", "nnfractals-viewer", "nnfractals-queue", "nnfractals-browser",
-                  "nnfractals-reels"] {
-            assert_eq!(classify_proc(n, &cmd(&[n])), None, "{n} must be left alone");
+        // The process list labels the GUI programs (so their CPU/RAM shows), but
+        // neither Stop button may ever take out the launcher, viewers, queue,
+        // browser or reels — nor an explorer doing something else.
+        let names = [("nnfractals-launcher", "nnfractals-launcher"), ("nnfractals-viewer", "nnfractals-viewer"), ("nnfractals-queue", "nnfractals-queue"),
+                     ("nnfractals-browser", "nnfractals-browser"), ("nnfractals-reels", "nnfractals-reels"), ("nnfractals-anim", "nnfractals-anim-viewer"),
+                     ("explorer", "./target/release/explorer"), ("explorer", "quat-render-timeline")];
+        for (name, arg) in names {
+            let kind = classify_proc(name, &cmd(&[arg, arg])).unwrap_or_default();
+            assert!(!stopped_by_evolution_stop(&kind) && !stopped_by_quat_stop(&kind), "{name} ({kind}) must be left alone");
         }
-        assert_eq!(classify_proc("explorer", &cmd(&["./target/release/explorer"])), None);
+        let ga = classify_proc("explorer", &cmd(&["explorer", "quat-dag-evolve", "--gpu"])).unwrap();
+        assert!(stopped_by_quat_stop(&ga), "the quat GA itself is what Stop ends");
     }
 }

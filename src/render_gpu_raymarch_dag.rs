@@ -279,7 +279,7 @@ impl GpuRaymarchDagRenderer {
             w.f32(params.light_dir.1);
             w.f32(params.light_dir.2);
             w.u32(params.aa);
-            w.u32(0);
+            w.u32(params.solid_interior as u32);
             w.u32(0);
         }
         self.queue.write_buffer(&self.params_buf, 0, &pb);
@@ -354,11 +354,11 @@ mod tests {
             time_axis: TimeAxis::C,
             time_val: 0.0,
             domain_radius: 1.6,
-            box_bounds: None, axis_assignment: None, clip_plane: None, slide_iter: None, hide_above: None, axis_remap: None, collapse: None,
+            box_bounds: None, axis_assignment: None, clip_plane: None, slide_iter: None, hide_above: None, zone: None, axis_remap: None, collapse: None,
             max_iter: 40,
             bailout: 4.0,
             max_march_steps: 200,
-            hit_epsilon: 1.6 * 1e-4,
+            hit_epsilon: 1.6 * 1e-4, pixel_lod: 0.0, solid_interior: false,
             step_safety: 0.8,
             light_dir: (0.5, 0.8, 0.3),
             normal_eps: 1.6 * 1e-3,
@@ -423,6 +423,40 @@ mod tests {
         }
         let large_frac = large_diffs as f64 / agreeing.max(1) as f64;
         assert!(large_frac < 0.05, "{large_diffs}/{agreeing} agreeing-hit pixels have a large color_t diff ({:.1}%)", large_frac * 100.0);
+    }
+
+    /// The GA's interpreter path with the opaque set and capped steps
+    /// (`solid_interior`), including an overstated distance estimate (large step
+    /// safety), agrees with the CPU march.
+    #[test]
+    fn gpu_matches_cpu_with_solid_interior() {
+        if !gpu_available() {
+            eprintln!("skipping: no GPU adapter available in this environment");
+            return;
+        }
+        let prog = [
+            OpNode { op: op::Z, a: 0, b: 0, kre: 0.0, kim: 0.0 },
+            OpNode { op: op::C, a: 0, b: 0, kre: 0.0, kim: 0.0 },
+            OpNode { op: op::SQR, a: 0, b: 0, kre: 0.0, kim: 0.0 },
+            OpNode { op: op::ADD, a: 2, b: 1, kre: 0.0, kim: 0.0 },
+        ];
+        for safety in [0.8, 40.0] {
+            let mut params = base_params(&prog, &[]);
+            params.solid_interior = true;
+            params.step_safety = safety;
+            params.max_march_steps += crate::quat_dag::SOLID_EXTRA_STEPS;
+            let cam = base_cam();
+            let (cs, cc) = render_raymarch_dag_frame(&params, &cam, 64, 64);
+            let (gs, gc) = render_raymarch_dag_frame_gpu(&params, &cam, 64, 64).expect("gpu available");
+            let n = cs.len();
+            let hit_mismatch = (0..n).filter(|&i| (cs[i] > 0.0) != (gs[i] > 0.0)).count();
+            let both: Vec<usize> = (0..n).filter(|&i| cs[i] > 0.0 && gs[i] > 0.0).collect();
+            let shade_off = both.iter().filter(|&&i| (cs[i] - gs[i]).abs() > 0.15).count();
+            let color_off = both.iter().filter(|&&i| (cc[i] - gc[i]).abs() > 5.0).count();
+            assert!(both.len() > n / 10, "safety {safety}: the set is hit ({} px)", both.len());
+            assert!(hit_mismatch * 20 < n, "safety {safety}: {hit_mismatch}/{n} pixels disagree on hit/miss");
+            assert!(shade_off * 20 < both.len() && color_off * 20 < both.len(), "safety {safety}: shading {shade_off}, colour {color_off} of {} differ", both.len());
+        }
     }
 
     #[test]

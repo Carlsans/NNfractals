@@ -494,10 +494,31 @@ pub struct RaymarchDagParams<'a> {
     /// existed, and every render's own FIRST/probe pass) disables this
     /// gate entirely.
     pub hide_above: Option<f64>,
+    /// Keep only these escape-time zones (the anim viewer's ▦ Planes zone
+    /// pick): the march renders the surface of the region whose escape time
+    /// lies in the zone instead of the distance-estimate surface, so inner
+    /// shells show without the outer ones. `slide_iter`/`hide_above` are
+    /// subtracted from it. `None` = the usual surface.
+    pub zone: Option<ZoneParams>,
     pub max_iter: u32,
     pub bailout: f64,
     pub max_march_steps: u32,
     pub hit_epsilon: f64,
+    /// Level of detail: a ray also stops once the distance estimate is under
+    /// this many pixel widths at its distance from the eye (0 = `hit_epsilon`
+    /// only). Far away, structure thinner than a pixel then renders solid
+    /// instead of as scattered dots that only fill in when zoomed in. CPU and
+    /// the codegen GPU path (the viewer and video export) honour it; the GA
+    /// leaves it 0 so its scores do not change.
+    pub pixel_lod: f64,
+    /// Treat the set as opaque: a ray that steps onto a point that never
+    /// escapes stops there, the surface placed by bisection back to the last
+    /// point outside. Without it, the distance estimate at such a point (from
+    /// the final orbit value) is often well above zero, so rays marched on
+    /// through the inside and out again, and which parts looked solid depended
+    /// on the viewing direction. The viewer and video turn it on; the GA leaves
+    /// it off (its scores would change).
+    pub solid_interior: bool,
     pub step_safety: f64,
     pub light_dir: Vec3,
     pub normal_eps: f64,
@@ -549,6 +570,12 @@ fn eval_collapsed(p: &RaymarchDagParams, point: Vec3) -> (f32, f64) {
     if c.method == Method::Offset { r.1 -= c.offset; }
     r.1 /= remap_max_scale(p);
     r
+}
+
+/// The escape time the render sees at a view-space point (projection, axis
+/// assignment and T applied): what a flat slice through the 3D view shows.
+pub fn escape_time_at(p: &RaymarchDagParams, point: Vec3) -> f32 {
+    eval_collapsed(p, point).0
 }
 
 fn de_at(p: &RaymarchDagParams, point: Vec3) -> f64 {
@@ -613,16 +640,42 @@ fn apply_clip_plane(t0: f64, t1: f64, eye: Vec3, dir: Vec3, clip: Option<(Vec3, 
     Some((nt0, nt1))
 }
 
+#[cfg(test)]
 fn march_ray(p: &RaymarchDagParams, eye: Vec3, dir: Vec3) -> Option<(Vec3, Vec3, f32)> {
-    let (t0, t1) = match p.box_bounds {
-        Some((bmin, bmax)) => ray_box(eye, dir, bmin, bmax)?,
-        None => ray_sphere(eye, dir, p.domain_radius)?,
+    march_ray_px(p, eye, dir, 0.0)
+}
+
+/// Diagonal of the region a ray is marched in (the box, else the domain sphere's diameter).
+fn march_extent(p: &RaymarchDagParams) -> f64 {
+    match p.box_bounds {
+        Some((a, b)) => { let d = sub(b, a); dot(d, d).sqrt() }
+        None => 2.0 * p.domain_radius,
+    }
+}
+
+/// `pixel`: the width of one pixel per unit of distance from the eye (for `pixel_lod`).
+fn march_ray_px(p: &RaymarchDagParams, eye: Vec3, dir: Vec3, pixel: f64) -> Option<(Vec3, Vec3, f32)> {
+    // The face the ray enters through (box, sphere or clip plane): a ray that
+    // starts inside the set (solid_interior) shows a flat cut there, lit as it.
+    let (t0, t1, mut entry_n) = match p.box_bounds {
+        Some((bmin, bmax)) => ray_box_entry(eye, dir, bmin, bmax)?,
+        None => {
+            let (a, b) = ray_sphere(eye, dir, p.domain_radius)?;
+            (a, b, if a > 0.0 { Some(normalize(add(eye, scale(dir, a)))) } else { None })
+        }
     };
-    let (t0, t1) = apply_clip_plane(t0, t1, eye, dir, p.clip_plane)?;
+    let (t0c, t1) = apply_clip_plane(t0, t1, eye, dir, p.clip_plane)?;
+    if t0c > t0 {
+        entry_n = p.clip_plane.map(|(_, n)| normalize(n));
+    }
+    let t0 = t0c;
     let hit_eps = p.hit_epsilon.max(1e-9);
     let min_step = (p.domain_radius * 1e-6).max(1e-9);
+    let inside = |et: f32| et >= p.max_iter as f32;
+    let cap = if p.solid_interior { march_extent(p) / SOLID_STEP_DIVISIONS } else { f64::INFINITY };
     let mut t = t0;
-    for _ in 0..p.max_march_steps.max(1) {
+    let mut prev = t0;
+    for i in 0..p.max_march_steps.max(1) {
         if t > t1 {
             return None;
         }
@@ -635,15 +688,369 @@ fn march_ray(p: &RaymarchDagParams, eye: Vec3, dir: Vec3) -> Option<(Vec3, Vec3,
         // efficient.
         let in_band = matches!(p.slide_iter, Some((lo, hi)) if (et as f64) >= lo && (et as f64) < hi);
         let above_cutoff = matches!(p.hide_above, Some(cutoff) if (et as f64) >= cutoff);
-        if de < hit_eps && !in_band && !above_cutoff {
+        let eps = hit_eps.max(p.pixel_lod * pixel * t);
+        if p.solid_interior && inside(et) && !in_band && !above_cutoff {
+            // Stepped into the set: its surface lies between the last point
+            // outside and here (at the entry itself when the ray starts inside).
+            let (mut a, mut b) = (prev, t);
+            if i > 0 {
+                for _ in 0..ZONE_BISECT {
+                    let m = 0.5 * (a + b);
+                    if inside(eval_collapsed(p, add(eye, scale(dir, m))).0) { b = m; } else { a = m; }
+                }
+            }
+            let hp = add(eye, scale(dir, b));
+            let normal = if i == 0 {
+                entry_n.map_or(scale(dir, -1.0), |n| if dot(n, dir) > 0.0 { scale(n, -1.0) } else { n })
+            } else {
+                zone_normal(p, hp, dir)
+            };
+            let probe = add(hp, scale(normal, p.color_probe_offset));
+            let color_et = eval_collapsed(p, probe).0;
+            return Some((hp, normal, color_et));
+        }
+        if de < eps && !in_band && !above_cutoff {
             let normal = estimate_normal(p, point);
             let probe = add(point, scale(normal, p.color_probe_offset));
             let color_et = eval_collapsed(p, probe).0;
             return Some((point, normal, color_et));
         }
-        t += (de * p.step_safety).max(min_step);
+        prev = t;
+        t += (de * p.step_safety).max(min_step).min(cap);
     }
     None
+}
+
+/// With `solid_interior`, a march step never exceeds the box diagonal over this.
+/// The distance estimate can overstate the distance badly (60 where the set was
+/// 38 away, for a formula whose orbit leaves at the first iteration), so an
+/// uncapped step jumped over the whole set; a capped one lands inside it, where
+/// `solid_interior` stops the ray.
+pub const SOLID_STEP_DIVISIONS: f64 = 128.0;
+/// Extra march steps a render with `solid_interior` needs to cross its whole
+/// region in capped steps (added to its usual budget).
+pub const SOLID_EXTRA_STEPS: u32 = (1.1 * SOLID_STEP_DIVISIONS) as u32;
+
+/// Most escape-time ranges a zone carries (the GPU uniform has this many slots).
+pub const ZONE_MAX_RANGES: usize = 8;
+/// Bisection steps that place a zone surface once a march step has crossed it.
+pub const ZONE_BISECT: u32 = 10;
+/// Default `ZoneParams::min_step` as a share of `max_step`.
+pub const ZONE_MIN_STEP_FRAC: f64 = 1.0 / 8.0;
+/// Default `ZoneParams::de_trust`.
+pub const ZONE_DE_TRUST: f64 = 1.0;
+/// Speckle filter: probes around a zone hit (offset sideways along the zone
+/// surface), points per probe (across the surface), and how many probes must
+/// meet the zone (`speck_test`).
+pub const ZONE_SPECKLE_SAMPLES: u32 = 6;
+pub const ZONE_SPECKLE_DEPTH: u32 = 5;
+pub const ZONE_SPECKLE_NEED: u32 = 5;
+/// Stands in for "no upper end" in a zone range (finite so the GPU can take it).
+pub const ZONE_INF: f64 = 3.0e38;
+
+/// Escape-time zones to render as solid: half-open `[lo, hi)` ranges, sorted
+/// and disjoint. A point that never escapes has escape time `max_iter`, so
+/// `[max_iter, ZONE_INF)` is the fractal's interior.
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub struct ZoneParams {
+    pub ranges: [(f64, f64); ZONE_MAX_RANGES],
+    pub n: usize,
+    /// Longest march step in view units. The step bound below is an
+    /// estimate, so this keeps thin zones from being stepped over.
+    pub max_step: f64,
+    /// Shortest march step. Near a range end the bound shrinks towards 0, and
+    /// in a noisy escape field it stays near an end for long stretches, so
+    /// without a floor the step budget runs out; the crossing is placed by
+    /// bisection anyway.
+    pub min_step: f64,
+    /// Speckle filter size (view units): a zone hit only counts when the
+    /// zone carries on sideways around it (`zone_solid_behind`). 0 = off.
+    pub speckle_len: f64,
+    /// Share of the distance-estimate step bound that is trusted (0 = fixed
+    /// `max_step` steps).
+    pub de_trust: f64,
+}
+
+impl ZoneParams {
+    /// From any list of ranges: sorted, overlapping/touching ranges merged,
+    /// empty ones dropped. More than `ZONE_MAX_RANGES` separate ranges do not
+    /// fit the GPU uniform, so the two ranges with the smallest gap between
+    /// them are joined (the gap is drawn too) until they fit: nothing picked
+    /// is ever lost (`fit_ranges`).
+    pub fn from_ranges(ranges: &[(f64, f64)], max_step: f64) -> ZoneParams {
+        let merged = fit_ranges(merge_ranges(ranges.to_vec()));
+        let mut z = ZoneParams { ranges: [(0.0, 0.0); ZONE_MAX_RANGES], n: 0, max_step, min_step: max_step * ZONE_MIN_STEP_FRAC, speckle_len: 0.0, de_trust: ZONE_DE_TRUST };
+        for r in merged {
+            z.ranges[z.n] = r;
+            z.n += 1;
+        }
+        z
+    }
+
+    /// `p` with this zone.
+    pub fn apply<'a>(&self, p: &RaymarchDagParams<'a>) -> RaymarchDagParams<'a> {
+        RaymarchDagParams { zone: Some(*self), ..*p }
+    }
+
+    pub fn ranges(&self) -> &[(f64, f64)] {
+        &self.ranges[..self.n]
+    }
+
+    pub fn contains(&self, et: f64) -> bool {
+        self.ranges().iter().any(|&(lo, hi)| et >= lo && et < hi)
+    }
+
+    /// This zone minus `[lo, hi)`.
+    pub fn without(&self, lo: f64, hi: f64) -> ZoneParams {
+        let mut out = Vec::new();
+        for &(a, b) in self.ranges() {
+            if hi <= a || lo >= b {
+                out.push((a, b));
+                continue;
+            }
+            if a < lo { out.push((a, lo)); }
+            if hi < b { out.push((hi, b)); }
+        }
+        ZoneParams { de_trust: self.de_trust, min_step: self.min_step, speckle_len: self.speckle_len, ..ZoneParams::from_ranges(&out, self.max_step) }
+    }
+
+    /// A safe march step from a point with escape time `et` and distance
+    /// estimate `de` (both from `eval_collapsed`).
+    ///
+    /// The smooth escape time is `n + 1 - log2(log2 |z|)`, whose gradient
+    /// has magnitude `|dz| / (ln2 · |z| · ln|z|)`, and the distance estimate
+    /// is `0.5 · |z| · ln|z| / |dz|`. So `|∇et| = 0.5 / (ln2 · de)`, and the
+    /// first-order distance to the level `et + Δ` is `2·ln2·Δ·de` for any
+    /// formula. `de · (1 - 2^-Δ)` is at most half of that and tends to `de`
+    /// (the distance to the set itself) for a far level, so it is used as the
+    /// step bound, with `Δ` the escape-time gap to the nearest range end.
+    /// A point that never escaped (`et >= max_iter`) or has no usable
+    /// estimate takes `max_step`.
+    pub fn step_bound(&self, et: f64, de: f64, max_iter: u32) -> f64 {
+        if et >= max_iter as f64 || !(de > 0.0) || !de.is_finite() || self.de_trust <= 0.0 {
+            return self.max_step;
+        }
+        let gap = self.ranges().iter()
+            .flat_map(|&(lo, hi)| [lo, hi])
+            .filter(|&b| b < ZONE_INF)
+            .map(|b| (et - b).abs())
+            .fold(f64::INFINITY, f64::min);
+        if !gap.is_finite() {
+            return self.max_step;
+        }
+        (self.de_trust * de * (1.0 - (-gap).exp2())).min(self.max_step)
+    }
+}
+
+/// `r` (sorted, disjoint) cut down to `ZONE_MAX_RANGES` ranges by repeatedly
+/// joining the two neighbours with the smallest gap.
+pub fn fit_ranges(mut r: Vec<(f64, f64)>) -> Vec<(f64, f64)> {
+    while r.len() > ZONE_MAX_RANGES {
+        let i = (0..r.len() - 1)
+            .min_by(|&a, &b| (r[a + 1].0 - r[a].1).partial_cmp(&(r[b + 1].0 - r[b].1)).unwrap_or(std::cmp::Ordering::Equal))
+            .unwrap_or(0);
+        r[i].1 = r[i + 1].1;
+        r.remove(i + 1);
+    }
+    r
+}
+
+/// Sorted, merged, non-empty copy of `r`.
+pub fn merge_ranges(mut r: Vec<(f64, f64)>) -> Vec<(f64, f64)> {
+    r.retain(|&(lo, hi)| hi > lo);
+    r.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+    let mut out: Vec<(f64, f64)> = Vec::new();
+    for (lo, hi) in r {
+        match out.last_mut() {
+            Some(last) if lo <= last.1 => last.1 = last.1.max(hi),
+            _ => out.push((lo, hi)),
+        }
+    }
+    out
+}
+
+/// The zone actually rendered: `p.zone` with the Slide Iteration band and the
+/// "hide top N%" cutoff taken out (those hide escape times in every mode).
+pub fn effective_zone(p: &RaymarchDagParams) -> Option<ZoneParams> {
+    let mut z = p.zone?;
+    if let Some((lo, hi)) = p.slide_iter { z = z.without(lo, hi); }
+    if let Some(cut) = p.hide_above { z = z.without(cut, ZONE_INF); }
+    Some(z)
+}
+
+/// Ray/box intersection that also returns the outward normal of the face the
+/// ray enters through (`None` when the eye is inside the box).
+fn ray_box_entry(eye: Vec3, dir: Vec3, bmin: Vec3, bmax: Vec3) -> Option<(f64, f64, Option<Vec3>)> {
+    let (t0, t1) = ray_box(eye, dir, bmin, bmax)?;
+    if t0 <= 0.0 {
+        return Some((t0, t1, None));
+    }
+    let (e, d) = ([eye.0, eye.1, eye.2], [dir.0, dir.1, dir.2]);
+    let (lo, hi) = ([bmin.0, bmin.1, bmin.2], [bmax.0, bmax.1, bmax.2]);
+    let mut best = (f64::NEG_INFINITY, 0usize);
+    for axis in 0..3 {
+        if d[axis].abs() < 1e-300 { continue; }
+        let near = if d[axis] > 0.0 { lo[axis] } else { hi[axis] };
+        let ta = (near - e[axis]) / d[axis];
+        if ta > best.0 { best = (ta, axis); }
+    }
+    let mut n = [0.0; 3];
+    n[best.1] = if d[best.1] > 0.0 { -1.0 } else { 1.0 };
+    Some((t0, t1, Some((n[0], n[1], n[2]))))
+}
+
+/// Gradient of the escape time at `point`, turned to face the camera: the
+/// normal of a zone surface (a level set of the escape time). Falls back to
+/// the distance-estimate normal where the escape time is flat (inside the
+/// set), and to `-dir` when both are degenerate.
+fn zone_normal(p: &RaymarchDagParams, point: Vec3, dir: Vec3) -> Vec3 {
+    let eps = p.normal_eps.max(1e-6);
+    const K: [Vec3; 4] = [(1.0, -1.0, -1.0), (-1.0, -1.0, 1.0), (-1.0, 1.0, -1.0), (1.0, 1.0, 1.0)];
+    let cap = p.max_iter as f64;
+    let mut g = (0.0, 0.0, 0.0);
+    for k in K {
+        let e = (eval_collapsed(p, add(point, scale(k, eps))).0 as f64).min(cap);
+        g = add(g, scale(k, e));
+    }
+    let face = |n: Vec3| if dot(n, dir) > 0.0 { scale(n, -1.0) } else { n };
+    if dot(g, g).sqrt() > 1e-9 {
+        return face(normalize(g));
+    }
+    let n = estimate_normal(p, point);
+    if n.0.is_finite() && dot(n, n) > 0.5 { face(n) } else { scale(dir, -1.0) }
+}
+
+/// `march_zone_in` with `p`'s effective zone (tests; a frame computes the
+/// zone once and calls `march_zone_in`).
+#[cfg(test)]
+fn march_zone(p: &RaymarchDagParams, eye: Vec3, dir: Vec3) -> Option<(Vec3, Vec3, f32)> {
+    march_zone_in(p, &effective_zone(p)?, eye, dir)
+}
+
+/// The zone twin of `march_ray`: the first point along the ray whose escape
+/// time is in zone `z` (`effective_zone(p)`). Steps are bounded by
+/// `ZoneParams::step_bound`; once a step lands inside, the crossing is placed
+/// by bisection. A ray that is already inside where it enters the box (or the
+/// clip plane) shows the flat cut there, lit as that face.
+fn march_zone_in(p: &RaymarchDagParams, z: &ZoneParams, eye: Vec3, dir: Vec3) -> Option<(Vec3, Vec3, f32)> {
+    let z = *z;
+    if z.n == 0 {
+        return None;
+    }
+    let (t0, t1, mut entry_n) = match p.box_bounds {
+        Some((bmin, bmax)) => ray_box_entry(eye, dir, bmin, bmax)?,
+        None => {
+            let (a, b) = ray_sphere(eye, dir, p.domain_radius)?;
+            let n = if a > 0.0 { Some(normalize(add(eye, scale(dir, a)))) } else { None };
+            (a, b, n)
+        }
+    };
+    let (t0c, t1) = apply_clip_plane(t0, t1, eye, dir, p.clip_plane)?;
+    if t0c > t0 {
+        entry_n = p.clip_plane.map(|(_, n)| normalize(n));
+    }
+    let t0 = t0c;
+    let min_step = z.min_step.max(p.hit_epsilon).max(1e-9);
+    let mut t = t0;
+    let mut prev = t0;
+    for i in 0..p.max_march_steps.max(1) {
+        let point = add(eye, scale(dir, t));
+        let (et, de) = eval_collapsed(p, point);
+        if z.contains(et as f64) {
+            let (th, hit) = if i == 0 {
+                let n = entry_n.map_or(scale(dir, -1.0), |n| if dot(n, dir) > 0.0 { scale(n, -1.0) } else { n });
+                (t, (point, n, et))
+            } else {
+                let (mut a, mut b, mut eb) = (prev, t, et);
+                for _ in 0..ZONE_BISECT {
+                    let m = 0.5 * (a + b);
+                    let em = eval_collapsed(p, add(eye, scale(dir, m))).0;
+                    if z.contains(em as f64) { b = m; eb = em; } else { a = m; }
+                }
+                let hp = add(eye, scale(dir, b));
+                (b, (hp, zone_normal(p, hp, dir), eb))
+            };
+            if zone_solid_behind(p, &z, hit.0, hit.1) {
+                return Some(hit);
+            }
+            // A speck: march on past it.
+            prev = th + 0.5 * z.speckle_len;
+            t = prev;
+            if t >= t1 {
+                return None;
+            }
+            continue;
+        }
+        if t >= t1 {
+            return None;
+        }
+        prev = t;
+        // The last step lands exactly on the exit so a zone touching it is seen.
+        t = (t + (z.step_bound(et as f64, de, p.max_iter) * p.step_safety).max(min_step)).min(t1);
+    }
+    None
+}
+
+/// The speckle test for a zone hit at `hit` whose surface normal is `n`
+/// (`speck_test` on the render's escape-time field).
+fn zone_solid_behind(p: &RaymarchDagParams, z: &ZoneParams, hit: Vec3, n: Vec3) -> bool {
+    speck_test(z, hit, n, |q| eval_collapsed(p, q).0 as f64)
+}
+
+/// A chaotic escape field breaks a zone into specks, small in every
+/// direction; a shell may be thin, but it carries on along its own surface.
+/// So `ZONE_SPECKLE_SAMPLES` probes sit `speckle_len / 2` away from the hit in
+/// the plane of the zone surface (perpendicular to its normal `n`, the
+/// escape-time gradient) and each looks across the surface, `ZONE_SPECKLE_DEPTH`
+/// points over `±speckle_len / 2` along `n`. At least `ZONE_SPECKLE_NEED`
+/// probes must meet the zone. Probing along the surface instead of along the
+/// ray keeps a thin shell however obliquely it is seen.
+fn speck_test(z: &ZoneParams, hit: Vec3, n: Vec3, et: impl Fn(Vec3) -> f64) -> bool {
+    if z.speckle_len <= 0.0 {
+        return true;
+    }
+    let n = if n.0.is_finite() && dot(n, n) > 1e-12 { normalize(n) } else { (0.0, 0.0, 1.0) };
+    let helper = if n.0.abs() < 0.9 { (1.0, 0.0, 0.0) } else { (0.0, 1.0, 0.0) };
+    let u = normalize(cross(n, helper));
+    let v = cross(n, u);
+    let r = 0.5 * z.speckle_len;
+    let mut met = 0u32;
+    for k in 0..ZONE_SPECKLE_SAMPLES {
+        if met >= ZONE_SPECKLE_NEED || met + (ZONE_SPECKLE_SAMPLES - k) < ZONE_SPECKLE_NEED {
+            break;
+        }
+        let a = std::f64::consts::TAU * k as f64 / ZONE_SPECKLE_SAMPLES as f64;
+        let base = add(hit, add(scale(u, r * a.cos()), scale(v, r * a.sin())));
+        let mut e = [0.0f64; ZONE_SPECKLE_DEPTH as usize];
+        let mut inside = false;
+        for (j, ej) in e.iter_mut().enumerate() {
+            let s = r * (2.0 * j as f64 / (ZONE_SPECKLE_DEPTH - 1) as f64 - 1.0);
+            *ej = et(add(base, scale(n, s)));
+            if z.contains(*ej) { inside = true; break; }
+        }
+        if inside || probe_crosses(z, &e) {
+            met += 1;
+        }
+    }
+    met >= ZONE_SPECKLE_NEED
+}
+
+/// A shell thinner than the probe spacing lies between two probe points: the
+/// escape time then runs steadily (monotonically) from below a range to above
+/// it. Noise jumps up and down instead, so it does not count.
+fn probe_crosses(z: &ZoneParams, e: &[f64]) -> bool {
+    let up = e.windows(2).all(|w| w[1] >= w[0]);
+    let down = e.windows(2).all(|w| w[1] <= w[0]);
+    if !(up || down) {
+        return false;
+    }
+    let (first, last) = (e[0], e[e.len() - 1]);
+    let (lo, hi) = (first.min(last), first.max(last));
+    z.ranges().iter().any(|&(a, b)| lo < a && hi >= b)
+}
+
+fn cross(a: Vec3, b: Vec3) -> Vec3 {
+    (a.1 * b.2 - a.2 * b.1, a.2 * b.0 - a.0 * b.2, a.0 * b.1 - a.1 * b.0)
 }
 
 /// Same rayon-parallel-per-pixel shape as `quat_raymarch::render_raymarch_frame`.
@@ -654,6 +1061,10 @@ pub fn render_raymarch_dag_frame(p: &RaymarchDagParams, cam: &RaymarchCamera, wi
     let aspect = width as f64 / (height.max(1)) as f64;
     let half_w = half_h * aspect;
     let light = normalize(p.light_dir);
+    // The zone is the same for every ray: compute it once.
+    let zone = effective_zone(p);
+    // One pixel's width per unit of distance (the screen spans 2·half_h vertically).
+    let pixel = 2.0 * half_h / height.max(1) as f64;
     let wf = width.max(1) as f64;
     let hf = height.max(1) as f64;
     let aa = p.aa.max(1);
@@ -671,7 +1082,8 @@ pub fn render_raymarch_dag_frame(p: &RaymarchDagParams, cam: &RaymarchCamera, wi
                     let u = ((px as f64 + jx) / wf * 2.0 - 1.0) * half_w;
                     let v = (1.0 - (py as f64 + jy) / hf * 2.0) * half_h;
                     let dir = normalize(add(add(forward, scale(right, u)), scale(up, v)));
-                    if let Some((_, normal, color_et)) = march_ray(p, cam.eye, dir) {
+                    let hit = match &zone { Some(z) => march_zone_in(p, z, cam.eye, dir), None => march_ray_px(p, cam.eye, dir, pixel) };
+                    if let Some((_, normal, color_et)) = hit {
                         let ndotl = dot(normal, light).max(0.0);
                         sum_shade += (0.15 + 0.85 * ndotl) as f32;
                         sum_color += color_et;
@@ -688,6 +1100,138 @@ pub fn render_raymarch_dag_frame(p: &RaymarchDagParams, cam: &RaymarchCamera, wi
 mod tests {
     use super::*;
     use crate::formula::eval_program as eval_program_2d;
+
+    #[test]
+    fn zone_ranges_merge_and_subtract() {
+        let z = ZoneParams::from_ranges(&[(5.0, 6.0), (2.0, 3.0), (3.0, 4.0), (8.0, 8.0)], 0.1);
+        assert_eq!(z.ranges(), &[(2.0, 4.0), (5.0, 6.0)]);
+        assert!(z.contains(3.5) && !z.contains(4.0) && z.contains(5.0));
+        let w = z.without(3.0, 5.5);
+        assert_eq!(w.ranges(), &[(2.0, 3.0), (5.5, 6.0)]);
+        assert_eq!(z.without(0.0, ZONE_INF).n, 0);
+    }
+
+    /// An overstated distance estimate (simulated with a huge step safety) jumps
+    /// a plain march clean over the set; with `solid_interior` the capped step
+    /// lands inside it and the surface is placed where the set really starts.
+    #[test]
+    fn solid_interior_catches_a_march_that_steps_over_the_set() {
+        let prog = crate::formula_text::parse_program("z^2 + c").unwrap();
+        let mut p = RaymarchDagParams {
+            formula: QuatDagFormula { prog: &prog, warp: &[], julia: false, jc: (0.0, 0.0), phoenix: (0.0, 0.0) },
+            time_axis: TimeAxis::C, time_val: 0.0, domain_radius: 2.5,
+            box_bounds: Some(((-2.5, -2.5, -2.5), (2.5, 2.5, 2.5))), axis_assignment: None, clip_plane: None,
+            slide_iter: None, hide_above: None, zone: None, axis_remap: None, collapse: None, max_iter: 40, bailout: 4.0, max_march_steps: 400,
+            hit_epsilon: 2e-4, pixel_lod: 0.0, solid_interior: false, step_safety: 40.0, light_dir: (0.5, 0.8, 0.3), normal_eps: 2e-3, color_probe_offset: 0.02, aa: 1,
+        };
+        let (eye, dir) = ((-2.4, 0.0, 0.0), (1.0, 0.0, 0.0));
+        assert!(march_ray(&p, eye, dir).is_none(), "the overstated steps jump over the set");
+        p.solid_interior = true;
+        let (hit, normal, _) = march_ray(&p, eye, dir).expect("stops in the set");
+        assert!((hit.0 + 2.0).abs() < 0.03, "surface placed where the set starts (-2): {hit:?}");
+        assert!(normal.0 < -0.5, "lit from the camera's side: {normal:?}");
+    }
+
+    #[test]
+    fn more_ranges_than_the_gpu_holds_join_their_closest_neighbours() {
+        // Nine separate one-wide bands, the gap after band 4 the narrowest.
+        let mut r: Vec<(f64, f64)> = (0..9).map(|i| (3.0 * i as f64, 3.0 * i as f64 + 1.0)).collect();
+        r[5] = (14.5, 16.0);
+        r.push((40.0, ZONE_INF));
+        let z = ZoneParams::from_ranges(&r, 0.1);
+        assert_eq!(z.n, ZONE_MAX_RANGES);
+        for (lo, _) in &r {
+            assert!(z.contains(*lo), "picked range at {lo} lost");
+        }
+        assert!(z.contains(100.0), "the interior (deepest pick) is kept");
+        assert!(z.contains(14.0), "the narrowest gaps were filled");
+    }
+
+    /// The speck test on synthetic escape-time fields: a curved shell thinner
+    /// than the probe spacing stays wherever it is hit (the probes follow its
+    /// surface), an isolated speck and pure noise go.
+    #[test]
+    fn speck_test_keeps_thin_shells_at_any_angle_and_drops_specks() {
+        let mut z = ZoneParams::from_ranges(&[(5.0, 6.0)], 0.1);
+        z.speckle_len = 0.1;
+        // A curved shell: band [5,6) is a sphere 0.005 thick (5 % of the speckle
+        // size) of radius 0.2, so 0.05 sideways along the tangent plane the
+        // surface has already curved 0.006 away and the probes only get across
+        // it between two points. Hits all round the sphere, so every surface
+        // tilt relative to the axes is covered.
+        let c = (0.3, -0.1, 0.2);
+        let field = |q: Vec3| { let d = sub(q, c); 5.5 + (dot(d, d).sqrt() - 0.2) / 0.005 };
+        for i in 0..24 {
+            let (a, b) = (i as f64 * 0.9, (i as f64 * 0.37).sin() * 1.4);
+            let n = (a.cos() * b.cos(), a.sin() * b.cos(), b.sin());
+            let hit = add(c, scale(n, 0.2 - 0.0024)); // just inside the band, as bisection places it
+            assert!(field(hit) >= 5.0 && field(hit) < 6.0);
+            assert!(speck_test(&z, hit, n, field), "thin curved shell dropped at normal {n:?}");
+            assert!(speck_test(&z, hit, scale(n, -1.0), field), "the facing direction of the normal must not matter");
+        }
+        // An isolated speck: in the band only within 0.002 of the hit.
+        let speck = |q: Vec3| if dot(q, q).sqrt() < 0.002 { 5.5 } else { 2.0 };
+        assert!(!speck_test(&z, (0.0, 0.0, 0.0), (0.0, 0.0, 1.0), speck));
+        // Pure noise (a hashed escape time per point): almost always dropped.
+        let noise = |q: Vec3| {
+            let mut h = (q.0.to_bits() ^ q.1.to_bits().rotate_left(21) ^ q.2.to_bits().rotate_left(42)).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+            h ^= h >> 29;
+            (h % 2000) as f64 / 100.0
+        };
+        let kept = (0..200).filter(|i| speck_test(&z, (*i as f64 * 0.37, 0.1, -0.2), (0.3, 0.5, 0.8), noise)).count();
+        assert!(kept <= 4, "noise kept {kept} of 200 times");
+    }
+
+    #[test]
+    fn zone_step_never_exceeds_the_cap_and_shrinks_near_a_range_end() {
+        let z = ZoneParams::from_ranges(&[(10.0, 11.0)], 0.05);
+        assert_eq!(z.step_bound(40.0, 1.0, 40), 0.05, "no estimate inside the set");
+        assert_eq!(z.step_bound(3.0, 0.0, 40), 0.05, "no estimate without a DE");
+        let far = z.step_bound(3.0, 0.01, 40);
+        let near = z.step_bound(9.9, 0.01, 40);
+        assert!(far <= 0.01 && near < far * 0.2, "far {far} near {near}");
+    }
+
+    /// The zone march on z^2+c finds the escape-time shell where it should:
+    /// along the real axis from the left, band [3,inf) starts where the
+    /// escape time first reaches 3.
+    #[test]
+    fn zone_march_hits_the_shell_of_the_picked_band() {
+        let prog = crate::formula_text::parse_program("z^2 + c").unwrap();
+        let p = RaymarchDagParams {
+            formula: QuatDagFormula { prog: &prog, warp: &[], julia: false, jc: (0.0, 0.0), phoenix: (0.0, 0.0) },
+            time_axis: TimeAxis::C, time_val: 0.0, domain_radius: 2.0,
+            box_bounds: Some(((-2.5, -2.5, -2.5), (2.5, 2.5, 2.5))), axis_assignment: None, clip_plane: None,
+            slide_iter: None, hide_above: None, zone: Some(ZoneParams::from_ranges(&[(3.0, ZONE_INF)], 4.0 * 1.732 / 256.0)),
+            axis_remap: None, collapse: None, max_iter: 40, bailout: 4.0, max_march_steps: 640,
+            hit_epsilon: 2e-4, pixel_lod: 0.0, solid_interior: false, step_safety: 0.8, light_dir: (0.5, 0.8, 0.3), normal_eps: 2e-3, color_probe_offset: 0.02, aa: 1,
+        };
+        let (point, normal, et) = march_zone(&p, (-3.0, 0.0, 0.0), (1.0, 0.0, 0.0)).expect("hits");
+        assert!(et >= 3.0 && et < 3.2, "et {et}");
+        let before = eval_collapsed(&p, (point.0 - 0.01, 0.0, 0.0)).0;
+        assert!(before < 3.0, "just before the hit the escape time {before} is still outside the band");
+        assert!(normal.0 < -0.9, "normal faces the ray: {normal:?}");
+        // Picking only the interior gives the set itself, which on this line starts at -2.
+        let mut q = p;
+        q.zone = Some(ZoneParams::from_ranges(&[(40.0, ZONE_INF)], 4.0 * 1.732 / 256.0));
+        let (pt, _, _) = march_zone(&q, (-3.0, 0.0, 0.0), (1.0, 0.0, 0.0)).expect("hits the set");
+        assert!((pt.0 + 2.0).abs() < 0.02, "{pt:?}");
+        // Speckle filter: the solid [3,inf) region and the thin [3,4) shell both
+        // carry on sideways, so their hits stay; an isolated speck does not.
+        let mut s = p;
+        let mut zs = s.zone.unwrap();
+        zs.speckle_len = 0.3;
+        s.zone = Some(zs);
+        let (ps, _, _) = march_zone(&s, (-3.0, 0.0, 0.0), (1.0, 0.0, 0.0)).expect("still hits");
+        assert!((ps.0 - point.0).abs() < 1e-6, "{ps:?} vs {point:?}");
+        let mut thin = s;
+        let mut zt = ZoneParams::from_ranges(&[(3.0, 4.0)], 4.0 * 1.732 / 256.0);
+        zt.speckle_len = 0.3;
+        thin.zone = Some(zt);
+        let first_thin = march_zone(&ZoneParams::from_ranges(&[(3.0, 4.0)], 4.0 * 1.732 / 256.0).apply(&p), (-3.0, 0.0, 0.0), (1.0, 0.0, 0.0)).unwrap().0;
+        let filtered = march_zone(&thin, (-3.0, 0.0, 0.0), (1.0, 0.0, 0.0)).expect("the shell stays").0;
+        assert!((filtered.0 - first_thin.0).abs() < 1e-6, "{filtered:?} vs {first_thin:?}");
+    }
 
     #[test]
     fn kbc_breaks_the_b_c_interchange_symmetry() {
@@ -1005,11 +1549,11 @@ mod tests {
             axis_assignment: None,
             clip_plane: None,
             slide_iter: None,
-            hide_above: None, axis_remap: None, collapse: None,
+            hide_above: None, zone: None, axis_remap: None, collapse: None,
             max_iter: 60,
             bailout: 4.0,
             max_march_steps: 200,
-            hit_epsilon: 1.6 * 1e-4,
+            hit_epsilon: 1.6 * 1e-4, pixel_lod: 0.0, solid_interior: false,
             step_safety: 0.8,
             light_dir: (0.5, 0.8, 0.3),
             normal_eps: 1.6 * 1e-3,

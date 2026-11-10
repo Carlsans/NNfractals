@@ -249,6 +249,14 @@ pub fn build_frame_params<'a>(
         }
     });
     let slide_iter = evaluate_slide_iteration(&timeline.effects_lanes, t);
+    // Picked zones are escape counts classified on the Planes tiles with their
+    // own iteration count; the render uses that count so it shows exactly the
+    // highlighted region (viewer and video alike).
+    let max_iter = if timeline.zone.active() { timeline.zone.render_iter(quality.max_iter) } else { quality.max_iter };
+    // The scale the tolerances follow: the box, or the camera's distance once it
+    // flies closer than that, so a close look stays sharp (box-sized tolerances
+    // made surfaces puffy and shading smeared up close).
+    let view = domain_radius.min(timeline.camera_distance.max(domain_radius * 1e-3));
     let params = RaymarchDagParams {
         formula,
         time_axis: TimeAxis::C,
@@ -264,18 +272,56 @@ pub fn build_frame_params<'a>(
         // `percentile_escape_time_cutoff` below. This function only ever
         // builds params from timeline state, never renders, so it has no
         // distribution to resolve a cutoff from yet.
-        hide_above: None, axis_remap, collapse: Some(timeline.collapse),
-        max_iter: quality.max_iter,
+        hide_above: None,
+        zone: zone_params(timeline, box_min, box_max, max_iter),
+        axis_remap, collapse: Some(timeline.collapse),
+        max_iter,
         bailout: bailout_radius,
-        max_march_steps: 200,
-        hit_epsilon: domain_radius * 1e-4,
+        // Zone march: its own budget. Otherwise distance-estimate steps plus
+        // enough capped steps to cross the whole box (`solid_interior`): with the
+        // camera inside a big box, 340 left 13% of rays unfinished, 600 under 0.5%.
+        max_march_steps: if timeline.zone.active() { zone_march_steps(ZONE_STEP_DIVISIONS, crate::quat_dag::ZONE_MIN_STEP_FRAC) } else { DE_MARCH_STEPS },
+        hit_epsilon: view * 1e-4,
+        // Half a pixel: far away, sub-pixel strands render solid instead of as
+        // scattered dots (and rays stop sooner).
+        pixel_lod: 0.5,
+        // The set is opaque: a ray that steps inside it stops there instead of
+        // marching on through (the shape then holds together under rotation).
+        solid_interior: true,
         step_safety: 0.8,
         light_dir: (0.5, 0.8, 0.3),
-        normal_eps: domain_radius * 1e-3,
-        color_probe_offset: domain_radius * 1e-2,
+        normal_eps: view * 1e-3,
+        color_probe_offset: view * 1e-2,
         aa: quality.aa,
     };
     (params, cam)
+}
+
+/// Step budget of the distance-estimate march in the viewer and video.
+pub const DE_MARCH_STEPS: u32 = 600;
+
+/// A zone march never steps more than the box diagonal over this.
+pub const ZONE_STEP_DIVISIONS: f64 = 256.0;
+/// March step budget with a zone filter: a ray taking only the shortest
+/// steps still crosses the whole box (an exhausted budget, not a skipped
+/// zone, was what lost most pixels against a brute-force march).
+pub fn zone_march_steps(divisions: f64, min_step_frac: f64) -> u32 {
+    (1.1 * divisions / min_step_frac).ceil() as u32 + 32
+}
+
+/// The timeline's zone filter as render params (`None` when it is off or
+/// keeps nothing at this iteration count).
+fn zone_params(timeline: &AnimationTimeline, box_min: (f64, f64, f64), box_max: (f64, f64, f64), max_iter: u32) -> Option<crate::quat_dag::ZoneParams> {
+    if !timeline.zone.active() {
+        return None;
+    }
+    let d = (box_max.0 - box_min.0, box_max.1 - box_min.1, box_max.2 - box_min.2);
+    let diag = (d.0 * d.0 + d.1 * d.1 + d.2 * d.2).sqrt().max(1e-9);
+    // An empty zone still renders (as nothing): the user picked bands that
+    // this iteration count cannot reach, and should see that.
+    let mut z = crate::quat_dag::ZoneParams::from_ranges(&timeline.zone.ranges(max_iter), diag / ZONE_STEP_DIVISIONS);
+    z.speckle_len = diag * timeline.zone.speckle_pct.max(0.0) / 100.0;
+    Some(z)
 }
 
 /// The raw escape-time value at the boundary of the top `fraction` of
@@ -325,6 +371,30 @@ mod tests {
 
     fn formula() -> QuatDagFormula<'static> {
         QuatDagFormula { prog: &MANDEL_PROG, warp: &[], julia: false, jc: (0.0, 0.0), phoenix: (0.0, 0.0) }
+    }
+
+    #[test]
+    fn tolerances_follow_the_camera_once_it_is_inside_the_box() {
+        let mut tl = AnimationTimeline::new(0);
+        let (far, _) = build_frame_params(&tl, formula(), 0.0, 4.0, RenderQuality { max_iter: 40, aa: 1 });
+        assert_eq!(far.hit_epsilon, far.domain_radius * 1e-4, "outside the box: box-sized as before");
+        assert!(far.pixel_lod > 0.0);
+        tl.camera_distance = far.domain_radius * 0.01;
+        let (near, _) = build_frame_params(&tl, formula(), 0.0, 4.0, RenderQuality { max_iter: 40, aa: 1 });
+        assert!((near.hit_epsilon - far.hit_epsilon * 0.01).abs() < 1e-12 && (near.normal_eps - far.normal_eps * 0.01).abs() < 1e-12);
+    }
+
+    #[test]
+    fn a_zone_renders_with_the_iteration_count_its_picks_were_made_with() {
+        let mut tl = AnimationTimeline::new(0);
+        tl.zone.toggle(crate::anim_timeline::ZONE_INTERIOR);
+        tl.zone.max_iter = 60;
+        let (params, _) = build_frame_params(&tl, formula(), 0.0, 4.0, RenderQuality { max_iter: 40, aa: 1 });
+        assert_eq!(params.max_iter, 60);
+        assert_eq!(params.zone.unwrap().ranges(), &[(60.0, crate::quat_dag::ZONE_INF)], "interior = never escaping within the picks' 60");
+        tl.zone.disabled = true;
+        let (params, _) = build_frame_params(&tl, formula(), 0.0, 4.0, RenderQuality { max_iter: 40, aa: 1 });
+        assert_eq!(params.max_iter, 40, "filter off: the render's own count");
     }
 
     #[test]
@@ -612,5 +682,333 @@ mod tests {
         let color_t: Vec<f32> = (0..10).map(|i| i as f32).collect();
         assert_eq!(percentile_escape_time_cutoff(&shading, &color_t, 60, 0.0), None);
         assert_eq!(percentile_escape_time_cutoff(&shading, &color_t, 60, -0.5), None);
+    }
+}
+
+#[cfg(test)]
+mod zone_visual {
+    use super::*;
+    use crate::anim_timeline::{ZoneFilter, ZONE_INTERIOR};
+    use crate::quat_dag::render_raymarch_dag_frame;
+
+    fn to_rgb(shading: &[f32], color: &[f32], max_iter: u32) -> Vec<u8> {
+        let rgb = crate::colormap::apply_colormap_equalized(color, max_iter, "lava");
+        let mut out = vec![0u8; shading.len() * 3];
+        for i in 0..shading.len() {
+            let v = shading[i];
+            for c in 0..3 {
+                out[i * 3 + c] = if v <= 0.0 { [8, 5, 15][c] } else { (rgb[i * 3 + c] as f32 * v).clamp(0.0, 255.0) as u8 };
+            }
+        }
+        out
+    }
+
+    /// Volume share of each escape band inside the default box at the timeline's T.
+    fn band_volumes(f: &QuatDagFormula, tl: &AnimationTimeline, bailout: f64, max_iter: u32) -> Vec<(u32, f64)> {
+        let n = 40;
+        let mut h: std::collections::BTreeMap<u32, usize> = Default::default();
+        for i in 0..n { for j in 0..n { for k in 0..n {
+            let g = |m: usize| -1.6 + 3.2 * (m as f64 + 0.5) / n as f64;
+            let q = tl.axis_assignment.assemble(g(i), g(j), g(k), tl.t_value);
+            let et = crate::quat_dag::quat_dag_escape_de(f, q, max_iter, bailout * bailout).0 as f64;
+            *h.entry(ZoneFilter::band_of(et, max_iter)).or_default() += 1;
+        }}}
+        h.into_iter().map(|(b, c)| (b, c as f64 / (n * n * n) as f64)).collect()
+    }
+
+    /// `ZONE_GENOMES=a.nn,b.nn ZONE_OUT=<dir> cargo test --release --lib zone_visual -- --ignored --nocapture`
+    /// For each genome: the normal render, zone renders (fast march) and the
+    /// same zones by a brute-force fine-step march, with the share of pixels
+    /// that differ. `mandel` in the list = classic z^2+c.
+    #[test]
+    #[ignore]
+    fn zone_renders_match_brute_force() {
+        let (Ok(list), Ok(out)) = (std::env::var("ZONE_GENOMES"), std::env::var("ZONE_OUT")) else { return };
+        let size: u32 = std::env::var("ZONE_SIZE").ok().and_then(|s| s.parse().ok()).unwrap_or(192);
+        let max_iter = 40;
+        std::fs::create_dir_all(&out).unwrap();
+        for path in list.split(',') {
+            let (g, label) = if path == "mandel" {
+                let mut g = crate::genome::Genome::default();
+                g.program = crate::formula_text::parse_program("z^2 + c").unwrap();
+                g.bailout_radius = 4.0;
+                (g, "mandel".to_string())
+            } else {
+                (crate::io::load_genome(std::path::Path::new(path)).unwrap(),
+                 std::path::Path::new(path).file_stem().unwrap().to_string_lossy().chars().take(16).collect())
+            };
+            let f = QuatDagFormula { prog: &g.program, warp: &g.warp, julia: g.julia_mode, jc: (g.julia_cre, g.julia_cim), phoenix: (g.phoenix_re, g.phoenix_im) };
+            let mut tl = AnimationTimeline::new(0);
+            tl.camera_distance = 5.5;
+            let bail = g.bailout_radius as f64;
+            let vols = band_volumes(&f, &tl, bail, max_iter);
+            println!("== {label}: band volumes {:?}", vols.iter().map(|(b, v)| format!("{}:{:.3}", ZoneFilter::band_label(*b), v)).collect::<Vec<_>>());
+            // A middle band by volume (escaped points only), and the deepest escaped band with some volume.
+            let esc: Vec<_> = vols.iter().filter(|(b, v)| *b != ZONE_INTERIOR && *b > 0 && *v > 0.002).cloned().collect();
+            if esc.is_empty() { println!("   no escaped bands"); continue; }
+            let mid = esc[esc.len() / 2].0;
+            let deep = esc[esc.len() - 1].0;
+            let cases: Vec<(String, ZoneFilter)> = vec![
+                ("off".into(), ZoneFilter::default()),
+                (format!("band{mid}"), ZoneFilter { bands: vec![mid], ..Default::default() }),
+                (format!("band{mid}+inside"), ZoneFilter { bands: vec![mid], include_inside: true, ..Default::default() }),
+                (format!("band{deep}_interior"), ZoneFilter { bands: vec![deep, ZONE_INTERIOR], ..Default::default() }),
+            ];
+            let trust: f64 = std::env::var("ZONE_TRUST").ok().and_then(|s| s.parse().ok()).unwrap_or(crate::quat_dag::ZONE_DE_TRUST);
+            let div: f64 = std::env::var("ZONE_DIV").ok().and_then(|s| s.parse().ok()).unwrap_or(ZONE_STEP_DIVISIONS);
+            for (name, zf) in cases {
+                tl.zone = zf.clone();
+                tl.zone.speckle_pct = std::env::var("ZONE_SPECKLE").ok().and_then(|s| s.parse().ok()).unwrap_or(0.0);
+                let (mut params, cam) = build_frame_params(&tl, f, 0.0, bail, RenderQuality { max_iter, aa: 1 });
+                let minfrac: f64 = std::env::var("ZONE_MINFRAC").ok().and_then(|s| s.parse().ok()).unwrap_or(crate::quat_dag::ZONE_MIN_STEP_FRAC);
+                if let Some(z) = params.zone.as_mut() {
+                    z.de_trust = trust;
+                    z.max_step *= ZONE_STEP_DIVISIONS / div;
+                    z.min_step = z.max_step * minfrac;
+                    params.max_march_steps = zone_march_steps(div, minfrac);
+                }
+                let t = std::time::Instant::now();
+                let (s, c) = render_raymarch_dag_frame(&params, &cam, size, size);
+                let fast_ms = t.elapsed().as_millis();
+                let sp = std::env::var("ZONE_SPECKLE").unwrap_or_default();
+                image::save_buffer(format!("{out}/{label}_{name}_s{sp}.png"), &to_rgb(&s, &c, max_iter), size, size, image::ColorType::Rgb8).unwrap();
+                if !tl.zone.active() { println!("   {name:<22} {fast_ms:>6} ms"); continue; }
+                // Speckle measure: hit pixels with at most 2 hit neighbours of 8.
+                let n = size as usize;
+                let lone = (0..n * n).filter(|&i| {
+                    let (x, y) = (i % n, i / n);
+                    if s[i] <= 0.0 || x == 0 || y == 0 || x == n - 1 || y == n - 1 { return false; }
+                    let nb = [(-1i32, -1i32), (0, -1), (1, -1), (-1, 0), (1, 0), (-1, 1), (0, 1), (1, 1)].iter()
+                        .filter(|(dx, dy)| s[((y as i32 + dy) as usize) * n + (x as i32 + dx) as usize] > 0.0).count();
+                    nb <= 2
+                }).count();
+                println!("   {name:<22} speckle {:.3}: {fast_ms} ms, hits {:.3}, lone pixels {:.2}% of hits", tl.zone.speckle_pct,
+                    s.iter().filter(|v| **v > 0.0).count() as f64 / s.len() as f64,
+                    100.0 * lone as f64 / s.iter().filter(|v| **v > 0.0).count().max(1) as f64);
+                if std::env::var("ZONE_NOREF").is_ok() { continue; }
+                let mut pr = params;
+                let mut z = pr.zone.unwrap();
+                z.max_step = z.max_step * div / ZONE_STEP_DIVISIONS / 24.0; // brute force: tiny fixed steps
+                z.de_trust = 0.0;
+                z.min_step = z.max_step;
+                pr.zone = Some(z);
+                pr.max_march_steps = 40_000;
+                let t = std::time::Instant::now();
+                let (s2, c2) = render_raymarch_dag_frame(&pr, &cam, size, size);
+                let ref_ms = t.elapsed().as_millis();
+                image::save_buffer(format!("{out}/{label}_{name}_ref.png"), &to_rgb(&s2, &c2, max_iter), size, size, image::ColorType::Rgb8).unwrap();
+                let hits = s.iter().filter(|v| **v > 0.0).count();
+                let hits_ref = s2.iter().filter(|v| **v > 0.0).count();
+                let mism = s.iter().zip(&s2).filter(|(a, b)| (**a > 0.0) != (**b > 0.0)).count();
+                let band_mism = s.iter().zip(&s2).zip(c.iter().zip(&c2))
+                    .filter(|((a, b), (x, y))| **a > 0.0 && **b > 0.0 && (x.floor() - y.floor()).abs() >= 1.0).count();
+                println!("   {name:<22} {fast_ms:>6} ms (ref {ref_ms} ms)  hits {:.3} (ref {:.3})  coverage mismatch {:.2}%  band mismatch {:.2}%",
+                    hits as f64 / s.len() as f64, hits_ref as f64 / s.len() as f64,
+                    100.0 * mism as f64 / s.len() as f64, 100.0 * band_mism as f64 / s.len() as f64);
+            }
+        }
+    }
+}
+
+/// Diagnostics on a saved viewer scene (ignored; run by hand).
+#[cfg(test)]
+mod scene_diag {
+    use super::*;
+
+    /// The genome a saved scene belongs to (found by content hash under `dirs`).
+    fn scene_genome(tl: &AnimationTimeline, dirs: &str) -> (std::path::PathBuf, crate::genome::Genome) {
+        let mut stack: Vec<std::path::PathBuf> = dirs.split(',').map(std::path::PathBuf::from).collect();
+        while let Some(d) = stack.pop() {
+            for e in std::fs::read_dir(&d).into_iter().flatten().flatten() {
+                let p = e.path();
+                if p.is_dir() { stack.push(p); continue; }
+                if p.extension().and_then(|x| x.to_str()) != Some("nn") { continue; }
+                if let Ok(g) = crate::io::load_genome(&p) {
+                    if g.content_hash() == tl.genome_content_hash { return (p, g); }
+                }
+            }
+        }
+        panic!("no genome with this content hash under {dirs}");
+    }
+
+    /// Prints, for one pixel the normal render misses but the set covers, the
+    /// march's steps and the true escape times along that ray.
+    #[test]
+    #[ignore]
+    fn trace_a_missed_ray() {
+        let tl: AnimationTimeline = serde_json::from_str(&std::fs::read_to_string(std::env::var("SCENE").unwrap()).unwrap()).unwrap();
+        let (_, g) = scene_genome(&tl, &std::env::var("SCENE_DIRS").unwrap_or_else(|_| "campaigns".into()));
+        let f = QuatDagFormula { prog: &g.program, warp: &g.warp, julia: g.julia_mode, jc: (g.julia_cre, g.julia_cim), phoenix: (g.phoenix_re, g.phoenix_im) };
+        let iter: u32 = std::env::var("SCENE_ITER").ok().and_then(|s| s.parse().ok()).unwrap_or(57);
+        let mut t = tl.clone();
+        t.zone = Default::default();
+        t.camera_yaw += std::f64::consts::PI;
+        let (p, cam) = build_frame_params(&t, f, 0.0, g.bailout_radius as f64, RenderQuality { max_iter: iter, aa: 1 });
+        let bail = g.bailout_radius as f64;
+        let size = 100u32;
+        let (shade, _) = crate::quat_dag::render_raymarch_dag_frame(&p, &cam, size, size);
+        let forward = crate::quat_motion::normalize(crate::quat_motion::sub(cam.target, cam.eye));
+        let (right, up) = crate::quat_motion::look_at_basis(forward, cam.up_hint);
+        let half_h = (cam.fov_y * 0.5).tan();
+        let mut shown = 0;
+        for py in (0..size).step_by(7) { for px in (0..size).step_by(7) {
+            if shade[(py * size + px) as usize] > 0.0 || shown >= 2 { continue; }
+            let u = ((px as f64 + 0.5) / size as f64 * 2.0 - 1.0) * half_h;
+            let v = (1.0 - (py as f64 + 0.5) / size as f64 * 2.0) * half_h;
+            let dir = crate::quat_motion::normalize(crate::quat_motion::add(crate::quat_motion::add(forward, crate::quat_motion::scale(right, u)), crate::quat_motion::scale(up, v)));
+            let (bmin, bmax) = p.box_bounds.unwrap();
+            let Some((t0, t1)) = crate::quat_raymarch::ray_box(cam.eye, dir, bmin, bmax) else { continue };
+            // Is the set on this ray at all? Fine fixed sampling.
+            let n = 4000;
+            let first_in = (0..n).map(|i| t0 + (t1 - t0) * i as f64 / n as f64).find(|&s| {
+                let q = p.axis_assignment.unwrap().assemble(cam.eye.0 + dir.0 * s, cam.eye.1 + dir.1 * s, cam.eye.2 + dir.2 * s, p.time_val);
+                crate::quat_dag::quat_dag_escape_de(&f, q, iter, bail * bail).0 >= iter as f32
+            });
+            let Some(tin) = first_in else { continue };
+            shown += 1;
+            println!("pixel ({px},{py}): box t {t0:.2}..{t1:.2}, the set starts at t={tin:.3}");
+            let mut s = t0;
+            for k in 0..60 {
+                let q = p.axis_assignment.unwrap().assemble(cam.eye.0 + dir.0 * s, cam.eye.1 + dir.1 * s, cam.eye.2 + dir.2 * s, p.time_val);
+                let (et, de) = crate::quat_dag::quat_dag_escape_de(&f, q, iter, bail * bail);
+                if k < 25 || s > tin - 3.0 { println!("  step {k:>2}: t={s:>8.3} et={et:>7.2} de={de:>10.4}{}", if s > tin { "   <- past the set's start" } else { "" }); }
+                s += (de * p.step_safety).max(p.domain_radius * 1e-6);
+                if s > t1 { println!("  exits the box at t={s:.2}"); break; }
+            }
+        }}
+    }
+
+    /// `SCENE=… SCENE_DIRS=… cargo test --release --lib scene_diag::rotate -- --ignored --nocapture`:
+    /// orbits the saved camera through 8 yaw angles and compares, per angle, the
+    /// normal (distance-estimate) render with a reference that does not trust the
+    /// distance estimate (the zone march on the set itself: fixed bounded steps,
+    /// hit = first point that never escapes). Prints the hit masks' overlap.
+    #[test]
+    #[ignore]
+    fn rotate_a_saved_scene_against_a_reference() {
+        let tl: AnimationTimeline = serde_json::from_str(&std::fs::read_to_string(std::env::var("SCENE").unwrap()).unwrap()).unwrap();
+        let (path, g) = scene_genome(&tl, &std::env::var("SCENE_DIRS").unwrap_or_else(|_| "campaigns".into()));
+        println!("genome {}", path.display());
+        let f = QuatDagFormula { prog: &g.program, warp: &g.warp, julia: g.julia_mode, jc: (g.julia_cre, g.julia_cim), phoenix: (g.phoenix_re, g.phoenix_im) };
+        let size: u32 = std::env::var("SCENE_SIZE").ok().and_then(|s| s.parse().ok()).unwrap_or(160);
+        let iter: u32 = std::env::var("SCENE_ITER").ok().and_then(|s| s.parse().ok()).unwrap_or(57);
+        let out = std::env::var("SCENE_OUT").ok();
+        for k in 0..8 {
+            let mut t = tl.clone();
+            t.zone = Default::default();
+            t.camera_yaw = tl.camera_yaw + k as f64 * std::f64::consts::TAU / 8.0;
+            let (p, cam) = build_frame_params(&t, f, 0.0, g.bailout_radius as f64, RenderQuality { max_iter: iter, aa: 1 });
+            let (de_shade, de_col) = crate::quat_dag::render_raymarch_dag_frame(&p, &cam, size, size);
+            let mut r = p;
+            let d = (r.box_bounds.unwrap().1 .0 - r.box_bounds.unwrap().0 .0).abs() * 1.732;
+            r.zone = Some(crate::quat_dag::ZoneParams::from_ranges(&[(iter as f64, crate::quat_dag::ZONE_INF)], d / 1024.0));
+            r.max_march_steps = 20000;
+            let (ref_shade, ref_col) = crate::quat_dag::render_raymarch_dag_frame(&r, &cam, size, size);
+            let (mut both, mut de_only, mut ref_only) = (0usize, 0usize, 0usize);
+            for i in 0..de_shade.len() {
+                match (de_shade[i] > 0.0, ref_shade[i] > 0.0) { (true, true) => both += 1, (true, false) => de_only += 1, (false, true) => ref_only += 1, _ => {} }
+            }
+            let iou = both as f64 / (both + de_only + ref_only).max(1) as f64;
+            println!("yaw +{:>3}°: overlap {:>5.1}%  normal-only {:>5} px  reference-only {:>5} px  (of {} hit)", k * 45, 100.0 * iou, de_only, ref_only, both + de_only + ref_only);
+            if let Some(dir) = &out {
+                std::fs::create_dir_all(dir).ok();
+                for (name, sh, co) in [("de", &de_shade, &de_col), ("ref", &ref_shade, &ref_col)] {
+                    let rgb = crate::colormap::apply_colormap_equalized(co, iter, "lava");
+                    let img: Vec<u8> = (0..sh.len() * 3).map(|j| { let i = j / 3; if sh[i] <= 0.0 { 20 } else { (rgb[j] as f32 * sh[i]) as u8 } }).collect();
+                    image::save_buffer(format!("{dir}/{name}_{k}.png"), &img, size, size, image::ColorType::Rgb8).unwrap();
+                }
+            }
+        }
+    }
+
+    /// `SCENE=anim_settings/<hash>.json SCENE_DIRS=dir1,dir2 [SCENE_SIZE=160] [SCENE_ITER=57]
+    /// cargo test --release --lib scene_diag -- --ignored --nocapture`: finds the genome
+    /// whose content hash names the scene, then renders it (CPU) at a range of camera
+    /// distances and prints the share of pixels that hit something.
+    #[test]
+    #[ignore]
+    fn render_a_saved_scene_at_several_distances() {
+        let scene = std::env::var("SCENE").expect("SCENE=anim_settings/<hash>.json");
+        let tl: AnimationTimeline = serde_json::from_str(&std::fs::read_to_string(&scene).unwrap()).unwrap();
+        let dirs = std::env::var("SCENE_DIRS").unwrap_or_else(|_| "campaigns".into());
+        let mut found = None;
+        let mut stack: Vec<std::path::PathBuf> = dirs.split(',').map(std::path::PathBuf::from).collect();
+        while let Some(d) = stack.pop() {
+            for e in std::fs::read_dir(&d).into_iter().flatten().flatten() {
+                let p = e.path();
+                if p.is_dir() { stack.push(p); continue; }
+                if p.extension().and_then(|x| x.to_str()) != Some("nn") { continue; }
+                if let Ok(g) = crate::io::load_genome(&p) {
+                    if g.content_hash() == tl.genome_content_hash { found = Some((p, g)); break; }
+                }
+            }
+            if found.is_some() { break; }
+        }
+        let (path, g) = found.expect("no genome with this content hash under SCENE_DIRS");
+        println!("genome {}", path.display());
+        let f = QuatDagFormula { prog: &g.program, warp: &g.warp, julia: g.julia_mode, jc: (g.julia_cre, g.julia_cim), phoenix: (g.phoenix_re, g.phoenix_im) };
+        let size: u32 = std::env::var("SCENE_SIZE").ok().and_then(|s| s.parse().ok()).unwrap_or(160);
+        let iter: u32 = std::env::var("SCENE_ITER").ok().and_then(|s| s.parse().ok()).unwrap_or(57);
+        let mut tl = tl;
+        // SCENE_ZONE=1+ : keep band 1 and everything inside (drop the outermost band 0).
+        if let Ok(z) = std::env::var("SCENE_ZONE") {
+            tl.zone.bands = z.trim_end_matches('+').split(',').filter_map(|b| b.parse().ok()).collect();
+            tl.zone.include_inside = z.ends_with('+');
+            tl.zone.disabled = false;
+        }
+        let out = std::env::var("SCENE_OUT").ok();
+        let s = characteristic_scale(&tl.bounds);
+        println!("box half-size {s:.2}, saved camera distance {:.2}, zone {:?}", tl.camera_distance, tl.zone);
+        for k in [0.1, 0.3, 0.6, 1.0625, 1.5, 3.0, 6.0, 12.0, 25.0] {
+            let mut t = tl.clone();
+            t.camera_distance = k * s;
+            let (p, cam) = build_frame_params(&t, f, 0.0, g.bailout_radius as f64, RenderQuality { max_iter: iter, aa: 1 });
+            let mut line = format!("distance {:>8.2} ({k:>6} × half-size):", k * s);
+            let mut p = p;
+            if let Some(n) = std::env::var("SCENE_STEPS").ok().and_then(|v| v.parse().ok()) { p.max_march_steps = n; }
+            for steps in [p.max_march_steps, p.max_march_steps * 10] {
+                let mut q = p;
+                q.max_march_steps = steps;
+                if let Some(l) = std::env::var("SCENE_LOD").ok().and_then(|v| v.parse::<f64>().ok()) { q.pixel_lod = l; }
+                // SCENE_FINE=8: zone steps that many times finer (budget scaled to match).
+                if let (Some(z), Some(f)) = (q.zone.as_mut(), std::env::var("SCENE_FINE").ok().and_then(|v| v.parse::<f64>().ok())) {
+                    z.max_step /= f;
+                    z.min_step /= f;
+                    q.max_march_steps = (steps as f64 * f) as u32;
+                }
+                let started = std::time::Instant::now();
+                let (shade, _) = crate::quat_dag::render_raymarch_dag_frame(&q, &cam, size, size);
+                let hits = shade.iter().filter(|v| **v > 0.0).count() as f64 / shade.len() as f64;
+                line.push_str(&format!("  {steps} steps: hits {:>5.1}% ({:.1}s)", 100.0 * hits, started.elapsed().as_secs_f64()));
+                #[cfg(feature = "wgpu-backend")]
+                if steps == p.max_march_steps && std::env::var("SCENE_GPU").is_ok() {
+                    if let Some(mut pipe) = crate::render_gpu_raymarch_dag_codegen::CompiledDagPipeline::compile(&g.program, &g.warp) {
+                        let _ = pipe.render(&q, &cam, size, size); // warm-up (pipeline compile)
+                        let started = std::time::Instant::now();
+                        let (gs, _) = pipe.render(&q, &cam, size, size);
+                        let gh = gs.iter().filter(|v| **v > 0.0).count() as f64 / gs.len() as f64;
+                        line.push_str(&format!("  GPU: hits {:>5.1}% {:.0} ms", 100.0 * gh, started.elapsed().as_secs_f64() * 1000.0));
+                        if std::env::var("SCENE_OLD").is_ok() {
+                            let mut o = q;
+                            o.solid_interior = false;
+                            o.pixel_lod = 0.0;
+                            o.max_march_steps = 200;
+                            let started = std::time::Instant::now();
+                            let (os, _) = pipe.render(&o, &cam, size, size);
+                            let oh = os.iter().filter(|v| **v > 0.0).count() as f64 / os.len() as f64;
+                            line.push_str(&format!("  old GPU: hits {:>5.1}% {:.0} ms", 100.0 * oh, started.elapsed().as_secs_f64() * 1000.0));
+                        }
+                    }
+                }
+                if let (Some(dir), true) = (&out, steps == p.max_march_steps) {
+                    let (shade, color) = crate::quat_dag::render_raymarch_dag_frame(&q, &cam, size, size);
+                    let rgb = crate::colormap::apply_colormap_equalized(&color, q.max_iter, "lava");
+                    let img: Vec<u8> = (0..shade.len()).flat_map(|i| (0..3).map(move |c| (i, c))).map(|(i, c)| if shade[i] <= 0.0 { 20 } else { (rgb[i * 3 + c] as f32 * shade[i]) as u8 }).collect();
+                    std::fs::create_dir_all(dir).ok();
+                    image::save_buffer(format!("{dir}/d{k}.png"), &img, size, size, image::ColorType::Rgb8).unwrap();
+                }
+            }
+            println!("{line}");
+        }
     }
 }

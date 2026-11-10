@@ -1,0 +1,41 @@
+{
+  "name": "mostly entropy",
+  "description": "Half 'is there a picture' (image_entropy_band), half the 11 metrics that tracked your S3 picks, plus smooth motion (t_cont_band), lit from every side (front_cover_band) and not chrome (grey_band). Slice projection.",
+  "evidence": "The Optuna campaigns of 2026-10-18/19 (scripts/optuna_campaigns.py, campaign 3 on; pop 32 × 10 gens, stop when flat 6, pool fractals_dag_mixed_kbc_seed). You: \"those results are the very best in a while\". Your GUI campaigns Carl_Test (355 runs) and wkend1 used the same terms.",
+  "terms": [
+    {
+      "name": "color_gradient",
+      "weight": 0.25
+    },
+    {
+      "name": "image_entropy_band",
+      "weight": 3.5875
+    },
+    {
+      "name": "organization_chaoticity",
+      "weight": -0.3557
+    },
+    {
+      "name": "organization_continuity",
+      "weight": 0.3388
+    },
+    {
+      "name": "organization_entropy",
+      "weight": 6.2
+    },
+    {
+      "name": "solidity",
+      "weight": -0.3366
+    },
+    {
+      "name": "sphericity",
+      "weight": -0.3906
+    }
+  ],
+  "collapse": "slice",
+  "eval_phases": 3,
+  "smooth_weight": 0.0,
+  "embed_diversity": 0.0,
+  "auto_range": true,
+  "pool_dir": "fractals_dag_mixed_kbc_seed"
+}

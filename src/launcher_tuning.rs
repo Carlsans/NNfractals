@@ -19,7 +19,7 @@ use std::time::{Duration, Instant};
 use eframe::egui::{self, Color32};
 use nnfractals::tuning::{Campaign, Kind, Optimizer, Param, RunRecord, Tuning, TUNINGS_DIR};
 
-use super::{build_quat_evolve_args, sibling, QuatEvoMode, QuatEvoPrefs};
+use super::{build_quat_evolve_args, launcher_recipe, sibling, QuatEvoMode, QuatEvoPrefs};
 
 const DEFAULT_MAX_MINUTES: f32 = 30.0;
 /// A run still alive this long after its final contact sheet was written is hung at exit.
@@ -100,19 +100,41 @@ fn read_auto(path: &Path) -> Option<bool> {
     serde_json::from_str::<serde_json::Value>(&std::fs::read_to_string(path).ok()?).ok()?.get("auto")?.as_bool()
 }
 
-/// The fitness recipe the Optuna campaigns have used so far: H1 with `image_motion` replaced
-/// by the T-continuity, front-cover and grey bands (same construction as
-/// `scripts/optuna_campaigns.py`).
-pub fn default_campaign_recipe(root: &Path) -> Option<String> {
-    let v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(root.join("taste_analysis/combo_specs.json")).ok()?).ok()?;
-    let h1 = v.get("H1_s3_rho25")?.as_object()?;
-    let band = h1.get("image_motion")?.as_f64()?;
-    let mut parts: Vec<String> = h1.iter().filter(|(k, _)| k.as_str() != "image_motion")
-        .filter_map(|(k, w)| Some(format!("{k}:{}", (w.as_f64()? * 1e4).round() / 1e4))).collect();
-    for n in ["t_cont_band", "front_cover_band", "grey_band"] {
-        parts.push(format!("{n}:{}", (band * 1e4).round() / 1e4));
+/// Name given to a campaign recipe recovered from run logs that matches no
+/// known recipe (its weights are rounded to 2 decimals).
+const FROM_LOGS: &str = "(from the run logs)";
+
+/// Give a campaign without a recorded recipe the one it scores with: a new
+/// campaign takes the run settings' recipe; one that already has runs (made
+/// before recipes were recorded) takes the recipe its latest run log names,
+/// matched back to a known recipe where the rounded weights fit.
+fn settle_recipe(camp: &mut Campaign, root: &Path, prefs: &QuatEvoPrefs) {
+    if !camp.recipe_spec.is_empty() {
+        return;
     }
-    Some(parts.join(","))
+    if camp.runs.is_empty() {
+        camp.recipe_spec = prefs.fitness_metric.trim().to_string();
+        camp.recipe_name = prefs.recipe.clone();
+        return;
+    }
+    let dir = Campaign::dir(root, &camp.name);
+    let mut logs: Vec<PathBuf> = std::fs::read_dir(&dir).into_iter().flatten().flatten().map(|e| e.path())
+        .filter(|p| p.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.starts_with("run_") && n.ends_with(".log")))
+        .collect();
+    logs.sort();
+    let Some(logged) = logs.iter().rev().find_map(|p| nnfractals::fitness_recipe::spec_from_log(&std::fs::read_to_string(p).ok()?)) else { return };
+    let known = launcher_recipe::Recipes::read(root);
+    match known.all().find(|r| nnfractals::fitness_recipe::spec_close(&r.spec(), &logged, 0.006)) {
+        Some(r) => { camp.recipe_spec = r.spec(); camp.recipe_name = r.name.clone(); }
+        None => { camp.recipe_spec = logged; camp.recipe_name = FROM_LOGS.into(); }
+    }
+}
+
+/// `Campaign::load` with its recipe settled (for display; the thread saves it).
+fn load_campaign(root: &Path, name: &str, prefs: &QuatEvoPrefs) -> Option<Campaign> {
+    let mut c = Campaign::load(root, name)?;
+    settle_recipe(&mut c, root, prefs);
+    Some(c)
 }
 
 // ── Campaign runner (own thread) ────────────────────────────────────────────────
@@ -167,6 +189,7 @@ fn read_live(out_dir: &Path) -> Vec<f64> {
 
 fn campaign_thread(root: PathBuf, name: String, mut tuning: Tuning, mut prefs: QuatEvoPrefs, rx: mpsc::Receiver<Cmd>, sh: Arc<Shared>) {
     let mut camp = Campaign::load(&root, &name).unwrap_or_else(|| Campaign::new(&name, tuning.clone()));
+    settle_recipe(&mut camp, &root, &prefs);
     let cdir = Campaign::dir(&root, &name);
     let camp_arg = cdir.to_string_lossy().to_string();
     let _ = std::fs::create_dir_all(cdir.join("runs"));
@@ -294,7 +317,7 @@ fn campaign_thread(root: PathBuf, name: String, mut tuning: Tuning, mut prefs: Q
         };
         let _ = py_call(&root, &["tell", "--campaign", &camp_arg], Some(&serde_json::json!({ "trial": trial, "value": value })));
         camp.tuning = tuning.clone();
-        camp.runs.push(RunRecord { trial, value, params: tuning.values_json(), seed, secs: started.elapsed().as_secs_f64(), stop_reason: stop_reason.into(), stem });
+        camp.runs.push(RunRecord { trial, value, params: tuning.values_json(), seed, secs: started.elapsed().as_secs_f64(), stop_reason: stop_reason.into(), stem, spec: prefs.fitness_metric.trim().to_string(), renderer: nnfractals::tuning::RENDERER_VERSION });
         let _ = camp.save(&root);
         let _ = std::fs::remove_dir_all(&work);
         if let Ok(serde_json::Value::Object(m)) = py_call(&root, &["importances", "--campaign", &camp_arg], None) {
@@ -755,7 +778,11 @@ impl TuningUi {
             return;
         }
         if prefs.fitness_metric.trim().is_empty() {
-            self.msg = "a campaign needs a fitness metric (run settings below) — scores come from it".into();
+            self.msg = "a campaign needs a fitness recipe (run settings below) — scores come from it".into();
+            return;
+        }
+        if let Err(e) = nnfractals::fitness_recipe::parse_spec(&prefs.fitness_metric) {
+            self.msg = format!("the fitness recipe has an error: {e} (open the ✏ Recipe builder)");
             return;
         }
         if prefs.max_minutes <= 0.0 { prefs.max_minutes = DEFAULT_MAX_MINUTES; }
@@ -767,7 +794,7 @@ impl TuningUi {
         let (r, t, p, s) = (root.to_path_buf(), self.tuning.clone(), prefs.clone(), shared.clone());
         let n = name.clone();
         std::thread::spawn(move || campaign_thread(r, n, t, p, rx, s));
-        self.camp = Campaign::load(root, &name);
+        self.camp = load_campaign(root, &name, prefs);
         self.shared = Some(shared);
         self.tx = Some(tx);
         self.applied_trial = None;
@@ -777,7 +804,7 @@ impl TuningUi {
     }
 
     /// Draw the window. `prefs` are the launcher's own run settings (edited here too).
-    pub fn show(&mut self, ctx: &egui::Context, root: &Path, prefs: &mut QuatEvoPrefs, ga_running: bool) -> Option<Action> {
+    pub fn show(&mut self, ctx: &egui::Context, root: &Path, prefs: &mut QuatEvoPrefs, rui: &mut launcher_recipe::RecipeUi, ga_running: bool) -> Option<Action> {
         if !self.open { return None; }
         let mut action = None;
         let mut open = self.open;
@@ -800,7 +827,7 @@ impl TuningUi {
             if v != self.seen_version {
                 self.seen_version = v;
                 if !self.camp_buf.trim().is_empty() {
-                    self.camp = Campaign::load(root, &nnfractals::tuning::sanitize(self.camp_buf.trim()));
+                    self.camp = load_campaign(root, &nnfractals::tuning::sanitize(self.camp_buf.trim()), prefs);
                 }
             }
             if phase == Some(Phase::Stopped) && self.tx.is_some() {
@@ -901,15 +928,15 @@ impl TuningUi {
 
                 // ── run settings ──
                 egui::CollapsingHeader::new("Run settings").default_open(true).show(ui, |ui| {
+                    launcher_recipe::picker(ui, "tun_recipe", root, prefs, rui);
                     ui.horizontal(|ui| {
-                        ui.label("Fitness metric:");
-                        ui.add(egui::TextEdit::singleline(&mut prefs.fitness_metric).desired_width(360.0));
-                        if ui.button("campaign recipe").on_hover_text("The recipe the previous campaigns used (H1 + continuity, front-cover and grey bands).").clicked() {
-                            match default_campaign_recipe(root) { Some(r) => prefs.fitness_metric = r, None => self.msg = "taste_analysis/combo_specs.json not readable".into() }
-                        }
+                        ui.label(egui::RichText::new("as text:").small().weak());
+                        ui.add(egui::TextEdit::singleline(&mut prefs.fitness_metric).desired_width(520.0).font(egui::TextStyle::Small))
+                            .on_hover_text("The recipe's --fitness-metric value (editing it makes the recipe «modified»).");
                     });
                     ui.horizontal(|ui| {
                         ui.label("Pool dir:"); ui.add(egui::TextEdit::singleline(&mut prefs.pool_dir).desired_width(190.0));
+                        folder_picker_button(ui, "tun_pool", &mut prefs.pool_dir, root);
                         ui.label("Collapse:");
                         egui::ComboBox::from_id_salt("tun_collapse").selected_text(prefs.collapse.clone()).show_ui(ui, |ui| {
                             for m in nnfractals::quat_collapse::OFFERED { ui.selectable_value(&mut prefs.collapse, m.name().to_string(), m.name()); }
@@ -983,7 +1010,7 @@ impl TuningUi {
                         });
                     });
                     if let Some(n) = pick {
-                        self.camp = Campaign::load(root, &n);
+                        self.camp = load_campaign(root, &n, prefs);
                         if let Some(c) = &self.camp { self.tuning = c.tuning.clone(); self.name_buf = c.tuning.name.clone(); }
                         self.camp_buf = n;
                     }
@@ -1022,6 +1049,21 @@ impl TuningUi {
                 }
                 if !self.msg.is_empty() { ui.label(egui::RichText::new(&self.msg).small()); }
                 if let Some(c) = &self.camp {
+                    let same = if c.recipe_name == FROM_LOGS { nnfractals::fitness_recipe::spec_close(&c.recipe_spec, &prefs.fitness_metric, 0.006) } else { nnfractals::fitness_recipe::same_spec(&c.recipe_spec, &prefs.fitness_metric) };
+                    if !c.recipe_spec.is_empty() && !same {
+                        let name = if c.recipe_name.is_empty() { "a custom recipe".to_string() } else { format!("«{}»", c.recipe_name) };
+                        ui.colored_label(Color32::from_rgb(240, 170, 60), format!("This campaign scores with {name}, and the run settings now use a different recipe: new trial values would not be comparable with its history, and Optuna would learn from mixed scores."));
+                        if ui.button("Use the campaign's recipe").clicked() {
+                            match nnfractals::fitness_recipe::Recipe::find(root, &c.recipe_name).filter(|r| nnfractals::fitness_recipe::same_spec(&r.spec(), &c.recipe_spec)) {
+                                Some(r) => { self.msg = launcher_recipe::apply(&r, prefs, root); }
+                                None => { prefs.fitness_metric = c.recipe_spec.clone(); prefs.recipe = c.recipe_name.clone(); self.msg = "recipe terms restored from the campaign".into(); }
+                            }
+                        }
+                    }
+                    let old_renderer = c.runs.iter().filter(|r| r.value.is_some() && r.renderer < nnfractals::tuning::RENDERER_VERSION).count();
+                    if old_renderer > 0 {
+                        ui.colored_label(Color32::from_rgb(240, 170, 60), format!("{old_renderer} earlier run(s) were scored with the old renderer, whose rays could skip parts of the shape: their values are not comparable with new runs, and Optuna would learn from mixed scores. Start a new campaign for a clean comparison."));
+                    }
                     ui.label(format!("{} runs · best {}", c.runs.len(), c.best().and_then(|r| r.value).map(|v| format!("{v:.3}")).unwrap_or_else(|| "—".into())));
                     if let Some(i) = run_chart(ui, &c.runs, &live) {
                         if let Some(v) = c.runs[i].params.as_object() {
@@ -1080,6 +1122,28 @@ mod tests {
     }
 
     #[test]
+    fn an_old_campaign_gets_the_recipe_its_run_logs_name() {
+        let root = std::env::temp_dir().join(format!("settle_test_{}", std::process::id()));
+        let mut c = Campaign::new("old", Tuning::defaults("t"));
+        c.runs.push(RunRecord { trial: 0, value: Some(8.0), params: serde_json::json!({}), seed: 1, secs: 60.0, stop_reason: "generations".into(), stem: None, spec: String::new(), renderer: 0 });
+        c.save(&root).unwrap();
+        // The explorer's banner, weights rounded to 2 decimals, as in Carl_Test's logs.
+        let campaign = &nnfractals::fitness_recipe::builtins()[0];
+        let banner: Vec<String> = campaign.terms.iter().map(|t| format!("{}:{:.2}", t.name, t.weight)).collect();
+        std::fs::write(Campaign::dir(&root, "old").join("run_000.log"), format!("seed: 1\nfitness method: single/combo metric — {}\n", banner.join(", "))).unwrap();
+        let mut prefs = QuatEvoPrefs::default();
+        prefs.fitness_metric = "taste:1".into(); // what is selected now must NOT be stamped on it
+        let got = load_campaign(&root, "old", &prefs).unwrap();
+        assert_eq!(got.recipe_name, campaign.name);
+        assert!(nnfractals::fitness_recipe::same_spec(&got.recipe_spec, &campaign.spec()), "the exact recipe, not the rounded log");
+        // A brand-new campaign takes the current settings.
+        let fresh = Campaign::new("new", Tuning::defaults("t"));
+        fresh.save(&root).unwrap();
+        assert_eq!(load_campaign(&root, "new", &prefs).unwrap().recipe_spec, "taste:1");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn edited_values_are_detected() {
         let t = Tuning::defaults("x");
         let same = t.values_json().as_object().cloned().unwrap();
@@ -1087,5 +1151,42 @@ mod tests {
         let mut other = same.clone();
         other.insert("survivors".into(), serde_json::json!(12));
         assert!(!same_values(&t, &other));
+    }
+}
+
+
+/// Pending folder-dialog answers, keyed by the field that asked, with when they came.
+static PICKED: std::sync::Mutex<Vec<(String, String, Instant)>> = std::sync::Mutex::new(Vec::new());
+/// An answer not taken within this long belongs to a window that was closed
+/// while its dialog was open: it is dropped, never applied later.
+const PICK_TTL: Duration = Duration::from_secs(5);
+
+/// A "Browse…" button that opens the desktop's folder dialog (zenity, else kdialog) on a
+/// background thread so the UI does not freeze, and writes the chosen folder into `target`
+/// (relative to `root` when it lies inside the project).
+pub fn folder_picker_button(ui: &mut egui::Ui, id: &str, target: &mut String, root: &std::path::Path) {
+    if ui.button("Browse…").on_hover_text("Pick a folder with the system dialog.").clicked() {
+        let (id, start, ctx) = (id.to_string(), root.join(target.trim()), ui.ctx().clone());
+        std::thread::spawn(move || {
+            let start = format!("{}/", start.display());
+            let out = std::process::Command::new("zenity")
+                .args(["--file-selection", "--directory", "--title=Pick a folder", "--filename", &start])
+                .output()
+                .or_else(|_| std::process::Command::new("kdialog").args(["--getexistingdirectory", &start]).output());
+            if let Ok(o) = out {
+                let path = String::from_utf8_lossy(&o.stdout).trim().to_string();
+                if o.status.success() && !path.is_empty() {
+                    PICKED.lock().unwrap().push((id, path, Instant::now()));
+                    ctx.request_repaint();
+                }
+            }
+        });
+    }
+    let mut p = PICKED.lock().unwrap();
+    p.retain(|(_, _, at)| at.elapsed() < PICK_TTL);
+    if let Some(i) = p.iter().position(|(k, _, _)| k == id) {
+        let (_, path, _) = p.remove(i);
+        let path = std::path::Path::new(&path);
+        *target = path.strip_prefix(root).unwrap_or(path).display().to_string();
     }
 }

@@ -122,3 +122,22 @@ quat_taste_sidecar.log
 train_taste_quat.log
 /tunings/
 /campaigns/
+# Quaternion experiments, Oct–Nov 2026: GA out-dirs / tournament and campaign
+# folders (genomes + renders), corpora, model weights, run logs, per-user prefs.
+fractals_dag_*/
+collapse_exp/
+train_corpus_quat_*/
+taste_model_backups/
+taste_model_quat_*.npz
+taste_model_quat_*.json
+taste_analysis/res.pkl
+anim_viewer_prefs.toml
+optuna_campaign*.log
+s3_*.log
+slice_*.log
+reel_render.log
+quat_sweep_*.log
+quat_richness_test*.log
+quat_evolve_subtree_night.log.*
+quat_boundedness_report.txt
+overnight_sweep.*

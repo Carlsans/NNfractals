@@ -33,7 +33,7 @@ struct Params {
     up_x: f32, up_y: f32, up_z: f32,
     light_x: f32, light_y: f32, light_z: f32,
     aa: u32,
-    _pad0: u32,
+    solid_interior: u32,
     _pad1: u32,
 }
 
@@ -318,6 +318,11 @@ fn de_at(p: vec3f) -> f32 {
     return quat_dag_escape_de(q).y;
 }
 
+fn et_at(p: vec3f) -> f32 {
+    let q = assemble(params.time_axis, p.x, p.y, p.z, params.time_val);
+    return quat_dag_escape_de(q).x;
+}
+
 // Tetrahedral 4-tap normal estimate — same technique as raymarch.wgsl.
 fn estimate_normal(p: vec3f) -> vec3f {
     let eps = max(params.normal_eps, 1e-6);
@@ -328,6 +333,28 @@ fn estimate_normal(p: vec3f) -> vec3f {
     let g = k0 * de_at(p + k0*eps) + k1 * de_at(p + k1*eps)
           + k2 * de_at(p + k2*eps) + k3 * de_at(p + k3*eps);
     return normalize(g);
+}
+
+// Escape-time gradient turned to face the camera (quat_dag::zone_normal): the
+// normal where a ray stops on the set itself (solid_interior).
+fn et_normal(p: vec3f, dir: vec3f) -> vec3f {
+    let eps = max(params.normal_eps, 1e-6);
+    let k0 = vec3f(1.0, -1.0, -1.0);
+    let k1 = vec3f(-1.0, -1.0, 1.0);
+    let k2 = vec3f(-1.0, 1.0, -1.0);
+    let k3 = vec3f(1.0, 1.0, 1.0);
+    let cap = f32(params.max_iter);
+    let g = k0 * min(et_at(p + k0*eps), cap) + k1 * min(et_at(p + k1*eps), cap)
+          + k2 * min(et_at(p + k2*eps), cap) + k3 * min(et_at(p + k3*eps), cap);
+    var n: vec3f;
+    if (length(g) > 1e-9) {
+        n = normalize(g);
+    } else {
+        n = estimate_normal(p);
+        if (!(dot(n, n) > 0.5)) { n = -dir; }
+    }
+    if (dot(n, dir) > 0.0) { n = -n; }
+    return n;
 }
 
 fn march_sample(u: f32, v: f32) -> vec2f {
@@ -350,23 +377,47 @@ fn march_sample(u: f32, v: f32) -> vec2f {
 
     let hit_eps = max(params.hit_epsilon, 1e-9);
     let min_step = max(params.domain_radius * 1e-6, 1e-9);
+    let cap = f32(params.max_iter);
+    // quat_dag::SOLID_STEP_DIVISIONS / solid_interior: capped steps, and a ray
+    // stepping into the set stops there (bisected back to its surface).
+    var step_cap: f32 = 3.4e38;
+    if (params.solid_interior != 0u) { step_cap = 2.0 * params.domain_radius / 128.0; }
     var t = t0;
+    var prev = t0;
     var hit = false;
+    var interior_hit = false;
     var hit_point = vec3f(0.0, 0.0, 0.0);
     for (var i: u32 = 0u; i < params.max_march_steps; i = i + 1u) {
         if (t > t1) { break; }
         let p = eye + dir * t;
-        let de = de_at(p);
+        let r = quat_dag_escape_de(assemble(params.time_axis, p.x, p.y, p.z, params.time_val));
+        let de = r.y;
+        if (params.solid_interior != 0u && r.x >= cap) {
+            var a = prev;
+            var b = t;
+            if (i != 0u) {
+                for (var k: u32 = 0u; k < 10u; k = k + 1u) {
+                    let m = 0.5 * (a + b);
+                    if (et_at(eye + dir * m) >= cap) { b = m; } else { a = m; }
+                }
+            }
+            hit = true;
+            interior_hit = true;
+            hit_point = eye + dir * b;
+            break;
+        }
         if (de < hit_eps) {
             hit = true;
             hit_point = p;
             break;
         }
-        t = t + max(de * params.step_safety, min_step);
+        prev = t;
+        t = t + min(max(de * params.step_safety, min_step), step_cap);
     }
     if (!hit) { return vec2f(0.0, 0.0); }
 
-    let normal = estimate_normal(hit_point);
+    var normal = estimate_normal(hit_point);
+    if (interior_hit) { normal = et_normal(hit_point, dir); }
     let light = normalize(vec3f(params.light_x, params.light_y, params.light_z));
     let ndotl = max(dot(normal, light), 0.0);
     let shading = 0.15 + 0.85 * ndotl;

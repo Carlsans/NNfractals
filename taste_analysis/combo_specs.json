@@ -1,0 +1,138 @@
+{
+ "taste_only (reference, in-sample)": {
+  "taste": 1
+ },
+ "entropy_only": {
+  "image_entropy_band": 1,
+  "image_motion": 0.5
+ },
+ "H1_s3_rho25": {
+  "image_entropy_band": 3.5875407111376387,
+  "image_motion": 1.7937703555688194,
+  "sphericity": -0.39063802973151024,
+  "organization_continuity": 0.33878664607155695,
+  "organization_chaoticity": -0.3557402447142619,
+  "bilateral_symmetry": -0.3685679357658684,
+  "color_gradient": -0.35819993593155486,
+  "box_dim": 0.30930752964021097,
+  "solidity": -0.3366475677092372,
+  "organization_entropy": -0.3126541169922018,
+  "cross_view_coverage_delta": 0.2948356445886889,
+  "cross_view_iou": -0.26603678766392497,
+  "coverage": -0.25612627232862273
+ },
+ "H2_union_rho25": {
+  "image_entropy_band": 4.145329455415116,
+  "image_motion": 2.072664727707558,
+  "sphericity": -0.39063802973151024,
+  "organization_continuity": 0.33878664607155695,
+  "organization_chaoticity": -0.3557402447142619,
+  "bilateral_symmetry": -0.3685679357658684,
+  "color_gradient": -0.35819993593155486,
+  "box_dim": 0.30930752964021097,
+  "solidity": -0.3366475677092372,
+  "organization_entropy": -0.3126541169922018,
+  "cross_view_coverage_delta": 0.2948356445886889,
+  "cross_view_iou": -0.26603678766392497,
+  "coverage": -0.25612627232862273,
+  "silhouette_irregularity": 0.3063648180514383,
+  "lacunarity": 0.25142392622603876
+ },
+ "H3_lr": {
+  "image_entropy_band": 1.0,
+  "image_motion": 0.5,
+  "organization_continuity": 0.02151788310555394,
+  "sphericity": -0.02675196277987787,
+  "organization_entropy": -0.007851119511485897,
+  "bilateral_symmetry": -0.2779877871474266,
+  "color_gradient": -0.02558883396336144,
+  "color_shading_corr": 0.08607153242221575,
+  "silhouette_irregularity": 0.007851119511485897,
+  "centroid_offset": -0.4562372782785693,
+  "color_band_autocorr": 0.01919162547252108,
+  "cross_view_coverage_delta": 0.07095085780750218
+ },
+ "ent+sphericity": {
+  "image_entropy_band": 1,
+  "image_motion": 0.5,
+  "sphericity": -8.577906786246384
+ },
+ "ent+organization_continuity": {
+  "image_entropy_band": 1,
+  "image_motion": 0.5,
+  "organization_continuity": 7.121151131464209
+ },
+ "ent+organization_chaoticity": {
+  "image_entropy_band": 1,
+  "image_motion": 0.5,
+  "organization_chaoticity": -7.146900938558826
+ },
+ "ent+bilateral_symmetry": {
+  "image_entropy_band": 1,
+  "image_motion": 0.5,
+  "bilateral_symmetry": -27.924594828319606
+ },
+ "ent+color_gradient": {
+  "image_entropy_band": 1,
+  "image_motion": 0.5,
+  "color_gradient": -5.007387011934837
+ },
+ "ent+color_shading_corr": {
+  "image_entropy_band": 1,
+  "image_motion": 0.5,
+  "color_shading_corr": 19.767305451720397
+ },
+ "ent+organization_entropy": {
+  "image_entropy_band": 1,
+  "image_motion": 0.5,
+  "organization_entropy": -6.669459964858688
+ },
+ "ent+anisotropy": {
+  "image_entropy_band": 1,
+  "image_motion": 0.5,
+  "anisotropy": -4.995491528756791
+ },
+ "ent+cross_view_coverage_delta": {
+  "image_entropy_band": 1,
+  "image_motion": 0.5,
+  "cross_view_coverage_delta": 33.930864662008894
+ },
+ "ent+crevice_fraction": {
+  "image_entropy_band": 1,
+  "image_motion": 0.5,
+  "crevice_fraction": -14.744722651291358
+ },
+ "ent+solidity": {
+  "image_entropy_band": 1,
+  "image_motion": 0.5,
+  "solidity": -11.92429632684326
+ },
+ "half_top3": {
+  "image_entropy_band": 5.0768797458376484,
+  "image_motion": 2.5384398729188242,
+  "sphericity": -1.9062015080547516,
+  "organization_continuity": 1.5824780292142686,
+  "organization_chaoticity": -1.588200208568628
+ },
+ "half_top5": {
+  "image_entropy_band": 7.437058759536514,
+  "image_motion": 3.718529379768257,
+  "sphericity": -1.143720904832851,
+  "organization_continuity": 0.9494868175285612,
+  "organization_chaoticity": -0.9529201251411769,
+  "bilateral_symmetry": -3.7232793104426136,
+  "color_gradient": -0.6676516015913115
+ },
+ "half_top8": {
+  "image_entropy_band": 7.267516470154979,
+  "image_motion": 3.6337582350774893,
+  "sphericity": -0.7148255655205319,
+  "organization_continuity": 0.5934292609553508,
+  "organization_chaoticity": -0.5955750782132355,
+  "bilateral_symmetry": -2.3270495690266335,
+  "color_gradient": -0.4172822509945697,
+  "color_shading_corr": 1.6472754543100332,
+  "organization_entropy": -0.5557883304048907,
+  "anisotropy": -0.41629096072973254
+ }
+}
