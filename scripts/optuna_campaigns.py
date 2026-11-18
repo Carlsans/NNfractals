@@ -11,7 +11,8 @@ kept under OUT/_campaigns/<campaign>/ until the campaign ends.
 
 Population and generations are fixed so a trial cannot win by buying more search.
 
-Env: OUT, COLLAPSE (slice), POOL, TRIALS (30), KEEP (8), RECIPE (cont). Stop with
+Env: OUT, COLLAPSE (slice), POOL, TRIALS (30), KEEP (8), RECIPE (cont), EXTRA ("term:weight,…"
+added to the fitness spec), LABEL (manifest scoring note). Stop with
 `touch STOP_campaigns` (checked before every trial).
 """
 import glob, json, os, re, shutil, subprocess, sys, tempfile, time
@@ -34,6 +35,13 @@ SPEC = dict({k: v for k, v in H1.items() if k != 'image_motion'}, t_cont_band=H1
 SPEC['front_cover_band'] = H1['image_motion']
 # Campaign 3+: penalise chrome/silver (grey share of lit sheet pixels > 0.3; Carl's ratings: less grey wins 57-64%).
 SPEC['grey_band'] = H1['image_motion']
+# Extra weighted terms, e.g. EXTRA="orgcx_rel2d:9" adds Carl's organised-complexity measure
+# (/home/carl/claude_complexity, explorer.rs `orgcx_scores_2d`) to the fitness.
+EXTRA = os.environ.get('EXTRA', '')
+for part in filter(None, EXTRA.split(',')):
+    k, w = part.split(':')
+    SPEC[k.strip()] = float(w)
+LABEL = os.environ.get('LABEL', 'v7: optuna campaign (30 trials, reset), H1_cont + front_cover_band + grey_band, evolved-only trial score, slice T linear')
 ARG = ','.join(f'{k}:{round(w, 4)}' for k, w in SPEC.items())
 CODE = subprocess.run(['git', 'rev-parse', '--short', 'HEAD'], capture_output=True, text=True).stdout.strip() + '+uncommitted'
 os.makedirs(OUT, exist_ok=True)
@@ -140,7 +148,7 @@ while True:
         man[os.path.basename(dst)] = {'combo': 'H1_cont', 'spec': SPEC, 'value': t.value, 'seed': t.user_attrs.get('seed'),
                                       'code': CODE, 'collapse': COLLAPSE, 'pool': POOL, 'campaign': camp,
                                       'trial': t.number, 'hp': t.params,
-                                      'scoring': 'v7: optuna campaign (30 trials, reset), H1_cont + front_cover_band + grey_band, evolved-only trial score, slice T linear'}
+                                      'scoring': LABEL + (f' + {EXTRA}' if EXTRA else '')}
         print(f'WINNER {camp} trial {t.number} value {t.value:.3f} {dst}', flush=True)
     json.dump(man, open(MF, 'w'), indent=1)
     vals = [t.value for t in done]

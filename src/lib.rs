@@ -72,6 +72,7 @@ pub mod queue_runner;
 pub mod tuning;
 pub mod fitness_recipe;
 pub mod view_slice;
+pub mod plot_paths;
 pub mod worker_tune;
 
 /// Derives the project root from the running binary's own location —

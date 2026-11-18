@@ -108,6 +108,12 @@ pub fn slice_escape_times(p: &RaymarchDagParams, frame: &SliceFrame, n: u32) -> 
     (0..n * n).into_par_iter().map(|i| escape_time_at(p, frame.point(i % n, i / n, n))).collect()
 }
 
+/// [`slice_escape_times`] without the floor at 0 (`quat_dag::escape_potential_at`).
+pub fn slice_escape_potential(p: &RaymarchDagParams, frame: &SliceFrame, n: u32) -> Vec<f32> {
+    let n = n as usize;
+    (0..n * n).into_par_iter().map(|i| crate::quat_dag::escape_potential_at(p, frame.point(i % n, i / n, n))).collect()
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum SliceColoring {
     /// The viewer's colour map, histogram-equalised like the Planes tiles.

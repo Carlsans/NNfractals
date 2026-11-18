@@ -119,6 +119,7 @@ taste_model_quat.json
 role_model_centroids.npz
 embed_cache/
 quat_taste_sidecar.log
+orgcx_sidecar.log
 train_taste_quat.log
 /tunings/
 /campaigns/

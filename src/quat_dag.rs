@@ -307,6 +307,14 @@ pub fn quat_dag_escape_de(f: &QuatDagFormula, point: Quat, max_iter: u32, bailou
 /// `quat_dag_escape_de`; with `zero_c` the orbit's C component is zeroed
 /// after every step (`Method::Proj3`: an orbit confined to R,A,B).
 pub fn quat_dag_escape_de_mode(f: &QuatDagFormula, point: Quat, max_iter: u32, bailout_sq: f64, zero_c: bool) -> (f32, f64) {
+    escape_de_core(f, point, max_iter, bailout_sq, zero_c, true)
+}
+
+/// The smooth escape time is `it + 1 - log2(log2 |z|)`. `clamp` floors it at 0,
+/// as renders and metrics see it; points that escape hard on the first step then
+/// share one flat value. Unclamped it keeps falling smoothly outwards (the outer
+/// equipotentials), which a contour plot needs to put lines there.
+fn escape_de_core(f: &QuatDagFormula, point: Quat, max_iter: u32, bailout_sq: f64, zero_c: bool, clamp: bool) -> (f32, f64) {
     let warped = if f.warp.is_empty() { point } else { eval_program_quat(f.warp, point, point) };
     // (z, c, dz/dpoint, dc/dpoint) — see the doc comment above: whichever
     // of z0/c is the warped point gets derivative ≈1 (the warp-derivative
@@ -333,7 +341,8 @@ pub fn quat_dag_escape_de_mode(f: &QuatDagFormula, point: Quat, max_iter: u32, b
 
         let ms = z.norm_sq();
         if ms > bailout_sq {
-            let et = ((it as f64 + 1.0) - (ms.log2() * 0.5).log2()).max(0.0) as f32;
+            let et = (it as f64 + 1.0) - (ms.log2() * 0.5).log2();
+            let et = (if clamp { et.max(0.0) } else { et }) as f32;
             let r = ms.sqrt();
             let de = (0.5 * r.ln() * r / dz.max(1e-300)).max(0.0);
             return (et, de);
@@ -345,6 +354,677 @@ pub fn quat_dag_escape_de_mode(f: &QuatDagFormula, point: Quat, max_iter: u32, b
     let r = z.norm_sq().sqrt().max(1e-300);
     let de = (0.5 * r.ln() * r / dz.max(1e-300)).max(0.0);
     (max_iter as f32, de)
+}
+
+/// What one orbit says about its starting point, beyond the escape time: the
+/// raw material of `explorer quat-anatomy`, which splits a fractal into one
+/// layer of lines per quantity.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct OrbitStats {
+    /// |z| passed the bailout before `max_iter`.
+    pub escaped: bool,
+    /// Smooth escape time `it + 1 - log2(log2 |z|)`, unclamped; `max_iter` inside.
+    pub smooth: f64,
+    /// z when it escaped, or after the last step (inside).
+    pub exit: Quat,
+    /// Smallest |z| over steps 1.. and the step it happened at ("atom domains").
+    pub min_norm: f64,
+    pub min_norm_iter: u32,
+    /// Orbit traps: the orbit's closest approach to the coordinate axes'
+    /// hyperplanes (min over steps of the smallest |component|) and to the unit sphere.
+    pub trap_cross: f64,
+    pub trap_sphere: f64,
+    /// ln(derivative magnitude) per step: > 0 where nearby points separate.
+    pub lyapunov: f64,
+    /// Distance estimate (as the renderer computes it).
+    pub de: f64,
+    /// Inside only: the length of the cycle the orbit settles into (1..=32), 0 if none found.
+    pub period: u32,
+}
+
+/// [`OrbitStats`] of one point: the same iteration as `quat_dag_escape_de_mode`
+/// (warp, Julia, phoenix, `zero_c`), recording more along the way.
+pub fn quat_dag_orbit_stats(f: &QuatDagFormula, point: Quat, max_iter: u32, bailout_sq: f64, zero_c: bool) -> OrbitStats {
+    let warped = if f.warp.is_empty() { point } else { eval_program_quat(f.warp, point, point) };
+    let (mut z, c, mut dz, dc) = if f.julia {
+        (warped, Quat::new(f.jc.0 as f64, f.jc.1 as f64, 0.0, 0.0), 1.0_f64, 0.0_f64)
+    } else {
+        (Quat::ZERO, warped, 0.0_f64, 1.0_f64)
+    };
+    let phoenix_q = Quat::new(f.phoenix.0 as f64, f.phoenix.1 as f64, 0.0, 0.0);
+    let phoenix_mag = phoenix_q.norm_sq().sqrt();
+    let (mut pz, mut dpz) = (Quat::ZERO, 0.0_f64);
+    let mut s = OrbitStats {
+        escaped: false, smooth: max_iter as f64, exit: z, min_norm: f64::INFINITY, min_norm_iter: 0,
+        trap_cross: f64::INFINITY, trap_sphere: f64::INFINITY, lyapunov: 0.0, de: 0.0, period: 0,
+    };
+    let step = |z: &mut Quat, dz: &mut f64, pz: &mut Quat, dpz: &mut f64| {
+        let (f0, df) = eval_program_quat_deriv(f.prog, *z, c, *dz, dc);
+        let dnext = df + phoenix_mag * *dpz;
+        let next = f0.add(phoenix_q.mul(*pz));
+        *dpz = *dz;
+        *pz = *z;
+        *dz = dnext;
+        *z = next;
+        if zero_c { z.c = 0.0; }
+    };
+    for it in 0..max_iter {
+        step(&mut z, &mut dz, &mut pz, &mut dpz);
+        let ms = z.norm_sq();
+        if !z.is_finite() {
+            s.escaped = true;
+            s.smooth = it as f64;
+            break;
+        }
+        let r = ms.sqrt();
+        if r < s.min_norm { s.min_norm = r; s.min_norm_iter = it + 1; }
+        s.trap_cross = s.trap_cross.min(z.r.abs().min(z.a.abs()).min(z.b.abs()).min(z.c.abs()));
+        s.trap_sphere = s.trap_sphere.min((r - 1.0).abs());
+        if ms > bailout_sq {
+            s.escaped = true;
+            s.smooth = (it as f64 + 1.0) - (ms.log2() * 0.5).log2();
+            s.exit = z;
+            s.lyapunov = dz.max(1e-300).ln() / (it + 1) as f64;
+            s.de = (0.5 * r.ln() * r / dz.max(1e-300)).max(0.0);
+            return s;
+        }
+    }
+    s.exit = z;
+    let r = z.norm_sq().sqrt().max(1e-300);
+    s.de = (0.5 * r.ln() * r / dz.max(1e-300)).max(0.0);
+    s.lyapunov = dz.max(1e-300).ln() / max_iter.max(1) as f64;
+    if !s.escaped {
+        // Period: steps until the orbit comes back to where it is now.
+        let z_ref = z;
+        let tol = 1e-6 * (1.0 + r);
+        for k in 1..=32u32 {
+            step(&mut z, &mut dz, &mut pz, &mut dpz);
+            if !z.is_finite() { break; }
+            if z.sub(z_ref).norm_sq().sqrt() < tol { s.period = k; break; }
+        }
+    }
+    s
+}
+
+// BEGIN generated by scripts/gen_orbit_features.py
+/// Length of an orbit feature vector ([`quat_dag_orbit_features`]).
+pub const ORBIT_FEATURES: usize = 269;
+/// Slots of the feature vector (generated with the trap list). Planes are the six
+/// coordinate planes of z, as pairs of components (r = 0, a = 1, b = 2, c = 3).
+pub mod orbit_feature {
+    pub const PLANES: [(usize, usize); 6] = [(0, 1), (0, 2), (0, 3), (1, 2), (1, 3), (2, 3)];
+    pub const PLANE_NAMES: [&str; 6] = ["ra", "rb", "rc", "ab", "ac", "bc"];
+    pub const COMP_NAMES: [&str; 4] = ["r", "a", "b", "c"];
+    /// An object the orbit is measured against: the smallest distance over steps 1.. from z to it.
+    #[derive(Clone, Copy, Debug)]
+    pub enum Trap {
+        Origin,
+        /// The hyperplane where component k is 0.
+        Plane(usize),
+        /// The nearest of the four hyperplanes (smallest |component|).
+        Cross,
+        /// The sphere |z| = radius.
+        Sphere(f64),
+        /// The coordinate axis of component k.
+        Axis(usize),
+        /// The hyperplane z_i = sign · z_j.
+        Diag(usize, usize, f64),
+        /// The circle of the given radius in the (i, j) plane.
+        Circle(usize, usize, f64),
+        Point([f64; 4]),
+    }
+    pub const N_TRAPS: usize = 143;
+    pub const TRAP_DEFS: [Trap; N_TRAPS] = [
+        Trap::Origin,
+        Trap::Plane(0),
+        Trap::Plane(1),
+        Trap::Plane(2),
+        Trap::Plane(3),
+        Trap::Cross,
+        Trap::Sphere(0.10),
+        Trap::Sphere(0.25),
+        Trap::Sphere(0.40),
+        Trap::Sphere(0.50),
+        Trap::Sphere(0.60),
+        Trap::Sphere(0.75),
+        Trap::Sphere(0.90),
+        Trap::Sphere(1.00),
+        Trap::Sphere(1.10),
+        Trap::Sphere(1.25),
+        Trap::Sphere(1.50),
+        Trap::Sphere(1.75),
+        Trap::Sphere(2.00),
+        Trap::Sphere(2.25),
+        Trap::Sphere(2.50),
+        Trap::Sphere(2.75),
+        Trap::Sphere(3.00),
+        Trap::Sphere(3.50),
+        Trap::Sphere(4.00),
+        Trap::Sphere(5.00),
+        Trap::Axis(0),
+        Trap::Axis(1),
+        Trap::Axis(2),
+        Trap::Axis(3),
+        Trap::Diag(0, 1, 1.0),
+        Trap::Diag(0, 1, -1.0),
+        Trap::Diag(0, 2, 1.0),
+        Trap::Diag(0, 2, -1.0),
+        Trap::Diag(0, 3, 1.0),
+        Trap::Diag(0, 3, -1.0),
+        Trap::Diag(1, 2, 1.0),
+        Trap::Diag(1, 2, -1.0),
+        Trap::Diag(1, 3, 1.0),
+        Trap::Diag(1, 3, -1.0),
+        Trap::Diag(2, 3, 1.0),
+        Trap::Diag(2, 3, -1.0),
+        Trap::Circle(0, 1, 0.5),
+        Trap::Circle(0, 1, 1.0),
+        Trap::Circle(0, 1, 1.5),
+        Trap::Circle(0, 2, 0.5),
+        Trap::Circle(0, 2, 1.0),
+        Trap::Circle(0, 2, 1.5),
+        Trap::Circle(0, 3, 0.5),
+        Trap::Circle(0, 3, 1.0),
+        Trap::Circle(0, 3, 1.5),
+        Trap::Circle(1, 2, 0.5),
+        Trap::Circle(1, 2, 1.0),
+        Trap::Circle(1, 2, 1.5),
+        Trap::Circle(1, 3, 0.5),
+        Trap::Circle(1, 3, 1.0),
+        Trap::Circle(1, 3, 1.5),
+        Trap::Circle(2, 3, 0.5),
+        Trap::Circle(2, 3, 1.0),
+        Trap::Circle(2, 3, 1.5),
+        Trap::Point([-1.50, -1.50, 0.00, 0.00]),
+        Trap::Point([-1.50, -1.00, 0.00, 0.00]),
+        Trap::Point([-1.50, -0.50, 0.00, 0.00]),
+        Trap::Point([-1.50, 0.00, 0.00, 0.00]),
+        Trap::Point([-1.50, 0.50, 0.00, 0.00]),
+        Trap::Point([-1.50, 1.00, 0.00, 0.00]),
+        Trap::Point([-1.50, 1.50, 0.00, 0.00]),
+        Trap::Point([-1.00, -1.50, 0.00, 0.00]),
+        Trap::Point([-1.00, -1.00, 0.00, 0.00]),
+        Trap::Point([-1.00, -0.50, 0.00, 0.00]),
+        Trap::Point([-1.00, 0.00, 0.00, 0.00]),
+        Trap::Point([-1.00, 0.50, 0.00, 0.00]),
+        Trap::Point([-1.00, 1.00, 0.00, 0.00]),
+        Trap::Point([-1.00, 1.50, 0.00, 0.00]),
+        Trap::Point([-0.50, -1.50, 0.00, 0.00]),
+        Trap::Point([-0.50, -1.00, 0.00, 0.00]),
+        Trap::Point([-0.50, -0.50, 0.00, 0.00]),
+        Trap::Point([-0.50, 0.00, 0.00, 0.00]),
+        Trap::Point([-0.50, 0.50, 0.00, 0.00]),
+        Trap::Point([-0.50, 1.00, 0.00, 0.00]),
+        Trap::Point([-0.50, 1.50, 0.00, 0.00]),
+        Trap::Point([0.00, -1.50, 0.00, 0.00]),
+        Trap::Point([0.00, -1.00, 0.00, 0.00]),
+        Trap::Point([0.00, -0.50, 0.00, 0.00]),
+        Trap::Point([0.00, 0.50, 0.00, 0.00]),
+        Trap::Point([0.00, 1.00, 0.00, 0.00]),
+        Trap::Point([0.00, 1.50, 0.00, 0.00]),
+        Trap::Point([0.50, -1.50, 0.00, 0.00]),
+        Trap::Point([0.50, -1.00, 0.00, 0.00]),
+        Trap::Point([0.50, -0.50, 0.00, 0.00]),
+        Trap::Point([0.50, 0.00, 0.00, 0.00]),
+        Trap::Point([0.50, 0.50, 0.00, 0.00]),
+        Trap::Point([0.50, 1.00, 0.00, 0.00]),
+        Trap::Point([0.50, 1.50, 0.00, 0.00]),
+        Trap::Point([1.00, -1.50, 0.00, 0.00]),
+        Trap::Point([1.00, -1.00, 0.00, 0.00]),
+        Trap::Point([1.00, -0.50, 0.00, 0.00]),
+        Trap::Point([1.00, 0.00, 0.00, 0.00]),
+        Trap::Point([1.00, 0.50, 0.00, 0.00]),
+        Trap::Point([1.00, 1.00, 0.00, 0.00]),
+        Trap::Point([1.00, 1.50, 0.00, 0.00]),
+        Trap::Point([1.50, -1.50, 0.00, 0.00]),
+        Trap::Point([1.50, -1.00, 0.00, 0.00]),
+        Trap::Point([1.50, -0.50, 0.00, 0.00]),
+        Trap::Point([1.50, 0.00, 0.00, 0.00]),
+        Trap::Point([1.50, 0.50, 0.00, 0.00]),
+        Trap::Point([1.50, 1.00, 0.00, 0.00]),
+        Trap::Point([1.50, 1.50, 0.00, 0.00]),
+        Trap::Point([0.25, 0.00, 0.00, 0.00]),
+        Trap::Point([-0.75, 0.00, 0.00, 0.00]),
+        Trap::Point([0.00, 0.25, 0.00, 0.00]),
+        Trap::Point([2.00, 0.00, 0.00, 0.00]),
+        Trap::Point([-2.00, 0.00, 0.00, 0.00]),
+        Trap::Point([0.00, 2.00, 0.00, 0.00]),
+        Trap::Point([0.00, -2.00, 0.00, 0.00]),
+        Trap::Point([1.25, 0.00, 0.00, 0.00]),
+        Trap::Point([0.88, 0.88, 0.00, 0.00]),
+        Trap::Point([0.00, 1.25, 0.00, 0.00]),
+        Trap::Point([-0.88, 0.88, 0.00, 0.00]),
+        Trap::Point([-1.25, 0.00, 0.00, 0.00]),
+        Trap::Point([-0.88, -0.88, 0.00, 0.00]),
+        Trap::Point([0.00, -1.25, 0.00, 0.00]),
+        Trap::Point([0.88, -0.88, 0.00, 0.00]),
+        Trap::Point([-1.00, 0.00, -1.00, 0.00]),
+        Trap::Point([-1.00, 0.00, 1.00, 0.00]),
+        Trap::Point([0.00, 0.00, -1.00, 0.00]),
+        Trap::Point([0.00, 0.00, 1.00, 0.00]),
+        Trap::Point([1.00, 0.00, -1.00, 0.00]),
+        Trap::Point([1.00, 0.00, 1.00, 0.00]),
+        Trap::Point([0.00, -1.00, -1.00, 0.00]),
+        Trap::Point([0.00, -1.00, 1.00, 0.00]),
+        Trap::Point([0.00, 1.00, -1.00, 0.00]),
+        Trap::Point([0.00, 1.00, 1.00, 0.00]),
+        Trap::Point([0.00, 0.00, -1.00, -1.00]),
+        Trap::Point([0.00, 0.00, -1.00, 1.00]),
+        Trap::Point([0.00, 0.00, 0.00, -1.00]),
+        Trap::Point([0.00, 0.00, 0.00, 1.00]),
+        Trap::Point([0.00, 0.00, 1.00, -1.00]),
+        Trap::Point([0.00, 0.00, 1.00, 1.00]),
+        Trap::Point([-1.00, 0.00, 0.00, -1.00]),
+        Trap::Point([-1.00, 0.00, 0.00, 1.00]),
+        Trap::Point([1.00, 0.00, 0.00, -1.00]),
+        Trap::Point([1.00, 0.00, 0.00, 1.00]),
+    ];
+    pub const TRAP_NAMES: [&str; N_TRAPS] = [
+        "origin",
+        "plane_r",
+        "plane_a",
+        "plane_b",
+        "plane_c",
+        "cross",
+        "sphere_0.1",
+        "sphere_0.25",
+        "sphere_0.4",
+        "sphere_0.5",
+        "sphere_0.6",
+        "sphere_0.75",
+        "sphere_0.9",
+        "sphere_1",
+        "sphere_1.1",
+        "sphere_1.25",
+        "sphere_1.5",
+        "sphere_1.75",
+        "sphere_2",
+        "sphere_2.25",
+        "sphere_2.5",
+        "sphere_2.75",
+        "sphere_3",
+        "sphere_3.5",
+        "sphere_4",
+        "sphere_5",
+        "axis_r",
+        "axis_a",
+        "axis_b",
+        "axis_c",
+        "diag_r=a",
+        "diag_r=-a",
+        "diag_r=b",
+        "diag_r=-b",
+        "diag_r=c",
+        "diag_r=-c",
+        "diag_a=b",
+        "diag_a=-b",
+        "diag_a=c",
+        "diag_a=-c",
+        "diag_b=c",
+        "diag_b=-c",
+        "circle_ra_0.5",
+        "circle_ra_1",
+        "circle_ra_1.5",
+        "circle_rb_0.5",
+        "circle_rb_1",
+        "circle_rb_1.5",
+        "circle_rc_0.5",
+        "circle_rc_1",
+        "circle_rc_1.5",
+        "circle_ab_0.5",
+        "circle_ab_1",
+        "circle_ab_1.5",
+        "circle_ac_0.5",
+        "circle_ac_1",
+        "circle_ac_1.5",
+        "circle_bc_0.5",
+        "circle_bc_1",
+        "circle_bc_1.5",
+        "pt_-1.5-1.5a",
+        "pt_-1.5-1a",
+        "pt_-1.5-0.5a",
+        "pt_-1.5",
+        "pt_-1.5+0.5a",
+        "pt_-1.5+1a",
+        "pt_-1.5+1.5a",
+        "pt_-1-1.5a",
+        "pt_-1-1a",
+        "pt_-1-0.5a",
+        "pt_-1",
+        "pt_-1+0.5a",
+        "pt_-1+1a",
+        "pt_-1+1.5a",
+        "pt_-0.5-1.5a",
+        "pt_-0.5-1a",
+        "pt_-0.5-0.5a",
+        "pt_-0.5",
+        "pt_-0.5+0.5a",
+        "pt_-0.5+1a",
+        "pt_-0.5+1.5a",
+        "pt_-1.5a",
+        "pt_-1a",
+        "pt_-0.5a",
+        "pt_+0.5a",
+        "pt_+1a",
+        "pt_+1.5a",
+        "pt_+0.5-1.5a",
+        "pt_+0.5-1a",
+        "pt_+0.5-0.5a",
+        "pt_+0.5",
+        "pt_+0.5+0.5a",
+        "pt_+0.5+1a",
+        "pt_+0.5+1.5a",
+        "pt_+1-1.5a",
+        "pt_+1-1a",
+        "pt_+1-0.5a",
+        "pt_+1",
+        "pt_+1+0.5a",
+        "pt_+1+1a",
+        "pt_+1+1.5a",
+        "pt_+1.5-1.5a",
+        "pt_+1.5-1a",
+        "pt_+1.5-0.5a",
+        "pt_+1.5",
+        "pt_+1.5+0.5a",
+        "pt_+1.5+1a",
+        "pt_+1.5+1.5a",
+        "pt_+0.25",
+        "pt_-0.75",
+        "pt_+0.25a",
+        "pt_+2",
+        "pt_-2",
+        "pt_+2a",
+        "pt_-2a",
+        "pt_+1.25",
+        "pt_+0.88+0.88a",
+        "pt_+1.25a",
+        "pt_-0.88+0.88a",
+        "pt_-1.25",
+        "pt_-0.88-0.88a",
+        "pt_-1.25a",
+        "pt_+0.88-0.88a",
+        "pt_-1-1b",
+        "pt_-1+1b",
+        "pt_-1b",
+        "pt_+1b",
+        "pt_+1-1b",
+        "pt_+1+1b",
+        "pt_-1a-1b",
+        "pt_-1a+1b",
+        "pt_+1a-1b",
+        "pt_+1a+1b",
+        "pt_-1b-1c",
+        "pt_-1b+1c",
+        "pt_-1c",
+        "pt_+1c",
+        "pt_+1b-1c",
+        "pt_+1b+1c",
+        "pt_-1-1c",
+        "pt_-1+1c",
+        "pt_+1-1c",
+        "pt_+1+1c",
+    ];
+    /// 1 if the orbit escaped, else 0.
+    pub const ESCAPED: usize = 0;
+    /// Smooth escape time, unclamped (`max_iter` inside).
+    pub const SMOOTH: usize = 1;
+    /// z at escape (inside: after the last step), components r, a, b, c.
+    pub const EXIT: usize = 2;
+    /// Orbit traps (TRAP_DEFS order): smallest distance over the orbit.
+    pub const TRAPS: usize = 6;
+    /// The step at which the TRAP_STEP_OF traps were closest (region outlines, "domains").
+    pub const TRAP_STEP: usize = 149;
+    /// Stripe averages ½ + ½ sin(s·θ) over the orbit, θ the angle of z in a plane: STRIPE_DEFS (plane, s).
+    pub const STRIPES: usize = 173;
+    /// Orbit averages, AVERAGE_NAMES order.
+    pub const AVERAGES: usize = 209;
+    /// Mean r and mean a of the orbit.
+    pub const CENTROID: usize = 222;
+    /// Total turning of the angle of z in each plane (winding), PLANES order.
+    pub const WINDING: usize = 224;
+    /// R-A angle of orbit points z₂ … z₉ (NaN if the orbit escaped before).
+    pub const EARLY_ANGLE: usize = 230;
+    /// ln|z| of z₂ … z₉.
+    pub const EARLY_LOG: usize = 238;
+    /// Angle of early orbit points in other planes: EARLY_OTHER_DEFS (plane, step).
+    pub const EARLY_OTHER: usize = 246;
+    /// Largest |z| before escape (inside: over the whole orbit).
+    pub const EXTENT: usize = 254;
+    /// First step with |z| above each PASSAGE_R radius (0 = never).
+    pub const PASSAGE: usize = 255;
+    /// ln|dz| per step after 5 and after 10 steps.
+    pub const EARLY_GROWTH: usize = 263;
+    /// ln|dz| at the end.
+    pub const LN_DZ: usize = 265;
+    /// ln|dz| per step.
+    pub const LYAPUNOV: usize = 266;
+    /// Distance estimate.
+    pub const DE: usize = 267;
+    /// Inside: period of the final cycle (0 = none found).
+    pub const PERIOD: usize = 268;
+    pub const TRAP_STEP_OF: [usize; 24] = [0, 5, 13, 9, 18, 16, 26, 27, 30, 31, 43, 42, 44, 1, 2, 97, 70, 85, 82, 91, 78, 109, 108, 99];
+    pub const STRIPE_DEFS: [(usize, u32); 36] = [(0, 1), (0, 2), (0, 3), (0, 4), (0, 5), (0, 6), (0, 7), (0, 8), (0, 9), (0, 10), (0, 11), (0, 12), (0, 13), (0, 14), (0, 15), (0, 16), (1, 1), (1, 2), (1, 3), (1, 4), (2, 1), (2, 2), (2, 3), (2, 4), (3, 1), (3, 2), (3, 3), (3, 4), (4, 1), (4, 2), (4, 3), (4, 4), (5, 1), (5, 2), (5, 3), (5, 4)];
+    pub const AVERAGE_NAMES: [&str; 13] = ["curvature", "triangle", "mean_log", "mean_abs", "log_var", "angle_spread", "near_unit", "mean_b", "mean_c", "var_r", "var_a", "var_b", "var_c"];
+    pub const EARLY_STEPS: [u32; 8] = [2, 3, 4, 5, 6, 7, 8, 9];
+    pub const EARLY_OTHER_DEFS: [(usize, u32); 8] = [(1, 2), (1, 3), (1, 4), (1, 5), (3, 2), (3, 3), (3, 4), (3, 5)];
+    pub const PASSAGE_R: [f64; 8] = [0.25, 0.50, 0.75, 1.00, 1.50, 2.00, 3.00, 4.00];
+}
+// END generated by scripts/gen_orbit_features.py
+/// Everything an orbit says about its starting point, as a flat vector (slots in
+/// [`orbit_feature`]): the same iteration as `quat_dag_escape_de_mode`. Orbit averages
+/// run over steps 2.. (z₁ is just c for z²+c-like formulas); outside they blend the
+/// last two partial averages by where |z| crossed the bailout, so they vary smoothly
+/// across escape-step boundaries (Härkönen's stripe averaging).
+pub fn quat_dag_orbit_features(f: &QuatDagFormula, point: Quat, max_iter: u32, bailout_sq: f64, zero_c: bool) -> [f32; ORBIT_FEATURES] {
+    use orbit_feature as of;
+    use orbit_feature::Trap;
+    use std::f64::consts::FRAC_1_SQRT_2;
+    let warped = if f.warp.is_empty() { point } else { eval_program_quat(f.warp, point, point) };
+    let (mut z, c, mut dz, dc) = if f.julia {
+        (warped, Quat::new(f.jc.0 as f64, f.jc.1 as f64, 0.0, 0.0), 1.0_f64, 0.0_f64)
+    } else {
+        (Quat::ZERO, warped, 0.0_f64, 1.0_f64)
+    };
+    let phoenix_q = Quat::new(f.phoenix.0 as f64, f.phoenix.1 as f64, 0.0, 0.0);
+    let phoenix_mag = phoenix_q.norm_sq().sqrt();
+    let (mut pz, mut dpz) = (Quat::ZERO, 0.0_f64);
+    let step = |z: &mut Quat, dz: &mut f64, pz: &mut Quat, dpz: &mut f64| {
+        let (f0, df) = eval_program_quat_deriv(f.prog, *z, c, *dz, dc);
+        let dnext = df + phoenix_mag * *dpz;
+        let next = f0.add(phoenix_q.mul(*pz));
+        *dpz = *dz;
+        *pz = *z;
+        *dz = dnext;
+        *z = next;
+        if zero_c { z.c = 0.0; }
+    };
+    let comps = |z: Quat| [z.r, z.a, z.b, z.c];
+    let mut out = [f32::NAN; ORBIT_FEATURES];
+    // Point traps keep squared distances (monotone), the others plain distances.
+    let mut tmin = [f64::INFINITY; of::N_TRAPS];
+    let mut tstep = [0u32; of::N_TRAPS];
+    const N_ST: usize = of::STRIPE_DEFS.len();
+    let (mut st_sum, mut st_last) = ([0.0f64; N_ST], [0.0f64; N_ST]);
+    // curvature, triangle, ln|z|, |z|, (ln|z|)², near-unit, r, a, b, c, r², a², b², c²
+    let (mut acc, mut last) = ([0.0f64; 14], [0.0f64; 14]);
+    let (mut dir_c, mut dir_s) = (0.0f64, 0.0f64);
+    let mut n_acc = 0usize;
+    let mut wind = [0.0f64; 6];
+    let mut extent = 0.0f64;
+    let mut passage = [0u32; of::PASSAGE_R.len()];
+    let c_norm = c.norm_sq().sqrt();
+    let (mut prev, mut prev2) = (z, z);
+    let mut escaped = false;
+    let mut smooth = max_iter as f64;
+    let mut final_r = 0.0;
+    for it in 0..max_iter {
+        prev2 = prev;
+        prev = z;
+        step(&mut z, &mut dz, &mut pz, &mut dpz);
+        if !z.is_finite() {
+            escaped = true;
+            smooth = it as f64;
+            z = prev;
+            break;
+        }
+        let n = it + 1;
+        if n == 5 { out[of::EARLY_GROWTH] = (dz.max(1e-300).ln() / 5.0) as f32; }
+        if n == 10 { out[of::EARLY_GROWTH + 1] = (dz.max(1e-300).ln() / 10.0) as f32; }
+        let q = comps(z);
+        let ms = z.norm_sq();
+        let r = ms.sqrt();
+        final_r = r;
+        for (k, &pr) in of::PASSAGE_R.iter().enumerate() {
+            if passage[k] == 0 && r > pr { passage[k] = n; }
+        }
+        for (k, t) in of::TRAP_DEFS.iter().enumerate() {
+            let v = match *t {
+                Trap::Origin => r,
+                Trap::Plane(i) => q[i].abs(),
+                Trap::Cross => q[0].abs().min(q[1].abs()).min(q[2].abs()).min(q[3].abs()),
+                Trap::Sphere(rad) => (r - rad).abs(),
+                Trap::Axis(i) => (ms - q[i] * q[i]).max(0.0).sqrt(),
+                Trap::Diag(i, j, s) => (q[i] - s * q[j]).abs() * FRAC_1_SQRT_2,
+                Trap::Circle(i, j, rad) => (q[i].hypot(q[j]) - rad).abs(),
+                Trap::Point(p) => (q[0] - p[0]).powi(2) + (q[1] - p[1]).powi(2) + (q[2] - p[2]).powi(2) + (q[3] - p[3]).powi(2),
+            };
+            if v < tmin[k] { tmin[k] = v; tstep[k] = n; }
+        }
+        let pq = comps(prev);
+        for (k, &(i, j)) in of::PLANES.iter().enumerate() {
+            // Signed angle from the previous point to this one, in the plane (i, j).
+            if n >= 2 { wind[k] += (pq[i] * q[j] - pq[j] * q[i]).atan2(pq[i] * q[i] + pq[j] * q[j]); }
+        }
+        let theta = q[1].atan2(q[0]);
+        if let Some(e) = of::EARLY_STEPS.iter().position(|&s| s == n) {
+            out[of::EARLY_ANGLE + e] = theta as f32;
+            out[of::EARLY_LOG + e] = r.max(1e-30).ln() as f32;
+        }
+        for (k, &(pl, st)) in of::EARLY_OTHER_DEFS.iter().enumerate() {
+            if st == n { let (i, j) = of::PLANES[pl]; out[of::EARLY_OTHER + k] = q[j].atan2(q[i]) as f32; }
+        }
+        if n >= 2 {
+            for (k, &(pl, s)) in of::STRIPE_DEFS.iter().enumerate() {
+                let (i, j) = of::PLANES[pl];
+                let (x, y) = (q[i], q[j]);
+                let rho = x.hypot(y);
+                // sin(s·θ) from (cos θ, sin θ) by complex powers: no trig per stripe.
+                let v = if rho > 0.0 {
+                    let (cth, sth) = (x / rho, y / rho);
+                    let (mut cr, mut si) = (1.0f64, 0.0f64);
+                    for _ in 0..s { let t = cr * cth - si * sth; si = cr * sth + si * cth; cr = t; }
+                    0.5 + 0.5 * si
+                } else { 0.5 };
+                st_last[k] = v;
+                st_sum[k] += v;
+            }
+            let (d1, d0) = (z.sub(prev), prev.sub(prev2));
+            let den = (d1.norm_sq() * d0.norm_sq()).sqrt();
+            let dot = d1.r * d0.r + d1.a * d0.a + d1.b * d0.b + d1.c * d0.c;
+            last[0] = if n >= 3 && den > 0.0 { (dot / den).clamp(-1.0, 1.0).acos() } else { 0.0 };
+            let m = prev.norm_sq();
+            let (lo, hi) = ((m - c_norm).abs(), m + c_norm);
+            last[1] = if hi > lo { ((r - lo) / (hi - lo)).clamp(-4.0, 4.0) } else { 0.0 };
+            let lr = r.max(1e-30).ln();
+            last[2] = lr;
+            last[3] = r.min(1e6);
+            last[4] = lr * lr;
+            last[5] = if r < 1.0 { 1.0 } else { 0.0 };
+            for k in 0..4 {
+                let v = q[k].clamp(-1e6, 1e6);
+                last[6 + k] = v;
+                last[10 + k] = v * v;
+            }
+            for k in 0..14 { acc[k] += last[k]; }
+            let rho = q[0].hypot(q[1]);
+            if rho > 0.0 { dir_c += q[0] / rho; dir_s += q[1] / rho; }
+            n_acc += 1;
+        }
+        if ms > bailout_sq {
+            escaped = true;
+            smooth = n as f64 - (ms.log2() * 0.5).log2();
+            break;
+        }
+        extent = extent.max(r);
+    }
+    let blend = if escaped && final_r > 1.0 {
+        (1.0 + ((0.5 * bailout_sq.ln()) / final_r.ln()).log2()).clamp(0.0, 1.0)
+    } else {
+        1.0
+    };
+    let avg = |sum: f64, last: f64| -> f64 {
+        if n_acc == 0 { return f64::NAN; }
+        let cur = sum / n_acc as f64;
+        if n_acc < 2 || blend >= 1.0 { return cur; }
+        let before = (sum - last) / (n_acc - 1) as f64;
+        blend * cur + (1.0 - blend) * before
+    };
+    for k in 0..N_ST { out[of::STRIPES + k] = avg(st_sum[k], st_last[k]) as f32; }
+    let a = |k: usize| avg(acc[k], last[k]);
+    out[of::AVERAGES] = a(0) as f32;
+    out[of::AVERAGES + 1] = a(1) as f32;
+    out[of::AVERAGES + 2] = a(2) as f32;
+    out[of::AVERAGES + 3] = a(3) as f32;
+    out[of::AVERAGES + 4] = (a(4) - a(2) * a(2)).max(0.0) as f32;
+    if n_acc > 0 { out[of::AVERAGES + 5] = (1.0 - dir_c.hypot(dir_s) / n_acc as f64) as f32; }
+    out[of::AVERAGES + 6] = a(5) as f32;
+    out[of::AVERAGES + 7] = a(8) as f32;
+    out[of::AVERAGES + 8] = a(9) as f32;
+    for k in 0..4 { out[of::AVERAGES + 9 + k] = (a(10 + k) - a(6 + k) * a(6 + k)).max(0.0) as f32; }
+    out[of::CENTROID] = a(6) as f32;
+    out[of::CENTROID + 1] = a(7) as f32;
+    for k in 0..6 { out[of::WINDING + k] = wind[k] as f32; }
+    out[of::EXTENT] = extent as f32;
+    for k in 0..of::PASSAGE_R.len() { out[of::PASSAGE + k] = passage[k] as f32; }
+    out[of::ESCAPED] = if escaped { 1.0 } else { 0.0 };
+    out[of::SMOOTH] = smooth as f32;
+    for (k, v) in comps(z).into_iter().enumerate() { out[of::EXIT + k] = v as f32; }
+    for (k, t) in of::TRAP_DEFS.iter().enumerate() {
+        let v = if matches!(t, Trap::Point(_)) { tmin[k].sqrt() } else { tmin[k] };
+        out[of::TRAPS + k] = v as f32;
+    }
+    for (j, &k) in of::TRAP_STEP_OF.iter().enumerate() { out[of::TRAP_STEP + j] = tstep[k] as f32; }
+    let r = z.norm_sq().sqrt().max(1e-300);
+    out[of::LN_DZ] = dz.max(1e-300).ln() as f32;
+    let steps = if escaped { smooth.ceil().max(1.0) } else { max_iter.max(1) as f64 };
+    out[of::LYAPUNOV] = (dz.max(1e-300).ln() / steps) as f32;
+    out[of::DE] = (0.5 * r.ln() * r / dz.max(1e-300)).max(0.0) as f32;
+    out[of::PERIOD] = 0.0;
+    if !escaped {
+        let z_ref = z;
+        let tol = 1e-6 * (1.0 + r);
+        for k in 1..=32u32 {
+            step(&mut z, &mut dz, &mut pz, &mut dpz);
+            if !z.is_finite() { break; }
+            if z.sub(z_ref).norm_sq().sqrt() < tol { out[of::PERIOD] = k as f32; break; }
+        }
+    }
+    out
+}
+
+/// [`quat_dag_orbit_features`] at a view-space point through the render's
+/// collapse, like [`orbit_stats_at`].
+pub fn orbit_features_at(p: &RaymarchDagParams, point: Vec3) -> [f32; ORBIT_FEATURES] {
+    use crate::quat_collapse::{Collapse, Method};
+    let c = Collapse::effective(p.collapse);
+    let (v4, lam) = c.map_point(point, p.time_val);
+    let q = assemble_point_t(p, (v4[0], v4[1], v4[2]), v4[3]);
+    let mut f = quat_dag_orbit_features(&p.formula, q, p.max_iter, p.bailout * p.bailout, c.method == Method::Proj3);
+    f[orbit_feature::DE] /= (lam * remap_max_scale(p)) as f32;
+    f
+}
+
+/// [`quat_dag_orbit_stats`] at a view-space point through the render's
+/// collapse (projection, axis assignment and T applied), like `escape_time_at`.
+/// The slab collapse uses its centre plane only.
+pub fn orbit_stats_at(p: &RaymarchDagParams, point: Vec3) -> OrbitStats {
+    use crate::quat_collapse::{Collapse, Method};
+    let c = Collapse::effective(p.collapse);
+    let (v4, lam) = c.map_point(point, p.time_val);
+    let q = assemble_point_t(p, (v4[0], v4[1], v4[2]), v4[3]);
+    let mut s = quat_dag_orbit_stats(&p.formula, q, p.max_iter, p.bailout * p.bailout, c.method == Method::Proj3);
+    s.de /= lam * remap_max_scale(p);
+    s
 }
 
 /// `eval_program_quat`, run in parallel with a scalar derivative-magnitude
@@ -547,13 +1227,17 @@ fn assemble_point_t(p: &RaymarchDagParams, point: Vec3, time_val: f64) -> Quat {
 /// `(escape_time, distance_estimate)` at a view-space point through the
 /// render's collapse method — the CPU twin of the shader's `de_at`.
 fn eval_collapsed(p: &RaymarchDagParams, point: Vec3) -> (f32, f64) {
+    eval_collapsed_c(p, point, true)
+}
+
+fn eval_collapsed_c(p: &RaymarchDagParams, point: Vec3, clamp: bool) -> (f32, f64) {
     use crate::quat_collapse::{Collapse, Method};
     let c = Collapse::effective(p.collapse);
     let bailout_sq = p.bailout * p.bailout;
     let one = |t: f64| -> (f32, f64) {
         let (v4, lam) = c.map_point(point, t);
         let q = assemble_point_t(p, (v4[0], v4[1], v4[2]), v4[3]);
-        let (et, de) = quat_dag_escape_de_mode(&p.formula, q, p.max_iter, bailout_sq, c.method == Method::Proj3);
+        let (et, de) = escape_de_core(&p.formula, q, p.max_iter, bailout_sq, c.method == Method::Proj3, clamp);
         (et, de / lam)
     };
     let mut r = match c.method {
@@ -576,6 +1260,12 @@ fn eval_collapsed(p: &RaymarchDagParams, point: Vec3) -> (f32, f64) {
 /// assignment and T applied): what a flat slice through the 3D view shows.
 pub fn escape_time_at(p: &RaymarchDagParams, point: Vec3) -> f32 {
     eval_collapsed(p, point).0
+}
+
+/// [`escape_time_at`] without the floor at 0: smooth everywhere outside the
+/// set, so contour plots get lines where the render's field is flat.
+pub fn escape_potential_at(p: &RaymarchDagParams, point: Vec3) -> f32 {
+    eval_collapsed_c(p, point, false).0
 }
 
 fn de_at(p: &RaymarchDagParams, point: Vec3) -> f64 {
@@ -1054,6 +1744,29 @@ fn cross(a: Vec3, b: Vec3) -> Vec3 {
 }
 
 /// Same rayon-parallel-per-pixel shape as `quat_raymarch::render_raymarch_frame`.
+/// The geometry behind [`render_raymarch_dag_frame`] (one ray per pixel, row 0
+/// = top): each pixel's first surface hit as (point, normal, colour value), or
+/// None. For line drawings of the surface (`explorer quat-surface-plot`).
+pub fn raymarch_dag_hits(p: &RaymarchDagParams, cam: &RaymarchCamera, width: u32, height: u32) -> Vec<Option<(Vec3, Vec3, f32)>> {
+    let forward = normalize(sub(cam.target, cam.eye));
+    let (right, up) = look_at_basis(forward, cam.up_hint);
+    let half_h = (cam.fov_y * 0.5).tan();
+    let half_w = half_h * width as f64 / (height.max(1)) as f64;
+    let zone = effective_zone(p);
+    let pixel = 2.0 * half_h / height.max(1) as f64;
+    let (wf, hf) = (width.max(1) as f64, height.max(1) as f64);
+    (0..(width as u64 * height as u64))
+        .into_par_iter()
+        .map(|idx| {
+            let (px, py) = ((idx % width as u64) as f64, (idx / width as u64) as f64);
+            let u = ((px + 0.5) / wf * 2.0 - 1.0) * half_w;
+            let v = (1.0 - (py + 0.5) / hf * 2.0) * half_h;
+            let dir = normalize(add(add(forward, scale(right, u)), scale(up, v)));
+            match &zone { Some(z) => march_zone_in(p, z, cam.eye, dir), None => march_ray_px(p, cam.eye, dir, pixel) }
+        })
+        .collect()
+}
+
 pub fn render_raymarch_dag_frame(p: &RaymarchDagParams, cam: &RaymarchCamera, width: u32, height: u32) -> (Vec<f32>, Vec<f32>) {
     let forward = normalize(sub(cam.target, cam.eye));
     let (right, up) = look_at_basis(forward, cam.up_hint);
@@ -1099,6 +1812,63 @@ pub fn render_raymarch_dag_frame(p: &RaymarchDagParams, cam: &RaymarchCamera, wi
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn orbit_features_agree_with_orbit_stats() {
+        use orbit_feature as of;
+        let prog = crate::formula_text::parse_program("z^2 + c").unwrap();
+        let f = QuatDagFormula { prog: &prog, warp: &[], julia: false, jc: (0.0, 0.0), phoenix: (0.0, 0.0) };
+        for &(x, y, b, c) in &[(0.5, 0.5, 0.0, 0.0), (-0.75, 0.3, 0.1, 0.0), (-1.0, 0.0, 0.0, 0.0), (0.1, 0.1, 0.0, 0.05), (-0.1226, 0.7449, 0.0, 0.0), (0.26, 0.0, 0.0, 0.0), (0.3, -0.5, 0.2, -0.1)] {
+            let q = Quat::new(x, y, b, c);
+            let s = quat_dag_orbit_stats(&f, q, 300, 16.0, false);
+            let v = quat_dag_orbit_features(&f, q, 300, 16.0, false);
+            let close = |a: f32, b: f64| (a as f64 - b).abs() <= 1e-4 * (1.0 + b.abs());
+            assert_eq!(v[of::ESCAPED] == 1.0, s.escaped, "{q:?}");
+            assert!(close(v[of::SMOOTH], s.smooth), "{q:?}: {} vs {}", v[of::SMOOTH], s.smooth);
+            assert!(close(v[of::EXIT], s.exit.r) && close(v[of::EXIT + 3], s.exit.c));
+            assert!(close(v[of::TRAPS], s.min_norm) && v[of::TRAP_STEP] as u32 == s.min_norm_iter, "{q:?}");
+            let ti = |n: &str| of::TRAPS + of::TRAP_NAMES.iter().position(|&t| t == n).unwrap();
+            assert!(close(v[ti("cross")], s.trap_cross) && close(v[ti("sphere_1")], s.trap_sphere));
+            // A point trap is a distance: at +1 it is |z - 1| at its closest.
+            assert!(v[ti("pt_+1")] >= 0.0 && v[ti("pt_+1")].is_finite());
+            assert!(close(v[of::DE], s.de) && v[of::PERIOD] as u32 == s.period, "{q:?}");
+            for j in 0..of::STRIPE_DEFS.len() { assert!((0.0..=1.0).contains(&v[of::STRIPES + j]), "stripe {j} of {q:?}: {}", v[of::STRIPES + j]); }
+            assert!((0.0..=std::f32::consts::PI).contains(&v[of::AVERAGES]));
+            assert!((0.0..=1.0).contains(&v[of::AVERAGES + 5]) && (0.0..=1.0).contains(&v[of::AVERAGES + 6]));
+            for k in 0..4 { assert!(v[of::AVERAGES + 9 + k] >= 0.0, "variances are not negative"); }
+        }
+        // An orbit that escapes at step 1 has no z2: its slot is NaN, not a made-up value.
+        let v = quat_dag_orbit_features(&f, Quat::new(5.0, 0.0, 0.0, 0.0), 50, 16.0, false);
+        assert!(v[of::EARLY_ANGLE].is_nan() && v[of::ESCAPED] == 1.0);
+        // Stripe s = 2 really is sin 2θ: an orbit stuck at angle π/4 (z = c on the fixed
+        // diagonal is not available for z²+c, so check the helper's identity directly).
+        let th = 0.3f64;
+        let (cth, sth) = (th.cos(), th.sin());
+        let (mut cr, mut si) = (1.0f64, 0.0f64);
+        for _ in 0..3 { let t = cr * cth - si * sth; si = cr * sth + si * cth; cr = t; }
+        assert!((si - (3.0 * th).sin()).abs() < 1e-12);
+    }
+
+    #[test]
+    fn orbit_stats_agree_with_the_escape_time_and_find_periods() {
+        let prog = crate::formula_text::parse_program("z^2 + c").unwrap();
+        let f = QuatDagFormula { prog: &prog, warp: &[], julia: false, jc: (0.0, 0.0), phoenix: (0.0, 0.0) };
+        // c = -1: 0, -1, 0, -1 … a 2-cycle through 0; the rabbit centre has a 3-cycle.
+        let s = quat_dag_orbit_stats(&f, Quat::new(-1.0, 0.0, 0.0, 0.0), 100, 16.0, false);
+        assert!(!s.escaped && s.period == 2 && s.min_norm == 0.0 && s.min_norm_iter == 2, "{s:?}");
+        let s = quat_dag_orbit_stats(&f, Quat::new(-0.1226, 0.7449, 0.0, 0.0), 400, 16.0, false);
+        assert_eq!(s.period, 3);
+        assert_eq!(quat_dag_orbit_stats(&f, Quat::new(0.1, 0.1, 0.0, 0.0), 400, 16.0, false).period, 1, "main cardioid: a fixed point");
+        // Escaping points: the smooth time and DE are the renderer's (unclamped) values.
+        for &(x, y) in &[(0.5, 0.5), (-0.75, 0.3), (-2.1, 0.0), (0.26, 0.0), (2.0, 1.0)] {
+            let q = Quat::new(x, y, 0.0, 0.0);
+            let s = quat_dag_orbit_stats(&f, q, 200, 16.0, false);
+            let (et, de) = escape_de_core(&f, q, 200, 16.0, false, false);
+            assert!(s.escaped && s.period == 0, "{x},{y}");
+            assert!((s.smooth as f32 - et).abs() < 1e-4 && (s.de - de).abs() < 1e-9, "{x},{y}: {} vs {et}", s.smooth);
+            assert!(s.exit.norm_sq() > 16.0 && s.lyapunov > 0.0);
+        }
+    }
     use crate::formula::eval_program as eval_program_2d;
 
     #[test]
