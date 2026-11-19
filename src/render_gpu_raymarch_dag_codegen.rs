@@ -1016,10 +1016,14 @@ mod tests {
     /// Wall time of `compile` on real corpus genomes — what one live formula
     /// edit costs in the anim viewer. GPU-bound, so ignored by default:
     /// `cargo test --release --features wgpu-backend --lib compile_timing -- --ignored --nocapture`
+    /// COMPILE_TIMING_DIR (default train_corpus_quat) and COMPILE_TIMING_N (default 30) pick the
+    /// genomes; `__GL_SHADER_DISK_CACHE=0` keeps NVIDIA's disk cache from hiding repeat compiles.
     #[test]
     #[ignore]
     fn compile_timing_on_corpus() {
-        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("train_corpus_quat");
+        let dir = std::env::var("COMPILE_TIMING_DIR").map(std::path::PathBuf::from)
+            .unwrap_or_else(|_| std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("train_corpus_quat"));
+        let n: usize = std::env::var("COMPILE_TIMING_N").ok().and_then(|v| v.parse().ok()).unwrap_or(30);
         let Ok(entries) = std::fs::read_dir(&dir) else { return };
         let mut ms = Vec::new();
         for e in entries.flatten().take(400) {
@@ -1030,7 +1034,7 @@ mod tests {
             let t = std::time::Instant::now();
             assert!(CompiledDagPipeline::compile(&g.program, &g.warp).is_some());
             ms.push(t.elapsed().as_secs_f64() * 1000.0);
-            if ms.len() == 30 { break; }
+            if ms.len() == n { break; }
         }
         let first = ms.remove(0); // includes device init
         ms.sort_by(|a, b| a.partial_cmp(b).unwrap());

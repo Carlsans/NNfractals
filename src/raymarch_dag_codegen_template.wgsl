@@ -18,9 +18,9 @@
 // exactly, just resolved at codegen time instead of at runtime).
 //
 // Everything else here — Quat helpers, assemble, quat_dag_escape_de,
-// estimate_normal, march_sample, main — is copied verbatim from
-// raymarch_dag.wgsl (already verified pixel-for-pixel against the CPU
-// path); this file has no independent design beyond the two placeholders.
+// march_sample, main — started as a copy of raymarch_dag.wgsl (verified
+// pixel-for-pixel against the CPU path), since restructured so the formula
+// is inlined at few call sites (see de_at).
 
 struct Params {
     width:              u32,
@@ -395,19 +395,25 @@ fn de_one(p: vec3f, t: f32) -> vec2f {
 }
 
 // Returns (escape_time, distance_estimate) — the escape time is needed at
-// the Slide Iteration gate in march_sample; estimate_normal below only
-// ever uses the distance-estimate half.
+// the Slide Iteration gate in march_sample; the normal taps use both halves.
+// The driver inlines every function call, and the formula's escape loop sits
+// under every de_at call, so this shader reaches de_one / de_at from as few call
+// sites as possible: the driver's compile time grows steeply with the shader's
+// size (with 108 inlined copies of the formula a new genome took ~10 s).
 fn de_at(p: vec3f) -> vec2f {
-    var r: vec2f;
+    // Thicken (col_mode 2): the nearest of three time values, t-h, t, t+h, in that order.
+    let tv = params.time_val;
+    var ts = array<f32, 3>(tv, tv, tv);
+    var n: u32 = 1u;
     if (params.col_mode == 2u) {
         let h = params.col_p0;
-        r = de_one(p, params.time_val - h);
-        let b = de_one(p, params.time_val);
-        if (b.y < r.y) { r = b; }
-        let c = de_one(p, params.time_val + h);
-        if (c.y < r.y) { r = c; }
-    } else {
-        r = de_one(p, params.time_val);
+        ts = array<f32, 3>(tv - h, tv, tv + h);
+        n = 3u;
+    }
+    var r = vec2f(0.0, 0.0);
+    for (var k: u32 = 0u; k < n; k = k + 1u) {
+        let b = de_one(p, ts[k]);
+        if (k == 0u || b.y < r.y) { r = b; }
     }
     if (params.col_mode == 3u) { r.y = r.y - params.col_p0; }
     if (params.remap_enabled != 0u) {
@@ -418,16 +424,23 @@ fn de_at(p: vec3f) -> vec2f {
     return r;
 }
 
-// Tetrahedral 4-tap normal estimate — same technique as raymarch.wgsl.
-fn estimate_normal(p: vec3f) -> vec3f {
+// The tetrahedral 4-tap gradients at p (same technique as raymarch.wgsl), from one
+// de_at call site: `de` of the distance estimate (estimate_normal) and `et` of the
+// escape time capped at max_iter (zone_normal). Both use the same taps.
+struct TapGrads { de: vec3f, et: vec3f }
+fn tap_grads(p: vec3f) -> TapGrads {
     let eps = max(params.normal_eps, 1e-6);
-    let k0 = vec3f(1.0, -1.0, -1.0);
-    let k1 = vec3f(-1.0, -1.0, 1.0);
-    let k2 = vec3f(-1.0, 1.0, -1.0);
-    let k3 = vec3f(1.0, 1.0, 1.0);
-    let g = k0 * de_at(p + k0*eps).y + k1 * de_at(p + k1*eps).y
-          + k2 * de_at(p + k2*eps).y + k3 * de_at(p + k3*eps).y;
-    return normalize(g);
+    let cap = f32(params.max_iter);
+    var taps = array<vec3f, 4>(vec3f(1.0, -1.0, -1.0), vec3f(-1.0, -1.0, 1.0), vec3f(-1.0, 1.0, -1.0), vec3f(1.0, 1.0, 1.0));
+    var gd = vec3f(0.0, 0.0, 0.0);
+    var ge = vec3f(0.0, 0.0, 0.0);
+    for (var k: u32 = 0u; k < 4u; k = k + 1u) {
+        let kk = taps[k];
+        let r = de_at(p + kk*eps);
+        gd = gd + kk * r.y;
+        ge = ge + kk * min(r.x, cap);
+    }
+    return TapGrads(gd, ge);
 }
 
 // ── Zone filter — mirrors quat_dag.rs's ZoneParams / march_zone ──────────
@@ -477,21 +490,14 @@ fn zone_step(et: f32, de: f32) -> f32 {
     if (gap >= 3.0e38) { return params.zone_max_step; }
     return min(params.zone_de_trust * de * (1.0 - exp2(-gap)), params.zone_max_step);
 }
-// Escape-time gradient turned to face the camera (zone_normal on the CPU).
-fn zone_normal(p: vec3f, dir: vec3f) -> vec3f {
-    let eps = max(params.normal_eps, 1e-6);
-    let k0 = vec3f(1.0, -1.0, -1.0);
-    let k1 = vec3f(-1.0, -1.0, 1.0);
-    let k2 = vec3f(-1.0, 1.0, -1.0);
-    let k3 = vec3f(1.0, 1.0, 1.0);
-    let cap = f32(params.max_iter);
-    let g = k0 * min(de_at(p + k0*eps).x, cap) + k1 * min(de_at(p + k1*eps).x, cap)
-          + k2 * min(de_at(p + k2*eps).x, cap) + k3 * min(de_at(p + k3*eps).x, cap);
+// Escape-time gradient turned to face the camera (zone_normal on the CPU), from the
+// taps' gradients `g` at the point; the distance-estimate normal where it is flat.
+fn zone_normal(g: TapGrads, dir: vec3f) -> vec3f {
     var n: vec3f;
-    if (length(g) > 1e-9) {
-        n = normalize(g);
+    if (length(g.et) > 1e-9) {
+        n = normalize(g.et);
     } else {
-        n = estimate_normal(p);
+        n = normalize(g.de);
         if (!(dot(n, n) > 0.5)) { n = -dir; }
     }
     if (dot(n, dir) > 0.0) { n = -n; }
@@ -575,7 +581,7 @@ fn march_zone(eye: vec3f, dir: vec3f, t0: f32, t1: f32, entry_n: vec3f, has_entr
             if (i == 0u) {
                 if (has_entry) { n = entry_n; if (dot(n, dir) > 0.0) { n = -n; } }
             } else {
-                n = zone_normal(hp, dir);
+                n = zone_normal(tap_grads(hp), dir);
                 et_hit = de_at(hp).x;
             }
             if (zone_solid_behind(hp, n)) {
@@ -744,14 +750,15 @@ fn march_sample(u: f32, v: f32) -> vec2f {
     }
     if (!hit) { return vec2f(0.0, 0.0); }
 
-    var normal = estimate_normal(hit_point);
+    let grads = tap_grads(hit_point);
+    var normal = normalize(grads.de);
     if (interior_hit) {
         if (started_inside) {
             // Started inside the set: the flat cut of the entry face (box, sphere, clip plane).
             normal = -dir;
             if (has_entry) { normal = entry_n; if (dot(normal, dir) > 0.0) { normal = -normal; } }
         } else {
-            normal = zone_normal(hit_point, dir);
+            normal = zone_normal(grads, dir);
         }
     }
     let light = normalize(vec3f(params.light_x, params.light_y, params.light_z));

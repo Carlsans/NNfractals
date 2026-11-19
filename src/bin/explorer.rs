@@ -5096,6 +5096,7 @@ struct OrgcxSidecar {
 
 fn start_orgcx_sidecar() -> Option<OrgcxSidecar> {
     use std::io::BufRead;
+    // ORGCX_THREADS (torch threads per sidecar) is inherited by the child.
     let script = Path::new("scripts/orgcx_scorer.py");
     if !script.exists() {
         eprintln!("  [orgcx] scripts/orgcx_scorer.py not found: orgcx terms score 0");
@@ -5157,11 +5158,14 @@ fn orgcx_scores_2d(genome: &Genome) -> (f64, f64) {
         hit_epsilon: d * 1e-4, pixel_lod: 0.0, solid_interior: solid_march(), step_safety: 0.8, light_dir: (0.5, 0.8, 0.3),
         normal_eps: d * 1e-3, color_probe_offset: d * 1e-2, aa: 1,
     };
-    let (mut rel, mut om) = (0.0, 0.0);
-    for base in BasePlane::ALL {
+    let slices: Vec<Vec<f32>> = BasePlane::ALL.iter().map(|&base| {
         let frame = SliceSpec { base, ..Default::default() }.frame((-d, -d, -d), (d, d, d));
-        let field = nnfractals::view_slice::slice_escape_times(&params, &frame, N as u32);
-        let (r, o) = orgcx_score_field(&field, &[N, N]);
+        nnfractals::view_slice::slice_escape_times(&params, &frame, N as u32)
+    }).collect();
+    let shape = [N, N];
+    let scores = orgcx_score_fields(&slices.iter().map(|f| (f.as_slice(), &shape[..])).collect::<Vec<_>>());
+    let (mut rel, mut om) = (0.0, 0.0);
+    for (r, o) in scores {
         rel += r / 3.0;
         om += o / 3.0;
     }
@@ -5169,30 +5173,70 @@ fn orgcx_scores_2d(genome: &Genome) -> (f64, f64) {
     (rel, om)
 }
 
-/// Scores one field (row-major, last axis fastest) with the orgcx sidecar: (rel, omega).
+/// Scores one field (row-major, last axis fastest) with an orgcx sidecar: (rel, omega).
 fn orgcx_score_field(field: &[f32], shape: &[usize]) -> (f64, f64) {
+    orgcx_score_fields(&[(field, shape)])[0]
+}
+
+/// Scores several fields in one request to one orgcx sidecar, which scores them on
+/// parallel threads (the three slices of `orgcx_scores_2d`): (rel, omega) per field,
+/// (0, 0) for a field that failed. ORGCX_SIDECARS (default 1) sidecars are started on
+/// demand, so parallel scoring workers (`--workers`) need not queue on one Python
+/// process; a caller takes the first free one, or waits for one in turn.
+fn orgcx_score_fields(fields: &[(&[f32], &[usize])]) -> Vec<(f64, f64)> {
     use std::io::{BufRead, Write};
-    static SIDECAR: std::sync::LazyLock<std::sync::Mutex<Option<OrgcxSidecar>>> = std::sync::LazyLock::new(|| std::sync::Mutex::new(start_orgcx_sidecar()));
+    static POOL: std::sync::LazyLock<Vec<std::sync::Mutex<Option<Option<OrgcxSidecar>>>>> = std::sync::LazyLock::new(|| {
+        let n = std::env::var("ORGCX_SIDECARS").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(1).clamp(1, 16);
+        (0..n).map(|_| std::sync::Mutex::new(None)).collect()
+    });
+    static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
     static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let zeros = vec![(0.0, 0.0); fields.len()];
     let dir = Path::new("explorer_out/orgcx_scratch");
     std::fs::create_dir_all(dir).ok();
-    let path = dir.join(format!("f{}_{}.f32", std::process::id(), SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)));
-    let bytes: Vec<u8> = field.iter().flat_map(|v| v.to_le_bytes()).collect();
-    if std::fs::write(&path, bytes).is_err() { return (0.0, 0.0); }
-    let dims = shape.iter().map(|n| n.to_string()).collect::<Vec<_>>().join(" ");
+    let mut paths = Vec::new();
+    let mut specs = Vec::new();
+    for (field, shape) in fields {
+        let path = dir.join(format!("f{}_{}.f32", std::process::id(), SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)));
+        let bytes: Vec<u8> = field.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let written = std::fs::write(&path, bytes).is_ok();
+        paths.push(path.clone());
+        if !written {
+            for p in &paths { std::fs::remove_file(p).ok(); }
+            return zeros;
+        }
+        let dims = shape.iter().map(|n| n.to_string()).collect::<Vec<_>>().join(" ");
+        specs.push(format!("{} {dims} twins=3 seed=0", path.display()));
+    }
     let reply = {
-        let mut guard = SIDECAR.lock().unwrap();
-        let Some(sc) = guard.as_mut() else { std::fs::remove_file(&path).ok(); return (0.0, 0.0) };
+        // A free sidecar if there is one, else the next in turn.
+        let mut guard = POOL.iter().find_map(|m| m.try_lock().ok())
+            .unwrap_or_else(|| POOL[NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % POOL.len()].lock().unwrap());
+        if guard.is_none() { *guard = Some(start_orgcx_sidecar()); }
+        let slot = guard.as_mut().unwrap();
+        let Some(sc) = slot.as_mut() else {
+            for p in &paths { std::fs::remove_file(p).ok(); }
+            return zeros;
+        };
         let mut line = String::new();
-        let ok = writeln!(sc.stdin, "{} {dims} twins=3 seed=0", path.display()).is_ok() && sc.stdin.flush().is_ok()
+        let ok = writeln!(sc.stdin, "{}", specs.join(" ; ")).is_ok() && sc.stdin.flush().is_ok()
             && sc.stdout.read_line(&mut line).map(|n| n > 0).unwrap_or(false);
-        if !ok { *guard = None; eprintln!("  [orgcx] sidecar died: orgcx terms score 0 from here"); }
+        if !ok { *slot = None; eprintln!("  [orgcx] sidecar died: this slot scores 0 from here"); }
         line
     };
-    std::fs::remove_file(&path).ok();
+    for p in &paths { std::fs::remove_file(p).ok(); }
     let v: serde_json::Value = serde_json::from_str(reply.trim()).unwrap_or(serde_json::Value::Null);
-    if let Some(e) = v.get("error") { eprintln!("  [orgcx] {e}"); }
-    (v.get("rel").and_then(|x| x.as_f64()).unwrap_or(0.0), v.get("omega").and_then(|x| x.as_f64()).unwrap_or(0.0))
+    // One field gets one object back, several a list in request order.
+    let items: Vec<serde_json::Value> = match v {
+        serde_json::Value::Array(a) => a,
+        serde_json::Value::Null => vec![],
+        o => vec![o],
+    };
+    (0..fields.len()).map(|i| {
+        let Some(o) = items.get(i) else { return (0.0, 0.0) };
+        if let Some(e) = o.get("error") { eprintln!("  [orgcx] {e}"); }
+        (o.get("rel").and_then(|x| x.as_f64()).unwrap_or(0.0), o.get("omega").and_then(|x| x.as_f64()).unwrap_or(0.0))
+    }).collect()
 }
 
 struct Memo<V>(std::sync::Mutex<std::collections::HashMap<u64, V>>);

@@ -12,7 +12,8 @@ kept under OUT/_campaigns/<campaign>/ until the campaign ends.
 Population and generations are fixed so a trial cannot win by buying more search.
 
 Env: OUT, COLLAPSE (slice), POOL, TRIALS (30), KEEP (8), RECIPE (cont), EXTRA ("term:weight,…"
-added to the fitness spec), LABEL (manifest scoring note). Stop with
+added to the fitness spec), LABEL (manifest scoring note), RUN_LIMIT (s per GA run, 2400), WORKERS
+(parallel scoring per GA run, 1), CONTROL_FILE (GA --control-file). Stop with
 `touch STOP_campaigns` (checked before every trial).
 """
 import glob, json, os, re, shutil, subprocess, sys, tempfile, time
@@ -48,11 +49,19 @@ os.makedirs(OUT, exist_ok=True)
 MF = f'{OUT}/manifest.json'
 
 
-def run_with_watchdog(cmd, log_path, grace=60, limit=2400):
+RUN_LIMIT = int(os.environ.get('RUN_LIMIT', 2400))
+# Genomes scored in parallel inside each GA run (quat-dag-evolve --workers; 0 = all cores).
+WORKERS = int(os.environ.get('WORKERS', 1))
+# A file the GA re-reads every second for {"workers": N}, so a guard can follow free memory.
+CONTROL_FILE = os.environ.get('CONTROL_FILE', '')
+
+
+def run_with_watchdog(cmd, log_path, grace=60, limit=RUN_LIMIT):
     """Run one GA. A run that has written its final contact sheet but is still alive
     after `grace` s is killed (2026-10-18: one run hung at exit for 12 h, a thread
     spinning after the save, and stalled the whole campaign); any run is killed
-    after `limit` s. The saved genomes are complete either way."""
+    after `limit` s (RUN_LIMIT; slower terms such as orgcx need more: 6 of 22 runs
+    of the first orgcx campaign hit 2400 s and saved nothing)."""
     proc = subprocess.Popen(cmd, stdout=open(log_path, 'w'), stderr=subprocess.STDOUT)
     start, done_at = time.time(), None
     while proc.poll() is None:
@@ -97,7 +106,7 @@ def run_trial(trial, camp_dir):
            '--mutation-max-edits', str(p['min_edits'] + p['extra_edits']), '--mutation-const-scale', f"{p['const_scale']:.4f}",
            '--mutation-max-depth', str(p['max_depth']),
            '--edit-weights', ','.join(f"{p[k]:.4f}" for k in ('w_perturb', 'w_swap', 'w_rewire', 'w_grow', 'w_prune')),
-           '--bulb-prob', f"{p['bulb_prob']:.4f}", '--kbc-prob', f"{p['kbc_prob']:.4f}"]
+           '--bulb-prob', f"{p['bulb_prob']:.4f}", '--kbc-prob', f"{p['kbc_prob']:.4f}", '--workers', str(WORKERS)] + (['--control-file', CONTROL_FILE] if CONTROL_FILE else [])
     if POOL:
         cmd += ['--pool-dir', POOL]
     run_with_watchdog(cmd, f'{tmp}/log.txt')
