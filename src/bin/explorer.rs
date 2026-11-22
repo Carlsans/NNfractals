@@ -4009,10 +4009,7 @@ fn t_cont_band(r: f64) -> f64 {
 /// at orbit position `orbit_t` ∈ [0,1) and T `phase`, `size`² RGB.
 /// Carl's six felt pens (gcodefractal `Configuration.setcolorlist`, his print
 /// order) with their measured ink colours, for previews that look like paper.
-const CARL_PENS: [(&str, (u8, u8, u8)); 6] = [
-    ("pink", (168, 57, 114)), ("green", (99, 123, 65)), ("lightblue", (36, 95, 143)),
-    ("red", (159, 59, 61)), ("purple", (57, 32, 97)), ("darkblue", (50, 48, 117)),
-];
+use nnfractals::plot_paths::CARL_PENS;
 
 /// Where an anatomy layer lives: outside the set, inside it, or everywhere.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -4021,12 +4018,19 @@ enum AnatReg { Out, In, All }
 /// (with its ±π seam), or outlines of the regions of an integer field.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum AnatKind { Smooth, Angle, Discrete }
+/// The costly part of the orbit feature vector an anatomy family reads: one trap
+/// (its distance, closest step or angle) or one stripe average. Orbits computed for
+/// a family evaluate only that (`quat_dag::FeatureNeed`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Uses { None, Trap(usize), Stripe(usize) }
 /// One anatomy layer: a quantity read from the orbit feature vector.
 struct AnatFam {
     name: String,
     reg: AnatReg,
     kind: AnatKind,
     what: String,
+    /// The costly orbit measurement it reads (traps, stripes); everything else is always computed.
+    uses: Uses,
     get: Box<dyn Fn(&[f32]) -> f32 + Sync + Send>,
 }
 
@@ -4065,6 +4069,449 @@ fn anat_trace(kind: AnatKind, g: &[f32], w: usize, h: usize, cell: f64, org: (f6
     }
 }
 
+/// Settings of [`anatomy_mosaic_streamed`] (the `quat-anatomy` mosaic flags).
+struct MosaicOpts {
+    bands: usize,
+    sectors: usize,
+    inner_bands: usize,
+    inner_sectors: usize,
+    variety: f64,
+    min_fill: f64,
+    min_layer_mm: f64,
+    levels: usize,
+    gap: f64,
+    min_len: f64,
+    /// Memory for one block of family values at the scoring resolution (GB).
+    block_gb: f64,
+    /// Sampling of the scoring pass (mm).
+    score_cell: f64,
+    /// Patches a family may be matched to (its best ones), bounding the matching's work.
+    match_top: usize,
+    /// > 0: every tile's lines follow the general outline (contours of the band
+    /// coordinate), displaced by up to this many band widths by the tile's family.
+    /// 0: each tile draws its family's own contours.
+    follow: f64,
+    /// Score and place only every n-th family (1 = all): the quick preview.
+    sample: usize,
+}
+
+/// This process's resident memory now and at its peak (GB), for progress lines.
+fn rss_note() -> String {
+    let st = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
+    let kb = |key: &str| st.lines().find(|l| l.starts_with(key)).and_then(|l| l.split_whitespace().nth(1)).and_then(|v| v.parse::<f64>().ok()).unwrap_or(0.0);
+    format!("rss {:.1} GB (peak {:.1})", kb("VmRSS:") / 1e6, kb("VmHWM:") / 1e6)
+}
+
+/// The orbit measurements family `k` needs: its trap or stripe, plus the trap at the
+/// origin (the inner patches are cut by the orbit's closest approach to 0).
+fn anat_need(fams: &[AnatFam], ks: &[usize]) -> nnfractals::quat_dag::FeatureNeed {
+    let mut need = nnfractals::quat_dag::FeatureNeed::default();
+    need.add_trap(0);
+    for &k in ks {
+        match fams[k].uses {
+            Uses::Trap(t) => need.add_trap(t),
+            Uses::Stripe(s) => need.add_stripe(s),
+            Uses::None => {}
+        }
+    }
+    need
+}
+
+/// The `quat-anatomy` mosaic with thousands of families: it never holds every
+/// family's values at once (2229 features × the canvas would be ~56 GB at 0.35 mm),
+/// and orbits only evaluate the traps and stripes the families at hand read
+/// (`FeatureNeed`; the 854 traps are most of an orbit's cost).
+/// 1) Scoring at `score_cell`: the families, sorted by the trap or stripe they read,
+///    are evaluated in blocks that fit `block_gb`, each traced and its ink per patch
+///    measured; Smooth and Discrete families also keep 1024 quantiles of their values.
+///    The patches have equal areas (see `Cuts`): outside --bands x --sectors, inside
+///    --inner-bands x --inner-sectors.
+/// 2) Assignment: every family gets a patch of its own where it can (maximum
+///    matching over its `match_top` best patches), the other patches the family
+///    drawing most there, discounted for reuse and for neighbours (as the in-memory
+///    mosaic).
+/// 3) Drawing at `cell`: per sample a cheap orbit finds its patch, a second one
+///    computes just the value of that patch's family. With `follow` > 0 one contour
+///    pass draws every tile: contours of the band coordinate (equal-area rank of the
+///    escape time outside, of the closest approach to 0 inside: the general outline)
+///    displaced by `follow` band widths times the family's rank. With `follow` = 0
+///    three passes (contours, angles, region outlines) draw each family's own lines.
+///    Then the patch boundaries. Returns (family, pen, line) for every line, the
+///    number of families used, the share of samples inside the set and a summary line.
+#[allow(clippy::too_many_arguments)]
+fn anatomy_mosaic_streamed(fams: &[AnatFam], active: &[usize], params: &nnfractals::quat_dag::RaymarchDagParams,
+                           point_mm: &(dyn Fn(f64, f64) -> (f64, f64, f64) + Sync), aw: f64, ah: f64, cell: f64, org: (f64, f64), o: &MosaicOpts)
+                           -> (Vec<(usize, usize, nnfractals::plot_paths::Polyline)>, usize, f64, String) {
+    use nnfractals::plot_paths as pp;
+    use nnfractals::quat_dag::{orbit_feature as of, orbit_features_at_need};
+    use rayon::prelude::*;
+    const NONE16: u16 = u16::MAX;
+    let t_all = std::time::Instant::now();
+    // Families sorted by the trap / stripe they read, so a block evaluates few of them.
+    let mut cands: Vec<usize> = active.iter().copied().filter(|&k| fams[k].reg != AnatReg::All).enumerate()
+        .filter(|(i, _)| i % o.sample.max(1) == 0).map(|(_, k)| k).collect();
+    cands.sort_by_key(|&k| match fams[k].uses { Uses::Trap(t) => (0, t, k), Uses::Stripe(s) => (1, s, k), Uses::None => (2, 0, k) });
+    assert!(cands.len() < NONE16 as usize, "too many families for the u16 family map");
+    let out_fam = |j: usize| fams[cands[j]].reg == AnatReg::Out;
+    let grid = |c: f64| ((aw / c).round().max(8.0) as usize, (ah / c).round().max(8.0) as usize);
+    let at = |c: f64, w: usize, i: usize| point_mm(((i % w) as f64 + 0.5) * c, ((i / w) as f64 + 0.5) * c);
+    let base_need = anat_need(fams, &[]);
+    let fam_need: Vec<nnfractals::quat_dag::FeatureNeed> = cands.iter().map(|&k| anat_need(fams, &[k])).collect();
+    // Quantile tables (1025 values) and the rank of a value in one.
+    let table = |mut v: Vec<f32>| -> Vec<f32> {
+        v.retain(|x| x.is_finite());
+        v.sort_unstable_by(f32::total_cmp);
+        if v.is_empty() { return Vec::new(); }
+        (0..=1024).map(|m| v[(m * (v.len() - 1)) / 1024]).collect()
+    };
+    let quant = |t: &[f32], x: f32| -> f32 {
+        if t.is_empty() || !x.is_finite() { return f32::NAN; }
+        let m = (t.len() - 1) as f64;
+        let lo = t.partition_point(|&e| e < x);
+        let hi = t.partition_point(|&e| e <= x);
+        let q = if hi > lo {
+            (lo + hi - 1) as f64 * 0.5 / m
+        } else if lo == 0 {
+            0.0
+        } else if lo > t.len() - 1 {
+            1.0
+        } else {
+            let (a, b) = (t[lo - 1] as f64, t[lo] as f64);
+            ((lo - 1) as f64 + if b > a { (x as f64 - a) / (b - a) } else { 0.5 }) / m
+        };
+        q.clamp(0.0, 0.999_999) as f32
+    };
+
+    // ---- 1) scoring resolution: base values (patch keys) and family blocks ----
+    let cs = o.score_cell;
+    let (ws, hs) = grid(cs);
+    let ns = ws * hs;
+    let block = ((o.block_gb * 1e9 / (ns as f64 * 4.0)) as usize).clamp(1, cands.len().max(1));
+    let n_blocks = cands.len().div_ceil(block);
+    // Base: escaped, smooth escape time, exit angle, closest approach to 0, and the
+    // second orbit point's ln|z| and angle (tie-breakers of the band / sector cuts).
+    let z2 = of::EARLY_STEPS.iter().position(|&st| st == 2).expect("orbit point 2 is an early step");
+    let fin = |x: f32| if x.is_finite() { x } else { 0.0 };
+    let base_of = |f: &[f32]| [f[of::ESCAPED], f[of::SMOOTH], f[of::EXIT + 1].atan2(f[of::EXIT]), f[of::TRAPS],
+                               fin(f[of::EARLY_LOG + z2]), fin(f[of::EARLY_ANGLE + z2])];
+    let mut base: Vec<[f32; 6]> = vec![[0.0; 6]; ns];
+    let mut vals: Vec<f32> = Vec::new();
+    let mut cdf: Vec<Vec<f32>> = vec![Vec::new(); cands.len()];
+    // Ink per mm² of each family in each patch (filled per block below).
+    let mut scores: Vec<Vec<f32>> = vec![Vec::new(); cands.len()];
+    let mut patch_ids: Vec<(bool, usize, usize)> = Vec::new();
+    let mut key_s: Vec<u32> = Vec::new();
+    // Equal-area patches: bands are quantiles of the escape time (outside) or of the
+    // orbit's closest approach to 0 (inside), and each band is cut into sectors at
+    // quantiles of the exit / cycle angle within that band, so every patch of a region
+    // has the same area (bands x angle ranges of the fractal's own structure). Ties are
+    // broken by the second orbit point (ln|z2| for bands, its angle for sectors): where
+    // the orbits all settle on one attracting point the cycle angle is the same
+    // everywhere, and the cuts would collapse into a few patches.
+    type K2 = (f32, f32);
+    let lex = |a: &K2, b: &K2| a.0.total_cmp(&b.0).then(a.1.total_cmp(&b.1));
+    struct Cuts { band: Vec<K2>, band_sect: Vec<Vec<K2>>, inner: Vec<K2>, inner_sect: Vec<Vec<K2>> }
+    let mut cuts = Cuts { band: Vec::new(), band_sect: Vec::new(), inner: Vec::new(), inner_sect: Vec::new() };
+    let edges = |mut v: Vec<K2>, n: usize| -> Vec<K2> {
+        v.sort_unstable_by(lex);
+        if v.is_empty() { return Vec::new(); }
+        (1..n).map(|k| v[(k * v.len() / n).min(v.len() - 1)]).collect()
+    };
+    let band_k = |b: &[f32; 6]| (fin(if b[0] > 0.5 { b[1] } else { b[3] }), b[4]);
+    let sect_k = |b: &[f32; 6]| (fin(b[2]), b[5]);
+    let idx = |e: &[K2], v: &K2| e.partition_point(|x| lex(x, v) != std::cmp::Ordering::Greater);
+    let key_of = |b: &[f32; 6], c: &Cuts| -> (bool, usize, usize) {
+        if b[0] > 0.5 {
+            let band = idx(&c.band, &band_k(b));
+            (true, band, c.band_sect.get(band).map_or(0, |e| idx(e, &sect_k(b))))
+        } else {
+            let ib = idx(&c.inner, &band_k(b));
+            (false, ib, c.inner_sect.get(ib).map_or(0, |e| idx(e, &sect_k(b))))
+        }
+    };
+    let mut area: Vec<f64> = Vec::new();
+    // The general outline's coordinate: rank of the escape time (outside) or of the
+    // closest approach to 0 (inside), from the scoring samples.
+    let (mut out_t, mut in_t) = (Vec::new(), Vec::new());
+    let t1 = std::time::Instant::now();
+    let mut evals = 0usize;
+    for bi in 0..n_blocks {
+        let fam_block = &cands[bi * block..((bi + 1) * block).min(cands.len())];
+        let nb = fam_block.len();
+        let need = anat_need(fams, fam_block);
+        evals += need.traps.len();
+        vals.clear();
+        vals.resize(ns * nb, f32::NAN);
+        let first = bi == 0;
+        let t_orbits = std::time::Instant::now();
+        vals.par_chunks_mut(nb).zip(base.par_iter_mut()).enumerate().for_each(|(i, (v, b))| {
+            let f = orbit_features_at_need(params, at(cs, ws, i), &need);
+            let esc = f[of::ESCAPED] > 0.5;
+            if first { *b = base_of(&f); }
+            for (s, &k) in fam_block.iter().enumerate() {
+                let here = match fams[k].reg { AnatReg::Out => esc, AnatReg::In => !esc, AnatReg::All => true };
+                if here { v[s] = (fams[k].get)(&f); }
+            }
+        });
+        if first {
+            cuts.band = edges(base.iter().filter(|b| b[0] > 0.5).map(band_k).collect(), o.bands);
+            cuts.inner = edges(base.iter().filter(|b| b[0] <= 0.5).map(band_k).collect(), o.inner_bands);
+            cuts.band_sect = (0..o.bands).into_par_iter().map(|k| edges(base.iter()
+                .filter(|b| b[0] > 0.5 && idx(&cuts.band, &band_k(b)) == k).map(sect_k).collect(), o.sectors)).collect();
+            cuts.inner_sect = (0..o.inner_bands).into_par_iter().map(|k| edges(base.iter()
+                .filter(|b| b[0] <= 0.5 && idx(&cuts.inner, &band_k(b)) == k).map(sect_k).collect(), o.inner_sectors)).collect();
+            out_t = table(base.iter().filter(|b| b[0] > 0.5).map(|b| b[1]).collect());
+            in_t = table(base.iter().filter(|b| b[0] <= 0.5).map(|b| b[3]).collect());
+            let keys: Vec<(bool, usize, usize)> = base.par_iter().map(|b| key_of(b, &cuts)).collect();
+            patch_ids = keys.clone();
+            patch_ids.par_sort_unstable();
+            patch_ids.dedup();
+            key_s = keys.par_iter().map(|k| patch_ids.binary_search(k).unwrap() as u32).collect();
+            area = vec![0.0; patch_ids.len()];
+            for &p in &key_s { area[p as usize] += cs * cs; }
+        }
+        let np = patch_ids.len();
+        let orbit_s = t_orbits.elapsed().as_secs_f64();
+        // Families in groups of 8: a group reads its values as one contiguous run per
+        // sample (one family alone would touch a cache line per sample).
+        const GROUP: usize = 8;
+        let results: Vec<(usize, Vec<f32>, Vec<f32>)> = (0..nb.div_ceil(GROUP)).into_par_iter().flat_map_iter(|gi| {
+            let (s0, s1) = (gi * GROUP, ((gi + 1) * GROUP).min(nb));
+            let mut raws: Vec<Vec<f32>> = (s0..s1).map(|_| Vec::with_capacity(ns)).collect();
+            for i in 0..ns {
+                for (r, &v) in raws.iter_mut().zip(&vals[i * nb + s0..i * nb + s1]) { r.push(v); }
+            }
+            raws.into_iter().enumerate().map(|(o_s, raw)| {
+                let j = bi * block + s0 + o_s;
+                let k = cands[j];
+                let mut tab = Vec::new();
+                let g: Vec<f32> = match fams[k].kind {
+                    AnatKind::Smooth => {
+                        // Equal-area rank: mid-rank of each value among the region's values.
+                        let mut by: Vec<(f32, u32)> = raw.iter().enumerate().filter(|(_, x)| x.is_finite()).map(|(i, &x)| (x, i as u32)).collect();
+                        by.sort_unstable_by(|a, b| a.0.total_cmp(&b.0));
+                        let n = by.len();
+                        if n > 0 { tab = (0..=1024).map(|m| by[(m * (n - 1)) / 1024].0).collect(); }
+                        let mut g = vec![f32::NAN; ns];
+                        let mut a = 0;
+                        while a < n {
+                            let mut b = a + 1;
+                            while b < n && by[b].0 == by[a].0 { b += 1; }
+                            let q = ((a + b) as f64 * 0.5 / n as f64).min(0.999_999) as f32;
+                            for t in &by[a..b] { g[t.1 as usize] = q; }
+                            a = b;
+                        }
+                        g
+                    }
+                    AnatKind::Angle => raw.iter().map(|&a| if a.is_finite() { ((a as f64 + std::f64::consts::PI) / std::f64::consts::TAU).clamp(0.0, 0.999_999) as f32 } else { f32::NAN }).collect(),
+                    AnatKind::Discrete => {
+                        tab = table(raw.clone());
+                        raw.iter().map(|&x| if x.is_finite() { x.round() } else { f32::NAN }).collect()
+                    }
+                };
+                let lines = anat_trace(fams[k].kind, &g, ws, hs, cs, (0.0, 0.0), o.levels, o.gap, o.min_len, &|_, _| true);
+                let mut sum = vec![0.0f32; np];
+                for l in &lines {
+                    for sg in l.pts.windows(2) {
+                        let (mx, my) = (0.5 * (sg[0].0 + sg[1].0), 0.5 * (sg[0].1 + sg[1].1));
+                        let (xi, yi) = (((mx / cs) as usize).min(ws - 1), ((my / cs) as usize).min(hs - 1));
+                        sum[key_s[yi * ws + xi] as usize] += ((sg[1].0 - sg[0].0).powi(2) + (sg[1].1 - sg[0].1).powi(2)).sqrt() as f32;
+                    }
+                }
+                for (p, v) in sum.iter_mut().enumerate() { *v /= area[p].max(1e-9) as f32; }
+                (j, sum, tab)
+            }).collect::<Vec<_>>()
+        }).collect();
+        for (j, sc, tab) in results {
+            scores[j] = sc;
+            cdf[j] = tab;
+        }
+        eprintln!("  scoring block {}/{n_blocks}: {nb} families ({} traps, {} stripes) at {cs} mm ({ws}x{hs}): orbits {orbit_s:.0}s, families {:.0}s; {:.0}s so far; {}",
+                  bi + 1, need.traps.len(), need.stripes.len(), t_orbits.elapsed().as_secs_f64() - orbit_s, t1.elapsed().as_secs_f64(), rss_note());
+    }
+    drop(vals);
+    let np = patch_ids.len();
+    let count: Vec<usize> = { let mut c = vec![0usize; np]; for &p in &key_s { c[p as usize] += 1; } c };
+    drop(key_s);
+
+    let t_assign = std::time::Instant::now();
+    // ---- 2) assignment ----
+    let top_of: Vec<f64> = (0..np).map(|p| {
+        let out = patch_ids[p].0;
+        (0..cands.len()).filter(|&j| out_fam(j) == out).map(|j| scores[j][p] as f64).fold(0.0f64, f64::max)
+    }).collect();
+    let ink = |j: usize, p: usize| scores[j][p] as f64 * area[p];
+    let adj: Vec<Vec<usize>> = (0..cands.len()).into_par_iter().map(|j| {
+        let mut ps: Vec<usize> = (0..np).filter(|&p| {
+            out_fam(j) == patch_ids[p].0 && scores[j][p] as f64 >= 0.5 * o.min_fill * top_of[p] && ink(j, p) >= o.min_layer_mm
+        }).collect();
+        let good = |p: usize| scores[j][p] as f64 >= o.min_fill * top_of[p];
+        ps.sort_by(|&a, &b| good(b).cmp(&good(a)).then(ink(j, b).total_cmp(&ink(j, a))));
+        ps.truncate(o.match_top);
+        ps
+    }).collect();
+    fn augment(j: usize, adj: &[Vec<usize>], seen: &mut [bool], owner: &mut [usize]) -> bool {
+        for &p in &adj[j] {
+            if seen[p] { continue; }
+            seen[p] = true;
+            if owner[p] == usize::MAX || augment(owner[p], adj, seen, owner) {
+                owner[p] = j;
+                return true;
+            }
+        }
+        false
+    }
+    let mut fam_order: Vec<usize> = (0..cands.len()).collect();
+    fam_order.sort_by_key(|&j| adj[j].len());
+    let mut owner = vec![usize::MAX; np];
+    let mut seen = vec![false; np];
+    for j in fam_order {
+        if adj[j].is_empty() { continue; }
+        seen.iter_mut().for_each(|s| *s = false);
+        augment(j, &adj, &mut seen, &mut owner);
+    }
+    let mut chosen = vec![usize::MAX; np];
+    let mut uses = vec![0usize; cands.len()];
+    for p in 0..np {
+        if owner[p] != usize::MAX { chosen[p] = owner[p]; uses[owner[p]] += 1; }
+    }
+    let matched = uses.iter().filter(|&&u| u > 0).count();
+    let mut order: Vec<usize> = (0..np).filter(|&p| chosen[p] == usize::MAX).collect();
+    order.sort_by_key(|&p| std::cmp::Reverse(count[p]));
+    for p in order {
+        let (out, b, sct) = patch_ids[p];
+        let n_sect = if out { o.sectors } else { o.inner_sectors };
+        let mut nb: Vec<usize> = Vec::new();
+        for k in [(out, b.wrapping_sub(1), sct), (out, b, (sct + n_sect - 1) % n_sect)] {
+            if let Ok(q) = patch_ids.binary_search(&k) { if chosen[q] != usize::MAX { nb.push(chosen[q]); } }
+        }
+        let top = top_of[p];
+        let best = (0..cands.len())
+            .filter(|&j| out_fam(j) == out && scores[j][p] as f64 >= o.min_fill * top)
+            .map(|j| {
+                let mut sc = scores[j][p] as f64;
+                if nb.contains(&j) { sc *= 0.3; }
+                (sc / (1.0 + o.variety * uses[j] as f64).powi(2), j)
+            })
+            .max_by(|a, b| a.0.total_cmp(&b.0));
+        if let Some((sc, j)) = best {
+            if sc > 0.0 { chosen[p] = j; uses[j] += 1; }
+        }
+    }
+    let used = uses.iter().filter(|&&u| u > 0).count();
+    eprintln!("  assignment in {:.1}s", t_assign.elapsed().as_secs_f64());
+    let t_score = t1.elapsed().as_secs_f64();
+    let np_out = patch_ids.iter().filter(|k| k.0).count();
+    // Equal-area cuts cannot split exactly tied samples: a region where every orbit is
+    // the same (the set flat inside) stays one patch with nothing to draw.
+    if let Some((p, &c)) = count.iter().enumerate().max_by_key(|x| x.1) {
+        let share = c as f64 / ns as f64;
+        if share > 0.02 { eprintln!("  largest patch {:?} covers {:.1}% of the view (its orbits all alike)", patch_ids[p], 100.0 * share); }
+    }
+    eprintln!("mosaic: {np} patches ({np_out} outside, {} inside), {} families scored in {t_score:.0}s ({evals} trap evaluations over {n_blocks} blocks, of {} for every family); {matched} families matched to a patch of their own, {used} used",
+              np - np_out, cands.len(), cands.len().div_ceil(block) * of::N_TRAPS);
+    drop(scores);
+
+    // ---- 3) drawing resolution: one value per sample, then tracing ----
+    let (w, h) = grid(cell);
+    let t3 = std::time::Instant::now();
+    let follow = o.follow.max(0.0);
+    // Displacement of the outline coordinate per unit of family rank, per region.
+    let (amp_out, amp_in) = (follow / o.bands as f64, follow / o.inner_bands as f64);
+    let scale = 1.0 / (1.0 + amp_out.max(amp_in));
+    let per: Vec<(f32, u16, u32, bool)> = (0..w * h).into_par_iter().map(|i| {
+        let pt = at(cell, w, i);
+        let f0 = orbit_features_at_need(params, pt, &base_need);
+        let b = base_of(&f0);
+        let inside = b[0] <= 0.5;
+        let Ok(p) = patch_ids.binary_search(&key_of(&b, &cuts)) else { return (f32::NAN, NONE16, u32::MAX, inside) };
+        let j = chosen[p];
+        if j == usize::MAX { return (f32::NAN, NONE16, p as u32, inside); }
+        let k = cands[j];
+        let x = if fams[k].uses == Uses::None { (fams[k].get)(&f0) } else { (fams[k].get)(&orbit_features_at_need(params, pt, &fam_need[j])) };
+        let rank = match fams[k].kind {
+            AnatKind::Angle => if x.is_finite() { ((x as f64 + std::f64::consts::PI) / std::f64::consts::TAU).clamp(0.0, 0.999_999) as f32 } else { f32::NAN },
+            AnatKind::Smooth => quant(&cdf[j], x),
+            AnatKind::Discrete => if follow > 0.0 { quant(&cdf[j], x) } else if x.is_finite() { x.round() } else { f32::NAN },
+        };
+        let v = if follow > 0.0 {
+            // Outline coordinate, displaced by the family; a family value missing here
+            // leaves the plain outline.
+            let u = if inside { quant(&in_t, b[3]) } else { quant(&out_t, b[1]) };
+            let amp = if inside { amp_in } else { amp_out };
+            ((u as f64 + amp * if rank.is_finite() { rank as f64 } else { 0.0 }) * scale) as f32
+        } else { rank };
+        (v, j as u16, p as u32, inside)
+    }).collect();
+    let inside = per.iter().filter(|x| x.3).count() as f64 / per.len().max(1) as f64;
+    let no_patch = per.iter().filter(|x| x.2 == u32::MAX).count();
+    let no_fam = per.iter().filter(|x| x.2 != u32::MAX && x.1 == NONE16).count();
+    let no_val = per.iter().filter(|x| x.1 != NONE16 && !x.0.is_finite()).count();
+    if no_patch + no_fam + no_val > 0 {
+        let pc = |n: usize| 100.0 * n as f64 / per.len().max(1) as f64;
+        eprintln!("  samples without a patch {:.1}%, in a patch without a family {:.1}%, without a value {:.1}%", pc(no_patch), pc(no_fam), pc(no_val));
+    }
+    let field: Vec<f32> = per.iter().map(|x| x.0).collect();
+    let fam_at: Vec<u16> = per.iter().map(|x| x.1).collect();
+    let pid: Vec<f32> = per.iter().map(|x| if x.2 == u32::MAX { f32::NAN } else { x.2 as f32 }).collect();
+    drop(per);
+    eprintln!("  {w}x{h} orbits at {cell} mm in {:.0}s, {:.1}% inside the set; {}", t3.elapsed().as_secs_f64(), 100.0 * inside, rss_note());
+    let kind_of: Vec<AnatKind> = cands.iter().map(|&k| fams[k].kind).collect();
+    // A cell is drawn when its four corners belong to one family's patches (of this kind).
+    let same_fam = |x: usize, y: usize| {
+        let a = fam_at[y * w + x];
+        (a != NONE16 && fam_at[y * w + x + 1] == a && fam_at[(y + 1) * w + x + 1] == a && fam_at[(y + 1) * w + x] == a).then_some(a as usize)
+    };
+    let same = |x: usize, y: usize, kind: AnatKind| same_fam(x, y).is_some_and(|a| kind_of[a] == kind);
+    let owner_of = |l: &pp::Polyline| -> Option<usize> {
+        let (p0, p1) = (l.pts[0], *l.pts.get(1).unwrap_or(&l.pts[0]));
+        let gx = (0.5 * (p0.0 + p1.0) - org.0) / cell - 0.5;
+        let gy = (0.5 * (p0.1 + p1.1) - org.1) / cell - 0.5;
+        let (x, y) = ((gx.max(0.0) as usize).min(w - 1), (gy.max(0.0) as usize).min(h - 1));
+        let a = fam_at[y * w + x];
+        (a != NONE16).then_some(a as usize)
+    };
+    let mut lines: Vec<(usize, usize, pp::Polyline)> = Vec::new();
+    let push = |ls: Vec<pp::Polyline>, lines: &mut Vec<(usize, usize, pp::Polyline)>| {
+        for l in ls { if let Some(j) = owner_of(&l) { lines.push((cands[j], 0, l)); } }
+    };
+    let t4 = std::time::Instant::now();
+    if follow > 0.0 {
+        let all = pp::contour_family(&field, w, h, cell, org, o.levels, o.gap, o.min_len, &|_, x, y| same_fam(x, y).is_some());
+        push(all.into_iter().map(|(_, l)| l).collect(), &mut lines);
+    } else {
+        let smooth = pp::contour_family(&field, w, h, cell, org, o.levels, o.gap, o.min_len, &|_, x, y| same(x, y, AnatKind::Smooth));
+        push(smooth.into_iter().map(|(_, l)| l).collect(), &mut lines);
+        let seam_ok = |x: usize, y: usize| {
+            let c = [field[y * w + x], field[y * w + x + 1], field[(y + 1) * w + x + 1], field[(y + 1) * w + x]];
+            c.iter().cloned().fold(f32::MIN, f32::max) - c.iter().cloned().fold(f32::MAX, f32::min) < 0.5
+        };
+        let angle = pp::contour_family(&field, w, h, cell, org, o.levels / 2, o.gap, o.min_len, &|_, x, y| same(x, y, AnatKind::Angle) && seam_ok(x, y));
+        push(angle.into_iter().map(|(_, l)| l).collect(), &mut lines);
+        let disc_field: Vec<f32> = field.iter().zip(&fam_at).map(|(&v, &a)| if a != NONE16 && kind_of[a as usize] == AnatKind::Discrete { v } else { f32::NAN }).collect();
+        let discrete = anat_trace(AnatKind::Discrete, &disc_field, w, h, cell, org, o.levels, o.gap, o.min_len, &|x, y| same(x, y, AnatKind::Discrete));
+        push(discrete, &mut lines);
+    }
+    eprintln!("  traced {} lines in {:.0}s; {}", lines.len(), t4.elapsed().as_secs_f64(), rss_note());
+    // Pens follow the layers: in each region the families, longest first, take
+    // different pens (darkblue stays for the partition lines).
+    const FILL_PENS: [usize; 5] = [2, 4, 3, 1, 0]; // lightblue, purple, red, green, pink
+    let mut len_of: std::collections::HashMap<usize, f64> = std::collections::HashMap::new();
+    for (k, _, l) in &lines { *len_of.entry(*k).or_insert(0.0) += l.length(); }
+    let mut pen_of: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
+    for reg in [AnatReg::Out, AnatReg::In] {
+        let mut ranked: Vec<(f64, usize)> = len_of.iter().filter(|(k, _)| fams[**k].reg == reg).map(|(k, l)| (*l, *k)).collect();
+        ranked.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)));
+        for (rank, &(_, k)) in ranked.iter().enumerate() { pen_of.insert(k, FILL_PENS[rank % FILL_PENS.len()]); }
+    }
+    for x in lines.iter_mut() { x.1 = pen_of[&x.0]; }
+    for l in anat_trace(AnatKind::Discrete, &pid, w, h, cell, org, o.levels, o.gap, o.min_len, &|_, _| true) { lines.push((usize::MAX, 5, l)); }
+    let how = if follow > 0.0 { format!("lines follow the outline, displaced up to {follow} band widths by each tile's family") } else { "each tile draws its family's own lines".to_string() };
+    let note = format!("streamed mosaic: scored {} families at {cs} mm ({ws}x{hs}, {n_blocks} blocks) in {t_score:.0} s, {np} patches, {matched} families matched to a patch of their own, {used} used; drawn at {cell} mm ({w}x{h}), {how}; {:.0} s",
+                       cands.len(), t_all.elapsed().as_secs_f64());
+    (lines, used, inside, note)
+}
+
 /// Every layer `quat-anatomy` knows (551): what an orbit says about its starting
 /// point, read from `quat_dag::orbit_feature` slots, outside and inside the set.
 fn anatomy_families() -> Vec<AnatFam> {
@@ -4072,81 +4519,92 @@ fn anatomy_families() -> Vec<AnatFam> {
     use AnatKind::*;
     use AnatReg::*;
     let mut v: Vec<AnatFam> = Vec::new();
-    let mut add = |name: String, reg: AnatReg, kind: AnatKind, what: String, get: Box<dyn Fn(&[f32]) -> f32 + Sync + Send>| {
-        v.push(AnatFam { name, reg, kind, what, get });
+    let mut add = |name: String, reg: AnatReg, kind: AnatKind, what: String, uses: Uses, get: Box<dyn Fn(&[f32]) -> f32 + Sync + Send>| {
+        v.push(AnatFam { name, reg, kind, what, uses, get });
     };
     let e = of::EXIT;
     let norm3 = move |f: &[f32]| f[e + 1].hypot(f[e + 2]).hypot(f[e + 3]);
     // Outside only: the escape itself.
-    add("equipotential".into(), Out, Smooth, "smooth escape time".into(), Box::new(|f| f[of::SMOOTH]));
-    add("escape_step".into(), Out, Discrete, "escape step (integer bands)".into(), Box::new(|f| f[of::SMOOTH].floor()));
+    add("equipotential".into(), Out, Smooth, "smooth escape time".into(), Uses::None, Box::new(|f| f[of::SMOOTH]));
+    add("escape_step".into(), Out, Discrete, "escape step (integer bands)".into(), Uses::None, Box::new(|f| f[of::SMOOTH].floor()));
     add("orthant".into(), Out, Discrete, "signs of z's four components at escape (16 regions)".into(),
-        Box::new(move |f| (0..4).map(|k| ((f[e + k] >= 0.0) as u32) << k).sum::<u32>() as f32));
-    add("distance".into(), Out, Smooth, "distance estimate to the set".into(), Box::new(|f| f[of::DE]));
-    add("exit_radius".into(), Out, Smooth, "ln|z| when it escaped".into(), Box::new(move |f| f[e].hypot(norm3(f)).max(1e-30).ln()));
+        Uses::None, Box::new(move |f| (0..4).map(|k| ((f[e + k] >= 0.0) as u32) << k).sum::<u32>() as f32));
+    add("distance".into(), Out, Smooth, "distance estimate to the set".into(), Uses::None, Box::new(|f| f[of::DE]));
+    add("exit_radius".into(), Out, Smooth, "ln|z| when it escaped".into(), Uses::None, Box::new(move |f| f[e].hypot(norm3(f)).max(1e-30).ln()));
     for (k, &(i, j)) in of::PLANES.iter().enumerate() {
         add(format!("exit_angle_{}", of::PLANE_NAMES[k]), Out, Angle, format!("angle of z in the {} plane at escape", of::PLANE_NAMES[k]),
-            Box::new(move |f| f[e + j].atan2(f[e + i])));
+            Uses::None, Box::new(move |f| f[e + j].atan2(f[e + i])));
     }
-    add("exit_tilt".into(), Out, Smooth, "angle between z's real and vector parts at escape".into(), Box::new(move |f| norm3(f).atan2(f[e])));
-    add("exit_elevation".into(), Out, Smooth, "elevation of z's vector part at escape".into(), Box::new(move |f| f[e + 3].atan2(f[e + 1].hypot(f[e + 2]))));
+    add("exit_tilt".into(), Out, Smooth, "angle between z's real and vector parts at escape".into(), Uses::None, Box::new(move |f| norm3(f).atan2(f[e])));
+    add("exit_elevation".into(), Out, Smooth, "elevation of z's vector part at escape".into(), Uses::None, Box::new(move |f| f[e + 3].atan2(f[e + 1].hypot(f[e + 2]))));
     for k in 1..4 {
         add(format!("exit_dir_{}", of::COMP_NAMES[k]), Out, Smooth, format!("{} component of z's direction at escape", of::COMP_NAMES[k]),
-            Box::new(move |f| f[e + k] / f[e].hypot(norm3(f)).max(1e-30)));
+            Uses::None, Box::new(move |f| f[e + k] / f[e].hypot(norm3(f)).max(1e-30)));
     }
     // Outside and inside: what the orbit does on the way.
     for (reg, pre, place) in [(Out, "", "outside"), (In, "inner_", "inside")] {
         for k in 0..of::N_TRAPS {
             add(format!("{pre}trap_{}", of::TRAP_NAMES[k]), reg, Smooth, format!("{place}: orbit's closest approach to {}", of::TRAP_NAMES[k]),
-                Box::new(move |f| f[of::TRAPS + k]));
+                Uses::Trap(k), Box::new(move |f| f[of::TRAPS + k]));
         }
         for (j, &k) in of::TRAP_STEP_OF.iter().enumerate() {
             add(format!("{pre}domains_{}", of::TRAP_NAMES[k]), reg, Discrete, format!("{place}: step of the closest approach to {} (region outlines)", of::TRAP_NAMES[k]),
-                Box::new(move |f| f[of::TRAP_STEP + j]));
+                Uses::Trap(k), Box::new(move |f| f[of::TRAP_STEP + j]));
         }
-        for (k, &(pl, sf)) in of::STRIPE_DEFS.iter().enumerate() {
-            add(format!("{pre}stripe_{}_{sf}", of::PLANE_NAMES[pl]), reg, Smooth, format!("{place}: stripe average of the {} angle, frequency {sf}", of::PLANE_NAMES[pl]),
-                Box::new(move |f| f[of::STRIPES + k]));
+        for (k, &(pl, sf, ph)) in of::STRIPE_DEFS.iter().enumerate() {
+            let (tag, wave) = if ph == 0 { ("", "sine") } else { ("c", "cosine") };
+            add(format!("{pre}stripe_{}_{sf}{tag}", of::PLANE_NAMES[pl]), reg, Smooth, format!("{place}: stripe average of the {} angle, frequency {sf} ({wave})", of::PLANE_NAMES[pl]),
+                Uses::Stripe(k), Box::new(move |f| f[of::STRIPES + k]));
+        }
+        for (a, &(t, i, j, ci, cj)) in of::TRAP_ANGLE_DEFS.iter().enumerate() {
+            add(format!("{pre}trap_angle_{}", of::TRAP_NAMES[t]), reg, Angle,
+                format!("{place}: angle of z about ({ci}, {cj}) in the {}{} plane where the orbit came closest to {}", of::COMP_NAMES[i], of::COMP_NAMES[j], of::TRAP_NAMES[t]),
+                Uses::Trap(t), Box::new(move |f| f[of::TRAP_ANGLE + a]));
         }
         for (k, n) in of::AVERAGE_NAMES.iter().enumerate() {
-            add(format!("{pre}{n}"), reg, Smooth, format!("{place}: orbit average ({n})"), Box::new(move |f| f[of::AVERAGES + k]));
+            add(format!("{pre}{n}"), reg, Smooth, format!("{place}: orbit average ({n})"), Uses::None, Box::new(move |f| f[of::AVERAGES + k]));
         }
-        add(format!("{pre}centroid_r"), reg, Smooth, format!("{place}: mean r of the orbit"), Box::new(|f| f[of::CENTROID]));
-        add(format!("{pre}centroid_a"), reg, Smooth, format!("{place}: mean a of the orbit"), Box::new(|f| f[of::CENTROID + 1]));
+        add(format!("{pre}centroid_r"), reg, Smooth, format!("{place}: mean r of the orbit"), Uses::None, Box::new(|f| f[of::CENTROID]));
+        add(format!("{pre}centroid_a"), reg, Smooth, format!("{place}: mean a of the orbit"), Uses::None, Box::new(|f| f[of::CENTROID + 1]));
         for k in 0..6 {
             add(format!("{pre}winding_{}", of::PLANE_NAMES[k]), reg, Smooth, format!("{place}: total turning of the orbit in the {} plane", of::PLANE_NAMES[k]),
-                Box::new(move |f| f[of::WINDING + k]));
+                Uses::None, Box::new(move |f| f[of::WINDING + k]));
         }
         for (k, st) in of::EARLY_STEPS.iter().enumerate() {
-            add(format!("{pre}z{st}_angle"), reg, Angle, format!("{place}: R-A angle of orbit point {st}"), Box::new(move |f| f[of::EARLY_ANGLE + k]));
-            add(format!("{pre}z{st}_radius"), reg, Smooth, format!("{place}: ln|z{st}|"), Box::new(move |f| f[of::EARLY_LOG + k]));
+            add(format!("{pre}z{st}_angle"), reg, Angle, format!("{place}: R-A angle of orbit point {st}"), Uses::None, Box::new(move |f| f[of::EARLY_ANGLE + k]));
+            add(format!("{pre}z{st}_radius"), reg, Smooth, format!("{place}: ln|z{st}|"), Uses::None, Box::new(move |f| f[of::EARLY_LOG + k]));
+        }
+        for (k, &(cmp, st)) in of::EARLY_COMP_DEFS.iter().enumerate() {
+            add(format!("{pre}z{st}_{}", of::COMP_NAMES[cmp]), reg, Smooth, format!("{place}: {} component of orbit point {st}", of::COMP_NAMES[cmp]),
+                Uses::None, Box::new(move |f| f[of::EARLY_COMP + k]));
         }
         for (k, &(pl, st)) in of::EARLY_OTHER_DEFS.iter().enumerate() {
             add(format!("{pre}z{st}_angle_{}", of::PLANE_NAMES[pl]), reg, Angle, format!("{place}: {} angle of orbit point {st}", of::PLANE_NAMES[pl]),
-                Box::new(move |f| f[of::EARLY_OTHER + k]));
+                Uses::None, Box::new(move |f| f[of::EARLY_OTHER + k]));
         }
-        add(format!("{pre}extent"), reg, Smooth, format!("{place}: largest |z| of the orbit before escape"), Box::new(|f| f[of::EXTENT]));
+        add(format!("{pre}extent"), reg, Smooth, format!("{place}: largest |z| of the orbit before escape"), Uses::None, Box::new(|f| f[of::EXTENT]));
         for (k, rr) in of::PASSAGE_R.iter().enumerate() {
-            add(format!("{pre}passage_{rr}"), reg, Discrete, format!("{place}: first step with |z| > {rr} (region outlines)"), Box::new(move |f| f[of::PASSAGE + k]));
+            add(format!("{pre}passage_{rr}"), reg, Discrete, format!("{place}: first step with |z| > {rr} (region outlines)"), Uses::None, Box::new(move |f| f[of::PASSAGE + k]));
         }
-        add(format!("{pre}growth_5"), reg, Smooth, format!("{place}: derivative growth per step over the first 5 steps"), Box::new(|f| f[of::EARLY_GROWTH]));
-        add(format!("{pre}growth_10"), reg, Smooth, format!("{place}: derivative growth per step over the first 10 steps"), Box::new(|f| f[of::EARLY_GROWTH + 1]));
-        add(format!("{pre}ln_dz"), reg, Smooth, format!("{place}: ln of the derivative at the end"), Box::new(|f| f[of::LN_DZ]));
-        add(format!("{pre}lyapunov"), reg, Smooth, format!("{place}: derivative growth per step"), Box::new(|f| f[of::LYAPUNOV]));
+        add(format!("{pre}growth_5"), reg, Smooth, format!("{place}: derivative growth per step over the first 5 steps"), Uses::None, Box::new(|f| f[of::EARLY_GROWTH]));
+        add(format!("{pre}growth_10"), reg, Smooth, format!("{place}: derivative growth per step over the first 10 steps"), Uses::None, Box::new(|f| f[of::EARLY_GROWTH + 1]));
+        add(format!("{pre}ln_dz"), reg, Smooth, format!("{place}: ln of the derivative at the end"), Uses::None, Box::new(|f| f[of::LN_DZ]));
+        add(format!("{pre}lyapunov"), reg, Smooth, format!("{place}: derivative growth per step"), Uses::None, Box::new(|f| f[of::LYAPUNOV]));
     }
     // Inside only: where the orbit settles.
     for (k, &(i, j)) in of::PLANES.iter().enumerate() {
         add(format!("cycle_angle_{}", of::PLANE_NAMES[k]), In, Angle, format!("inside: {} angle of the point the orbit settles on", of::PLANE_NAMES[k]),
-            Box::new(move |f| f[e + j].atan2(f[e + i])));
+            Uses::None, Box::new(move |f| f[e + j].atan2(f[e + i])));
     }
     for k in 1..4 {
         add(format!("cycle_dir_{}", of::COMP_NAMES[k]), In, Smooth, format!("inside: {} component of the direction of the point the orbit settles on", of::COMP_NAMES[k]),
-            Box::new(move |f| f[e + k] / f[e].hypot(norm3(f)).max(1e-30)));
+            Uses::None, Box::new(move |f| f[e + k] / f[e].hypot(norm3(f)).max(1e-30)));
     }
-    add("cycle_tilt".into(), In, Smooth, "inside: tilt of the point the orbit settles on".into(), Box::new(move |f| norm3(f).atan2(f[e])));
-    add("cycle_radius".into(), In, Smooth, "inside: |z| where the orbit settles".into(), Box::new(move |f| f[e].hypot(norm3(f))));
-    add("period".into(), In, Discrete, "inside: period of the final cycle (region outlines)".into(), Box::new(|f| f[of::PERIOD]));
-    add("outline".into(), All, Discrete, "the edge of the set".into(), Box::new(|f| f[of::ESCAPED]));
+    add("cycle_tilt".into(), In, Smooth, "inside: tilt of the point the orbit settles on".into(), Uses::None, Box::new(move |f| norm3(f).atan2(f[e])));
+    add("cycle_radius".into(), In, Smooth, "inside: |z| where the orbit settles".into(), Uses::None, Box::new(move |f| f[e].hypot(norm3(f))));
+    add("period".into(), In, Discrete, "inside: period of the final cycle (region outlines)".into(), Uses::None, Box::new(|f| f[of::PERIOD]));
+    add("outline".into(), All, Discrete, "the edge of the set".into(), Uses::None, Box::new(|f| f[of::ESCAPED]));
+    debug_assert!({ let mut n: Vec<&str> = v.iter().map(|f| f.name.as_str()).collect(); n.sort_unstable(); n.windows(2).all(|p| p[0] != p[1]) }, "duplicate family names");
     v
 }
 
@@ -4160,20 +4618,29 @@ fn anatomy_families() -> Vec<AnatFam> {
 /// Default sampling 0.35 mm (coarsened so the feature vectors stay under
 /// --feature-gb, 3.5 GB: they hold 269 floats per sample).
 /// --compose overlay: every family over the whole view (dense: they pile up).
-/// --compose mosaic: the fractal subdivides itself: outside into --bands
-/// equal-area escape-time bands × --sectors exit-angle sectors, inside into atom
-/// domains × --inner-bands equal-area bands of the orbit's closest approach to the
-/// origin × --inner-sectors cycle-angle sectors. Every family first gets a patch
-/// of its own (maximum matching), the rest go to the family that draws most there
-/// (discounted for reuse and neighbours); each patch is filled by the
-/// family that draws most there (discounted for reuse and for its neighbours'),
-/// patch boundaries drawn.
+/// --compose mosaic (`anatomy_mosaic_streamed`): the fractal subdivides itself into
+/// equal-area patches: outside --bands escape-time bands × --sectors exit-angle
+/// sectors, inside --inner-bands bands of the orbit's closest approach to the origin
+/// × --inner-sectors cycle-angle sectors. Every family first gets a patch of its own
+/// (maximum matching over its --match-top best), the rest go to the family that draws
+/// most there (discounted for reuse and neighbours); patch boundaries drawn. Families
+/// are scored at --score-cell (default 2 × --cell) in blocks of --block-gb (default
+/// --feature-gb). --follow A (default 0.5): every tile's lines follow the general
+/// outline (equipotentials outside, closest-approach layers inside), displaced by up to
+/// A band widths by its family; --follow 0: each tile draws its family's own lines.
 /// --compose plate: one tile per non-empty family (same view, own scale), then a
 /// mosaic tile; --tiles CxR (default: just enough).
+/// --timeline FILE --at-s T: the anim viewer's state (its ✎ Plot window passes it):
+/// render parameters from that timeline at T, the slice cut from its box.
+/// --preview OUT.png [--preview-px 1200]: a quick look in seconds instead of the plot:
+/// 1 mm sampling (--cell 2 for a draft), the mosaic scores one family in
+/// --sample-families (6) at 4 mm; the lines go straight into a PNG, nothing else is
+/// written. A full run also writes preview.png (pens as ink on paper).
 /// Families: --families name,name (default all). Writes the SVG per pen +
 /// Marlin G-code (one file per pen under `<stem>_pens/`), per-family SVGs under
 /// `layers/` (overlay, mosaic) and a summary.
 fn cmd_quat_anatomy(args: &[String]) {
+    let t_start = std::time::Instant::now();
     use nnfractals::plot_paths as pp;
     use nnfractals::quat_dag::{orbit_feature as of, ORBIT_FEATURES as NF};
     use nnfractals::view_slice::{BasePlane, SliceSpec};
@@ -4189,7 +4656,13 @@ fn cmd_quat_anatomy(args: &[String]) {
     assert!(pv.len() == 2, "--paper WxH");
     let (paper_w, paper_h) = (pv[0], pv[1]);
     let margin: f64 = get_flag_or(args, "--margin", 20.0);
-    let cell: f64 = get_flag_or(args, "--cell", 0.35);
+    // --preview out.png: a quick look (seconds, not minutes) at what the plot would be:
+    // 1 mm sampling (--cell 2 for a draft), the mosaic scores one family in
+    // --sample-families (6) at 4 mm,
+    // and the lines go straight into a PNG (no SVG, no G-code).
+    let preview: Option<PathBuf> = get_flag(args, "--preview").map(PathBuf::from);
+    let compose_early = get_flag(args, "--compose").unwrap_or("overlay");
+    let cell: f64 = get_flag_or(args, "--cell", match (&preview, compose_early) { (None, _) => 0.35, (Some(_), "plate") => 0.8, (Some(_), _) => 1.0 });
     let pen: f64 = get_flag_or(args, "--pen", 0.4);
     let gap: f64 = get_flag_or(args, "--gap", 0.8);
     let min_len: f64 = get_flag_or(args, "--min-len", 1.5);
@@ -4245,22 +4718,38 @@ fn cmd_quat_anatomy(args: &[String]) {
 
     let method = nnfractals::quat_collapse::Collapse::effective(g.collapse).method;
     let formula = nnfractals::quat_dag::QuatDagFormula { prog: &g.program, warp: &g.warp, julia: g.julia_mode, jc: (g.julia_cre, g.julia_cim), phoenix: (g.phoenix_re, g.phoenix_im) };
-    let (collapse_eff, d) = nnfractals::quat_collapse::view_setup(g.collapse, g.view_range);
-    let params = nnfractals::quat_dag::RaymarchDagParams {
-        formula, time_axis: nnfractals::quat_fractal::TimeAxis::C,
-        time_val: nnfractals::quat_collapse::time_for_phase_m(method, g.bailout_radius as f64, phase), domain_radius: d,
-        box_bounds: None, axis_assignment: None, clip_plane: None, slide_iter: None, hide_above: None, zone: None, axis_remap: None, collapse: collapse_eff,
-        max_iter, bailout: g.bailout_radius as f64, max_march_steps: march_steps(150),
-        hit_epsilon: d * 1e-4, pixel_lod: 0.0, solid_interior: solid_march(), step_safety: 0.8, light_dir: (0.5, 0.8, 0.3),
-        normal_eps: d * 1e-3, color_probe_offset: d * 1e-2, aa: 1,
+    // --timeline FILE --at-s T (the anim viewer's Plot window): the viewer's own render
+    // parameters at that time (box, axes, collapse, T), the slice cut from its box,
+    // exactly as its Slice window shows it. Otherwise the genome's default view.
+    let timeline: Option<nnfractals::anim_timeline::AnimationTimeline> = get_flag(args, "--timeline").map(|p| {
+        let txt = std::fs::read_to_string(p).unwrap_or_else(|e| panic!("--timeline {p}: {e}"));
+        serde_json::from_str(&txt).unwrap_or_else(|e| panic!("--timeline {p}: {e}"))
+    });
+    let (params, frame) = if let Some(tl) = &timeline {
+        let t: f64 = get_flag_or(args, "--at-s", 0.0);
+        let (p, _) = nnfractals::anim_eval::build_frame_params(tl, formula, t, g.bailout_radius as f64, nnfractals::anim_eval::RenderQuality { max_iter, aa: 1 });
+        let (bmin, bmax) = p.box_bounds.expect("the viewer's timeline always gives a box");
+        (p, spec.frame(bmin, bmax))
+    } else {
+        let (collapse_eff, d) = nnfractals::quat_collapse::view_setup(g.collapse, g.view_range);
+        let p = nnfractals::quat_dag::RaymarchDagParams {
+            formula, time_axis: nnfractals::quat_fractal::TimeAxis::C,
+            time_val: nnfractals::quat_collapse::time_for_phase_m(method, g.bailout_radius as f64, phase), domain_radius: d,
+            box_bounds: None, axis_assignment: None, clip_plane: None, slide_iter: None, hide_above: None, zone: None, axis_remap: None, collapse: collapse_eff,
+            max_iter, bailout: g.bailout_radius as f64, max_march_steps: march_steps(150),
+            hit_epsilon: d * 1e-4, pixel_lod: 0.0, solid_interior: solid_march(), step_safety: 0.8, light_dir: (0.5, 0.8, 0.3),
+            normal_eps: d * 1e-3, color_probe_offset: d * 1e-2, aa: 1,
+        };
+        (p, spec.frame((-d, -d, -d), (d, d, d)))
     };
-    let frame = spec.frame((-d, -d, -d), (d, d, d));
     // The sampled area: the whole drawing area, or one plate tile (every tile shows the same view).
     let (aw, ah) = if plate { ((dw - gutter * (cols - 1) as f64) / cols as f64, (dh - gutter * (rows - 1) as f64) / rows as f64) } else { (dw, dh) };
     // Keep the feature vectors (NF floats per sample) under --feature-gb.
     let feature_gb: f64 = get_flag_or(args, "--feature-gb", 3.5);
     let gb = |c: f64| (aw / c).round() * (ah / c).round() * NF as f64 * 4.0 / 1e9;
-    let cell = if gb(cell) > feature_gb {
+    // The mosaic streams its features (anatomy_mosaic_streamed) and keeps the full sampling.
+    let streamed = compose == "mosaic";
+    let cell = if !streamed && gb(cell) > feature_gb {
         let c = cell * (gb(cell) / feature_gb).sqrt() * 1.01;
         eprintln!("sampling coarsened from {cell} to {c:.3} mm so the feature vectors fit in {feature_gb} GB");
         c
@@ -4282,14 +4771,32 @@ fn cmd_quat_anatomy(args: &[String]) {
 
     // One feature vector per sample (flat, NF floats each).
     let t0 = std::time::Instant::now();
-    let mut feat = vec![0f32; w * h * NF];
+    let mut feat = vec![0f32; if streamed { 0 } else { w * h * NF }];
     feat.par_chunks_mut(NF).enumerate().for_each(|(i, out)| {
         out.copy_from_slice(&nnfractals::quat_dag::orbit_features_at(&params, point(i % w, i / w)));
     });
     let fv = |i: usize| &feat[i * NF..(i + 1) * NF];
-    let escaped: Vec<bool> = (0..w * h).map(|i| fv(i)[of::ESCAPED] > 0.5).collect();
-    let inside = escaped.iter().filter(|&&e| !e).count() as f64 / escaped.len() as f64;
-    eprintln!("{w}x{h} orbits ({cell} mm) in {:.1}s, {:.1}% inside the set", t0.elapsed().as_secs_f64(), 100.0 * inside);
+    let escaped: Vec<bool> = if streamed { Vec::new() } else { (0..w * h).map(|i| fv(i)[of::ESCAPED] > 0.5).collect() };
+    let mut inside = escaped.iter().filter(|&&e| !e).count() as f64 / escaped.len().max(1) as f64;
+    if !streamed { eprintln!("{w}x{h} orbits ({cell} mm) in {:.1}s, {:.1}% inside the set", t0.elapsed().as_secs_f64(), 100.0 * inside); }
+    let mut streamed_out = if streamed {
+        let point_mm = |px: f64, py: f64| {
+            let a = (px - 0.5 * aw) / half_mm;
+            let b = (0.5 * ah - py) / half_mm;
+            (centre.0 + frame.u.0 * a + frame.v.0 * b, centre.1 + frame.u.1 * a + frame.v.1 * b, centre.2 + frame.u.2 * a + frame.v.2 * b)
+        };
+        let o = MosaicOpts {
+            bands, sectors, inner_bands, inner_sectors, variety, min_fill, min_layer_mm, levels, gap, min_len,
+            block_gb: get_flag_or(args, "--block-gb", feature_gb),
+            score_cell: get_flag_or(args, "--score-cell", if preview.is_some() { 4.0f64.max(cell) } else { 2.0 * cell }),
+            sample: get_flag_or(args, "--sample-families", if preview.is_some() { 6usize } else { 1 }).max(1),
+            match_top: get_flag_or(args, "--match-top", 256usize),
+            follow: get_flag_or(args, "--follow", 0.5),
+        };
+        let r = anatomy_mosaic_streamed(&fams, &active, &params, &point_mm, aw, ah, cell, origin, &o);
+        inside = r.2;
+        Some(r)
+    } else { None };
 
     // A family's field: its value where it lives (NaN elsewhere: the tracer skips
     // any cell touching a NaN), normalised: equal-area ranks, turns, or integers.
@@ -4473,9 +4980,11 @@ fn cmd_quat_anatomy(args: &[String]) {
 
     let stem_full = Path::new(path).file_stem().unwrap().to_string_lossy().to_string();
     let stem_short: String = stem_full.chars().take(48).collect();
-    let stem = format!("{stem_short}_{}_p{phase:.2}_z{}_{compose}", base.label(), spec.zoom);
+    // With the viewer's timeline the time is its playhead (seconds), not a T phase.
+    let when = match (&timeline, get_flag(args, "--at-s")) { (Some(_), Some(t)) => format!("t{t}s"), (Some(_), None) => "t0s".to_string(), _ => format!("p{phase:.2}") };
+    let stem = format!("{stem_short}_{}_{when}_z{}_{compose}", base.label(), spec.zoom);
     let out = PathBuf::from(get_flag(args, "--out-dir").map(String::from).unwrap_or_else(|| format!("explorer_out/anatomy/{stem}")));
-    std::fs::create_dir_all(out.join("layers")).expect("create --out-dir");
+    if preview.is_none() { std::fs::create_dir_all(out.join("layers")).expect("create --out-dir"); }
     let sheet = pp::Sheet { w: paper_w, h: paper_h, pen };
     let hex = |c: (u8, u8, u8)| format!("#{:02x}{:02x}{:02x}", c.0, c.1, c.2);
     let mut by_pen: Vec<Vec<pp::Polyline>> = vec![Vec::new(); 6];
@@ -4489,7 +4998,7 @@ fn cmd_quat_anatomy(args: &[String]) {
         summary.push('\n');
     };
     let write_layer = |file: &str, name: &str, pen_i: usize, what: &str, lines: &[pp::Polyline]| {
-        if lines.is_empty() { return; }
+        if lines.is_empty() || preview.is_some() { return; }
         let paths: Vec<pp::CurvePath> = lines.par_iter().map(|l| pp::fit_polyline(l, tol)).filter(|c| !c.curves.is_empty()).collect();
         let layer = [pp::Layer { name: name.to_string(), color: hex(CARL_PENS[pen_i].1), paths }];
         std::fs::write(out.join("layers").join(file), pp::to_svg(&sheet, &layer, &format!("{stem_full}: {name} ({what})"))).expect("write layer svg");
@@ -4529,7 +5038,9 @@ fn cmd_quat_anatomy(args: &[String]) {
             }
         }
         "mosaic" => {
-            let (lines, _) = mosaic(origin);
+            let (lines, _, _, note) = streamed_out.take().expect("the mosaic is streamed");
+            summary.push_str(&note);
+            summary.push('\n');
             let mut per: std::collections::BTreeMap<usize, (usize, Vec<pp::Polyline>)> = std::collections::BTreeMap::new();
             for (k, pen_i, l) in lines {
                 by_pen[pen_i].push(l.clone());
@@ -4578,7 +5089,23 @@ fn cmd_quat_anatomy(args: &[String]) {
     let at_min = if compose == "mosaic" { format!(", {n_min} with at least {} m (--min-layer-m)", min_layer_mm / 1000.0) } else { String::new() };
     summary.push_str(&format!("{n_layers} layers with at least 1 m of line, {n_half} with at least 0.5 m{at_min}\n"));
     eprintln!("{n_layers} layers with at least 1 m of line, {n_half} with at least 0.5 m{at_min}");
+    // The plot as it will look on paper (pens in their order, ink darkening where they cross).
+    let raster = |px: u32, path: &Path| {
+        let layers: Vec<((u8, u8, u8), &[pp::Polyline])> = by_pen.iter().enumerate().map(|(i, l)| (CARL_PENS[i].1, l.as_slice())).collect();
+        let (w, h, rgb) = pp::rasterize((paper_w, paper_h), px, pen, &layers);
+        if let Some(d) = path.parent() { std::fs::create_dir_all(d).ok(); }
+        image::save_buffer(path, &rgb, w, h, image::ColorType::Rgb8).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+    };
+    if let Some(png) = &preview {
+        let px: u32 = get_flag_or(args, "--preview-px", 1200);
+        raster(px, png);
+        let drawn_m: f64 = by_pen.iter().flatten().map(|l| l.length()).sum::<f64>() / 1000.0;
+        // One line the anim viewer's Plot window reads back.
+        println!("PREVIEW {} | {drawn_m:.0} m of line | {:.1}% inside | {:.0} s", png.display(), 100.0 * inside, t_start.elapsed().as_secs_f64());
+        return;
+    }
     std::fs::write(out.join("summary.txt"), &summary).expect("write summary");
+    raster(1600, &out.join("preview.png"));
     let layers_in: Vec<(String, String, Vec<pp::Polyline>)> = by_pen.into_iter().enumerate()
         .map(|(i, l)| (CARL_PENS[i].0.to_string(), hex(CARL_PENS[i].1), l)).filter(|(_, _, l)| !l.is_empty()).collect();
     print!("{stem}: ");
@@ -4819,12 +5346,14 @@ fn plane_stats(genome: &Genome) -> [f64; 4] {
 }
 
 /// Terms with their own render pass (stills, sheet views, taste), not the full sweep.
-const SPECIAL_TERM_NAMES: [&str; 19] = ["taste", "image_entropy_band", "image_motion", "image_fg_shuffle", "res_diff", "res_iou", "motion_ratio", "motion_step", "t_cont", "t_big", "t_cont_band", "front_cover", "front_cover_band", "grey_share", "grey_band", "orgcx_rel", "orgcx_omega", "orgcx_rel2d", "orgcx_omega2d"];
+const SPECIAL_TERM_NAMES: [&str; 15] = ["taste", "image_entropy_band", "image_motion", "image_fg_shuffle", "res_diff", "res_iou", "motion_ratio", "motion_step", "t_cont", "t_big", "t_cont_band", "front_cover", "front_cover_band", "grey_share", "grey_band"];
+/// Terms scored on a sampled escape-time field by the orgcx sidecar (no render, no full sweep).
+const FIELD_TERM_NAMES: [&str; 4] = ["orgcx_rel", "orgcx_omega", "orgcx_rel2d", "orgcx_omega2d"];
 
 /// Raw value of each named fitness term for one genome (the same dispatch the
 /// metric-driven GA uses), plus the full metrics when any term needed them.
 fn metric_term_values(genome: &Genome, names: &[String], probe_size: u32, use_gpu: bool) -> (Vec<f64>, Option<QuatFullMetrics>) {
-    let needs_full = names.iter().any(|name| !SPECIAL_TERM_NAMES.contains(&name.as_str()) && !name.starts_with("planes_") && !STRUCTURAL_METRIC_NAMES.contains(&name.as_str()) && !ORGANIZATION_METRIC_NAMES.contains(&name.as_str()));
+    let needs_full = names.iter().any(|name| !SPECIAL_TERM_NAMES.contains(&name.as_str()) && !FIELD_TERM_NAMES.contains(&name.as_str()) && !name.starts_with("planes_") && !STRUCTURAL_METRIC_NAMES.contains(&name.as_str()) && !ORGANIZATION_METRIC_NAMES.contains(&name.as_str()));
     let needs_organization = names.iter().any(|name| ORGANIZATION_METRIC_NAMES.contains(&name.as_str()));
     let full = if needs_full { Some(prof("full (score_genome_dag_full)", || score_genome_dag_full(genome, probe_size, use_gpu))) } else { None };
     let organization = if needs_organization {
@@ -8965,6 +9494,36 @@ fn main() {
             match get_flag(&args, "--out") { Some(o) => std::fs::write(o, csv).expect("write --out"), None => print!("{csv}") }
         }
         Some("quat-anatomy") => cmd_quat_anatomy(&args),
+        Some("gcode-preview") => {
+            // What a G-code file draws, as a PNG: pen-down moves (G1, and G5 Béziers),
+            // one colour per pen (split at M0 / M226 pen changes, named by M117 "Pen k:
+            // name"), ink darkening where lines cross. Y is flipped back unless the
+            // file is for Carl's machine (M851 header); --flip-y / --no-flip override.
+            let path = get_flag(&args, "--gcode").unwrap_or_else(|| panic!("gcode-preview needs --gcode FILE.gcode"));
+            let text = std::fs::read_to_string(path).unwrap_or_else(|e| panic!("{path}: {e}"));
+            let flip = if args.iter().any(|a| a == "--flip-y") { Some(true) } else if args.iter().any(|a| a == "--no-flip") { Some(false) } else { None };
+            let (pens, lo, hi) = nnfractals::plot_paths::gcode_lines(&text, flip);
+            if pens.is_empty() { panic!("{path}: nothing is drawn (no pen-down moves)"); }
+            // Paper: the machine's origin to the far corner of the drawing, plus a margin.
+            let margin = 10.0;
+            let (x0, y0) = (lo.0.min(0.0) - margin, lo.1.min(0.0) - margin);
+            let paper = (hi.0 - x0 + margin, hi.1 - y0 + margin);
+            let pens_px: Vec<((u8, u8, u8), Vec<nnfractals::plot_paths::Polyline>)> = pens.iter().enumerate().map(|(i, p)| {
+                let col = p.name.as_deref().and_then(|n| CARL_PENS.iter().find(|c| c.0 == n)).map(|c| c.1).unwrap_or(CARL_PENS[i % CARL_PENS.len()].1);
+                let lines = p.lines.iter().map(|l| nnfractals::plot_paths::Polyline { closed: l.closed, pts: l.pts.iter().map(|&(x, y)| (x - x0, y - y0)).collect() }).collect();
+                (col, lines)
+            }).collect();
+            let refs: Vec<((u8, u8, u8), &[nnfractals::plot_paths::Polyline])> = pens_px.iter().map(|(c, l)| (*c, l.as_slice())).collect();
+            let px: u32 = get_flag_or(&args, "--px", 1600);
+            let (w, h, rgb) = nnfractals::plot_paths::rasterize(paper, px, get_flag_or(&args, "--pen", 0.4), &refs);
+            let out = get_flag(&args, "--out").map(PathBuf::from).unwrap_or_else(|| Path::new(path).with_extension("png"));
+            image::save_buffer(&out, &rgb, w, h, image::ColorType::Rgb8).unwrap_or_else(|e| panic!("{}: {e}", out.display()));
+            for (i, p) in pens.iter().enumerate() {
+                let len: f64 = p.lines.iter().map(|l| l.length()).sum();
+                println!("pen {} {:12} {:7} paths {:8.1} m", i + 1, p.name.as_deref().unwrap_or("-"), p.lines.len(), len / 1000.0);
+            }
+            println!("drawing {:.0} x {:.0} mm (x {:.0}..{:.0}, y {:.0}..{:.0}) → {}", hi.0 - lo.0, hi.1 - lo.1, lo.0, hi.0, lo.1, hi.1, out.display());
+        }
         Some("quat-surface-plot") => {
             // A pen-plotter drawing of a genome's 3D surface as the GA's sheet camera
             // sees it (--orbit 0..1 around the sheet's axis, T at --phase): the visible
@@ -10097,7 +10656,7 @@ mod recipe_catalog_tests {
             lookup_metric(&g, n, Some(&full), Some(&org)); // panics on a name the GA does not know
         }
         let known: Vec<&str> = FULL_SWEEP_TERM_NAMES.iter().chain(&STRUCTURAL_METRIC_NAMES).chain(&ORGANIZATION_METRIC_NAMES)
-            .chain(&SPECIAL_TERM_NAMES).chain(&PLANE_TERM_NAMES).copied().collect();
+            .chain(&SPECIAL_TERM_NAMES).chain(&FIELD_TERM_NAMES).chain(&PLANE_TERM_NAMES).copied().collect();
         for n in &known { assert!(info(n).is_some(), "{n} is accepted by the GA but missing from the recipe catalog"); }
         for t in CATALOG {
             assert!(known.contains(&t.name), "catalog term {} is not accepted by the GA", t.name);

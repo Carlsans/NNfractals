@@ -16,6 +16,8 @@
 
 use rayon::prelude::*;
 use std::collections::HashMap;
+// Contour tracing hashes millions of integer edge keys per field: FxHash, not SipHash.
+use rustc_hash::FxHashMap;
 use std::fmt::Write as _;
 
 pub type P2 = (f64, f64);
@@ -64,6 +66,14 @@ pub fn contour(f: &[f32], w: usize, h: usize, level: f32, keep: &(dyn Fn(usize, 
 /// in cell (x, y). Cells with a non-finite corner are skipped. One list of
 /// polylines per level, in grid coordinates.
 pub fn contour_levels(f: &[f32], w: usize, h: usize, levels: &[f32], keep: &(dyn Fn(usize, usize, usize) -> bool + Sync)) -> Vec<Vec<Polyline>> {
+    contour_levels_strided(f, w, h, levels, &|_, _| 1, keep)
+}
+
+/// [`contour_levels`] where cell (x, y) only tries the levels whose 1-based index is a
+/// multiple of `stride(x, y)` (a power of two): the levels a gap rule could keep there,
+/// without testing every level a steep cell crosses.
+pub fn contour_levels_strided(f: &[f32], w: usize, h: usize, levels: &[f32], stride: &(dyn Fn(usize, usize) -> usize + Sync),
+                              keep: &(dyn Fn(usize, usize, usize) -> bool + Sync)) -> Vec<Vec<Polyline>> {
     let nl = levels.len();
     let mut out: Vec<Vec<Polyline>> = vec![Vec::new(); nl];
     if nl == 0 || w < 2 || h < 2 {
@@ -75,10 +85,10 @@ pub fn contour_levels(f: &[f32], w: usize, h: usize, levels: &[f32], keep: &(dyn
     let hid = |x: usize, y: usize| 2 * (y * w + x) as u64;
     let vid = |x: usize, y: usize| 2 * (y * w + x) as u64 + 1;
     let rows: Vec<usize> = (0..h - 1).collect();
-    let parts: Vec<(HashMap<u64, P2>, Vec<(u64, u64)>)> = rows
+    let parts: Vec<(FxHashMap<u64, P2>, Vec<(u64, u64)>)> = rows
         .par_chunks(32)
         .map(|chunk| {
-            let mut pts: HashMap<u64, P2> = HashMap::new();
+            let mut pts: FxHashMap<u64, P2> = FxHashMap::default();
             let mut segs: Vec<(u64, u64)> = Vec::new();
             for &y in chunk {
                 for x in 0..w - 1 {
@@ -94,7 +104,10 @@ pub fn contour_levels(f: &[f32], w: usize, h: usize, levels: &[f32], keep: &(dyn
                     // Levels L with lo < L <= hi are the ones some corner is below.
                     let i0 = levels.partition_point(|&l| l <= lo);
                     let i1 = levels.partition_point(|&l| l <= hi);
-                    for i in i0..i1 {
+                    let st = stride(x, y).max(1);
+                    // First index i >= i0 with (i + 1) a multiple of st.
+                    let first = (i0 + 1).div_ceil(st) * st - 1;
+                    for i in (first..i1).step_by(st) {
                         if !keep(i, x, y) {
                             continue;
                         }
@@ -135,7 +148,7 @@ pub fn contour_levels(f: &[f32], w: usize, h: usize, levels: &[f32], keep: &(dyn
             (pts, segs)
         })
         .collect();
-    let mut pts: HashMap<u64, P2> = HashMap::with_capacity(parts.iter().map(|p| p.0.len()).sum());
+    let mut pts: FxHashMap<u64, P2> = FxHashMap::with_capacity_and_hasher(parts.iter().map(|p| p.0.len()).sum(), Default::default());
     let mut segs: Vec<(u64, u64)> = Vec::with_capacity(parts.iter().map(|p| p.1.len()).sum());
     for (p, sg) in parts {
         for (k, v) in p {
@@ -152,8 +165,8 @@ pub fn contour_levels(f: &[f32], w: usize, h: usize, levels: &[f32], keep: &(dyn
 /// Joins segments that share a crossing point into polylines: open chains from
 /// their free ends first, then the remaining closed loops. Each line comes with
 /// the key of its first point.
-fn chain(pts: &HashMap<u64, P2>, segs: &[(u64, u64)]) -> Vec<(u64, Polyline)> {
-    let mut adj: HashMap<u64, [u32; 2]> = HashMap::with_capacity(pts.len());
+fn chain(pts: &FxHashMap<u64, P2>, segs: &[(u64, u64)]) -> Vec<(u64, Polyline)> {
+    let mut adj: FxHashMap<u64, [u32; 2]> = FxHashMap::with_capacity_and_hasher(pts.len(), Default::default());
     for (i, &(a, b)) in segs.iter().enumerate() {
         for n in [a, b] {
             let e = adj.entry(n).or_insert([u32::MAX; 2]);
@@ -247,6 +260,20 @@ pub fn grid_to_mm(l: Polyline, cell: f64, origin: P2) -> Polyline {
     Polyline { closed: l.closed, pts: l.pts.iter().map(|&(x, y)| (origin.0 + (x + 0.5) * cell, origin.1 + (y + 0.5) * cell)).collect() }
 }
 
+/// The slope (value change per cell) the gap rule uses in a cell with corners a, b, c, d
+/// (clockwise from top-left): the bilinear gradient, but at least the corners' range over
+/// the diagonal. A saddle or a checkerboard of noise has a zero gradient at the centre
+/// while every level between its corners crosses the cell; without the range bound the
+/// rule kept all of them (2048 levels in each cell of a noisy field, billions of segments).
+/// For a planar cell the range over the diagonal never exceeds the gradient, so smooth
+/// fields are thinned exactly as before.
+pub fn cell_slope(a: f64, b: f64, c: f64, d: f64) -> f64 {
+    let gx = 0.5 * ((b - a) + (c - d));
+    let gy = 0.5 * ((d - a) + (c - b));
+    let range = a.max(b).max(c).max(d) - a.min(b).min(c).min(d);
+    (gx * gx + gy * gy).sqrt().max(range * std::f64::consts::FRAC_1_SQRT_2)
+}
+
 /// One family of contour lines: `g` (normalised to [0, 1)) at levels i/levels,
 /// i = 1..levels, in mm. Level i is drawn in a cell only where the gap to the
 /// next line of its hierarchy step (2^trailing_zeros(i) levels) is at least
@@ -259,21 +286,26 @@ pub fn contour_family(g: &[f32], w: usize, h: usize, cell: f64, origin: P2, leve
     let n = levels.max(2);
     let delta = 1.0 / n as f64;
     let values: Vec<f32> = (1..n).map(|i| (i as f64 * delta) as f32).collect();
-    let keep = |k: usize, x: usize, y: usize| {
-        let i = k + 1;
-        if !mask(i, x, y) {
-            return false;
-        }
+    // The gap rule keeps level i in a cell when level_step(i) · delta / |gradient| · cell
+    // >= min_gap, i.e. when i is a multiple of the smallest power of two that passes:
+    // the cell's stride, so only those levels are tried.
+    let stride = |x: usize, y: usize| -> usize {
         if min_gap <= 0.0 {
-            return true;
+            return 1;
         }
         let (a, b, c, d) = (g[y * w + x] as f64, g[y * w + x + 1] as f64, g[(y + 1) * w + x + 1] as f64, g[(y + 1) * w + x] as f64);
-        let gx = 0.5 * ((b - a) + (c - d));
-        let gy = 0.5 * ((d - a) + (c - b));
-        let grad = (gx * gx + gy * gy).sqrt();
-        grad <= 0.0 || level_step(i) as f64 * delta / grad * cell >= min_gap
+        let grad = cell_slope(a, b, c, d);
+        if !(grad > 0.0) {
+            return 1;
+        }
+        let mut s = 1usize;
+        while (s as f64) * delta / grad * cell < min_gap && s < n {
+            s *= 2;
+        }
+        s
     };
-    contour_levels(g, w, h, &values, &keep)
+    let keep = |k: usize, x: usize, y: usize| mask(k + 1, x, y);
+    contour_levels_strided(g, w, h, &values, &stride, &keep)
         .into_iter()
         .enumerate()
         .flat_map(|(k, ls)| ls.into_iter().map(move |l| (k + 1, l)))
@@ -894,9 +926,239 @@ pub fn to_gcode(sheet: &Sheet, layers: &[Layer], o: &GcodeOpts, comment: &str) -
     (s, st)
 }
 
+// ------------------------------------------------------------------ previews
+
+/// The six felt pens of Carl's plotter (gcodefractal), in his order: name and RGB.
+pub const CARL_PENS: [(&str, (u8, u8, u8)); 6] = [
+    ("pink", (168, 57, 114)), ("green", (99, 123, 65)), ("lightblue", (36, 95, 143)),
+    ("red", (159, 59, 61)), ("purple", (57, 32, 97)), ("darkblue", (50, 48, 117)),
+];
+
+/// A quick raster of a plot: `layers` (pen colour, lines in mm on a `paper` of
+/// width × height mm) on white paper, `px` pixels wide. Each line is an anti-aliased
+/// stroke about one pixel wide whose ink is scaled to a `pen_mm` wide pen (a 0.4 mm
+/// pen covers about half a pixel of a 1200 px view of a 0.9 m sheet); ink multiplies,
+/// so crossing pens darken like real ink. Returns (width, height, RGB bytes).
+pub fn rasterize(paper: (f64, f64), px: u32, pen_mm: f64, layers: &[((u8, u8, u8), &[Polyline])]) -> (u32, u32, Vec<u8>) {
+    let w = px.max(16) as usize;
+    let s = w as f64 / paper.0.max(1e-9);
+    let ink = (pen_mm * s).clamp(0.05, 1.0) as f32;
+    let h = ((paper.1 * s).round() as usize).max(16);
+    let mut img = vec![1.0f32; w * h * 3];
+    for (col, lines) in layers {
+        // Coverage of this pen: segments sampled every half pixel, each sample splatted
+        // bilinearly (a stroke about a pixel wide).
+        let mut cov = vec![0.0f32; w * h];
+        let mut splat = |x: f64, y: f64, a: f32| {
+            let (fx, fy) = (x - 0.5, y - 0.5);
+            let (x0, y0) = (fx.floor(), fy.floor());
+            let (tx, ty) = ((fx - x0) as f32, (fy - y0) as f32);
+            for (dx, dy, wgt) in [(0, 0, (1.0 - tx) * (1.0 - ty)), (1, 0, tx * (1.0 - ty)), (0, 1, (1.0 - tx) * ty), (1, 1, tx * ty)] {
+                let (xi, yi) = (x0 as i64 + dx, y0 as i64 + dy);
+                if xi >= 0 && yi >= 0 && (xi as usize) < w && (yi as usize) < h {
+                    cov[yi as usize * w + xi as usize] += a * wgt;
+                }
+            }
+        };
+        for l in lines.iter() {
+            for seg in l.pts.windows(2) {
+                let (a, b) = ((seg[0].0 * s, seg[0].1 * s), (seg[1].0 * s, seg[1].1 * s));
+                let len = ((b.0 - a.0).powi(2) + (b.1 - a.1).powi(2)).sqrt();
+                let n = (len * 2.0).ceil().max(1.0) as usize;
+                for k in 0..n {
+                    let t = (k as f64 + 0.5) / n as f64;
+                    splat(a.0 + t * (b.0 - a.0), a.1 + t * (b.1 - a.1), (len / n as f64) as f32 * ink);
+                }
+            }
+        }
+        let c = [col.0 as f32 / 255.0, col.1 as f32 / 255.0, col.2 as f32 / 255.0];
+        img.par_chunks_mut(3).zip(cov.par_iter()).for_each(|(p, &a)| {
+            let a = a.min(1.0) * 0.9;
+            for k in 0..3 { p[k] *= 1.0 - a + a * c[k]; }
+        });
+    }
+    (w as u32, h as u32, img.iter().map(|v| (v.clamp(0.0, 1.0) * 255.0).round() as u8).collect())
+}
+
+/// One pen's part of a G-code file read back by [`gcode_lines`].
+#[derive(Clone, Debug, Default)]
+pub struct GcodePen {
+    /// The pen's name from an `M117 Pen k: name` message, if any.
+    pub name: Option<String>,
+    pub lines: Vec<Polyline>,
+}
+
+/// What a G-code file draws: absolute XY moves with the pen down (Z at or below
+/// 0.5 mm, as `G1 Z0`), straight (`G0`/`G1`) or cubic (`G5 I J P Q X Y`, I/J from the
+/// start, P/Q from the end), split into pens at every pen change (`M0`, `M226`).
+/// `flip_y`: mirror Y about the drawing's top (files written with the default
+/// Y flip); `None` decides from the file (Carl's machine header `M851` = no flip).
+/// Returns the pens and the bounding box (min, max) of everything drawn.
+pub fn gcode_lines(text: &str, flip_y: Option<bool>) -> (Vec<GcodePen>, P2, P2) {
+    let flip = flip_y.unwrap_or(!text.contains("M851"));
+    let mut pens = vec![GcodePen::default()];
+    let (mut x, mut y, mut z) = (0.0f64, 0.0f64, 10.0f64);
+    let mut cur: Vec<P2> = Vec::new();
+    let (mut lo, mut hi) = ((f64::MAX, f64::MAX), (f64::MIN, f64::MIN));
+    let finish = |cur: &mut Vec<P2>, pens: &mut Vec<GcodePen>| {
+        if cur.len() >= 2 { pens.last_mut().unwrap().lines.push(Polyline { pts: std::mem::take(cur), closed: false }); }
+        cur.clear();
+    };
+    for raw in text.lines() {
+        let line = raw.split(';').next().unwrap_or("").trim();
+        if line.is_empty() { continue; }
+        let mut words = line.split_whitespace();
+        let Some(cmd) = words.next() else { continue };
+        let cmd = cmd.to_ascii_uppercase();
+        if cmd == "M117" {
+            // "M117 Pen 3: lightblue" names the pen that follows.
+            let msg = line[4..].trim();
+            if let Some((_, name)) = msg.split_once(':') {
+                let name = name.trim().to_string();
+                if pens.last().is_some_and(|p| p.lines.is_empty() && cur.is_empty()) { pens.last_mut().unwrap().name = Some(name); }
+                else { finish(&mut cur, &mut pens); pens.push(GcodePen { name: Some(name), lines: Vec::new() }); }
+            }
+            continue;
+        }
+        if cmd == "M0" || cmd == "M226" {
+            finish(&mut cur, &mut pens);
+            if !pens.last().unwrap().lines.is_empty() { pens.push(GcodePen::default()); }
+            continue;
+        }
+        if !matches!(cmd.as_str(), "G0" | "G00" | "G1" | "G01" | "G5" | "G05") { continue; }
+        let mut v = std::collections::HashMap::new();
+        for wd in words {
+            let mut ch = wd.chars();
+            if let Some(k) = ch.next() {
+                if let Ok(n) = ch.as_str().parse::<f64>() { v.insert(k.to_ascii_uppercase(), n); }
+            }
+        }
+        if let Some(&nz) = v.get(&'Z') {
+            if nz > 0.5 && z <= 0.5 { finish(&mut cur, &mut pens); }
+            z = nz;
+        }
+        let (nx, ny) = (v.get(&'X').copied().unwrap_or(x), v.get(&'Y').copied().unwrap_or(y));
+        let moved = nx != x || ny != y;
+        if z <= 0.5 && moved && cmd != "G0" && cmd != "G00" {
+            if cur.is_empty() { cur.push((x, y)); }
+            if cmd.starts_with("G5") || cmd == "G05" {
+                let c1 = (x + v.get(&'I').copied().unwrap_or(0.0), y + v.get(&'J').copied().unwrap_or(0.0));
+                let c2 = (nx + v.get(&'P').copied().unwrap_or(0.0), ny + v.get(&'Q').copied().unwrap_or(0.0));
+                flatten(&[(x, y), c1, c2, (nx, ny)], 0.05, &mut cur);
+            } else {
+                cur.push((nx, ny));
+            }
+        } else if moved {
+            finish(&mut cur, &mut pens);
+        }
+        x = nx;
+        y = ny;
+    }
+    finish(&mut cur, &mut pens);
+    pens.retain(|p| !p.lines.is_empty());
+    for p in &pens {
+        for l in &p.lines {
+            for &(a, b) in &l.pts { lo = (lo.0.min(a), lo.1.min(b)); hi = (hi.0.max(a), hi.1.max(b)); }
+        }
+    }
+    if flip {
+        let top = hi.1 + lo.1;
+        for p in &mut pens {
+            for l in &mut p.lines { for q in &mut l.pts { q.1 = top - q.1; } }
+        }
+    }
+    (pens, lo, hi)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gcode_read_back_draws_what_was_written() {
+        // Two pens: a circle and a zigzag, written in both dialects, straight and Bézier.
+        let circle = Polyline { closed: true, pts: (0..=64).map(|k| { let a = k as f64 / 64.0 * std::f64::consts::TAU; (100.0 + 30.0 * a.cos(), 80.0 + 30.0 * a.sin()) }).collect() };
+        let zig = Polyline { closed: false, pts: (0..10).map(|k| (20.0 + 8.0 * k as f64, if k % 2 == 0 { 20.0 } else { 30.0 })).collect() };
+        let true_len = circle.length() + zig.length();
+        let sheet = Sheet { w: 200.0, h: 150.0, pen: 0.4 };
+        let layers = [
+            Layer { name: "pink".into(), color: "#a83972".into(), paths: vec![fit_polyline(&circle, 0.05)] },
+            Layer { name: "green".into(), color: "#637b41".into(), paths: vec![fit_polyline(&zig, 0.05)] },
+        ];
+        for carl in [false, true] {
+            for bezier in [false, true] {
+                let mut o = GcodeOpts::marlin(vec!["G0 Z2 F600".into()], vec!["G1 Z0 F600".into()]);
+                o.bezier = bezier;
+                o.pause_between_layers = true;
+                if carl {
+                    o.flip_y = false;
+                    o.header = vec!["G1 Z15".into(), "M851 Z-1.2".into()];
+                    o.pen_change = vec!["M117 Pen {k}: {name}".into(), "G1 Z35".into(), "G1 X432.5 Y447".into(), "M226 P121".into(), "G1 Z15".into()];
+                    o.pause_first = true;
+                }
+                let (g, st) = to_gcode(&sheet, &layers, &o, "test");
+                let (pens, lo, hi) = gcode_lines(&g, None);
+                assert_eq!(pens.len(), 2, "carl {carl} bezier {bezier}: {} pens", pens.len());
+                if carl { assert_eq!(pens[0].name.as_deref(), Some("pink")); assert_eq!(pens[1].name.as_deref(), Some("green")); }
+                let len: f64 = pens.iter().flat_map(|p| &p.lines).map(|l| l.length()).sum();
+                assert!((len - st.draw_mm).abs() < 0.01 * st.draw_mm + 0.5, "carl {carl} bezier {bezier}: read {len:.2} mm, wrote {:.2}", st.draw_mm);
+                // (the Bézier fit rounds the zigzag's corners: a few % longer than the polyline)
+                assert!((len - true_len).abs() < 0.05 * true_len, "carl {carl} bezier {bezier}: {len:.2} vs {true_len:.2}");
+                // Same place on paper: the circle's box, whichever way Y was written.
+                let circ = &pens[0].lines;
+                let (ymin, ymax) = circ.iter().flat_map(|l| &l.pts).fold((f64::MAX, f64::MIN), |a, p| (a.0.min(p.1), a.1.max(p.1)));
+                assert!((ymax - ymin - 60.0).abs() < 1.0 && hi.0 > lo.0, "carl {carl} bezier {bezier}: circle height {}", ymax - ymin);
+            }
+        }
+    }
+
+    #[test]
+    fn rasterized_lines_land_where_they_are_drawn() {
+        let l = Polyline { closed: false, pts: vec![(10.0, 50.5), (90.0, 50.5)] };
+        let (w, h, rgb) = rasterize((100.0, 100.0), 100, 1.0, &[((200, 0, 0), std::slice::from_ref(&l))]);
+        assert_eq!((w, h), (100, 100));
+        let px = |x: usize, y: usize| &rgb[(y * w as usize + x) * 3..(y * w as usize + x) * 3 + 3];
+        assert!(px(50, 50)[1] < 120 && px(50, 50)[0] > 150, "on the line: {:?}", px(50, 50));
+        assert_eq!(px(50, 20), &[255, 255, 255], "paper elsewhere");
+    }
+
+    #[test]
+    fn a_checkerboard_of_noise_is_thinned_like_any_steep_field() {
+        // Alternating samples: every cell is a saddle with a zero bilinear gradient.
+        let (w, h) = (64usize, 64usize);
+        let g: Vec<f32> = (0..w * h).map(|i| if (i % w + i / w) % 2 == 0 { 0.1 } else { 0.9 }).collect();
+        let lines = contour_family(&g, w, h, 0.35, (0.0, 0.0), 2048, 0.8, 0.0, &|_, _, _| true);
+        let segs: usize = lines.iter().map(|(_, l)| l.pts.len().saturating_sub(1)).sum();
+        // At most a few lines per cell survive the 0.8 mm gap at 0.35 mm sampling.
+        assert!(segs <= 4 * w * h, "{segs} segments for {} cells", w * h);
+    }
+
+    #[test]
+    fn strided_gap_rule_draws_exactly_what_testing_every_level_did() {
+        // A field with gentle and very steep parts (a ripple on a ramp, plus a cliff).
+        let (w, h) = (120usize, 90usize);
+        let g: Vec<f32> = (0..w * h).map(|i| {
+            let (x, y) = ((i % w) as f64, (i / w) as f64);
+            let v = 0.3 * x / w as f64 + 0.05 * (x * 0.7).sin() * (y * 0.3).cos() + if x > 80.0 { 0.4 } else { 0.0 } + 0.1 * y / h as f64;
+            v.clamp(0.0, 0.999) as f32
+        }).collect();
+        let (levels, gap, cell) = (1024usize, 0.8, 0.35);
+        let new = contour_family(&g, w, h, cell, (0.0, 0.0), levels, gap, 0.0, &|_, _, _| true);
+        // The rule as it was: every crossing level tested.
+        let delta = 1.0 / levels as f64;
+        let values: Vec<f32> = (1..levels).map(|i| (i as f64 * delta) as f32).collect();
+        let keep = |k: usize, x: usize, y: usize| {
+            let i = k + 1;
+            let (a, b, c, d) = (g[y * w + x] as f64, g[y * w + x + 1] as f64, g[(y + 1) * w + x + 1] as f64, g[(y + 1) * w + x] as f64);
+            let grad = cell_slope(a, b, c, d);
+            grad <= 0.0 || level_step(i) as f64 * delta / grad * cell >= gap
+        };
+        let old: Vec<(usize, Polyline)> = contour_levels(&g, w, h, &values, &keep).into_iter().enumerate()
+            .flat_map(|(k, ls)| ls.into_iter().map(move |l| (k + 1, grid_to_mm(l, cell, (0.0, 0.0))))).collect();
+        assert!(old.len() > 50, "the test field should draw plenty: {}", old.len());
+        let summary = |v: &[(usize, Polyline)]| { let mut s: Vec<(usize, usize, i64)> = v.iter().map(|(k, l)| (*k, l.pts.len(), (l.length() * 1e6) as i64)).collect(); s.sort(); s };
+        assert_eq!(summary(&new), summary(&old));
+    }
 
     fn radial(n: usize, c: f64) -> Vec<f32> {
         (0..n * n).map(|i| (((i % n) as f64 - c).hypot((i / n) as f64 - c)) as f32).collect()

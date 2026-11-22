@@ -18,6 +18,8 @@ use std::sync::mpsc;
 use std::thread;
 
 use eframe::egui;
+#[path = "../anim_viewer_plot.rs"]
+mod plot_window;
 use nnfractals::formula::{op, reachable_from_root, OpNode, N_SLOTS};
 use nnfractals::formula_text::{parse_program, program_to_text, ParseError};
 use nnfractals::quat_dag::QuatDagFormula;
@@ -935,6 +937,8 @@ struct App {
     formula_editor: FormulaEditor,
     planes: PlanesPanel,
     slice: SlicePanel,
+    /// ✎ Plot window: pen-plotter anatomy of the Slice window's slice.
+    plot: plot_window::PlotPanel,
     /// A drag-value in the formula editor is being dragged this frame —
     /// part of `is_interacting()`, so the live preview drops to preview
     /// quality while a constant is swept.
@@ -1166,6 +1170,7 @@ impl App {
             formula_editor,
             planes: PlanesPanel { size: prefs.planes_size, click_picks: prefs.planes_click_picks, open: std::env::var_os("NN_ANIM_OPEN_PLANES").is_some(), ..Default::default() },
             slice: SlicePanel::default(),
+            plot: plot_window::PlotPanel::default(),
             formula_dragging: false,
             timeline,
             timeline_origin,
@@ -1356,6 +1361,31 @@ impl App {
     /// the original formula say nothing about the edited one. The current
     /// timeline is copied under the new genome's content hash so the camera,
     /// bounds and clips come along when the file is reopened.
+    /// The genome as the viewer has it now: the loaded one with the formula as edited.
+    fn current_genome(&self) -> nnfractals::genome::Genome {
+        let mut g = self.loaded_genome.clone();
+        g.program = self.program.clone();
+        g.warp = self.warp.clone();
+        g.julia_mode = self.julia_mode;
+        (g.julia_cre, g.julia_cim) = (self.jc.0, self.jc.1);
+        (g.phoenix_re, g.phoenix_im) = (self.phoenix.0, self.phoenix.1);
+        g.bailout_radius = self.bailout_radius;
+        g
+    }
+
+    /// What the ✎ Plot window plots: this genome, timeline and playhead, through the
+    /// Slice window's plane, with the Slice window's iterations.
+    fn plot_inputs(&self) -> plot_window::PlotInputs {
+        plot_window::PlotInputs {
+            genome: self.current_genome(),
+            timeline: self.timeline.clone(),
+            at_s: self.playhead_s,
+            spec: self.slice.spec,
+            max_iter: if self.slice.iter > 0 { self.slice.iter } else { self.max_iter },
+            label: self.genome_label.clone(),
+        }
+    }
+
     fn save_formula_as_new(&mut self) -> anyhow::Result<PathBuf> {
         let src = &self.loaded_genome;
         let mut g = nnfractals::genome::Genome {
@@ -3668,6 +3698,8 @@ impl eframe::App for App {
                     .on_hover_text("All six RABC planes (RA, RB, RC, AB, AC, BC) as flat slices; click one to render it at any resolution");
                 ui.toggle_value(&mut self.slice.open, "\u{2702} Slice")
                     .on_hover_text("A flat 2D image through the 3D view on its X/Y/Z planes, at any tilt: a cheap live preview to try angles, then a hi-res PNG (colours, grey, or black & white)");
+                ui.toggle_value(&mut self.plot.open, "\u{270e} Plot")
+                    .on_hover_text("The Slice window's slice as a pen-plotter drawing (thousands of orbit layers in a self-subdivided mosaic, or an atlas): a quick preview, then SVG + G-code for Carl's machine; also shows any G-code file");
                 if let Some(err) = &self.gpu_error {
                     ui.colored_label(egui::Color32::RED, err);
                 }
@@ -4239,6 +4271,16 @@ impl eframe::App for App {
             self.show_planes_window(&ctx);
         }
         self.show_slice_window(&ctx);
+        if self.plot.open {
+            // The plot is the Slice window's slice: everything that changes it is in the key.
+            let key = format!("{:?}|{}|{:?}|{:?}|{:?}|{:?}|{}|{:?}|{:?}|{}|{}|{}",
+                self.slice.spec, self.slice.iter, self.timeline.bounds, self.timeline.axis_assignment, self.timeline.collapse,
+                self.timeline.equal_axis_scale, self.playhead_s, self.program, self.warp, self.julia_mode, self.bailout_radius, self.timeline.t_value);
+            let mut plot = std::mem::take(&mut self.plot);
+            let action = plot.show(&ctx, &key, &|| self.plot_inputs());
+            self.plot = plot;
+            if let plot_window::PlotAction::OpenSlice = action { self.slice.open = true; }
+        }
         if self.bbox_dialog_open {
             self.show_bbox_dialog(&ctx);
         }

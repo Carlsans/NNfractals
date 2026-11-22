@@ -2425,6 +2425,7 @@ dependencies = [
  "pollster 0.3.0",
  "rand 0.9.4",
  "rayon",
+ "rustc-hash 2.1.2",
  "serde",
  "serde_json",
  "stl_io",
