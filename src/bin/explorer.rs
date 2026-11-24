@@ -5361,7 +5361,9 @@ fn write_pen_plot(args: &[String], out: &Path, stem: &str, comment: &str, sheet:
         o.pen_down = z("0");
         o.pen_up = z("7");
         o.short_lift = Some((5.0, z("2.5")));
-        o.pen_change = vec!["M117 Pen {k}: {name}".into(), format!("G1 Z35 F{zf}"), format!("G0 X432.5 Y447 F{}", o.travel), "M226 P121".into(), format!("G1 Z15 F{zf}")];
+        // While the machine waits, its single-line status display (20 characters) shows
+        // the pen and the ink it will draw before the next change: "3:lightblue .07g".
+        o.pen_change = vec!["M117 {k}:{name}{ink}".into(), format!("G1 Z35 F{zf}"), format!("G0 X432.5 Y447 F{}", o.travel), "M226 P121".into(), format!("G1 Z15 F{zf}")];
         o.pause_first = true;
         o.pause_between_layers = true;
     }

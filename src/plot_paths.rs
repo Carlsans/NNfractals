@@ -743,7 +743,9 @@ pub struct GcodeOpts {
     pub footer: Vec<String>,
     /// Travel shorter than `.0` mm lifts the pen with `.1` instead of `pen_up`.
     pub short_lift: Option<(f64, Vec<String>)>,
-    /// The pen-change pause; `{k}` and `{name}` become the layer number and name.
+    /// The pen-change pause; `{k}` and `{name}` become the layer number and name, `{ink}`
+    /// " .07g": the ink the pen now put in draws before the next change (with `ink`).
+    /// `M117` messages are cut to the 20 characters of a single-line status display.
     pub pen_change: Vec<String>,
     /// Also pause before the first layer (to put the first pen in).
     pub pause_first: bool,
@@ -805,7 +807,7 @@ impl GcodeOpts {
         GcodeOpts {
             origin: (0.0, 0.0), flip_y: true, feed: 3000.0, travel: 6000.0, pen_up, pen_down, bezier: false, flat_tol: 0.02,
             home: false, pause_between_layers: false, header: Vec::new(), footer: Vec::new(), short_lift: None,
-            pen_change: vec!["M0 Change pen for layer {k} {name}".into()], pause_first: false, refill_mm: None,
+            pen_change: vec!["M0 Change pen for layer {k} {name}{ink}".into()], pause_first: false, refill_mm: None,
             ink: None, progress_step: 0, motion: None, m73: false,
         }
     }
@@ -843,9 +845,16 @@ pub fn to_gcode(sheet: &Sheet, layers: &[Layer], o: &GcodeOpts, comment: &str) -
     let mut st = PlotStats::default();
     let mut pen = o.origin;
     let mut lifts = 0usize;
-    let pause = |body: &mut String, k: usize, name: &str| {
+    let pause = |body: &mut String, k: usize, name: &str, ink_g: Option<f64>| {
+        // " .07g": compact, so "3:lightblue #2 .30g" fits the 20-character status line.
+        let ink = ink_g.map(|g| { let t = format!("{g:.2}"); format!(" {}g", t.strip_prefix('0').unwrap_or(&t)) }).unwrap_or_default();
         for c in &o.pen_change {
-            let _ = writeln!(body, "{}", c.replace("{k}", &k.to_string()).replace("{name}", name));
+            let line = c.replace("{k}", &k.to_string()).replace("{name}", name).replace("{ink}", &ink);
+            let line = match line.strip_prefix("M117 ") {
+                Some(msg) => format!("M117 {}", msg.chars().take(20).collect::<String>()),
+                None => line,
+            };
+            let _ = writeln!(body, "{line}");
         }
     };
     let mut down = false;
@@ -893,12 +902,16 @@ pub fn to_gcode(sheet: &Sheet, layers: &[Layer], o: &GcodeOpts, comment: &str) -
     }
     for (k, layer) in layers.iter().enumerate() {
         let _ = writeln!(body, "; ---- layer {} {} ({} paths)", k + 1, layer.name, layer.paths.len());
+        let refill_mm = o.refill_mm.or(o.ink.map(|i| i.refill_mm()));
+        // The ink the pen put in at a change draws before the next one: the layer's line
+        // left, at most a refill's worth.
+        let layer_len: f64 = layer.paths.iter().map(&line_len).sum();
+        let ink_for = |left_mm: f64| o.ink.map(|i| (left_mm.min(refill_mm.unwrap_or(f64::INFINITY)) / 1000.0 * i.g_per_m).max(0.0));
         if o.pause_between_layers && !layer.paths.is_empty() && (k > 0 || o.pause_first) {
-            pause(&mut body, k + 1, &layer.name);
+            pause(&mut body, k + 1, &layer.name, ink_for(layer_len));
         }
         let mut since_refill = 0.0;
         let mut refills = 0;
-        let refill_mm = o.refill_mm.or(o.ink.map(|i| i.refill_mm()));
         let layer_secs: f64 = plan[k].iter().sum();
         let mut layer_elapsed = 0.0f64;
         let layer_start = st.draw_mm;
@@ -915,10 +928,14 @@ pub fn to_gcode(sheet: &Sheet, layers: &[Layer], o: &GcodeOpts, comment: &str) -
                 lifts += 1;
                 down = false;
             }
-            if refill_mm.is_some_and(|r| since_refill >= r) {
+            // No change when the rest of this colour fits in the reserve the pen still holds
+            // (it is changed after refill_g of its capacity_g): no pause for a few mm.
+            let left_mm = layer_len - (st.draw_mm - layer_start);
+            let reserve_mm = o.ink.map_or(0.0, |i| (i.capacity_g - i.refill_g).max(0.0) / i.g_per_m.max(1e-12) * 1000.0);
+            if refill_mm.is_some_and(|r| since_refill >= r) && left_mm > reserve_mm {
                 refills += 1;
                 // "lightblue #2": a fresh (refilled) pen of this colour; short for a 20-character LCD.
-                pause(&mut body, k + 1, &format!("{} #{}", layer.name, refills + 1));
+                pause(&mut body, k + 1, &format!("{} #{}", layer.name, refills + 1), ink_for(layer_len - (st.draw_mm - layer_start)));
                 since_refill = 0.0;
             }
             let drawn_before = st.draw_mm;
@@ -1237,6 +1254,26 @@ mod tests {
     use super::*;
 
     #[test]
+    fn no_pen_change_for_what_the_reserve_can_finish() {
+        // 220 mm of line; a pen is changed after 0.1 g (200 mm at 0.5 g/m) but holds 0.4 g:
+        // the last 20 mm fit in its reserve, so no second pen.
+        let paths: Vec<CurvePath> = (0..11).map(|k| {
+            let y = 10.0 + k as f64 * 2.0;
+            CurvePath { curves: vec![[(10.0, y), (16.0, y), (23.0, y), (30.0, y)]], closed: false }
+        }).collect();
+        let layers = [Layer { name: "red".into(), color: "#9f3b3d".into(), paths }];
+        let sheet = Sheet { w: 100.0, h: 100.0, pen: 0.4 };
+        let mut o = GcodeOpts::marlin(vec!["G0 Z2".into()], vec!["G1 Z0".into()]);
+        o.ink = Some(Ink { g_per_m: 0.5, capacity_g: 0.4, refill_g: 0.1, measured: true });
+        let (_, st) = to_gcode(&sheet, &layers, &o, "t");
+        assert_eq!(st.pens[0].refills, 0);
+        // A pen with no reserve is changed.
+        o.ink = Some(Ink { g_per_m: 0.5, capacity_g: 0.1, refill_g: 0.1, measured: true });
+        let (_, st) = to_gcode(&sheet, &layers, &o, "t");
+        assert_eq!(st.pens[0].refills, 1);
+    }
+
+    #[test]
     fn move_time_is_trapezoidal() {
         // Long enough to cruise: 100 mm at 50 mm/s with 100 mm/s²: 2 + 0.5 s.
         assert!((move_time(100.0, 50.0, 100.0) - 2.5).abs() < 1e-9);
@@ -1259,7 +1296,8 @@ mod tests {
         let mut o = GcodeOpts::marlin(vec!["G0 Z2".into()], vec!["G1 Z0".into()]);
         o.pause_between_layers = true;
         o.pen_change = vec!["M117 Pen {k}: {name}".into(), "M226 P121".into()];
-        o.ink = Some(Ink { g_per_m: 0.5, capacity_g: 0.4, refill_g: 0.1, measured: true });
+        // A 0.12 g pen changed after 0.1 g: a 0.02 g reserve (40 mm), so the 4 refills stay.
+        o.ink = Some(Ink { g_per_m: 0.5, capacity_g: 0.12, refill_g: 0.1, measured: true });
         o.progress_step = 10;
         let (g, st) = to_gcode(&sheet, &layers, &o, "t");
         let p = &st.pens[0];
@@ -1267,6 +1305,13 @@ mod tests {
         assert!((p.ink_g.unwrap() - 0.5).abs() < 0.001);
         assert_eq!(p.refills, 4, "{g}");
         assert!(g.contains("M117 Pen 1: lightblue #2") && g.contains("M117 Pen 1: lightblue #5"), "{g}");
+        // The ink each pen will draw: 1 m at 0.5 g/m changed every 0.1 g, so 0.10 g each time.
+        o.pen_change = vec!["M117 {k}:{name}{ink}".into(), "M226 P121".into()];
+        o.pause_first = true;
+        let (g2, _) = to_gcode(&sheet, &layers, &o, "t");
+        assert!(g2.contains("M117 1:lightblue .10g") && g2.contains("M117 1:lightblue #5 .10g"), "{g2}");
+        assert!(g2.lines().filter_map(|l| l.strip_prefix("M117 ")).all(|m| m.chars().count() <= 20), "single-line LCD: 20 characters");
+        o.pause_first = false;
         let progress: Vec<&str> = g.lines().filter(|l| l.starts_with("M117 lightblue ")).collect();
         assert_eq!(progress.len(), 10, "{progress:?}");
         assert!(progress.last().unwrap().starts_with("M117 lightblue 100%"), "{progress:?}");
