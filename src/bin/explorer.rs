@@ -5231,7 +5231,23 @@ struct PlotterSettings {
     z_max_feed: f64,
     #[serde(default = "default_z_max_accel")]
     z_max_accel: f64,
+    /// Drawing and travel speeds (mm/min), and the X/Y limits set at the start of every
+    /// plot (M203 mm/s, M201 / M204 mm/s²). A large, heavy machine (a long 20x20 beam,
+    /// a stepper on the pen carriage), not built for speed (2026-11-23).
+    #[serde(default = "default_draw_feed")]
+    draw_feed: f64,
+    #[serde(default = "default_travel_feed")]
+    travel_feed: f64,
+    #[serde(default = "default_xy_max_feed")]
+    xy_max_feed: f64,
+    #[serde(default = "default_xy_max_accel")]
+    xy_max_accel: f64,
 }
+
+fn default_draw_feed() -> f64 { 1800.0 }
+fn default_travel_feed() -> f64 { 3000.0 }
+fn default_xy_max_feed() -> f64 { 50.0 }
+fn default_xy_max_accel() -> f64 { 100.0 }
 
 fn default_z_feed() -> f64 { 1800.0 }
 fn default_z_max_feed() -> f64 { 30.0 }
@@ -5242,7 +5258,8 @@ fn plotter_settings() -> PlotterSettings {
     if let Some(s) = std::fs::read_to_string(&path).ok().and_then(|t| toml::from_str::<PlotterSettings>(&t).ok()) {
         return s;
     }
-    let s = PlotterSettings { ink_g_per_m: 0.0, pen_capacity_g: 0.4, refill_g: 0.3, z_feed: default_z_feed(), z_max_feed: default_z_max_feed(), z_max_accel: default_z_max_accel() };
+    let s = PlotterSettings { ink_g_per_m: 0.0, pen_capacity_g: 0.4, refill_g: 0.3, z_feed: default_z_feed(), z_max_feed: default_z_max_feed(), z_max_accel: default_z_max_accel(),
+        draw_feed: default_draw_feed(), travel_feed: default_travel_feed(), xy_max_feed: default_xy_max_feed(), xy_max_accel: default_xy_max_accel() };
     let text = [
         "# Carl's pen plotter: the felt pens' ink, for the G-code's ink totals, refill pauses",
         "# and LCD progress (explorer quat-anatomy / quat-slice-plot / quat-surface-plot).",
@@ -5251,6 +5268,8 @@ fn plotter_settings() -> PlotterSettings {
         "# each pen's metres), weigh again: ink_g_per_m = grams lost / metres drawn.",
         "# z_feed: pen up/down speed (mm/min); z_max_feed (mm/s) and z_max_accel (mm/s^2) are set",
         "# with M203 / M201 at the start of every plot (--machine carl).",
+        "# draw_feed / travel_feed: drawing and travel speeds (mm/min); xy_max_feed (mm/s) and",
+        "# xy_max_accel (mm/s^2) are set with M203 / M201 / M204 at the start of every plot.",
         "",
     ].join("\n") + &toml::to_string(&s).unwrap_or_default();
     let _ = std::fs::write(&path, text);
@@ -5312,8 +5331,17 @@ fn write_pen_plot(args: &[String], out: &Path, stem: &str, comment: &str, sheet:
         // inherits another's; the Z limits set for this plot whatever the EEPROM holds.
         let zf = get_flag_or(args, "--z-feed", ps.z_feed);
         let z = |v: &str| vec![format!("G1 Z{v} F{zf}")];
+        // Speeds for a heavy, slow machine (plotter.toml; --feed / --travel override).
+        o.feed = get_flag_or(args, "--feed", ps.draw_feed);
+        o.travel = get_flag_or(args, "--travel", ps.travel_feed);
         o.flip_y = false;
-        o.header = vec![format!("M203 Z{}", ps.z_max_feed), format!("M201 Z{}", ps.z_max_accel), format!("G1 Z15 F{zf}"), "M851 Z-1.2".into()];
+        o.header = vec![
+            format!("M203 X{xy} Y{xy} Z{}", ps.z_max_feed, xy = ps.xy_max_feed),
+            format!("M201 X{xa} Y{xa} Z{}", ps.z_max_accel, xa = ps.xy_max_accel),
+            format!("M204 P{xa} T{xa}", xa = ps.xy_max_accel),
+            format!("G1 Z15 F{zf}"), "M851 Z-1.2".into(),
+        ];
+        o.motion = Some(pp::Motion { xy_accel: ps.xy_max_accel, z_feed: zf, z_accel: ps.z_max_accel, short_lift_mm: 2.5, lift_mm: 7.0 });
         o.footer = vec![format!("G1 Z15 F{zf}")];
         o.pen_down = z("0");
         o.pen_up = z("7");

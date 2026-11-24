@@ -754,6 +754,30 @@ pub struct GcodeOpts {
     /// LCD progress: `M117 <pen> <n>%` (and the ink used from the current pen) every
     /// this many percent of a layer's line (0 = none). 20 characters at most.
     pub progress_step: u32,
+    /// The machine's motion, for the time estimate only (`None`: lengths ÷ speeds).
+    pub motion: Option<Motion>,
+}
+
+/// What the time estimate needs to know about the machine: every path, travel hop and
+/// pen lift starts and ends at rest (the pen lifts between paths), so on a slow,
+/// heavy machine the acceleration, not the speed, sets most of a plot's time.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Motion {
+    /// X/Y acceleration (mm/s²).
+    pub xy_accel: f64,
+    /// Pen lift speed (mm/min) and acceleration (mm/s²).
+    pub z_feed: f64,
+    pub z_accel: f64,
+    /// Lift heights (mm): for hops shorter than `short_lift`'s distance, and the others.
+    pub short_lift_mm: f64,
+    pub lift_mm: f64,
+}
+
+/// Seconds to move `d` mm from rest to rest at up to `v` mm/s with acceleration `a`.
+pub fn move_time(d: f64, v: f64, a: f64) -> f64 {
+    if d <= 0.0 || v <= 0.0 { return 0.0; }
+    if a <= 0.0 { return d / v; }
+    if d >= v * v / a { d / v + v / a } else { 2.0 * (d / a).sqrt() }
 }
 
 /// A felt pen's ink: how much one metre of line uses, what a pen holds, and after how
@@ -777,7 +801,7 @@ impl GcodeOpts {
             origin: (0.0, 0.0), flip_y: true, feed: 3000.0, travel: 6000.0, pen_up, pen_down, bezier: false, flat_tol: 0.02,
             home: false, pause_between_layers: false, header: Vec::new(), footer: Vec::new(), short_lift: None,
             pen_change: vec!["M0 Change pen for layer {k} {name}".into()], pause_first: false, refill_mm: None,
-            ink: None, progress_step: 0,
+            ink: None, progress_step: 0, motion: None,
         }
     }
 }
@@ -818,6 +842,8 @@ pub fn to_gcode(sheet: &Sheet, layers: &[Layer], o: &GcodeOpts, comment: &str) -
         }
     };
     let mut down = false;
+    // Time estimate with acceleration (`o.motion`), in seconds.
+    let mut secs = 0.0f64;
     for (k, layer) in layers.iter().enumerate() {
         let _ = writeln!(body, "; ---- layer {} {} ({} paths)", k + 1, layer.name, layer.paths.len());
         if o.pause_between_layers && !layer.paths.is_empty() && (k > 0 || o.pause_first) {
@@ -841,6 +867,12 @@ pub fn to_gcode(sheet: &Sheet, layers: &[Layer], o: &GcodeOpts, comment: &str) -
             let Some(first) = p.curves.first() else { continue };
             let s = tx(first[0]);
             let hop = dist(pen, s);
+            if let Some(m) = o.motion {
+                let short = o.short_lift.as_ref().is_some_and(|(d, _)| hop < *d);
+                let h = if short { m.short_lift_mm } else { m.lift_mm };
+                // Up (if down), across, down.
+                secs += if down { 2.0 } else { 1.0 } * move_time(h, m.z_feed / 60.0, m.z_accel) + move_time(hop, o.travel / 60.0, m.xy_accel);
+            }
             if down {
                 let cmds = match &o.short_lift { Some((d, c)) if hop < *d => c, _ => &o.pen_up };
                 for c in cmds {
@@ -913,6 +945,7 @@ pub fn to_gcode(sheet: &Sheet, layers: &[Layer], o: &GcodeOpts, comment: &str) -
                 }
                 st.curves += 1;
             }
+            if let Some(m) = o.motion { secs += move_time(st.draw_mm - drawn_before, o.feed / 60.0, m.xy_accel); }
             since_refill += st.draw_mm - drawn_before;
             st.paths += 1;
             pen = cur;
@@ -939,8 +972,11 @@ pub fn to_gcode(sheet: &Sheet, layers: &[Layer], o: &GcodeOpts, comment: &str) -
     }
     let end = o.origin;
     st.travel_mm += dist(pen, end);
-    // Pen moves at ~0.3 s each way on a typical Z or servo lift.
-    st.minutes = st.draw_mm / o.feed.max(1.0) + st.travel_mm / o.travel.max(1.0) + lifts as f64 * 0.6 / 60.0;
+    st.minutes = match o.motion {
+        Some(m) => (secs + move_time(dist(pen, end), o.travel / 60.0, m.xy_accel)) / 60.0,
+        // Pen moves at ~0.3 s each way on a typical Z or servo lift.
+        None => st.draw_mm / o.feed.max(1.0) + st.travel_mm / o.travel.max(1.0) + lifts as f64 * 0.6 / 60.0,
+    };
     let mut s = String::new();
     for line in comment.lines() {
         let _ = writeln!(s, "; {line}");
@@ -948,7 +984,7 @@ pub fn to_gcode(sheet: &Sheet, layers: &[Layer], o: &GcodeOpts, comment: &str) -
     let _ = writeln!(s, "; paper {}x{} mm, pen {} mm, paper corner at bed X{} Y{}{}", f3(sheet.w), f3(sheet.h), f3(sheet.pen), f3(o.origin.0), f3(o.origin.1), if o.flip_y { " (front-left)" } else { "" });
     let _ = writeln!(
         s,
-        "; {} paths, {} {} moves, draw {:.1} m, travel {:.1} m, about {:.0} min at F{}/F{}",
+        "; {} paths, {} {} moves, draw {:.1} m, travel {:.1} m, about {:.0} min at F{}/F{}{}",
         st.paths,
         st.g_lines,
         if o.bezier { "G5" } else { "G1" },
@@ -956,7 +992,8 @@ pub fn to_gcode(sheet: &Sheet, layers: &[Layer], o: &GcodeOpts, comment: &str) -
         st.travel_mm / 1000.0,
         st.minutes,
         f3(o.feed),
-        f3(o.travel)
+        f3(o.travel),
+        match o.motion { Some(m) => format!(" with {} mm/s² (X/Y) and {} mm/s² (Z) accelerations", m.xy_accel, m.z_accel), None => String::new() }
     );
     if o.bezier {
         let _ = writeln!(s, "; G5 needs Marlin built with BEZIER_CURVE_SUPPORT; otherwise use the G1 file");
@@ -1144,6 +1181,16 @@ pub fn gcode_lines(text: &str, flip_y: Option<bool>) -> (Vec<GcodePen>, P2, P2) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn move_time_is_trapezoidal() {
+        // Long enough to cruise: 100 mm at 50 mm/s with 100 mm/s²: 2 + 0.5 s.
+        assert!((move_time(100.0, 50.0, 100.0) - 2.5).abs() < 1e-9);
+        // Too short to reach speed: 2.5 mm triangle, 2·√(2.5/100) = 0.316 s.
+        assert!((move_time(2.5, 50.0, 100.0) - 2.0 * (0.025f64).sqrt()).abs() < 1e-9);
+        // No acceleration given: length / speed.
+        assert!((move_time(10.0, 5.0, 0.0) - 2.0).abs() < 1e-12);
+    }
 
     #[test]
     fn ink_totals_refills_and_lcd_progress() {
