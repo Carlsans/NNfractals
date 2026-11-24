@@ -16,7 +16,8 @@ videos as private (youtube.com/... support "yt_api_form" to request the audit).
 Usage:
   youtube_upload.py --file VIDEO --title T [--description D] [--tags a,b] [--privacy private|unlisted|public]
                     [--category 1] [--thumbnail IMAGE]
-  youtube_upload.py --auth [--lang en]   (only the consent, asked again; to set it up or record the demo)
+  youtube_upload.py --auth [--lang en] [--browser "firefox --private-window"]
+                                    (only the consent, asked again; to set it up or record the demo)
 Prints one line each: STATUS <text>, PROGRESS <0..100>, DONE <video id>, WARN <text>, ERROR <text>.
 """
 import argparse
@@ -41,9 +42,10 @@ def fail(text):
     sys.exit(1)
 
 
-def credentials(fresh=False, lang=None):
+def credentials(fresh=False, lang=None, browser=None):
     """The saved login, refreshed if needed; Google's consent in the browser when there is
-    none, or always with fresh=True (--auth). lang ("en") sets the consent screen's language."""
+    none, or always with fresh=True (--auth). lang ("en") sets the consent screen's language;
+    browser is a command the consent URL is appended to (e.g. "firefox --private-window")."""
     from google.auth.transport.requests import Request
     from google.oauth2.credentials import Credentials
     from google_auth_oauthlib.flow import InstalledAppFlow
@@ -68,6 +70,11 @@ def credentials(fresh=False, lang=None):
     flow = InstalledAppFlow.from_client_secrets_file(SECRET, SCOPES)
     say("STATUS", "waiting for Google's consent in the browser")
     extra = {"hl": lang} if lang else {}
+    if browser:
+        import shlex
+        import webbrowser
+        webbrowser.register("nnfractals-consent", None, webbrowser.GenericBrowser(shlex.split(browser) + ["%s"]))
+        extra["browser"] = "nnfractals-consent"
     creds = flow.run_local_server(port=0, open_browser=True, authorization_prompt_message="",
                                   success_message="NNfractals can upload to YouTube now; you can close this tab.", **extra)
     save_token(creds)
@@ -154,6 +161,8 @@ def main():
     p.add_argument("--thumbnail")
     p.add_argument("--auth", action="store_true", help="only Google's consent in the browser, always asked again (set-up, or recording the demo for Google's verification)")
     p.add_argument("--lang", help="language of Google's consent screen, e.g. en (Google's verification wants the demo in English)")
+    p.add_argument("--browser", help='browser command for the consent, e.g. "firefox --private-window" (a private window avoids '
+                                     "Google's 500 error with many signed-in accounts, and keeps them out of a recording)")
     p.add_argument("--dry-run", action="store_true", help="no Google: fake progress and a fake id (tests; also env NNFRACTALS_YOUTUBE_DRY_RUN=1)")
     a = p.parse_args()
     try:
@@ -162,7 +171,7 @@ def main():
     except ImportError:
         fail("the uploader's libraries are missing: install them into ~/.local/share/nnfractals/youtube-venv")
     if a.auth:
-        credentials(fresh=True, lang=a.lang)
+        credentials(fresh=True, lang=a.lang, browser=a.browser)
         say("DONE", "authorised")
         return
     if not a.file:
