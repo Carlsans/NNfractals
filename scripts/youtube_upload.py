@@ -69,7 +69,12 @@ def credentials(fresh=False, lang=None, browser=None):
         fail(f"no OAuth client: save the JSON of a Desktop-app OAuth client (Google Cloud Console, YouTube Data API v3 enabled) as {SECRET}")
     flow = InstalledAppFlow.from_client_secrets_file(SECRET, SCOPES)
     say("STATUS", "waiting for Google's consent in the browser")
-    extra = {"hl": lang} if lang else {}
+    # prompt=consent: Google shows the permission screen even when access was already given
+    # (the verification demo must show it) and always returns a refresh token; without it a
+    # second consent can come back with no refresh token, and the login would last 1 hour.
+    extra = {"prompt": "consent"}
+    if lang:
+        extra["hl"] = lang
     if browser:
         import shlex
         import webbrowser
