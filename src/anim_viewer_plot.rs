@@ -65,7 +65,13 @@ struct Job {
     log: Vec<String>,
 }
 
+/// One pen of an export: name, colour (#rrggbb), metres, grams of ink, pens needed, minutes.
+struct PenRow { name: String, color: egui::Color32, m: f64, g: f64, pens: u64, min: f64 }
+
 pub struct PlotPanel {
+    /// The last export's pens and total (metres, grams, minutes, ink measured?).
+    pens: Vec<PenRow>,
+    total: Option<(f64, f64, f64, bool)>,
     pub open: bool,
     compose: Compose,
     follow: f64,
@@ -91,6 +97,7 @@ pub struct PlotPanel {
 impl Default for PlotPanel {
     fn default() -> Self {
         PlotPanel {
+            pens: Vec::new(), total: None,
             open: false, compose: Compose::Mosaic, follow: 0.5, density: 0, atlas: 1, draft: false, machine_carl: true, auto: false,
             tex: None, shown_png: None, shown: String::new(), note: String::new(), key: String::new(), changed_at: None, job: None, status: None,
             last_export: None, gcode_path: String::new(),
@@ -282,8 +289,18 @@ impl PlotPanel {
                 let draw = find(" paths, ").and_then(|l| l.split_once("; draw ").map(|(_, r)| r.split(" → ").next().unwrap_or("").to_string())).unwrap_or_default();
                 let dir = job.dir.clone().unwrap_or_default();
                 self.shown = format!("export: {}", dir.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default());
-                let ink = find("ink: ").map(|l| l.trim().to_string()).unwrap_or_default();
-                self.note = format!("{} · draw {draw} · {ink}", layers.trim());
+                self.note = format!("{} · draw {draw}", layers.trim());
+                // The pens' table: "PEN\tk\tname\t#rrggbb\tm\tg\tpens\tmin", "TOTAL\tm\tg\tmin\tmeasured|estimate".
+                let hex = |h: &str| u32::from_str_radix(h.trim_start_matches('#'), 16).ok()
+                    .map(|v| egui::Color32::from_rgb((v >> 16) as u8, (v >> 8) as u8, v as u8)).unwrap_or(egui::Color32::GRAY);
+                self.pens = job.log.iter().filter_map(|l| l.strip_prefix("PEN\t")).filter_map(|r| {
+                    let f: Vec<&str> = r.split('\t').collect();
+                    (f.len() >= 7).then(|| PenRow { name: f[1].to_string(), color: hex(f[2]), m: f[3].parse().unwrap_or(0.0), g: f[4].parse().unwrap_or(0.0), pens: f[5].parse().unwrap_or(0), min: f[6].parse().unwrap_or(0.0) })
+                }).collect();
+                self.total = job.log.iter().rev().find_map(|l| l.strip_prefix("TOTAL\t")).and_then(|r| {
+                    let f: Vec<&str> = r.split('\t').collect();
+                    (f.len() >= 4).then(|| (f[0].parse().unwrap_or(0.0), f[1].parse().unwrap_or(0.0), f[2].parse().unwrap_or(0.0), f[3] == "measured"))
+                });
                 self.status = Some(Ok(format!("saved in {} ({secs:.0} s)", dir.display())));
                 self.last_export = Some(dir);
             }
@@ -374,6 +391,36 @@ impl PlotPanel {
                 Some(Ok(m)) => { ui.colored_label(egui::Color32::from_rgb(120, 200, 120), m); }
                 Some(Err(e)) => { ui.colored_label(egui::Color32::RED, e); }
                 None => {}
+            }
+            // The last export's pens: what each needs.
+            if !self.pens.is_empty() {
+                let hm = |min: f64| format!("{}h{:02}", (min / 60.0) as u64, (min % 60.0).round() as u64);
+                egui::Grid::new("plot_pens").striped(true).num_columns(6).show(ui, |ui| {
+                    for h in ["pen", "line", "ink", "pens", "time", ""] { ui.strong(h); }
+                    ui.end_row();
+                    for p in &self.pens {
+                        ui.horizontal(|ui| { ui.colored_label(p.color, "\u{25a0}"); ui.label(&p.name); });
+                        ui.label(format!("{:.0} m", p.m));
+                        ui.label(format!("{:.2} g", p.g));
+                        ui.label(format!("{}", p.pens)).on_hover_text("pens (or refills) of ink needed: grams ÷ the 0.3 g a pen draws before it is changed");
+                        ui.label(hm(p.min));
+                        ui.label("");
+                        ui.end_row();
+                    }
+                    if let Some((m, g, min, measured)) = self.total {
+                        ui.strong("all");
+                        ui.strong(format!("{m:.0} m"));
+                        ui.strong(format!("{g:.2} g"));
+                        ui.label("");
+                        ui.strong(hm(min));
+                        if measured { ui.label(""); } else {
+                            ui.colored_label(egui::Color32::from_rgb(230, 180, 80), "ink estimated (1 mg/m)")
+                                .on_hover_text("Not measured yet: weigh a pen, plot a known length, weigh it again, and set ink_g_per_m (grams per metre) in plotter.toml");
+                        }
+                        ui.end_row();
+                    }
+                });
+                ui.weak("time: plotting only, pen changes not counted. On the LCD: each pen's progress and the ink used from it (M117), and the whole plot's progress bar and time left (M73).");
             }
             // The picture.
             if let Some(t) = &self.tex {

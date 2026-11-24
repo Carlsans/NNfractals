@@ -756,6 +756,9 @@ pub struct GcodeOpts {
     pub progress_step: u32,
     /// The machine's motion, for the time estimate only (`None`: lengths ÷ speeds).
     pub motion: Option<Motion>,
+    /// Also `M73 P<percent> R<minutes left>` for the whole plot at each percent (needs
+    /// Marlin's SET_PROGRESS_MANUALLY): the LCD's progress bar and remaining time.
+    pub m73: bool,
 }
 
 /// What the time estimate needs to know about the machine: every path, travel hop and
@@ -787,6 +790,8 @@ pub struct Ink {
     pub g_per_m: f64,
     pub capacity_g: f64,
     pub refill_g: f64,
+    /// `g_per_m` was measured on the machine (otherwise an estimate, said so in the G-code).
+    pub measured: bool,
 }
 
 impl Ink {
@@ -801,7 +806,7 @@ impl GcodeOpts {
             origin: (0.0, 0.0), flip_y: true, feed: 3000.0, travel: 6000.0, pen_up, pen_down, bezier: false, flat_tol: 0.02,
             home: false, pause_between_layers: false, header: Vec::new(), footer: Vec::new(), short_lift: None,
             pen_change: vec!["M0 Change pen for layer {k} {name}".into()], pause_first: false, refill_mm: None,
-            ink: None, progress_step: 0, motion: None,
+            ink: None, progress_step: 0, motion: None, m73: false,
         }
     }
 }
@@ -825,6 +830,8 @@ pub struct PenStats {
     pub draw_mm: f64,
     pub ink_g: Option<f64>,
     pub refills: usize,
+    /// Planned plotting time of this pen (minutes; pen changes not counted).
+    pub minutes: f64,
 }
 
 /// Marlin G-code for the layers, and its statistics. Pen state is always
@@ -842,8 +849,48 @@ pub fn to_gcode(sheet: &Sheet, layers: &[Layer], o: &GcodeOpts, comment: &str) -
         }
     };
     let mut down = false;
-    // Time estimate with acceleration (`o.motion`), in seconds.
-    let mut secs = 0.0f64;
+    // Plan: every path's time (the lift and hop before it, then drawing it), as the
+    // machine will spend it; progress (per pen and for the plot) follows time, not line
+    // length, since lifts and hops are half of a plot's time on a slow machine.
+    let line_len = |p: &CurvePath| -> f64 {
+        p.curves.iter().map(|c| {
+            let mut f = Vec::new();
+            flatten(c, o.flat_tol, &mut f);
+            let mut q = c[0];
+            f.iter().map(|&x| { let d = dist(q, x); q = x; d }).sum::<f64>()
+        }).sum()
+    };
+    let plan: Vec<Vec<f64>> = {
+        let (mut at, mut pdown) = (o.origin, false);
+        layers.iter().map(|layer| {
+            let v: Vec<f64> = layer.paths.iter().map(|p| {
+                let (Some(first), Some(last)) = (p.curves.first(), p.curves.last()) else { return 0.0 };
+                let s0 = tx(first[0]);
+                let hop = dist(at, s0);
+                let l = line_len(p);
+                let t = match o.motion {
+                    Some(m) => {
+                        let short = o.short_lift.as_ref().is_some_and(|(d, _)| hop < *d);
+                        let h = if short { m.short_lift_mm } else { m.lift_mm };
+                        (if pdown { 2.0 } else { 1.0 }) * move_time(h, m.z_feed / 60.0, m.z_accel)
+                            + move_time(hop, o.travel / 60.0, m.xy_accel) + move_time(l, o.feed / 60.0, m.xy_accel)
+                    }
+                    None => l / (o.feed / 60.0).max(1e-9) + hop / (o.travel / 60.0).max(1e-9) + if pdown { 0.6 } else { 0.3 },
+                };
+                pdown = true;
+                at = tx(last[3]);
+                t
+            }).collect();
+            pdown = false;
+            v
+        }).collect()
+    };
+    let plan_total: f64 = plan.iter().flatten().sum();
+    let mut elapsed = 0.0f64;
+    let mut shown_all = 0u32;
+    if o.m73 {
+        let _ = writeln!(body, "M73 P0 R{}", (plan_total / 60.0).ceil() as u64);
+    }
     for (k, layer) in layers.iter().enumerate() {
         let _ = writeln!(body, "; ---- layer {} {} ({} paths)", k + 1, layer.name, layer.paths.len());
         if o.pause_between_layers && !layer.paths.is_empty() && (k > 0 || o.pause_first) {
@@ -852,27 +899,14 @@ pub fn to_gcode(sheet: &Sheet, layers: &[Layer], o: &GcodeOpts, comment: &str) -
         let mut since_refill = 0.0;
         let mut refills = 0;
         let refill_mm = o.refill_mm.or(o.ink.map(|i| i.refill_mm()));
-        // The layer's whole line, for its progress percentage.
-        let layer_mm: f64 = if o.progress_step > 0 {
-            layer.paths.iter().flat_map(|p| p.curves.iter()).map(|c| {
-                let mut f = Vec::new();
-                flatten(c, o.flat_tol, &mut f);
-                let mut q = c[0];
-                f.iter().map(|&x| { let d = dist(q, x); q = x; d }).sum::<f64>()
-            }).sum()
-        } else { 0.0 };
+        let layer_secs: f64 = plan[k].iter().sum();
+        let mut layer_elapsed = 0.0f64;
         let layer_start = st.draw_mm;
         let mut shown_pct = 0u32;
-        for p in &layer.paths {
+        for (pi, p) in layer.paths.iter().enumerate() {
             let Some(first) = p.curves.first() else { continue };
             let s = tx(first[0]);
             let hop = dist(pen, s);
-            if let Some(m) = o.motion {
-                let short = o.short_lift.as_ref().is_some_and(|(d, _)| hop < *d);
-                let h = if short { m.short_lift_mm } else { m.lift_mm };
-                // Up (if down), across, down.
-                secs += if down { 2.0 } else { 1.0 } * move_time(h, m.z_feed / 60.0, m.z_accel) + move_time(hop, o.travel / 60.0, m.xy_accel);
-            }
             if down {
                 let cmds = match &o.short_lift { Some((d, c)) if hop < *d => c, _ => &o.pen_up };
                 for c in cmds {
@@ -945,23 +979,36 @@ pub fn to_gcode(sheet: &Sheet, layers: &[Layer], o: &GcodeOpts, comment: &str) -
                 }
                 st.curves += 1;
             }
-            if let Some(m) = o.motion { secs += move_time(st.draw_mm - drawn_before, o.feed / 60.0, m.xy_accel); }
             since_refill += st.draw_mm - drawn_before;
             st.paths += 1;
             pen = cur;
-            if o.progress_step > 0 && layer_mm > 0.0 {
-                let pct = (((st.draw_mm - layer_start) / layer_mm * 100.0).floor() as u32).min(100) / o.progress_step * o.progress_step;
+            let t = plan[k][pi];
+            layer_elapsed += t;
+            elapsed += t;
+            if o.progress_step > 0 && layer_secs > 0.0 {
+                let pct = (((layer_elapsed / layer_secs) * 100.0).floor() as u32).min(100) / o.progress_step * o.progress_step;
                 if pct > shown_pct {
                     shown_pct = pct;
-                    // e.g. "lightblue 37% 0.21g": this pen's progress and the ink used from the pen in it.
-                    let ink = o.ink.map(|i| format!(" {:.2}g", since_refill / 1000.0 * i.g_per_m)).unwrap_or_default();
+                    // e.g. "lightblue 37% .21g": this pen's progress (by time) and the ink used
+                    // from the pen in the holder; 20 characters for the LCD.
+                    let ink = o.ink.map(|i| {
+                        let g = format!("{:.2}", since_refill / 1000.0 * i.g_per_m);
+                        format!(" {}g", g.strip_prefix('0').unwrap_or(&g))
+                    }).unwrap_or_default();
                     let msg: String = format!("{} {pct}%{ink}", layer.name).chars().take(20).collect();
                     let _ = writeln!(body, "M117 {msg}");
                 }
             }
+            if o.m73 && plan_total > 0.0 {
+                let all = (((elapsed / plan_total) * 100.0).floor() as u32).min(100);
+                if all > shown_all {
+                    shown_all = all;
+                    let _ = writeln!(body, "M73 P{all} R{}", (((plan_total - elapsed) / 60.0).max(0.0)).ceil() as u64);
+                }
+            }
         }
         let layer_mm_drawn = st.draw_mm - layer_start;
-        st.pens.push(PenStats { name: layer.name.clone(), draw_mm: layer_mm_drawn, ink_g: o.ink.map(|i| layer_mm_drawn / 1000.0 * i.g_per_m), refills });
+        st.pens.push(PenStats { name: layer.name.clone(), draw_mm: layer_mm_drawn, ink_g: o.ink.map(|i| layer_mm_drawn / 1000.0 * i.g_per_m), refills, minutes: layer_secs / 60.0 });
         if down {
             for c in &o.pen_up {
                 let _ = writeln!(body, "{c}");
@@ -972,8 +1019,11 @@ pub fn to_gcode(sheet: &Sheet, layers: &[Layer], o: &GcodeOpts, comment: &str) -
     }
     let end = o.origin;
     st.travel_mm += dist(pen, end);
+    if o.m73 && shown_all < 100 {
+        let _ = writeln!(body, "M73 P100 R0");
+    }
     st.minutes = match o.motion {
-        Some(m) => (secs + move_time(dist(pen, end), o.travel / 60.0, m.xy_accel)) / 60.0,
+        Some(m) => (plan_total + move_time(dist(pen, end), o.travel / 60.0, m.xy_accel)) / 60.0,
         // Pen moves at ~0.3 s each way on a typical Z or servo lift.
         None => st.draw_mm / o.feed.max(1.0) + st.travel_mm / o.travel.max(1.0) + lifts as f64 * 0.6 / 60.0,
     };
@@ -1001,18 +1051,22 @@ pub fn to_gcode(sheet: &Sheet, layers: &[Layer], o: &GcodeOpts, comment: &str) -
     for (k, p) in st.pens.iter().enumerate() {
         match (p.ink_g, o.ink) {
             (Some(g), Some(i)) => {
-                let _ = writeln!(s, "; pen {} {}: {:.1} m, ink {:.3} g = {} pen(s) of {} g ({} refill pause(s) every {:.0} m)",
-                    k + 1, p.name, p.draw_mm / 1000.0, g, (g / i.refill_g).ceil().max(1.0) as u64, i.refill_g, p.refills, i.refill_mm() / 1000.0);
+                let _ = writeln!(s, "; pen {} {}: {:.1} m, ink {:.3} g = {} pen(s) of {} g ({} refill pause(s) every {:.0} m), about {:.0} min",
+                    k + 1, p.name, p.draw_mm / 1000.0, g, (g / i.refill_g).ceil().max(1.0) as u64, i.refill_g, p.refills, i.refill_mm() / 1000.0, p.minutes);
             }
-            _ => { let _ = writeln!(s, "; pen {} {}: {:.1} m", k + 1, p.name, p.draw_mm / 1000.0); }
+            _ => { let _ = writeln!(s, "; pen {} {}: {:.1} m, about {:.0} min", k + 1, p.name, p.draw_mm / 1000.0, p.minutes); }
         }
     }
     if let Some(i) = o.ink {
         let total: f64 = st.pens.iter().filter_map(|p| p.ink_g).sum();
-        let _ = writeln!(s, "; ink in all: {total:.3} g at {} g per metre; a pen holds {} g, changed after {} g", i.g_per_m, i.capacity_g, i.refill_g);
+        let _ = writeln!(s, "; ink in all: {total:.3} g at {} g per metre{}; a pen holds {} g, changed after {} g", i.g_per_m,
+            if i.measured { "" } else { " (an estimate, not measured: set ink_g_per_m in plotter.toml)" }, i.capacity_g, i.refill_g);
     }
     if o.progress_step > 0 {
-        let _ = writeln!(s, "; LCD: M117 <pen> <percent of its line>% <ink used from the pen in the holder, g>");
+        let _ = writeln!(s, "; LCD: M117 <pen> <percent of its time>% <ink used from the pen in the holder, g>");
+    }
+    if o.m73 {
+        let _ = writeln!(s, "; LCD: M73 P<percent of the plot's time> R<minutes left> (progress bar, remaining time)");
     }
     let _ = writeln!(s, "; pen down: {} | pen up: {}", o.pen_down.join(" ; "), o.pen_up.join(" ; "));
     let _ = writeln!(s, "G21 ; millimetres\nG90 ; absolute positions");
@@ -1205,7 +1259,7 @@ mod tests {
         let mut o = GcodeOpts::marlin(vec!["G0 Z2".into()], vec!["G1 Z0".into()]);
         o.pause_between_layers = true;
         o.pen_change = vec!["M117 Pen {k}: {name}".into(), "M226 P121".into()];
-        o.ink = Some(Ink { g_per_m: 0.5, capacity_g: 0.4, refill_g: 0.1 });
+        o.ink = Some(Ink { g_per_m: 0.5, capacity_g: 0.4, refill_g: 0.1, measured: true });
         o.progress_step = 10;
         let (g, st) = to_gcode(&sheet, &layers, &o, "t");
         let p = &st.pens[0];
@@ -1217,7 +1271,19 @@ mod tests {
         assert_eq!(progress.len(), 10, "{progress:?}");
         assert!(progress.last().unwrap().starts_with("M117 lightblue 100%"), "{progress:?}");
         assert!(progress.iter().all(|l| l.len() - 5 <= 20), "LCD lines fit 20 characters: {progress:?}");
-        assert!(g.contains("; pen 1 lightblue: 1.0 m, ink 0.500 g = 5 pen(s) of 0.1 g"), "{g}");
+        assert!(g.contains("; pen 1 lightblue: 1.0 m, ink 0.500 g = 5 pen(s) of 0.1 g (4 refill pause(s) every 0 m)"), "{g}");
+        // The whole plot's progress for the LCD bar: M73 from 0 to 100, minutes left falling.
+        o.m73 = true;
+        o.motion = Some(Motion { xy_accel: 100.0, z_feed: 1800.0, z_accel: 200.0, short_lift_mm: 2.5, lift_mm: 7.0 });
+        let (g, st) = to_gcode(&sheet, &layers, &o, "t");
+        let m73: Vec<(u32, u64)> = g.lines().filter_map(|l| l.strip_prefix("M73 P")).map(|r| {
+            let (p, rem) = r.split_once(" R").unwrap();
+            (p.parse().unwrap(), rem.parse().unwrap())
+        }).collect();
+        assert_eq!(m73.first().map(|x| x.0), Some(0));
+        assert_eq!(m73.last(), Some(&(100, 0)), "{m73:?}");
+        assert!(m73.windows(2).all(|w| w[1].0 >= w[0].0 && w[1].1 <= w[0].1), "{m73:?}");
+        assert!(st.minutes > 0.0 && (st.pens[0].minutes - st.minutes).abs() < 0.1, "{} vs {}", st.pens[0].minutes, st.minutes);
     }
 
     #[test]

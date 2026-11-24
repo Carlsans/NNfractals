@@ -5104,8 +5104,14 @@ fn cmd_quat_anatomy(args: &[String]) {
         let px: u32 = get_flag_or(args, "--preview-px", 1200);
         raster(px, png);
         let drawn_m: f64 = by_pen.iter().flatten().map(|l| l.length()).sum::<f64>() / 1000.0;
+        // The plot draws about √(cell / 0.35 mm) times more line than a coarse preview,
+        // and uses ink_g_per_m (or the 1 mg/m estimate) per metre of it.
+        let plot_m = drawn_m * (cell / 0.35).max(1.0).sqrt();
+        let ps = plotter_settings();
+        let rate = if ps.ink_g_per_m > 0.0 { ps.ink_g_per_m } else { 0.001 };
         // One line the anim viewer's Plot window reads back.
-        println!("PREVIEW {} | {drawn_m:.0} m of line | {:.1}% inside | {:.0} s", png.display(), 100.0 * inside, t_start.elapsed().as_secs_f64());
+        println!("PREVIEW {} | about {plot_m:.0} m of line and {:.2} g of ink{} when plotted | {:.1}% inside | {:.0} s", png.display(),
+                 plot_m * rate, if ps.ink_g_per_m > 0.0 { "" } else { " (estimated rate)" }, 100.0 * inside, t_start.elapsed().as_secs_f64());
         return;
     }
     std::fs::write(out.join("summary.txt"), &summary).expect("write summary");
@@ -5263,7 +5269,8 @@ fn plotter_settings() -> PlotterSettings {
     let text = [
         "# Carl's pen plotter: the felt pens' ink, for the G-code's ink totals, refill pauses",
         "# and LCD progress (explorer quat-anatomy / quat-slice-plot / quat-surface-plot).",
-        "# ink_g_per_m: grams of ink per metre of line; 0 = not measured (G-code gives lengths only).",
+        "# ink_g_per_m: grams of ink per metre of line; 0 = not measured: the G-code then uses an",
+        "# estimate of 0.001 g/m (1 mg per metre, a 0.4 mm felt pen) and says it is one.",
         "# Measure it: weigh a pen (0.001 g scale), draw a known length (the summary gives",
         "# each pen's metres), weigh again: ink_g_per_m = grams lost / metres drawn.",
         "# z_feed: pen up/down speed (mm/min); z_max_feed (mm/s) and z_max_accel (mm/s^2) are set",
@@ -5320,10 +5327,15 @@ fn write_pen_plot(args: &[String], out: &Path, stem: &str, comment: &str, sheet:
     // Ink (plotter.toml, flags override): totals per pen, a refill pause every refill_g
     // of ink (unless --refill-m sets a distance).
     let ps = plotter_settings();
-    let g_per_m: f64 = get_flag_or(args, "--ink-g-per-m", ps.ink_g_per_m);
-    if g_per_m > 0.0 {
-        o.ink = Some(pp::Ink { g_per_m, capacity_g: get_flag_or(args, "--pen-ink-g", ps.pen_capacity_g), refill_g: get_flag_or(args, "--refill-ink-g", ps.refill_g) });
-    }
+    // Not measured (0): an estimate of 1 mg per metre (a 0.4 mm felt pen leaves roughly a
+    // micrometre-thick film of ink in the paper), said to be one wherever it is shown.
+    let measured_rate: f64 = get_flag_or(args, "--ink-g-per-m", ps.ink_g_per_m);
+    o.ink = Some(pp::Ink {
+        g_per_m: if measured_rate > 0.0 { measured_rate } else { 0.001 },
+        capacity_g: get_flag_or(args, "--pen-ink-g", ps.pen_capacity_g),
+        refill_g: get_flag_or(args, "--refill-ink-g", ps.refill_g),
+        measured: measured_rate > 0.0,
+    });
     o.progress_step = get_flag_or(args, "--progress-step", if get_flag(args, "--machine") == Some("carl") { 1u32 } else { 0 });
     if get_flag(args, "--machine") == Some("carl") {
         // Z at z_feed (was F30000, which the firmware capped at its 200 mm/s: the TMC2100
@@ -5342,6 +5354,9 @@ fn write_pen_plot(args: &[String], out: &Path, stem: &str, comment: &str, sheet:
             format!("G1 Z15 F{zf}"), "M851 Z-1.2".into(),
         ];
         o.motion = Some(pp::Motion { xy_accel: ps.xy_max_accel, z_feed: zf, z_accel: ps.z_max_accel, short_lift_mm: 2.5, lift_mm: 7.0 });
+        // The plot's real progress (by planned time) and minutes left on the LCD (M73; the
+        // firmware has SET_PROGRESS_MANUALLY since 2026-11-23).
+        o.m73 = true;
         o.footer = vec![format!("G1 Z15 F{zf}")];
         o.pen_down = z("0");
         o.pen_up = z("7");
@@ -5360,11 +5375,14 @@ fn write_pen_plot(args: &[String], out: &Path, stem: &str, comment: &str, sheet:
                 let (gc, st) = pp::to_gcode(&sheet, &layers[k..=k], &one, &format!("{comment}\nTHIS FILE: pen {} {} only", k + 1, layers[k].name));
                 std::fs::write(dir.join(format!("{}_{}_{}.gcode", k + 1, layers[k].name, if bez { "g5" } else { "g1" })), gc).expect("write pen gcode");
                 if !bez {
-                    let ink = match (st.pens.first().and_then(|p| p.ink_g), o.ink) {
-                        (Some(g), Some(i)) => format!(", ink {g:.3} g = {} pen(s) of {} g", (g / i.refill_g).ceil().max(1.0) as u64, i.refill_g),
-                        _ => String::new(),
+                    let (g, pens) = match (st.pens.first().and_then(|p| p.ink_g), o.ink) {
+                        (Some(g), Some(i)) => (g, (g / i.refill_g).ceil().max(1.0) as u64),
+                        _ => (0.0, 0),
                     };
-                    per_pen.push(format!("  pen {} {:8} {}: {:5} paths, draw {:5.1} m, travel {:4.1} m, ~{:.0} min{ink}", k + 1, layers[k].name, layers[k].color, st.paths, st.draw_mm / 1000.0, st.travel_mm / 1000.0, st.minutes));
+                    per_pen.push(format!("  pen {} {:8} {}: {:5} paths, draw {:5.1} m, travel {:4.1} m, ~{:.0} min, ink {g:.3} g = {pens} pen(s) of {} g",
+                        k + 1, layers[k].name, layers[k].color, st.paths, st.draw_mm / 1000.0, st.travel_mm / 1000.0, st.minutes, o.ink.map_or(0.0, |i| i.refill_g)));
+                    // For the anim viewer's Plot window (tab-separated): pen, name, colour, metres, grams, pens, minutes.
+                    per_pen.push(format!("PEN\t{}\t{}\t{}\t{:.1}\t{g:.3}\t{pens}\t{:.0}", k + 1, layers[k].name, layers[k].color, st.draw_mm / 1000.0, st.minutes));
                 }
             }
         }
@@ -5381,10 +5399,11 @@ fn write_pen_plot(args: &[String], out: &Path, stem: &str, comment: &str, sheet:
     for l in per_pen {
         println!("{l}");
     }
-    match o.ink {
-        Some(i) => println!("ink: {:.3} g in all at {} g/m (pens of {} g, changed after {} g; plotter.toml)",
-                            st1.pens.iter().filter_map(|p| p.ink_g).sum::<f64>(), i.g_per_m, i.capacity_g, i.refill_g),
-        None => println!("ink: not estimated (set ink_g_per_m in plotter.toml: grams of ink per metre of line)"),
+    if let Some(i) = o.ink {
+        let total: f64 = st1.pens.iter().filter_map(|p| p.ink_g).sum();
+        println!("ink: {total:.3} g in all at {} g/m{} (pens of {} g, changed after {} g; plotter.toml)",
+                 i.g_per_m, if i.measured { "" } else { ", an ESTIMATE (ink_g_per_m not measured)" }, i.capacity_g, i.refill_g);
+        println!("TOTAL\t{:.1}\t{total:.3}\t{:.0}\t{}", st1.draw_mm / 1000.0, st1.minutes, if i.measured { "measured" } else { "estimate" });
     }
 }
 
