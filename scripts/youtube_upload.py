@@ -16,7 +16,7 @@ videos as private (youtube.com/... support "yt_api_form" to request the audit).
 Usage:
   youtube_upload.py --file VIDEO --title T [--description D] [--tags a,b] [--privacy private|unlisted|public]
                     [--category 1] [--thumbnail IMAGE]
-  youtube_upload.py --auth          (only the consent, to set it up)
+  youtube_upload.py --auth [--lang en]   (only the consent, asked again; to set it up or record the demo)
 Prints one line each: STATUS <text>, PROGRESS <0..100>, DONE <video id>, WARN <text>, ERROR <text>.
 """
 import argparse
@@ -41,13 +41,15 @@ def fail(text):
     sys.exit(1)
 
 
-def credentials():
+def credentials(fresh=False, lang=None):
+    """The saved login, refreshed if needed; Google's consent in the browser when there is
+    none, or always with fresh=True (--auth). lang ("en") sets the consent screen's language."""
     from google.auth.transport.requests import Request
     from google.oauth2.credentials import Credentials
     from google_auth_oauthlib.flow import InstalledAppFlow
 
     creds = None
-    if os.path.exists(TOKEN):
+    if not fresh and os.path.exists(TOKEN):
         try:
             creds = Credentials.from_authorized_user_file(TOKEN, SCOPES)
         except Exception:
@@ -65,8 +67,9 @@ def credentials():
         fail(f"no OAuth client: save the JSON of a Desktop-app OAuth client (Google Cloud Console, YouTube Data API v3 enabled) as {SECRET}")
     flow = InstalledAppFlow.from_client_secrets_file(SECRET, SCOPES)
     say("STATUS", "waiting for Google's consent in the browser")
+    extra = {"hl": lang} if lang else {}
     creds = flow.run_local_server(port=0, open_browser=True, authorization_prompt_message="",
-                                  success_message="NNfractals can upload to YouTube now; you can close this tab.")
+                                  success_message="NNfractals can upload to YouTube now; you can close this tab.", **extra)
     save_token(creds)
     return creds
 
@@ -149,7 +152,8 @@ def main():
     p.add_argument("--privacy", default="private", choices=["private", "unlisted", "public"])
     p.add_argument("--category", default="1")
     p.add_argument("--thumbnail")
-    p.add_argument("--auth", action="store_true", help="only the consent (set-up)")
+    p.add_argument("--auth", action="store_true", help="only Google's consent in the browser, always asked again (set-up, or recording the demo for Google's verification)")
+    p.add_argument("--lang", help="language of Google's consent screen, e.g. en (Google's verification wants the demo in English)")
     p.add_argument("--dry-run", action="store_true", help="no Google: fake progress and a fake id (tests; also env NNFRACTALS_YOUTUBE_DRY_RUN=1)")
     a = p.parse_args()
     try:
@@ -158,7 +162,7 @@ def main():
     except ImportError:
         fail("the uploader's libraries are missing: install them into ~/.local/share/nnfractals/youtube-venv")
     if a.auth:
-        credentials()
+        credentials(fresh=True, lang=a.lang)
         say("DONE", "authorised")
         return
     if not a.file:
