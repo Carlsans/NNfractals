@@ -1383,6 +1383,7 @@ impl App {
             spec: self.slice.spec,
             max_iter: if self.slice.iter > 0 { self.slice.iter } else { self.max_iter },
             label: self.genome_label.clone(),
+            genome_path: self.genome_path.clone(),
         }
     }
 

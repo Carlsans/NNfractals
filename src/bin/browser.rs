@@ -107,6 +107,8 @@ fn cmp_cells(a: Option<&Cell>, b: Option<&Cell>, desc: bool) -> Ordering {
 struct Row {
     nn_path: PathBuf,
     png_path: PathBuf,
+    /// The pen-plot preview (`plot_thumb_path`), shown when the gallery is in plot view.
+    plot_path: PathBuf,
     /// Whether an animated-thumbnail frame sequence exists for this genome
     /// (see `anim_frame_path`) — checked once at load time (a single cheap
     /// `exists()` on frame 0) rather than on every repaint.
@@ -128,6 +130,14 @@ const ANIM_FRAME_MS: u64 = 180;
 /// in the browser generates these frames; a render pipeline (e.g.
 /// `explorer quat-raymarch-genome` run N times, or a future dedicated
 /// subcommand) writes them alongside a genome's `.nn`/`.png`.
+/// A genome's plot thumbnail: `<folder>/_plots/<name>.png`, written by
+/// `explorer plot-thumbs` (or the anim viewer's ✎ Plot window), a quick pen-plot
+/// preview of the genome. In a subfolder so nothing takes it for the render.
+fn plot_thumb_path(nn: &Path) -> PathBuf {
+    let dir = nn.parent().unwrap_or(Path::new("."));
+    dir.join("_plots").join(format!("{}.png", nn.file_stem().and_then(|s| s.to_str()).unwrap_or("genome")))
+}
+
 fn anim_frame_path(png_path: &Path, frame: usize) -> PathBuf {
     let stem = png_path.file_stem().and_then(|s| s.to_str()).unwrap_or("thumb");
     let ext = png_path.extension().and_then(|s| s.to_str()).unwrap_or("png");
@@ -223,7 +233,7 @@ fn parse_nn(path: &Path) -> Option<Row> {
 
     let png_path = path.with_extension("png");
     let has_anim = anim_frame_path(&png_path, 0).exists();
-    Some(Row { nn_path: path.to_path_buf(), png_path, has_anim, cells })
+    Some(Row { nn_path: path.to_path_buf(), png_path, plot_path: plot_thumb_path(path), has_anim, cells })
 }
 
 /// Read `dir` for `*.nn`, parse each, stream `Row`s back.
@@ -269,6 +279,9 @@ struct BrowserPrefs {
     /// 4D→3D collapse method for quaternion views/ratings ("slice", "s3", ...).
     #[serde(default)]
     collapse: String,
+    /// Thumbnails show the pen-plot preview (`_plots/`) instead of the render.
+    #[serde(default)]
+    thumb_plot: bool,
 }
 
 fn default_starred_dir() -> String {
@@ -294,6 +307,7 @@ impl Default for BrowserPrefs {
             autoreload: false,
             starred_dir: default_starred_dir(),
             collapse: String::new(),
+            thumb_plot: false,
         }
     }
 }
@@ -537,6 +551,20 @@ struct App {
     // Autoreload: periodically pick up newly-saved fractals without a full reload.
     autoreload: bool,
     last_refresh: std::time::Instant,
+
+    /// A running `explorer plot-thumbs` (plot thumbnails for the folder or the selection).
+    plot_job: Option<PlotThumbJob>,
+}
+
+/// `explorer plot-thumbs` running in the background; its "PLOT-THUMB i/n path" lines
+/// say which thumbnail just landed.
+struct PlotThumbJob {
+    child: std::process::Child,
+    lines: mpsc::Receiver<String>,
+    done: usize,
+    total: usize,
+    failed: usize,
+    stop_file: PathBuf,
 }
 
 /// One side of the rating pair rendered as a live rotating raymarch.
@@ -592,6 +620,67 @@ impl App {
             live_turn_offset: 0.0,
             autoreload: prefs_autoreload,
             last_refresh: std::time::Instant::now(),
+            plot_job: None,
+        }
+    }
+
+    /// Starts `explorer plot-thumbs` for the selection (made again) or, with nothing
+    /// selected, for every genome in the folder that has no plot thumbnail yet.
+    fn start_plot_thumbs(&mut self) {
+        let folder = self.folder.canonicalize().unwrap_or_else(|_| self.folder.clone());
+        let sel = self.selected_paths();
+        let mut args: Vec<String> = vec!["plot-thumbs".into(), "--dir".into(), folder.display().to_string()];
+        if !sel.is_empty() {
+            let files: Vec<String> = sel.iter().map(|p| p.canonicalize().unwrap_or_else(|_| p.clone()).display().to_string()).collect();
+            args.extend(["--files".into(), files.join(","), "--force".into()]);
+        }
+        let stop_file = folder.join("_plots").join("STOP");
+        let _ = std::fs::remove_file(&stop_file);
+        let bin = nnfractals::locate_bin("explorer");
+        let spawned = std::process::Command::new("nice").args(["-n", "10"]).arg(&bin).args(&args)
+            .current_dir(nnfractals::project_root())
+            .stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::null()).stdin(std::process::Stdio::null())
+            .spawn();
+        match spawned {
+            Ok(mut child) => {
+                let (tx, rx) = mpsc::channel();
+                if let Some(out) = child.stdout.take() {
+                    thread::spawn(move || {
+                        use std::io::BufRead;
+                        // Keep reading even if the browser stops listening: a closed pipe would kill it.
+                        for line in std::io::BufReader::new(out).lines().map_while(Result::ok) { let _ = tx.send(line); }
+                    });
+                }
+                self.status = if sel.is_empty() { "making plot thumbnails for the folder (the ones missing)…".into() } else { format!("making plot thumbnails for {} selected…", sel.len()) };
+                self.plot_job = Some(PlotThumbJob { child, lines: rx, done: 0, total: 0, failed: 0, stop_file });
+            }
+            Err(e) => self.status = format!("couldn't start {}: {e} — is it built? (cargo build --release --bin explorer)", bin.display()),
+        }
+    }
+
+    /// Reads the plot-thumbnail job's progress; each new thumbnail is reloaded.
+    fn poll_plot_job(&mut self, ctx: &egui::Context) {
+        let Some(job) = &mut self.plot_job else { return };
+        while let Ok(line) = job.lines.try_recv() {
+            if let Some(rest) = line.strip_prefix("PLOT-THUMBS ") {
+                if let Some(n) = rest.split_whitespace().next().and_then(|v| v.parse::<usize>().ok()) { job.total = n; }
+            } else if let Some(rest) = line.strip_prefix("PLOT-THUMB ") {
+                job.done += 1;
+                if let Some((_, path)) = rest.split_once(' ') {
+                    let p = PathBuf::from(path);
+                    // Forget the cached "missing" (or older) thumbnail, by either spelling of the path.
+                    self.thumb_cache.retain(|k, _| !(k == &p || k.file_name() == p.file_name() && k.parent().and_then(|d| d.file_name()) == Some(std::ffi::OsStr::new("_plots"))));
+                }
+            } else if line.starts_with("PLOT-THUMB-FAIL") || line.starts_with("PLOT-THUMB-SKIP") {
+                job.done += 1;
+                job.failed += 1;
+            }
+        }
+        if let Ok(Some(_)) = job.child.try_wait() {
+            let job = self.plot_job.take().unwrap();
+            self.status = format!("plot thumbnails: {} made{}", job.done - job.failed, if job.failed > 0 { format!(", {} skipped (not quaternion DAG genomes, or failed)", job.failed) } else { String::new() });
+        } else {
+            ctx.request_repaint_after(std::time::Duration::from_millis(500));
         }
     }
 
@@ -736,6 +825,9 @@ impl App {
                 let _ = std::fs::remove_file(anim_frame_path(&png, i));
             }
             self.anim_cache.remove(&png);
+            let plot = plot_thumb_path(p);
+            let _ = std::fs::remove_file(&plot);
+            self.thumb_cache.remove(&plot);
         }
         self.rows.retain(|r| !self.selection.contains(&r.nn_path));
         let n = paths.len();
@@ -774,6 +866,12 @@ impl App {
                         let _ = std::fs::copy(&png, &dpng);
                     }
                 }
+            }
+            let plot = plot_thumb_path(p);
+            if plot.exists() {
+                let dplot = plot_thumb_path(&dnn);
+                if let Some(d) = dplot.parent() { let _ = std::fs::create_dir_all(d); }
+                if remove { let _ = move_file(&plot, &dplot); } else { let _ = std::fs::copy(&plot, &dplot); }
             }
             done.push(p.clone());
         }
@@ -854,6 +952,26 @@ impl App {
                 self.prefs.autoreload = self.autoreload;
                 self.last_refresh = std::time::Instant::now();
                 self.save_prefs();
+            }
+            ui.separator();
+            // Thumbnails: the render, or the pen-plot preview.
+            let before = self.prefs.thumb_plot;
+            ui.selectable_value(&mut self.prefs.thumb_plot, false, "🖼 render").on_hover_text("Thumbnails show the genome's render");
+            ui.selectable_value(&mut self.prefs.thumb_plot, true, "✎ plot").on_hover_text("Thumbnails show the pen-plot preview (_plots/ in the folder):\nthe genome's XY slice as a 3000-layer mosaic for the pen plotter");
+            if self.prefs.thumb_plot != before { self.save_prefs(); }
+            if let Some(job) = &self.plot_job {
+                ui.add(egui::ProgressBar::new(if job.total > 0 { job.done as f32 / job.total as f32 } else { 0.0 }).desired_width(120.0)
+                    .text(format!("plots {}/{}", job.done, job.total)));
+                if ui.small_button("stop").on_hover_text("Stop after the thumbnail being made").clicked() {
+                    let _ = std::fs::write(&job.stop_file, "");
+                }
+            } else {
+                let n_sel = self.selection.len();
+                let label = if n_sel > 0 { format!("✎ Make plot thumbs ({n_sel})") } else { "✎ Make plot thumbs".to_string() };
+                if ui.button(label).on_hover_text("A quick pen-plot preview of every genome in the folder that has none yet\n(or of the selected ones, made again): ~5 s each, in the background.\nThe anim viewer's ✎ Plot window can also set one from the slice you choose.").clicked() {
+                    self.start_plot_thumbs();
+                    if !self.prefs.thumb_plot { self.prefs.thumb_plot = true; self.save_prefs(); }
+                }
             }
             ui.separator();
             if ui.button("Columns ▾").clicked() {
@@ -1026,7 +1144,14 @@ impl App {
                         let _ = std::fs::copy(&png, dir.join(pn));
                     }
                 }
+                let plot = plot_thumb_path(&nn);
+                if plot.exists() {
+                    let dplot = plot_thumb_path(&dir.join(&nn_name));
+                    if let Some(d) = dplot.parent() { let _ = std::fs::create_dir_all(d); }
+                    let _ = std::fs::copy(&plot, &dplot);
+                }
             } else {
+                let _ = std::fs::remove_file(plot_thumb_path(&dir.join(&nn_name)));
                 let _ = std::fs::remove_file(dir.join(&nn_name));
                 if let Some(pn) = png.file_name() {
                     let _ = std::fs::remove_file(dir.join(pn));
@@ -1397,6 +1522,7 @@ impl App {
         // OTHER type, all reading as zero/empty.
         let columns: Vec<String> = self.prefs.columns.iter().filter(|c| field_relevant_to_folder(&self.folder, c)).cloned().collect();
         let thumb = self.prefs.thumb_size as f32;
+        let plot_view = self.prefs.thumb_plot;
         let sort_col = self.prefs.sort_column.clone();
         let sort_desc = self.prefs.sort_desc;
         let mods = ui.input(|i| i.modifiers);
@@ -1500,7 +1626,12 @@ impl App {
                         // (`Row::has_anim`, checked once at load time); falls back
                         // to the static thumbnail otherwise — genomes with no
                         // animated frames are completely unaffected.
-                        let frame_tex: Option<&TextureHandle> = if r.has_anim {
+                        let frame_tex: Option<&TextureHandle> = if plot_view {
+                            thumb_cache
+                                .entry(r.plot_path.clone())
+                                .or_insert_with(|| load_thumb(ui.ctx(), &r.plot_path, thumb as u32))
+                                .as_ref()
+                        } else if r.has_anim {
                             let frames = anim_cache
                                 .entry(r.png_path.clone())
                                 .or_insert_with(|| load_anim_thumb(ui.ctx(), &r.png_path, thumb as u32));
@@ -1524,6 +1655,8 @@ impl App {
                             let scale = (thumb / ts.x).min(thumb / ts.y).min(1.0);
                             let size = ts * scale;
                             ui.add(egui::Image::new(egui::load::SizedTexture::new(t.id(), size)));
+                        } else if plot_view {
+                            ui.weak("no plot yet").on_hover_text("✎ Make plot thumbs in the toolbar");
                         } else {
                             ui.weak("—");
                         }
@@ -1783,6 +1916,7 @@ impl eframe::App for App {
             self.sort_dirty = false;
         }
 
+        self.poll_plot_job(&ctx);
         egui::Panel::top("toolbar").show(ui, |ui| self.toolbar(ui));
         egui::CentralPanel::default().show(ui, |ui| {
             if self.rating_mode {

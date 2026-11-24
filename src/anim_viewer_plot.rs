@@ -20,6 +20,8 @@ pub struct PlotInputs {
     pub spec: nnfractals::view_slice::SliceSpec,
     pub max_iter: u32,
     pub label: String,
+    /// The genome's file (where the gallery looks for its plot thumbnail).
+    pub genome_path: PathBuf,
 }
 
 /// Something the window asks the viewer to do.
@@ -73,6 +75,8 @@ pub struct PlotPanel {
     machine_carl: bool,
     auto: bool,
     tex: Option<egui::TextureHandle>,
+    /// The PNG behind the picture shown.
+    shown_png: Option<PathBuf>,
     shown: String,
     note: String,
     /// What the shown preview was made from (viewer state + plot settings).
@@ -88,7 +92,7 @@ impl Default for PlotPanel {
     fn default() -> Self {
         PlotPanel {
             open: false, compose: Compose::Mosaic, follow: 0.5, density: 0, atlas: 1, draft: false, machine_carl: true, auto: false,
-            tex: None, shown: String::new(), note: String::new(), key: String::new(), changed_at: None, job: None, status: None,
+            tex: None, shown_png: None, shown: String::new(), note: String::new(), key: String::new(), changed_at: None, job: None, status: None,
             last_export: None, gcode_path: String::new(),
         }
     }
@@ -134,6 +138,22 @@ fn spawn_explorer(args: &[String], cap_memory: bool) -> Result<(Child, mpsc::Rec
         });
     }
     Ok((child, rx))
+}
+
+/// A genome's plot thumbnail in the gallery (nnfractals-browser): `<folder>/_plots/<name>.png`.
+fn plot_thumb_path(nn: &Path) -> PathBuf {
+    let dir = nn.parent().unwrap_or(Path::new("."));
+    dir.join("_plots").join(format!("{}.png", nn.file_stem().and_then(|s| s.to_str()).unwrap_or("genome")))
+}
+
+/// `src` scaled to the gallery's largest thumbnail (320 px) and saved at `dst`.
+fn save_thumb(src: &Path, dst: &Path) -> Result<(), String> {
+    let img = image::open(src).map_err(|e| format!("{}: {e}", src.display()))?;
+    let small = img.resize(320, 320, image::imageops::FilterType::Triangle);
+    if let Some(d) = dst.parent() { std::fs::create_dir_all(d).map_err(|e| format!("{}: {e}", d.display()))?; }
+    let tmp = dst.with_extension("tmp.png");
+    small.save(&tmp).map_err(|e| format!("{}: {e}", tmp.display()))?;
+    std::fs::rename(&tmp, dst).map_err(|e| format!("{}: {e}", dst.display()))
 }
 
 fn load_png(ctx: &egui::Context, path: &Path) -> Result<egui::TextureHandle, String> {
@@ -246,7 +266,7 @@ impl PlotPanel {
             return;
         }
         match load_png(ctx, &job.png) {
-            Ok(t) => { self.tex = Some(t); }
+            Ok(t) => { self.tex = Some(t); self.shown_png = Some(job.png.clone()); }
             Err(e) => { self.status = Some(Err(e)); return; }
         }
         let find = |pat: &str| job.log.iter().rev().find(|l| l.contains(pat)).cloned();
@@ -262,7 +282,8 @@ impl PlotPanel {
                 let draw = find(" paths, ").and_then(|l| l.split_once("; draw ").map(|(_, r)| r.split(" → ").next().unwrap_or("").to_string())).unwrap_or_default();
                 let dir = job.dir.clone().unwrap_or_default();
                 self.shown = format!("export: {}", dir.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default());
-                self.note = format!("{} · draw {draw}", layers.trim());
+                let ink = find("ink: ").map(|l| l.trim().to_string()).unwrap_or_default();
+                self.note = format!("{} · draw {draw} · {ink}", layers.trim());
                 self.status = Some(Ok(format!("saved in {} ({secs:.0} s)", dir.display())));
                 self.last_export = Some(dir);
             }
@@ -366,6 +387,13 @@ impl PlotPanel {
             }
             ui.separator();
             ui.horizontal(|ui| {
+                if let Some(png) = self.shown_png.clone() {
+                    if ui.add_enabled(self.tex.is_some(), egui::Button::new("\u{1f5bc} Use as gallery thumbnail"))
+                        .on_hover_text("Saves the picture shown as this genome's plot thumbnail (_plots/ next to its .nn), which the gallery shows in its ✎ plot view").clicked() {
+                        let dst = plot_thumb_path(&inputs().genome_path);
+                        self.status = Some(save_thumb(&png, &dst).map(|_| format!("gallery thumbnail saved: {}", dst.display())));
+                    }
+                }
                 if let Some(dir) = self.last_export.clone() {
                     if ui.button("\u{1f4c2} Open export folder").clicked() { let _ = Command::new("xdg-open").arg(&dir).spawn(); }
                     if ui.add_enabled(self.job.is_none(), egui::Button::new("check its G-code")).on_hover_text("Draws the exported G-code itself (all pens), exactly as the machine will").clicked() {

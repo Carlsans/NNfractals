@@ -142,3 +142,4 @@ quat_richness_test*.log
 quat_evolve_subtree_night.log.*
 quat_boundedness_report.txt
 overnight_sweep.*
+plotter.toml

@@ -5092,7 +5092,11 @@ fn cmd_quat_anatomy(args: &[String]) {
     // The plot as it will look on paper (pens in their order, ink darkening where they cross).
     let raster = |px: u32, path: &Path| {
         let layers: Vec<((u8, u8, u8), &[pp::Polyline])> = by_pen.iter().enumerate().map(|(i, l)| (CARL_PENS[i].1, l.as_slice())).collect();
-        let (w, h, rgb) = pp::rasterize((paper_w, paper_h), px, pen, &layers);
+        // A preview samples coarser than the plot (1-2 mm against 0.35 mm) and so draws
+        // fewer lines: about √(cell / 0.35 mm) times less (2 mm: 275 m against 653 m on
+        // trial26 XY). Its ink is that much stronger, so the tone matches the plot's.
+        let ink = if preview.is_some() { pen * (cell / 0.35).max(1.0).sqrt() } else { pen };
+        let (w, h, rgb) = pp::rasterize((paper_w, paper_h), px, ink, &layers);
         if let Some(d) = path.parent() { std::fs::create_dir_all(d).ok(); }
         image::save_buffer(path, &rgb, w, h, image::ColorType::Rgb8).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
     };
@@ -5110,6 +5114,77 @@ fn cmd_quat_anatomy(args: &[String]) {
         .map(|(i, l)| (CARL_PENS[i].0.to_string(), hex(CARL_PENS[i].1), l)).filter(|(_, _, l)| !l.is_empty()).collect();
     print!("{stem}: ");
     write_pen_plot(args, &out, &stem, summary.trim_end(), sheet, tol, layers_in, true);
+}
+
+/// Where the gallery (nnfractals-browser) looks for a genome's plot thumbnail:
+/// `<folder>/_plots/<name>.png`, in a subfolder so tools that scan a folder's PNGs
+/// never take it for the genome's render.
+fn plot_thumb_path(nn: &Path) -> PathBuf {
+    let dir = nn.parent().unwrap_or(Path::new("."));
+    dir.join("_plots").join(format!("{}.png", nn.file_stem().and_then(|s| s.to_str()).unwrap_or("genome")))
+}
+
+/// `explorer plot-thumbs --dir D [--files a.nn,b.nn] [--force]`: the gallery's plot
+/// thumbnails, a quick plot preview (`quat-anatomy --preview`) of every quaternion
+/// genome in D saved as D/_plots/<name>.png. Skips genomes that already have one
+/// (unless --force) and genomes without a DAG program. One genome at a time (each
+/// preview uses every core); writes to a temporary file and renames it, so a reader
+/// never sees half a PNG. Prints "PLOT-THUMB i/n <png>" as each lands (the browser
+/// reads these). The look: --compose mosaic|plate (mosaic), --plane XY, --zoom 0.6,
+/// --cell 2 (draft sampling), --px 320 (the gallery's largest), --follow 0.5, the
+/// 6200-patch mosaic.
+/// Stop with D/_plots/STOP.
+fn cmd_plot_thumbs(args: &[String]) {
+    let dir = PathBuf::from(get_flag(args, "--dir").unwrap_or_else(|| panic!("plot-thumbs needs --dir FOLDER")));
+    let out_dir = dir.join("_plots");
+    std::fs::create_dir_all(&out_dir).unwrap_or_else(|e| panic!("{}: {e}", out_dir.display()));
+    let mut files: Vec<PathBuf> = match get_flag(args, "--files") {
+        Some(list) => list.split(',').map(|f| f.trim()).filter(|f| !f.is_empty()).map(PathBuf::from).collect(),
+        None => std::fs::read_dir(&dir).map(|rd| rd.filter_map(|e| e.ok()).map(|e| e.path()).filter(|p| p.extension().and_then(|s| s.to_str()) == Some("nn")).collect()).unwrap_or_default(),
+    };
+    files.sort();
+    let force = args.iter().any(|a| a == "--force");
+    let todo: Vec<PathBuf> = files.into_iter().filter(|f| force || !plot_thumb_path(f).exists()).collect();
+    let n = todo.len();
+    println!("PLOT-THUMBS {n} to make in {}", out_dir.display());
+    let opt = |flag: &str, default: &str| get_flag(args, flag).unwrap_or(default).to_string();
+    let compose = opt("--compose", "mosaic");
+    let t0 = std::time::Instant::now();
+    let mut made = 0usize;
+    for (i, nn) in todo.iter().enumerate() {
+        if out_dir.join("STOP").exists() { println!("PLOT-THUMBS stopped (_plots/STOP)"); break; }
+        let quat = io::load_genome(nn).map(|g| !g.program.is_empty()).unwrap_or(false);
+        if !quat {
+            println!("PLOT-THUMB-SKIP {}/{n} {} (no DAG program)", i + 1, nn.display());
+            continue;
+        }
+        let png = plot_thumb_path(nn);
+        let tmp = out_dir.join(format!(".{}.tmp.png", nn.file_stem().and_then(|s| s.to_str()).unwrap_or("g")));
+        let mut a: Vec<String> = vec!["explorer".into(), "quat-anatomy".into(), "--genome".into(), nn.display().to_string(),
+            "--preview".into(), tmp.display().to_string(), "--preview-px".into(), opt("--px", "320"),
+            "--plane".into(), opt("--plane", "XY"), "--zoom".into(), opt("--zoom", "0.6"), "--cell".into(), opt("--cell", "2"),
+            "--compose".into(), compose.clone()];
+        if compose == "mosaic" {
+            a.extend(["--bands", "64", "--sectors", "48", "--inner-bands", "56", "--inner-sectors", "56", "--levels", "2048",
+                      "--min-layer-m", "0.05", "--min-fill", "0.03"].map(String::from));
+            a.extend(["--follow".into(), opt("--follow", "0.5")]);
+        } else {
+            a.extend(["--tiles".into(), opt("--tiles", "12x12"), "--gutter".into(), "3".into()]);
+        }
+        match std::panic::catch_unwind(|| cmd_quat_anatomy(&a)) {
+            Ok(()) if tmp.exists() => {
+                if std::fs::rename(&tmp, &png).is_ok() {
+                    made += 1;
+                    println!("PLOT-THUMB {}/{n} {}", i + 1, png.display());
+                }
+            }
+            _ => {
+                let _ = std::fs::remove_file(&tmp);
+                println!("PLOT-THUMB-FAIL {}/{n} {}", i + 1, nn.display());
+            }
+        }
+    }
+    println!("PLOT-THUMBS done: {made} made in {:.0} s", t0.elapsed().as_secs_f64());
 }
 
 /// Pen colours for `--colors K` / `--palette name:#rrggbb,...`: K (name, colour)
@@ -5134,6 +5209,54 @@ fn pen_palette(args: &[String], n_pens: usize) -> Vec<(String, String)> {
 /// SVG colour, lines). Each layer's order starts at the paper's lower-left corner.
 /// Marlin options: --origin X,Y --no-flip-y --feed --travel --pen-up/--pen-down
 /// ("cmd|cmd") --flat-tol --home --pen-change.
+/// Carl's plotter (`plotter.toml` in the project root, written with these defaults the
+/// first time it is needed): the felt pens' ink. `ink_g_per_m` 0 means not measured yet,
+/// and G-code then gives lengths only. Flags override: --ink-g-per-m, --pen-ink-g,
+/// --refill-ink-g.
+#[derive(serde::Deserialize, serde::Serialize)]
+struct PlotterSettings {
+    /// Grams of ink one metre of line uses.
+    ink_g_per_m: f64,
+    /// Ink a full pen holds (g).
+    pen_capacity_g: f64,
+    /// A pen is changed (refilled) after drawing this much ink (g).
+    refill_g: f64,
+    /// Pen up/down speed (mm/min). The Z axis (TMC2100) skipped steps at F30000 and the
+    /// pen drifted up over a plot's ~50,000 lifts (2026-11-23).
+    #[serde(default = "default_z_feed")]
+    z_feed: f64,
+    /// Z limits set at the start of every plot (M203, mm/s; M201, mm/s²), whatever the
+    /// EEPROM holds; the same as the firmware's defaults since 2026-11-23.
+    #[serde(default = "default_z_max_feed")]
+    z_max_feed: f64,
+    #[serde(default = "default_z_max_accel")]
+    z_max_accel: f64,
+}
+
+fn default_z_feed() -> f64 { 1800.0 }
+fn default_z_max_feed() -> f64 { 30.0 }
+fn default_z_max_accel() -> f64 { 200.0 }
+
+fn plotter_settings() -> PlotterSettings {
+    let path = nnfractals::project_root().join("plotter.toml");
+    if let Some(s) = std::fs::read_to_string(&path).ok().and_then(|t| toml::from_str::<PlotterSettings>(&t).ok()) {
+        return s;
+    }
+    let s = PlotterSettings { ink_g_per_m: 0.0, pen_capacity_g: 0.4, refill_g: 0.3, z_feed: default_z_feed(), z_max_feed: default_z_max_feed(), z_max_accel: default_z_max_accel() };
+    let text = [
+        "# Carl's pen plotter: the felt pens' ink, for the G-code's ink totals, refill pauses",
+        "# and LCD progress (explorer quat-anatomy / quat-slice-plot / quat-surface-plot).",
+        "# ink_g_per_m: grams of ink per metre of line; 0 = not measured (G-code gives lengths only).",
+        "# Measure it: weigh a pen (0.001 g scale), draw a known length (the summary gives",
+        "# each pen's metres), weigh again: ink_g_per_m = grams lost / metres drawn.",
+        "# z_feed: pen up/down speed (mm/min); z_max_feed (mm/s) and z_max_accel (mm/s^2) are set",
+        "# with M203 / M201 at the start of every plot (--machine carl).",
+        "",
+    ].join("\n") + &toml::to_string(&s).unwrap_or_default();
+    let _ = std::fs::write(&path, text);
+    s
+}
+
 fn write_pen_plot(args: &[String], out: &Path, stem: &str, comment: &str, sheet: nnfractals::plot_paths::Sheet, tol: f64,
                   layers_in: Vec<(String, String, Vec<nnfractals::plot_paths::Polyline>)>, pen_changes: bool) {
     use nnfractals::plot_paths as pp;
@@ -5175,15 +5298,27 @@ fn write_pen_plot(args: &[String], out: &Path, stem: &str, comment: &str, sheet:
     // Z offset M851 Z-1.2, Z0 draws, hops under 5 mm lift to 2.5 mm, longer ones to
     // 7 mm, pens are put in at the centre on M226 P121 (button), coordinates as
     // drawn (no Y flip), Z15 at start and end.
+    // Ink (plotter.toml, flags override): totals per pen, a refill pause every refill_g
+    // of ink (unless --refill-m sets a distance).
+    let ps = plotter_settings();
+    let g_per_m: f64 = get_flag_or(args, "--ink-g-per-m", ps.ink_g_per_m);
+    if g_per_m > 0.0 {
+        o.ink = Some(pp::Ink { g_per_m, capacity_g: get_flag_or(args, "--pen-ink-g", ps.pen_capacity_g), refill_g: get_flag_or(args, "--refill-ink-g", ps.refill_g) });
+    }
+    o.progress_step = get_flag_or(args, "--progress-step", if get_flag(args, "--machine") == Some("carl") { 1u32 } else { 0 });
     if get_flag(args, "--machine") == Some("carl") {
-        let z = |v: &str| vec![format!("G1 Z{v} F30000")];
+        // Z at z_feed (was F30000, which the firmware capped at its 200 mm/s: the TMC2100
+        // skipped steps and the pen drifted up), every Z move with its own speed so none
+        // inherits another's; the Z limits set for this plot whatever the EEPROM holds.
+        let zf = get_flag_or(args, "--z-feed", ps.z_feed);
+        let z = |v: &str| vec![format!("G1 Z{v} F{zf}")];
         o.flip_y = false;
-        o.header = vec!["G1 Z15".into(), "M851 Z-1.2".into()];
-        o.footer = vec!["G1 Z15".into()];
+        o.header = vec![format!("M203 Z{}", ps.z_max_feed), format!("M201 Z{}", ps.z_max_accel), format!("G1 Z15 F{zf}"), "M851 Z-1.2".into()];
+        o.footer = vec![format!("G1 Z15 F{zf}")];
         o.pen_down = z("0");
         o.pen_up = z("7");
         o.short_lift = Some((5.0, z("2.5")));
-        o.pen_change = vec!["M117 Pen {k}: {name}".into(), "G1 Z35".into(), "G1 X432.5 Y447".into(), "M226 P121".into(), "G1 Z15".into()];
+        o.pen_change = vec!["M117 Pen {k}: {name}".into(), format!("G1 Z35 F{zf}"), format!("G0 X432.5 Y447 F{}", o.travel), "M226 P121".into(), format!("G1 Z15 F{zf}")];
         o.pause_first = true;
         o.pause_between_layers = true;
     }
@@ -5197,7 +5332,11 @@ fn write_pen_plot(args: &[String], out: &Path, stem: &str, comment: &str, sheet:
                 let (gc, st) = pp::to_gcode(&sheet, &layers[k..=k], &one, &format!("{comment}\nTHIS FILE: pen {} {} only", k + 1, layers[k].name));
                 std::fs::write(dir.join(format!("{}_{}_{}.gcode", k + 1, layers[k].name, if bez { "g5" } else { "g1" })), gc).expect("write pen gcode");
                 if !bez {
-                    per_pen.push(format!("  pen {} {:8} {}: {:5} paths, draw {:5.1} m, travel {:4.1} m, ~{:.0} min", k + 1, layers[k].name, layers[k].color, st.paths, st.draw_mm / 1000.0, st.travel_mm / 1000.0, st.minutes));
+                    let ink = match (st.pens.first().and_then(|p| p.ink_g), o.ink) {
+                        (Some(g), Some(i)) => format!(", ink {g:.3} g = {} pen(s) of {} g", (g / i.refill_g).ceil().max(1.0) as u64, i.refill_g),
+                        _ => String::new(),
+                    };
+                    per_pen.push(format!("  pen {} {:8} {}: {:5} paths, draw {:5.1} m, travel {:4.1} m, ~{:.0} min{ink}", k + 1, layers[k].name, layers[k].color, st.paths, st.draw_mm / 1000.0, st.travel_mm / 1000.0, st.minutes));
                 }
             }
         }
@@ -5213,6 +5352,11 @@ fn write_pen_plot(args: &[String], out: &Path, stem: &str, comment: &str, sheet:
     );
     for l in per_pen {
         println!("{l}");
+    }
+    match o.ink {
+        Some(i) => println!("ink: {:.3} g in all at {} g/m (pens of {} g, changed after {} g; plotter.toml)",
+                            st1.pens.iter().filter_map(|p| p.ink_g).sum::<f64>(), i.g_per_m, i.capacity_g, i.refill_g),
+        None => println!("ink: not estimated (set ink_g_per_m in plotter.toml: grams of ink per metre of line)"),
     }
 }
 
@@ -9494,6 +9638,7 @@ fn main() {
             match get_flag(&args, "--out") { Some(o) => std::fs::write(o, csv).expect("write --out"), None => print!("{csv}") }
         }
         Some("quat-anatomy") => cmd_quat_anatomy(&args),
+        Some("plot-thumbs") => cmd_plot_thumbs(&args),
         Some("gcode-preview") => {
             // What a G-code file draws, as a PNG: pen-down moves (G1, and G5 Béziers),
             // one colour per pen (split at M0 / M226 pen changes, named by M117 "Pen k:

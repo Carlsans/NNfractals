@@ -747,8 +747,27 @@ pub struct GcodeOpts {
     pub pen_change: Vec<String>,
     /// Also pause before the first layer (to put the first pen in).
     pub pause_first: bool,
-    /// Pause (the `pen_change` block, name "refill …") after every this many mm drawn in a layer.
+    /// Pause (the `pen_change` block, name "<pen> #2", "#3", …) after every this many mm drawn in a layer.
     pub refill_mm: Option<f64>,
+    /// Ink accounting: what a pen holds and uses (`None`: lengths only).
+    pub ink: Option<Ink>,
+    /// LCD progress: `M117 <pen> <n>%` (and the ink used from the current pen) every
+    /// this many percent of a layer's line (0 = none). 20 characters at most.
+    pub progress_step: u32,
+}
+
+/// A felt pen's ink: how much one metre of line uses, what a pen holds, and after how
+/// much the pen is changed (refilled), which sets the refill pauses.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Ink {
+    pub g_per_m: f64,
+    pub capacity_g: f64,
+    pub refill_g: f64,
+}
+
+impl Ink {
+    /// Line one refill draws (mm).
+    pub fn refill_mm(&self) -> f64 { self.refill_g / self.g_per_m.max(1e-12) * 1000.0 }
 }
 
 impl GcodeOpts {
@@ -758,12 +777,13 @@ impl GcodeOpts {
             origin: (0.0, 0.0), flip_y: true, feed: 3000.0, travel: 6000.0, pen_up, pen_down, bezier: false, flat_tol: 0.02,
             home: false, pause_between_layers: false, header: Vec::new(), footer: Vec::new(), short_lift: None,
             pen_change: vec!["M0 Change pen for layer {k} {name}".into()], pause_first: false, refill_mm: None,
+            ink: None, progress_step: 0,
         }
     }
 }
 
 /// Lengths and an estimated time for a plot.
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct PlotStats {
     pub paths: usize,
     pub curves: usize,
@@ -771,6 +791,16 @@ pub struct PlotStats {
     pub draw_mm: f64,
     pub travel_mm: f64,
     pub minutes: f64,
+    /// Per layer (pen): name, line drawn (mm), ink (g, with `GcodeOpts::ink`), refill pauses.
+    pub pens: Vec<PenStats>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct PenStats {
+    pub name: String,
+    pub draw_mm: f64,
+    pub ink_g: Option<f64>,
+    pub refills: usize,
 }
 
 /// Marlin G-code for the layers, and its statistics. Pen state is always
@@ -795,6 +825,18 @@ pub fn to_gcode(sheet: &Sheet, layers: &[Layer], o: &GcodeOpts, comment: &str) -
         }
         let mut since_refill = 0.0;
         let mut refills = 0;
+        let refill_mm = o.refill_mm.or(o.ink.map(|i| i.refill_mm()));
+        // The layer's whole line, for its progress percentage.
+        let layer_mm: f64 = if o.progress_step > 0 {
+            layer.paths.iter().flat_map(|p| p.curves.iter()).map(|c| {
+                let mut f = Vec::new();
+                flatten(c, o.flat_tol, &mut f);
+                let mut q = c[0];
+                f.iter().map(|&x| { let d = dist(q, x); q = x; d }).sum::<f64>()
+            }).sum()
+        } else { 0.0 };
+        let layer_start = st.draw_mm;
+        let mut shown_pct = 0u32;
         for p in &layer.paths {
             let Some(first) = p.curves.first() else { continue };
             let s = tx(first[0]);
@@ -807,9 +849,10 @@ pub fn to_gcode(sheet: &Sheet, layers: &[Layer], o: &GcodeOpts, comment: &str) -
                 lifts += 1;
                 down = false;
             }
-            if o.refill_mm.is_some_and(|r| since_refill >= r) {
+            if refill_mm.is_some_and(|r| since_refill >= r) {
                 refills += 1;
-                pause(&mut body, k + 1, &format!("refill {} #{refills}", layer.name));
+                // "lightblue #2": a fresh (refilled) pen of this colour; short for a 20-character LCD.
+                pause(&mut body, k + 1, &format!("{} #{}", layer.name, refills + 1));
                 since_refill = 0.0;
             }
             let drawn_before = st.draw_mm;
@@ -873,7 +916,19 @@ pub fn to_gcode(sheet: &Sheet, layers: &[Layer], o: &GcodeOpts, comment: &str) -
             since_refill += st.draw_mm - drawn_before;
             st.paths += 1;
             pen = cur;
+            if o.progress_step > 0 && layer_mm > 0.0 {
+                let pct = (((st.draw_mm - layer_start) / layer_mm * 100.0).floor() as u32).min(100) / o.progress_step * o.progress_step;
+                if pct > shown_pct {
+                    shown_pct = pct;
+                    // e.g. "lightblue 37% 0.21g": this pen's progress and the ink used from the pen in it.
+                    let ink = o.ink.map(|i| format!(" {:.2}g", since_refill / 1000.0 * i.g_per_m)).unwrap_or_default();
+                    let msg: String = format!("{} {pct}%{ink}", layer.name).chars().take(20).collect();
+                    let _ = writeln!(body, "M117 {msg}");
+                }
+            }
         }
+        let layer_mm_drawn = st.draw_mm - layer_start;
+        st.pens.push(PenStats { name: layer.name.clone(), draw_mm: layer_mm_drawn, ink_g: o.ink.map(|i| layer_mm_drawn / 1000.0 * i.g_per_m), refills });
         if down {
             for c in &o.pen_up {
                 let _ = writeln!(body, "{c}");
@@ -905,6 +960,22 @@ pub fn to_gcode(sheet: &Sheet, layers: &[Layer], o: &GcodeOpts, comment: &str) -
     );
     if o.bezier {
         let _ = writeln!(s, "; G5 needs Marlin built with BEZIER_CURVE_SUPPORT; otherwise use the G1 file");
+    }
+    for (k, p) in st.pens.iter().enumerate() {
+        match (p.ink_g, o.ink) {
+            (Some(g), Some(i)) => {
+                let _ = writeln!(s, "; pen {} {}: {:.1} m, ink {:.3} g = {} pen(s) of {} g ({} refill pause(s) every {:.0} m)",
+                    k + 1, p.name, p.draw_mm / 1000.0, g, (g / i.refill_g).ceil().max(1.0) as u64, i.refill_g, p.refills, i.refill_mm() / 1000.0);
+            }
+            _ => { let _ = writeln!(s, "; pen {} {}: {:.1} m", k + 1, p.name, p.draw_mm / 1000.0); }
+        }
+    }
+    if let Some(i) = o.ink {
+        let total: f64 = st.pens.iter().filter_map(|p| p.ink_g).sum();
+        let _ = writeln!(s, "; ink in all: {total:.3} g at {} g per metre; a pen holds {} g, changed after {} g", i.g_per_m, i.capacity_g, i.refill_g);
+    }
+    if o.progress_step > 0 {
+        let _ = writeln!(s, "; LCD: M117 <pen> <percent of its line>% <ink used from the pen in the holder, g>");
     }
     let _ = writeln!(s, "; pen down: {} | pen up: {}", o.pen_down.join(" ; "), o.pen_up.join(" ; "));
     let _ = writeln!(s, "G21 ; millimetres\nG90 ; absolute positions");
@@ -1073,6 +1144,34 @@ pub fn gcode_lines(text: &str, flip_y: Option<bool>) -> (Vec<GcodePen>, P2, P2) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ink_totals_refills_and_lcd_progress() {
+        // One pen, 20 straight strokes of 50 mm: 1 m of line.
+        let paths: Vec<CurvePath> = (0..20).map(|k| {
+            let y = 10.0 + k as f64 * 2.0;
+            CurvePath { curves: vec![[(10.0, y), (26.0, y), (43.0, y), (60.0, y)]], closed: false }
+        }).collect();
+        let layers = [Layer { name: "lightblue".into(), color: "#245f8f".into(), paths }];
+        let sheet = Sheet { w: 100.0, h: 100.0, pen: 0.4 };
+        // 0.5 g per metre, changed after 0.1 g: a refill every 200 mm, 4 of them in 1 m.
+        let mut o = GcodeOpts::marlin(vec!["G0 Z2".into()], vec!["G1 Z0".into()]);
+        o.pause_between_layers = true;
+        o.pen_change = vec!["M117 Pen {k}: {name}".into(), "M226 P121".into()];
+        o.ink = Some(Ink { g_per_m: 0.5, capacity_g: 0.4, refill_g: 0.1 });
+        o.progress_step = 10;
+        let (g, st) = to_gcode(&sheet, &layers, &o, "t");
+        let p = &st.pens[0];
+        assert!((p.draw_mm - 1000.0).abs() < 0.5, "{}", p.draw_mm);
+        assert!((p.ink_g.unwrap() - 0.5).abs() < 0.001);
+        assert_eq!(p.refills, 4, "{g}");
+        assert!(g.contains("M117 Pen 1: lightblue #2") && g.contains("M117 Pen 1: lightblue #5"), "{g}");
+        let progress: Vec<&str> = g.lines().filter(|l| l.starts_with("M117 lightblue ")).collect();
+        assert_eq!(progress.len(), 10, "{progress:?}");
+        assert!(progress.last().unwrap().starts_with("M117 lightblue 100%"), "{progress:?}");
+        assert!(progress.iter().all(|l| l.len() - 5 <= 20), "LCD lines fit 20 characters: {progress:?}");
+        assert!(g.contains("; pen 1 lightblue: 1.0 m, ink 0.500 g = 5 pen(s) of 0.1 g"), "{g}");
+    }
 
     #[test]
     fn gcode_read_back_draws_what_was_written() {
@@ -1287,7 +1386,7 @@ mod tests {
         let (g, st) = to_gcode(&sheet, &two, &c, "t");
         let lifts: Vec<&str> = g.lines().filter(|l| l.starts_with("G1 Z2.5") || l.starts_with("G1 Z7") || l.starts_with("M117")).collect();
         // Start lift, pen in, hop of 1 mm (low lift), refill (12 mm drawn >= 10), long hop (high lift), end of layer.
-        assert_eq!(lifts, vec!["G1 Z7", "M117 1 a", "G1 Z2.5", "M117 1 refill a #1", "G1 Z7", "G1 Z7"], "{g}");
+        assert_eq!(lifts, vec!["G1 Z7", "M117 1 a", "G1 Z2.5", "M117 1 a #2", "G1 Z7", "G1 Z7"], "{g}");
         assert!(g.contains("G90 ; absolute positions\nM851 Z-1.2\n"));
         assert!((st.draw_mm - 18.0).abs() < 1e-6);
         assert!(svg.contains(r#"<path d="M10 10C20 10 30 20 30 30"/>"#));
