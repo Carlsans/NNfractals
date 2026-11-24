@@ -670,7 +670,7 @@ mod tests {
             created_at: 0, waypoints: Vec::new(), chain_label: None,
             time_mod: Vec::new(), time_frames: DEFAULT_TIME_FRAMES,
             blend_nn_filename: None, blend_shape: String::new(), blend_amp: 0.0,
-            time_prog: Vec::new(), rife_fps: 0, keyframe_stride: 0, quat: None,
+            time_prog: Vec::new(), rife_fps: 0, keyframe_stride: 0, quat: None, youtube: Vec::new(),
         };
         let spec = QuatRenderSpec {
             mode: "timeline".to_string(),

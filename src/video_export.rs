@@ -2145,6 +2145,32 @@ pub struct QueueItem {
     /// deserializes as a plain (2D) item.
     #[serde(default)]
     pub quat: Option<QuatRenderSpec>,
+    /// This item's videos uploaded to YouTube from the queue manager (the render, and
+    /// its 9:16 reel as a Short). `#[serde(default)]`: older items have none.
+    #[serde(default)]
+    pub youtube: Vec<YoutubeUpload>,
+}
+
+/// One video uploaded to YouTube (`scripts/youtube_upload.py`, from the queue manager).
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub struct YoutubeUpload {
+    /// The uploaded file.
+    pub file: String,
+    pub video_id: String,
+    /// private, unlisted or public, as asked (an API project YouTube has not audited
+    /// uploads as private whatever is asked).
+    pub privacy: String,
+    /// Unix seconds.
+    pub uploaded_at: u64,
+    /// The 9:16 reel crop, uploaded as a Short.
+    #[serde(default)]
+    pub short: bool,
+}
+
+impl YoutubeUpload {
+    pub fn url(&self) -> String {
+        if self.short { format!("https://youtube.com/shorts/{}", self.video_id) } else { format!("https://youtu.be/{}", self.video_id) }
+    }
 }
 
 /// Everything one quaternion ray-march render (still or orbit video) needs —
@@ -2405,6 +2431,7 @@ pub fn enqueue(spec: QueueSpec) -> Result<QueueItem, String> {
         blend_amp: spec.blend_amp,
         rife_fps: spec.rife_fps,
         quat: spec.quat_spec,
+        youtube: Vec::new(),
     };
 
     let mut items = load_queue();
@@ -3010,7 +3037,7 @@ mod tests {
             waypoints: Vec::new(), chain_label: None, keyframe_stride: 0,
             time_mod: Vec::new(), time_prog: Vec::new(), time_frames: 0,
             blend_nn_filename: None, blend_shape: String::new(), blend_amp: 0.0,
-            rife_fps: 0, quat: None,
+            rife_fps: 0, quat: None, youtube: Vec::new(),
         }
     }
 

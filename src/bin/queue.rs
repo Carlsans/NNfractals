@@ -18,6 +18,8 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 
 use eframe::egui::{self, Color32};
+#[path = "../queue_youtube.rs"]
+mod queue_youtube;
 
 use nnfractals::queue_runner::{
     now_minute_of_day, parse_hhmm, process_queue_item, HoldWindow, ProcessorLock, QueueProgress,
@@ -528,6 +530,8 @@ struct App {
     exe_stamp: Option<(PathBuf, std::time::SystemTime)>,
     /// Cached so the banner doesn't stat the binary on every repaint.
     stale_checked: std::cell::Cell<Option<(std::time::Instant, bool)>>,
+    /// Upload a finished video to YouTube (`queue_youtube.rs`).
+    youtube: queue_youtube::YoutubePanel,
 }
 
 impl App {
@@ -609,6 +613,7 @@ impl App {
                 std::fs::metadata(&p).and_then(|m| m.modified()).ok().map(|t| (p, t))
             }),
             stale_checked: std::cell::Cell::new(None),
+            youtube: queue_youtube::YoutubePanel::default(),
         }
     }
 
@@ -964,11 +969,14 @@ impl eframe::App for App {
                             });
                         } else if it.status == QueueStatus::Done {
                             if let Some(out) = &it.output_path {
-                                let path = PathBuf::from(out);
-                                let resp = ui.link(out)
-                                    .on_hover_text("Click to open the video · right-click to open its folder");
-                                if resp.clicked() { to_open = Some(path.clone()); }
-                                if resp.secondary_clicked() { to_open_folder = Some(path); }
+                                ui.horizontal_wrapped(|ui| {
+                                    let path = PathBuf::from(out);
+                                    let resp = ui.link(out)
+                                        .on_hover_text("Click to open the video · right-click to open its folder");
+                                    if resp.clicked() { to_open = Some(path.clone()); }
+                                    if resp.secondary_clicked() { to_open_folder = Some(path); }
+                                    self.youtube.row(ui, it);
+                                });
                             }
                         } else if it.status == QueueStatus::Failed {
                             if let Some(e) = &it.error {
@@ -1030,6 +1038,10 @@ impl eframe::App for App {
                 }
             });
         });
+
+        if self.youtube.show(&ctx, &mut self.items) {
+            save_queue(&self.items);
+        }
 
         // Keep repainting while something is actively happening so the
         // progress readout and status stay live. With nothing pending or
