@@ -98,6 +98,34 @@ def clean(text, limit):
     return text.replace("<", "‹").replace(">", "›")[:limit]
 
 
+# What YouTube's refusals mean, in plain words (reason codes of the Data API).
+EXPLAIN = {
+    "uploadLimitExceeded": "YouTube's daily upload limit for this channel is reached (it lifts within about 24 hours; "
+                           "YouTube Studio has the same limit). Re-uploading the same video uses it up too.",
+    "quotaExceeded": "the API project's daily quota is used up (it resets at midnight Pacific time).",
+    "rateLimitExceeded": "too many requests in a short time; wait a few minutes.",
+    "invalidTitle": "YouTube refuses the title (empty, too long, or a character it does not accept).",
+    "invalidDescription": "YouTube refuses the description (over 5000 bytes, or a character it does not accept).",
+    "invalidTags": "YouTube refuses the tags (about 500 characters in all at most).",
+    "invalidCategoryId": "YouTube refuses the category.",
+    "forbidden": "this Google account may not upload to that channel.",
+    "youtubeSignupRequired": "this Google account has no YouTube channel yet: create one on youtube.com first.",
+}
+
+
+def refusal(e):
+    """'400 uploadLimitExceeded: <plain explanation>' from a googleapiclient HttpError."""
+    import json as _json
+    reason, message = "", ""
+    try:
+        err = _json.loads(e.content.decode("utf-8", "replace")).get("error", {})
+        first = (err.get("errors") or [{}])[0]
+        reason, message = first.get("reason", ""), first.get("message") or err.get("message", "")
+    except Exception:
+        message = str(e)
+    return f"{e.resp.status} {reason}: {EXPLAIN.get(reason, message)}".replace(" : ", " ")
+
+
 def upload(a):
     from googleapiclient.discovery import build
     from googleapiclient.errors import HttpError
@@ -133,7 +161,7 @@ def upload(a):
                 say("STATUS", f"YouTube answered {e.resp.status}, trying again in {wait:.0f} s")
                 time.sleep(wait)
                 continue
-            fail(f"YouTube refused the upload: {e.resp.status} {e._get_reason() if hasattr(e, '_get_reason') else e}")
+            fail(f"YouTube refused the upload: {refusal(e)}")
         except (OSError, ConnectionError, TimeoutError) as e:
             if tries < 8:
                 tries += 1
@@ -151,7 +179,7 @@ def upload(a):
             yt.thumbnails().set(videoId=vid, media_body=MediaFileUpload(a.thumbnail)).execute()
             say("STATUS", "thumbnail set")
         except HttpError as e:  # custom thumbnails need a phone-verified channel
-            say("WARN", f"thumbnail not set ({e.resp.status}): custom thumbnails need a verified channel")
+            say("WARN", f"thumbnail not set ({refusal(e)}); custom thumbnails need a phone-verified channel")
     say("DONE", vid)
 
 
