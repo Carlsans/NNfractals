@@ -522,7 +522,12 @@ fn run(root: &Path) {
             }
         }
         // GA workers follow the free memory while the campaign runs.
-        let workers = campaign.as_ref().filter(|c| !c.paused).map(|_| workers_for(mem, cfg.max_workers));
+        // Down at once when memory gets short, back up only with 1 GB to spare (free memory
+        // hovering at a threshold made the count flap every few seconds).
+        let workers = campaign.as_ref().filter(|c| !c.paused).map(|_| {
+            let (down, up) = (workers_for(mem, cfg.max_workers), workers_for(mem - 1.0, cfg.max_workers));
+            match last_workers { Some(l) if down < l => down, Some(l) if up > l => up, Some(l) => l, None => down }
+        });
         if let (Some(w), Some(cf)) = (workers, cfg.campaign_env.get("CONTROL_FILE")) {
             if last_workers != Some(w) {
                 let _ = fs::write(root.join(cf), format!("{{\"workers\": {w}}}\n"));
