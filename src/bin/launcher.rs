@@ -27,6 +27,8 @@ use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
 mod launcher_tuning;
 #[path = "../launcher_recipe.rs"]
 mod launcher_recipe;
+#[path = "../launcher_idle.rs"]
+mod launcher_idle;
 
 use nnfractals::config::Config;
 use nnfractals::fitness_profile::{self, FieldSpec, FitnessProfile, Group, Sign, FIELDS};
@@ -37,6 +39,9 @@ struct Args {
     /// Write the .desktop entry to ~/.local/share/applications and exit
     #[arg(long)]
     install_desktop: bool,
+    /// Open the Idle manager window (what runs while the computer is not in use) at start
+    #[arg(long)]
+    idle: bool,
 }
 
 // ── Locating things ────────────────────────────────────────────────────────────
@@ -728,6 +733,8 @@ struct App {
     tuning_ui: launcher_tuning::TuningUi,
     /// Fitness-recipe builder window (`launcher_recipe.rs`).
     recipe_ui: launcher_recipe::RecipeUi,
+    /// nnfractals-idle: state, service, settings, statistics (`launcher_idle.rs`).
+    idle_ui: launcher_idle::IdlePanel,
 
     // ── Fitness profiles ──────────────────────────────────────────────────
     show_fitness: bool,
@@ -950,6 +957,7 @@ impl App {
             prefs_path,
             tuning_ui: launcher_tuning::TuningUi::new(&project_root()),
             recipe_ui,
+            idle_ui: launcher_idle::IdlePanel::default(),
 
             show_fitness: false,
             fp_profiles: Vec::new(),
@@ -2030,11 +2038,12 @@ impl eframe::App for App {
                 self.save_quat_evo_prefs();
             }
         }
+        self.idle_ui.show(&ctx, &self.root);
 
         // While a job OR a "generate forever" supervisor runs, repaint
         // frequently for smooth progress; otherwise just keep the resource
         // monitor ticking.
-        if self.job.running || self.quat_forever.is_some() || self.tuning_ui.busy() || self.recipe_ui.busy() {
+        if self.job.running || self.quat_forever.is_some() || self.tuning_ui.busy() || self.recipe_ui.busy() || self.idle_ui.busy() {
             ui.ctx().request_repaint_after(Duration::from_millis(250));
         } else {
             ui.ctx().request_repaint_after(Duration::from_secs(60));
@@ -2110,6 +2119,24 @@ impl eframe::App for App {
                     };
                     self.spawn(sibling(bin_name), &[p.as_str()], "viewer");
                 }
+            });
+
+            ui.add_space(8.0);
+            ui.separator();
+
+            // ── When the computer is not in use (nnfractals-idle) ──
+            ui.label(egui::RichText::new("When the computer is not in use").strong());
+            ui.horizontal(|ui| {
+                if ui
+                    .button("⏾  Idle manager")
+                    .on_hover_text("What runs while nobody uses the computer (renders first, then the \
+                                    campaign), its settings, and the last 24 h: what ran when.")
+                    .clicked()
+                {
+                    self.idle_ui.open = true;
+                }
+                let (line, color) = self.idle_ui.summary(&self.root);
+                ui.colored_label(color, line);
             });
 
             ui.add_space(8.0);
@@ -2650,12 +2677,15 @@ fn main() -> anyhow::Result<()> {
             .with_inner_size([620.0, 620.0]),
         ..Default::default()
     };
+    let open_idle = args.idle;
     eframe::run_native(
         "NNFractals Launcher",
         options,
-        Box::new(|cc| {
+        Box::new(move |cc| {
             nnfractals::gui_font::install(&cc.egui_ctx);
-            Ok(Box::new(App::new()))
+            let mut app = App::new();
+            app.idle_ui.open = open_idle;
+            Ok(Box::new(app))
         }),
     )
     .map_err(|e| anyhow::anyhow!("{e}"))?;

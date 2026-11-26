@@ -86,6 +86,9 @@ pub struct PlotPanel {
     mix: bool,
     /// The pens' assignment (--color-seed): the same for the preview and the export.
     color_seed: u64,
+    /// plotter.toml's values as edited here (loaded when the section opens).
+    plotter: Option<Vec<f64>>,
+    plotter_msg: Option<Result<String, String>>,
     tex: Option<egui::TextureHandle>,
     /// The PNG behind the picture shown.
     shown_png: Option<PathBuf>,
@@ -105,7 +108,7 @@ impl Default for PlotPanel {
         PlotPanel {
             pens: Vec::new(), total: None,
             open: false, compose: Compose::Mosaic, follow: 0.5, density: 0, atlas: 1, draft: false, machine_carl: true, auto: false,
-            ink: 4.5, mix: true, color_seed: fresh_color_seed(),
+            ink: plotter_values()[0], mix: true, color_seed: fresh_color_seed(), plotter: None, plotter_msg: None,
             tex: None, shown_png: None, shown: String::new(), note: String::new(), key: String::new(), changed_at: None, job: None, status: None,
             last_export: None, gcode_path: String::new(),
         }
@@ -113,6 +116,78 @@ impl Default for PlotPanel {
 }
 
 fn root() -> PathBuf { nnfractals::project_root() }
+
+/// plotter.toml (project root, read by `explorer` for every plot): key, label, unit, default.
+const PLOTTER_KEYS: [(&str, &str, &str, f64); 11] = [
+    ("ink_density", "default ink ×", "(lines 0.8 mm / this apart)", 4.5),
+    ("ink_g_per_m", "ink per metre", "g/m (0: not measured, 0.001 estimate)", 0.0),
+    ("pen_capacity_g", "a pen holds", "g", 0.4),
+    ("refill_g", "change a pen after", "g", 0.3),
+    ("draw_feed", "drawing speed", "mm/min", 1800.0),
+    ("travel_feed", "travel speed", "mm/min", 3000.0),
+    ("xy_max_feed", "X/Y max speed", "mm/s (M203)", 50.0),
+    ("xy_max_accel", "X/Y max acceleration", "mm/s² (M201, M204)", 100.0),
+    ("z_feed", "pen up/down speed", "mm/min", 1800.0),
+    ("z_max_feed", "Z max speed", "mm/s (M203)", 30.0),
+    ("z_max_accel", "Z max acceleration", "mm/s² (M201)", 200.0),
+];
+
+fn plotter_toml() -> PathBuf { root().join("plotter.toml") }
+
+/// plotter.toml's values in PLOTTER_KEYS order (defaults where missing).
+fn plotter_values() -> Vec<f64> {
+    let t: toml::Table = std::fs::read_to_string(plotter_toml()).ok().and_then(|s| s.parse().ok()).unwrap_or_default();
+    PLOTTER_KEYS.iter().map(|(k, _, _, d)| t.get(*k).and_then(|v| v.as_float().or_else(|| v.as_integer().map(|i| i as f64))).unwrap_or(*d)).collect()
+}
+
+/// Writes the values into plotter.toml line by line, keeping its comments; missing keys go at the end.
+fn save_plotter_values(vals: &[f64]) -> Result<(), String> {
+    save_plotter_values_to(&plotter_toml(), vals)
+}
+
+fn save_plotter_values_to(path: &Path, vals: &[f64]) -> Result<(), String> {
+    let mut text = std::fs::read_to_string(&path).unwrap_or_default();
+    for ((k, _, _, _), v) in PLOTTER_KEYS.iter().zip(vals) {
+        let line = format!("{k} = {v:?}");
+        let mut found = false;
+        let mut out: Vec<String> = Vec::new();
+        for l in text.lines() {
+            if !found && l.split('=').next().is_some_and(|x| x.trim() == *k) && !l.trim_start().starts_with('#') {
+                out.push(line.clone());
+                found = true;
+            } else {
+                out.push(l.to_string());
+            }
+        }
+        if !found { out.push(line); }
+        text = out.join("\n") + "\n";
+    }
+    text.parse::<toml::Table>().map_err(|e| format!("plotter.toml would not parse: {e}"))?;
+    std::fs::write(path, text).map_err(|e| format!("{}: {e}", path.display()))
+}
+
+#[cfg(test)]
+mod plotter_settings_tests {
+    use super::*;
+
+    #[test]
+    fn saving_keeps_the_comments_and_adds_missing_keys() {
+        let p = std::env::temp_dir().join(format!("nnf_plotter_{}.toml", std::process::id()));
+        std::fs::write(&p, "# Carl's plotter\n# ink_g_per_m: measured\nink_g_per_m = 0.0\npen_capacity_g = 0.4\nz_feed = 1800.0\n").unwrap();
+        let mut v: Vec<f64> = PLOTTER_KEYS.iter().map(|k| k.3).collect();
+        v[1] = 0.0025; // ink_g_per_m
+        v[0] = 3.0;    // ink_density, missing from the file
+        save_plotter_values_to(&p, &v).unwrap();
+        let text = std::fs::read_to_string(&p).unwrap();
+        assert!(text.starts_with("# Carl's plotter\n# ink_g_per_m: measured\n"), "{text}");
+        let t: toml::Table = text.parse().unwrap();
+        assert_eq!(t["ink_g_per_m"].as_float(), Some(0.0025));
+        assert_eq!(t["ink_density"].as_float(), Some(3.0));
+        assert_eq!(t["z_feed"].as_float(), Some(1800.0));
+        assert_eq!(text.matches("ink_g_per_m =").count(), 1);
+        let _ = std::fs::remove_file(p);
+    }
+}
 
 /// A new colour seed (the window's start, and 🎲).
 fn fresh_color_seed() -> u64 {
@@ -386,6 +461,34 @@ impl PlotPanel {
                     if ui.button("\u{1f3b2}").on_hover_text("Other colours: a new seed").clicked() { self.color_seed = fresh_color_seed(); }
                 });
             });
+            let section = egui::CollapsingHeader::new("\u{2699} plotter settings (plotter.toml)").id_salt("plotter_settings").show(ui, |ui| {
+                let mut vals = self.plotter.take().unwrap_or_else(plotter_values);
+                egui::Grid::new("plotter_grid").num_columns(3).spacing([12.0, 4.0]).show(ui, |ui| {
+                    for (i, (_, label, unit, _)) in PLOTTER_KEYS.iter().enumerate() {
+                        ui.label(*label);
+                        let speed = if vals[i].abs() >= 100.0 { 10.0 } else { 0.01 };
+                        ui.add(egui::DragValue::new(&mut vals[i]).speed(speed).range(0.0..=100_000.0));
+                        ui.label(egui::RichText::new(*unit).small().weak());
+                        ui.end_row();
+                    }
+                });
+                ui.horizontal(|ui| {
+                    if ui.button("\u{1f4be} Save").on_hover_text("Written into plotter.toml (its comments kept); every plot made from now on uses it").clicked() {
+                        let v = vals.clone();
+                        self.plotter_msg = Some(save_plotter_values(&v).map(|_| "saved".into()));
+                        if self.plotter_msg.as_ref().is_some_and(|r| r.is_ok()) { self.ink = v[0]; }
+                    }
+                    let mut reload = false;
+                    if ui.button("reload").clicked() { reload = true; self.plotter_msg = None; }
+                    match &self.plotter_msg {
+                        Some(Ok(m)) => { ui.colored_label(egui::Color32::LIGHT_GREEN, m); }
+                        Some(Err(e)) => { ui.colored_label(egui::Color32::LIGHT_RED, e); }
+                        None => {}
+                    }
+                    if !reload { self.plotter = Some(vals.clone()); }
+                });
+            });
+            if section.fully_closed() { self.plotter = None; }
             ui.separator();
             ui.horizontal(|ui| {
                 let busy = self.job.is_some();

@@ -29,82 +29,24 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use serde::{Deserialize, Serialize};
-
-const STOP_FILE: &str = "STOP_campaigns";
-const STATUS: &str = "explorer_out/idle_manager_status.json";
-const LOG: &str = "explorer_out/idle_manager.log";
-const CONFIG: &str = "idle_manager.toml";
-
-#[derive(Clone, Serialize, Deserialize)]
-#[serde(default)]
-struct Config {
-    idle_after_min: f64,
-    sound_counts_as_use: bool,
-    renders: bool,
-    campaign: bool,
-    free_memory_after_min: f64,
-    max_workers: usize,
-    min_free_gb: f64,
-    campaign_log: String,
-    ignore_devices: Vec<String>,
-    campaign_env: BTreeMap<String, String>,
-}
-
-impl Default for Config {
-    fn default() -> Self {
-        let env = [
-            ("OUT", "fractals_dag_orgcx_loop"), ("COLLAPSE", "slice"), ("EXTRA", "orgcx_rel2d:4"), ("RUN_LIMIT", "3600"),
-            ("WORKERS", "6"), ("CONTROL_FILE", "explorer_out/ga_control.json"), ("ORGCX_SIDECARS", "4"), ("ORGCX_THREADS", "4"),
-            ("LABEL", "v10: optuna campaign (30 trials, reset), H1_cont + front_cover_band + grey_band, evolved-only trial score, slice T linear, run limit 3600 s, parallel scoring under a memory guard"),
-        ];
-        Config {
-            idle_after_min: 10.0,
-            sound_counts_as_use: true,
-            renders: true,
-            campaign: true,
-            free_memory_after_min: 15.0,
-            max_workers: 6,
-            min_free_gb: 2.0,
-            campaign_log: "optuna_campaign_orgcx.log".into(),
-            ignore_devices: vec!["PC Speaker".into()],
-            campaign_env: env.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
-        }
-    }
-}
-
-const CONFIG_HEADER: &str = "\
-# nnfractals-idle: what runs while nobody uses the computer (see src/bin/idle_manager.rs).
-# Read at start: `systemctl --user restart nnfractals-idle` after editing.
-#
-# idle_after_min        minutes without keyboard/mouse/remote input before work starts
-# sound_counts_as_use   sound coming out of the speakers (a film, a call) also means the computer is in use
-# renders / campaign    what may run: the video render queue first, then the GA campaign
-# free_memory_after_min back at the computer this long: the paused campaign ends its trial
-#                       cleanly so its memory is freed (renders stay paused, keeping progress)
-# max_workers           most GA workers; fewer when memory is short (14 GB free: up to 10, 9: 6, 6: 4, 4: 2, else 1)
-# min_free_gb           the campaign pauses below this much free memory, even while idle
-# campaign_log          where the campaign script writes (appended)
-# ignore_devices        input devices whose events are not use (names as in /proc/bus/input/devices)
-# [campaign_env]        the campaign's settings (scripts/optuna_campaigns.py reads them);
-#                       these are the orgcx campaign's, as in explorer_out/resume_campaign.sh
-";
+use nnfractals::idle::{self, Config, Job, Status, CONFIG, LOG, STOP_FILE};
 
 fn load_config(root: &Path) -> Config {
     let p = root.join(CONFIG);
-    match fs::read_to_string(&p) {
-        Ok(t) => toml::from_str(&t).unwrap_or_else(|e| {
-            log(&format!("{CONFIG}: {e}; using the defaults"));
-            Config::default()
-        }),
-        Err(_) => {
-            let c = Config::default();
-            let body = toml::to_string(&c).unwrap_or_default();
-            let _ = fs::write(&p, format!("{CONFIG_HEADER}\n{body}"));
-            log(&format!("wrote the default settings to {}", p.display()));
-            c
-        }
+    if !p.exists() {
+        let c = Config::default();
+        let _ = c.save(root);
+        log(&format!("wrote the default settings to {}", p.display()));
+        return c;
     }
+    let (c, err) = Config::load(root);
+    if let Some(e) = err { log(&format!("{e}; using the defaults")); }
+    c
+}
+
+/// A state change, for the statistics (nnfractals::idle::stats).
+fn event(root: &Path, ev: &str, n: Option<f64>, why: Option<&str>) {
+    if !cfg!(test) { idle::record(root, ev, n, why); }
 }
 
 // ---------------------------------------------------------------- small helpers
@@ -251,58 +193,28 @@ fn watch_new_devices(act: &Arc<Activity>, ignore: &[String]) {
 
 // ---------------------------------------------------------------- jobs and status
 
-#[derive(Clone, Serialize, Deserialize)]
-struct Job {
-    /// Leader pid = process group id (each job is started in a group of its own).
-    pgid: i32,
-    paused: bool,
-    started_ms: u64,
-}
-
-#[derive(Default, Serialize, Deserialize)]
-struct Status {
-    in_use: bool,
-    since_ms: u64,
-    last_input_ms: u64,
-    last_device: String,
-    sound_playing: bool,
-    mem_free_gb: f64,
-    workers: Option<usize>,
-    render: Option<Job>,
-    campaign: Option<Job>,
-    note: String,
-    devices: Vec<(String, u64)>,
-    updated_ms: u64,
-}
-
-fn read_status(root: &Path) -> Status {
-    fs::read_to_string(root.join(STATUS)).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default()
-}
-
-fn write_status(root: &Path, s: &Status) {
-    let p = root.join(STATUS);
-    let tmp = p.with_extension("json.tmp");
-    if fs::write(&tmp, serde_json::to_string_pretty(s).unwrap_or_default()).is_ok() { let _ = fs::rename(tmp, p); }
-}
-
-/// A job from an earlier run of the manager, still alive and still what it was.
 fn adopt(job: Option<Job>, what: &str) -> Option<Job> {
     job.filter(|j| alive(j.pgid) && cmdline(j.pgid).contains(what))
 }
 
-fn pause(job: &mut Job, what: &str, why: &str) {
+/// "render" or "campaign" → the events' prefix.
+fn ev_prefix(what: &str) -> &'static str { if what == "render" { "render" } else { "camp" } }
+
+fn pause(root: &Path, job: &mut Job, what: &str, why: &str) {
     if !job.paused {
         signal_group(job.pgid, libc::SIGSTOP);
         job.paused = true;
         log(&format!("paused the {what} ({why})"));
+        event(root, &format!("{}_pause", ev_prefix(what)), None, Some(why));
     }
 }
 
-fn resume(job: &mut Job, what: &str) {
+fn resume(root: &Path, job: &mut Job, what: &str) {
     if job.paused {
         signal_group(job.pgid, libc::SIGCONT);
         job.paused = false;
         log(&format!("resumed the {what}"));
+        event(root, &format!("{}_resume", ev_prefix(what)), None, None);
     }
 }
 
@@ -376,7 +288,7 @@ fn run(root: &Path) {
     let cfg = load_config(root);
     let idle_after = (cfg.idle_after_min * 60_000.0) as u64;
     let free_after = (cfg.free_memory_after_min * 60_000.0) as u64;
-    let act = Arc::new(Activity { last_ms: AtomicU64::new(now_ms()), last_dev: Mutex::new("(start)".into()), devices: Mutex::new(BTreeMap::new()) });
+    let act = Arc::new(Activity { last_ms: AtomicU64::new(now_ms()), last_dev: Mutex::new(String::new()), devices: Mutex::new(BTreeMap::new()) });
     watch_new_devices(&act, &cfg.ignore_devices);
     let names: Vec<String> = act.devices.lock().unwrap().values().map(|d| d.0.clone()).collect();
     if names.is_empty() {
@@ -384,12 +296,17 @@ fn run(root: &Path) {
     }
     log(&format!("started: idle after {} min without input from {} device(s): {}{}", cfg.idle_after_min, names.len(), names.join(", "),
                  if cfg.sound_counts_as_use { "; sound playing counts as use" } else { "" }));
+    event(root, "start", None, None);
+    idle::prune_events(root, 30);
 
-    let old = read_status(root);
+    let old = Status::read(root);
     let mut render = adopt(old.render, "queue-run");
     let mut campaign = adopt(old.campaign, "optuna_campaigns.py");
     for (j, what) in [(&render, "render"), (&campaign, "campaign")] {
-        if let Some(j) = j { log(&format!("took back the {what} it had started (group {}{})", j.pgid, if j.paused { ", paused" } else { "" })); }
+        if let Some(j) = j {
+            log(&format!("took back the {what} it had started (group {}{})", j.pgid, if j.paused { ", paused" } else { "" }));
+            event(root, &format!("{}_adopt", ev_prefix(what)), Some(if j.paused { 1.0 } else { 0.0 }), None);
+        }
     }
     let explorer = root.join("target/release/explorer");
     let mut children: Vec<Child> = Vec::new();
@@ -407,29 +324,33 @@ fn run(root: &Path) {
             // Stopping the manager hands its work back: nothing it paused stays frozen.
             // A new instance takes the jobs back (status file) and pauses them again if
             // the computer is in use.
-            if let Some(j) = render.as_mut() { resume(j, "render"); }
-            if let Some(j) = campaign.as_mut() { resume(j, "campaign"); }
-            let mut st = read_status(root);
+            if let Some(j) = render.as_mut() { resume(root, j, "render"); }
+            if let Some(j) = campaign.as_mut() { resume(root, j, "campaign"); }
+            let mut st = Status::read(root);
             st.render = render.clone();
             st.campaign = campaign.clone();
             st.note = "manager stopped; its jobs were left running".into();
-            write_status(root, &st);
+            st.write(root);
             log("stopping");
+            event(root, "stop", None, None);
             return;
         }
         tick += 1;
         if tick % 6 == 0 { watch_new_devices(&act, &cfg.ignore_devices); }
+        if tick % 17_280 == 0 { idle::prune_events(root, 30); } // once a day
         children.retain_mut(|c| !matches!(c.try_wait(), Ok(Some(_))));
         let now = now_ms();
         // Jobs that ended.
         if render.as_ref().is_some_and(|j| !alive(j.pgid)) {
             let left = pending_renders();
             log(&format!("render queue run ended ({} pending left)", left));
+            event(root, "render_end", Some(left as f64), None);
             if left > 0 && left >= render_pending_at_start { render_retry_at = now + 10 * 60_000; } // no progress: the window holds the queue, or an item keeps failing
             render = None;
         }
         if campaign.as_ref().is_some_and(|j| !alive(j.pgid)) {
             log("the campaign script ended");
+            event(root, "camp_end", None, None);
             campaign = None;
             campaign_retry_at = now + 5 * 60_000;
         }
@@ -450,18 +371,21 @@ fn run(root: &Path) {
             if in_use {
                 let why = if input_recent { format!("input from {}", act.last_dev.lock().unwrap()) } else { "sound playing".into() };
                 log(&format!("computer in use ({why})"));
+                event(root, "use", None, Some(&why));
             } else {
                 log(&format!("computer not in use for {} min: work may run", cfg.idle_after_min));
+                event(root, "idle", None, None);
             }
         }
         let mem = mem_available_gb();
         if in_use {
-            if let Some(j) = render.as_mut() { pause(j, "render", "computer in use"); }
-            if let Some(j) = campaign.as_mut() { pause(j, "campaign", "computer in use"); }
+            if let Some(j) = render.as_mut() { pause(root, j, "render", "computer in use"); }
+            if let Some(j) = campaign.as_mut() { pause(root, j, "campaign", "computer in use"); }
             if let Some(j) = campaign.as_ref() {
                 if j.paused && now.saturating_sub(since) >= free_after {
                     log(&format!("in use for {} min: ending the campaign's trial to free its memory", cfg.free_memory_after_min));
                     stop_campaign_cleanly(root, j);
+                    event(root, "camp_stop_clean", None, None);
                     campaign = None;
                     log(&format!("campaign stopped; {:.1} GB free now", mem_available_gb()));
                 }
@@ -471,15 +395,16 @@ fn run(root: &Path) {
             // 1) renders first.
             let pending = if cfg.renders { pending_renders() } else { 0 };
             if let Some(j) = render.as_mut() {
-                if let Some(c) = campaign.as_mut() { pause(c, "campaign", "a render goes first"); }
-                resume(j, "render");
+                if let Some(c) = campaign.as_mut() { pause(root, c, "campaign", "a render goes first"); }
+                resume(root, j, "render");
                 note = "rendering the video queue".into();
             } else if pending > 0 && now >= render_retry_at {
-                if let Some(c) = campaign.as_mut() { pause(c, "campaign", "a render goes first"); }
+                if let Some(c) = campaign.as_mut() { pause(root, c, "campaign", "a render goes first"); }
                 match spawn(root, &explorer, &["queue-run"], &BTreeMap::new(), "explorer_out/idle_manager_render.log") {
                     Ok(child) => {
                         let pgid = child.id() as i32;
                         log(&format!("{pending} render(s) pending: started the render queue (group {pgid})"));
+                        event(root, "render_start", Some(pending as f64), None);
                         render = Some(Job { pgid, paused: false, started_ms: now });
                         render_pending_at_start = pending;
                         children.push(child);
@@ -491,10 +416,10 @@ fn run(root: &Path) {
                 // 2) then the campaign.
                 if let Some(c) = campaign.as_mut() {
                     if mem < cfg.min_free_gb {
-                        pause(c, "campaign", &format!("only {mem:.1} GB free"));
+                        pause(root, c, "campaign", &format!("only {mem:.1} GB free"));
                         note = format!("campaign paused: only {mem:.1} GB free");
                     } else if c.paused && mem >= cfg.min_free_gb + 1.0 {
-                        resume(c, "campaign");
+                        resume(root, c, "campaign");
                     }
                     if !c.paused { note = "running the campaign".into(); }
                 } else if let Some(p) = foreign_campaign(None) {
@@ -510,6 +435,7 @@ fn run(root: &Path) {
                         Ok(child) => {
                             let pgid = child.id() as i32;
                             log(&format!("started the campaign (group {pgid}, {} → {})", env.get("OUT").map(String::as_str).unwrap_or("?"), cfg.campaign_log));
+                            event(root, "camp_start", None, None);
                             campaign = Some(Job { pgid, paused: false, started_ms: now });
                             children.push(child);
                             note = "running the campaign".into();
@@ -532,17 +458,18 @@ fn run(root: &Path) {
             if last_workers != Some(w) {
                 let _ = fs::write(root.join(cf), format!("{{\"workers\": {w}}}\n"));
                 log(&format!("GA workers: {w} ({mem:.1} GB free)"));
+                event(root, "workers", Some(w as f64), None);
                 last_workers = Some(w);
             }
         }
         if campaign.is_none() { last_workers = None; }
 
         let devices: Vec<(String, u64)> = act.devices.lock().unwrap().values().cloned().collect();
-        write_status(root, &Status {
+        Status {
             in_use, since_ms: since, last_input_ms: last_input, last_device: act.last_dev.lock().unwrap().clone(),
             sound_playing: sound, mem_free_gb: mem, workers, render: render.clone(), campaign: campaign.clone(),
             note: note.clone(), devices, updated_ms: now,
-        });
+        }.write(root);
         std::thread::sleep(Duration::from_secs(5));
     }
 }
@@ -554,11 +481,12 @@ fn ago(ms: u64) -> String {
 }
 
 fn show_status(root: &Path) {
-    let s = read_status(root);
-    if s.updated_ms == 0 { println!("nnfractals-idle has not run yet (no {STATUS})"); return; }
+    let s = Status::read(root);
+    if s.updated_ms == 0 { println!("nnfractals-idle has not run yet (no {})", idle::STATUS); return; }
     let stale = now_ms().saturating_sub(s.updated_ms) > 30_000;
     println!("{}{}", if s.in_use { "computer in use" } else { "computer NOT in use" }, if stale { "  (status is old: is the service running?)" } else { "" });
-    println!("  since {}, last input {} ({}){}", ago(s.since_ms), ago(s.last_input_ms), s.last_device, if s.sound_playing { ", sound playing" } else { "" });
+    let input = if s.last_device.is_empty() { format!("no input since the manager started ({})", ago(s.last_input_ms)) } else { format!("last input {} ({})", ago(s.last_input_ms), s.last_device) };
+    println!("  since {}, {input}{}", ago(s.since_ms), if s.sound_playing { ", sound playing" } else { "" });
     println!("  {}", s.note);
     for (j, what) in [(&s.render, "render"), (&s.campaign, "campaign")] {
         if let Some(j) = j { println!("  {what}: group {}, started {}{}", j.pgid, ago(j.started_ms), if j.paused { ", PAUSED" } else { ", running" }); }
@@ -574,8 +502,12 @@ fn main() {
     match std::env::args().nth(1).as_deref() {
         None | Some("run") => run(&root),
         Some("status") => show_status(&root),
+        Some("stats") => {
+            let hours: f64 = std::env::args().nth(2).and_then(|h| h.parse().ok()).unwrap_or(24.0);
+            print!("{}", idle::stats_text(&idle::stats(&root, hours)));
+        }
         Some(o) => {
-            eprintln!("nnfractals-idle [run|status]: unknown {o}");
+            eprintln!("nnfractals-idle [run|status|stats [hours]]: unknown {o}");
             std::process::exit(2);
         }
     }
@@ -584,6 +516,7 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use nnfractals::idle::CONFIG_HEADER;
 
     #[test]
     fn workers_follow_memory_and_the_cap() {
@@ -622,10 +555,10 @@ mod tests {
         // A child in a group of its own, paused and resumed like a render.
         let mut child = Command::new("sleep").arg("30").process_group(0).spawn().unwrap();
         let mut job = Job { pgid: child.id() as i32, paused: false, started_ms: 0 };
-        pause(&mut job, "test", "test");
+        pause(Path::new("."), &mut job, "test", "test");
         std::thread::sleep(Duration::from_millis(200));
         assert_eq!(proc_stat(job.pgid).unwrap().3, 'T');
-        resume(&mut job, "test");
+        resume(Path::new("."), &mut job, "test");
         std::thread::sleep(Duration::from_millis(200));
         assert_ne!(proc_stat(job.pgid).unwrap().3, 'T');
         assert_eq!(group_members(job.pgid), vec![job.pgid]);
