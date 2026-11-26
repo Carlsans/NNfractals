@@ -144,3 +144,4 @@ quat_boundedness_report.txt
 overnight_sweep.*
 plotter.toml
 youtube.toml
+idle_manager.toml

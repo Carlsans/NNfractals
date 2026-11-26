@@ -33,6 +33,10 @@ path = "src/bin/launcher.rs"
 required-features = ["launcher"]
 
 [[bin]]
+name = "nnfractals-idle"
+path = "src/bin/idle_manager.rs"
+
+[[bin]]
 name = "nnfractals-queue"
 path = "src/bin/queue.rs"
 required-features = ["queue", "wgpu-backend"]

@@ -1,0 +1,15 @@
+[Unit]
+Description=NNfractals idle manager: the render queue, then the GA campaign, while the computer is not in use
+Documentation=file://%h/rust_projects/NNfractals/src/bin/idle_manager.rs
+
+[Service]
+ExecStart=%h/rust_projects/NNfractals/target/release/nnfractals-idle run
+WorkingDirectory=%h/rust_projects/NNfractals
+# Its renders and campaign live in their own process groups and outlive a restart of the
+# manager, which takes them back from explorer_out/idle_manager_status.json.
+KillMode=process
+Restart=on-failure
+RestartSec=30
+
+[Install]
+WantedBy=default.target

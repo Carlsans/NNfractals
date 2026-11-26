@@ -63,17 +63,22 @@ def run_with_watchdog(cmd, log_path, grace=60, limit=RUN_LIMIT):
     after `limit` s (RUN_LIMIT; slower terms such as orgcx need more: 6 of 22 runs
     of the first orgcx campaign hit 2400 s and saved nothing)."""
     proc = subprocess.Popen(cmd, stdout=open(log_path, 'w'), stderr=subprocess.STDOUT)
-    start, done_at = time.time(), None
+    # Running time, not wall time: nnfractals-idle pauses the whole campaign (SIGSTOP) while
+    # the computer is in use, and hours spent paused must not count against the limit.
+    ran, done_ran, last = 0.0, None, time.time()
     while proc.poll() is None:
         time.sleep(5)
-        if done_at is None:
+        now = time.time()
+        ran += min(now - last, 30.0)
+        last = now
+        if done_ran is None:
             try:
                 if 'wrote contact sheet' in open(log_path, errors='replace').read()[-400:]:
-                    done_at = time.time()
+                    done_ran = ran
             except OSError:
                 pass
-        if (done_at and time.time() - done_at > grace) or time.time() - start > limit:
-            print(f'WATCHDOG killing hung run (pid {proc.pid}, {"after save" if done_at else "time limit"})', flush=True)
+        if (done_ran is not None and ran - done_ran > grace) or ran > limit:
+            print(f'WATCHDOG killing hung run (pid {proc.pid}, {"after save" if done_ran is not None else "time limit"})', flush=True)
             proc.kill()
             proc.wait()
 
