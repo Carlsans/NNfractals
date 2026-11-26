@@ -4041,16 +4041,25 @@ struct AnatFam {
 #[allow(clippy::too_many_arguments)]
 fn anat_trace(kind: AnatKind, g: &[f32], w: usize, h: usize, cell: f64, org: (f64, f64), levels: usize, gap: f64, min_len: f64,
               extra: &(dyn Fn(usize, usize) -> bool + Sync)) -> Vec<nnfractals::plot_paths::Polyline> {
+    anat_trace_keyed(kind, g, w, h, cell, org, levels, gap, min_len, extra).into_iter().map(|(_, l)| l).collect()
+}
+
+/// [`anat_trace`] with each line's count (contours: level / stride, so neighbouring lines
+/// alternate its parity; region outlines: their order), which a pen mix alternates on.
+#[allow(clippy::too_many_arguments)]
+fn anat_trace_keyed(kind: AnatKind, g: &[f32], w: usize, h: usize, cell: f64, org: (f64, f64), levels: usize, gap: f64, min_len: f64,
+                    extra: &(dyn Fn(usize, usize) -> bool + Sync)) -> Vec<(usize, nnfractals::plot_paths::Polyline)> {
     use nnfractals::plot_paths as pp;
     use rayon::prelude::*;
+    let keyed = |v: Vec<(usize, usize, pp::Polyline)>| -> Vec<(usize, pp::Polyline)> { v.into_iter().map(|(i, st, l)| (i / st.max(1), l)).collect() };
     match kind {
-        AnatKind::Smooth => pp::contour_family(g, w, h, cell, org, levels, gap, min_len, &|_, x, y| extra(x, y)).into_iter().map(|(_, l)| l).collect(),
+        AnatKind::Smooth => keyed(pp::contour_family_strided(g, w, h, cell, org, levels, gap, min_len, &|_, x, y| extra(x, y))),
         AnatKind::Angle => {
             let mask = |_: usize, x: usize, y: usize| {
                 let c = [g[y * w + x], g[y * w + x + 1], g[(y + 1) * w + x + 1], g[(y + 1) * w + x]];
                 c.iter().cloned().fold(f32::MIN, f32::max) - c.iter().cloned().fold(f32::MAX, f32::min) < 0.5 && extra(x, y)
             };
-            pp::contour_family(g, w, h, cell, org, levels / 2, gap, min_len, &mask).into_iter().map(|(_, l)| l).collect()
+            keyed(pp::contour_family_strided(g, w, h, cell, org, levels / 2, gap, min_len, &mask))
         }
         AnatKind::Discrete => {
             let mut vals: Vec<i64> = g.iter().filter(|x| x.is_finite()).map(|&x| x as i64).collect();
@@ -4064,9 +4073,56 @@ fn anat_trace(kind: AnatKind, g: &[f32], w: usize, h: usize, cell: f64, org: (f6
                 i == lv.partition_point(|&l| l <= lo) && extra(x, y)
             };
             pp::contour_levels(g, w, h, &lv, &keep).into_iter().flatten()
-                .map(|l| pp::grid_to_mm(l, cell, org)).filter(|l| l.length() >= min_len).collect()
+                .map(|l| pp::grid_to_mm(l, cell, org)).filter(|l| l.length() >= min_len).enumerate().collect()
         }
     }
+}
+
+/// How `quat-anatomy`'s families get their pens (--pens, --color-seed).
+#[derive(Clone, Copy)]
+struct PenOpts {
+    /// gcodefractal's pen mixes, else one fill pen per family.
+    mix: bool,
+    seed: u64,
+}
+
+/// Pens for the families' lines `(family, key, line)`, in place (the key, a line's count
+/// within its family, is replaced by its pen). In each region (outside, inside, whole) the
+/// families, longest first, take turns: on the fill pens (lightblue, purple, red, green,
+/// pink), or with `mix` on gcodefractal's pens and mixes (pp::carl_pen_mixes, shares by
+/// its distribution factors, pp::pick_mix from the colour seed), a mix's pens alternating
+/// line by line. Partition lines (family usize::MAX) and the set's outline stay darkblue.
+/// Returns each family's pen or mix.
+fn anat_assign_pens(fams: &[AnatFam], lines: &mut [(usize, usize, nnfractals::plot_paths::Polyline)], o: PenOpts) -> std::collections::HashMap<usize, Vec<usize>> {
+    use nnfractals::plot_paths as pp;
+    const FILL_PENS: [usize; 5] = [2, 4, 3, 1, 0]; // lightblue, purple, red, green, pink
+    let mixes = pp::carl_pen_mixes();
+    let mut len_of: std::collections::HashMap<usize, f64> = std::collections::HashMap::new();
+    for (k, _, l) in lines.iter() {
+        if *k != usize::MAX { *len_of.entry(*k).or_insert(0.0) += l.length(); }
+    }
+    let mut mix_of: std::collections::HashMap<usize, Vec<usize>> = std::collections::HashMap::new();
+    for (ri, reg) in [AnatReg::Out, AnatReg::In, AnatReg::All].into_iter().enumerate() {
+        let mut ranked: Vec<(f64, usize)> = len_of.iter().filter(|(k, _)| fams[**k].reg == reg && fams[**k].name != "outline").map(|(k, l)| (*l, *k)).collect();
+        ranked.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)));
+        for (rank, &(_, k)) in ranked.iter().enumerate() {
+            let mix = if o.mix { mixes[pp::pick_mix(&mixes, rank, o.seed.wrapping_add(ri as u64))].pens.clone() } else { vec![FILL_PENS[rank % FILL_PENS.len()]] };
+            mix_of.insert(k, mix);
+        }
+    }
+    for x in lines.iter_mut() {
+        x.1 = match mix_of.get(&x.0) { Some(m) => pp::mix_pen(m, x.1), None => 5 };
+    }
+    mix_of
+}
+
+/// A seed from the system's randomness (Carl: a fresh seed every run unless reproducing one).
+fn fresh_seed() -> u64 {
+    let mut b = [0u8; 8];
+    if std::fs::File::open("/dev/urandom").and_then(|mut f| std::io::Read::read_exact(&mut f, &mut b)).is_err() {
+        return std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(1);
+    }
+    u64::from_le_bytes(b) % 1_000_000_000
 }
 
 /// Settings of [`anatomy_mosaic_streamed`] (the `quat-anatomy` mosaic flags).
@@ -4091,6 +4147,12 @@ struct MosaicOpts {
     /// coordinate), displaced by up to this many band widths by the tile's family.
     /// 0: each tile draws its family's own contours.
     follow: f64,
+    pens: PenOpts,
+    /// The levels and gap of the scoring pass, which only compares how much each family
+    /// draws in each patch: those of ink 1, whatever --ink draws (5x the lines to trace
+    /// at ink 4.5 for the same ranking).
+    score_levels: usize,
+    score_gap: f64,
     /// Score and place only every n-th family (1 = all): the quick preview.
     sample: usize,
 }
@@ -4141,7 +4203,7 @@ fn anat_need(fams: &[AnatFam], ks: &[usize]) -> nnfractals::quat_dag::FeatureNee
 #[allow(clippy::too_many_arguments)]
 fn anatomy_mosaic_streamed(fams: &[AnatFam], active: &[usize], params: &nnfractals::quat_dag::RaymarchDagParams,
                            point_mm: &(dyn Fn(f64, f64) -> (f64, f64, f64) + Sync), aw: f64, ah: f64, cell: f64, org: (f64, f64), o: &MosaicOpts)
-                           -> (Vec<(usize, usize, nnfractals::plot_paths::Polyline)>, usize, f64, String) {
+                           -> (Vec<(usize, usize, nnfractals::plot_paths::Polyline)>, usize, f64, String, std::collections::HashMap<usize, Vec<usize>>) {
     use nnfractals::plot_paths as pp;
     use nnfractals::quat_dag::{orbit_feature as of, orbit_features_at_need};
     use rayon::prelude::*;
@@ -4309,7 +4371,7 @@ fn anatomy_mosaic_streamed(fams: &[AnatFam], active: &[usize], params: &nnfracta
                         raw.iter().map(|&x| if x.is_finite() { x.round() } else { f32::NAN }).collect()
                     }
                 };
-                let lines = anat_trace(fams[k].kind, &g, ws, hs, cs, (0.0, 0.0), o.levels, o.gap, o.min_len, &|_, _| true);
+                let lines = anat_trace(fams[k].kind, &g, ws, hs, cs, (0.0, 0.0), o.score_levels, o.score_gap, o.min_len, &|_, _| true);
                 let mut sum = vec![0.0f32; np];
                 for l in &lines {
                     for sg in l.pts.windows(2) {
@@ -4472,44 +4534,36 @@ fn anatomy_mosaic_streamed(fams: &[AnatFam], active: &[usize], params: &nnfracta
         (a != NONE16).then_some(a as usize)
     };
     let mut lines: Vec<(usize, usize, pp::Polyline)> = Vec::new();
-    let push = |ls: Vec<pp::Polyline>, lines: &mut Vec<(usize, usize, pp::Polyline)>| {
-        for l in ls { if let Some(j) = owner_of(&l) { lines.push((cands[j], 0, l)); } }
+    // (family, the line's count for pen mixes, line): the count becomes the pen below.
+    let push = |ls: Vec<(usize, pp::Polyline)>, lines: &mut Vec<(usize, usize, pp::Polyline)>| {
+        for (key, l) in ls { if let Some(j) = owner_of(&l) { lines.push((cands[j], key, l)); } }
     };
+    let keyed = |v: Vec<(usize, usize, pp::Polyline)>| -> Vec<(usize, pp::Polyline)> { v.into_iter().map(|(i, st, l)| (i / st.max(1), l)).collect() };
     let t4 = std::time::Instant::now();
     if follow > 0.0 {
-        let all = pp::contour_family(&field, w, h, cell, org, o.levels, o.gap, o.min_len, &|_, x, y| same_fam(x, y).is_some());
-        push(all.into_iter().map(|(_, l)| l).collect(), &mut lines);
+        let all = pp::contour_family_strided(&field, w, h, cell, org, o.levels, o.gap, o.min_len, &|_, x, y| same_fam(x, y).is_some());
+        push(keyed(all), &mut lines);
     } else {
-        let smooth = pp::contour_family(&field, w, h, cell, org, o.levels, o.gap, o.min_len, &|_, x, y| same(x, y, AnatKind::Smooth));
-        push(smooth.into_iter().map(|(_, l)| l).collect(), &mut lines);
+        let smooth = pp::contour_family_strided(&field, w, h, cell, org, o.levels, o.gap, o.min_len, &|_, x, y| same(x, y, AnatKind::Smooth));
+        push(keyed(smooth), &mut lines);
         let seam_ok = |x: usize, y: usize| {
             let c = [field[y * w + x], field[y * w + x + 1], field[(y + 1) * w + x + 1], field[(y + 1) * w + x]];
             c.iter().cloned().fold(f32::MIN, f32::max) - c.iter().cloned().fold(f32::MAX, f32::min) < 0.5
         };
-        let angle = pp::contour_family(&field, w, h, cell, org, o.levels / 2, o.gap, o.min_len, &|_, x, y| same(x, y, AnatKind::Angle) && seam_ok(x, y));
-        push(angle.into_iter().map(|(_, l)| l).collect(), &mut lines);
+        let angle = pp::contour_family_strided(&field, w, h, cell, org, o.levels / 2, o.gap, o.min_len, &|_, x, y| same(x, y, AnatKind::Angle) && seam_ok(x, y));
+        push(keyed(angle), &mut lines);
         let disc_field: Vec<f32> = field.iter().zip(&fam_at).map(|(&v, &a)| if a != NONE16 && kind_of[a as usize] == AnatKind::Discrete { v } else { f32::NAN }).collect();
-        let discrete = anat_trace(AnatKind::Discrete, &disc_field, w, h, cell, org, o.levels, o.gap, o.min_len, &|x, y| same(x, y, AnatKind::Discrete));
+        let discrete = anat_trace_keyed(AnatKind::Discrete, &disc_field, w, h, cell, org, o.levels, o.gap, o.min_len, &|x, y| same(x, y, AnatKind::Discrete));
         push(discrete, &mut lines);
     }
     eprintln!("  traced {} lines in {:.0}s; {}", lines.len(), t4.elapsed().as_secs_f64(), rss_note());
-    // Pens follow the layers: in each region the families, longest first, take
-    // different pens (darkblue stays for the partition lines).
-    const FILL_PENS: [usize; 5] = [2, 4, 3, 1, 0]; // lightblue, purple, red, green, pink
-    let mut len_of: std::collections::HashMap<usize, f64> = std::collections::HashMap::new();
-    for (k, _, l) in &lines { *len_of.entry(*k).or_insert(0.0) += l.length(); }
-    let mut pen_of: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
-    for reg in [AnatReg::Out, AnatReg::In] {
-        let mut ranked: Vec<(f64, usize)> = len_of.iter().filter(|(k, _)| fams[**k].reg == reg).map(|(k, l)| (*l, *k)).collect();
-        ranked.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)));
-        for (rank, &(_, k)) in ranked.iter().enumerate() { pen_of.insert(k, FILL_PENS[rank % FILL_PENS.len()]); }
-    }
-    for x in lines.iter_mut() { x.1 = pen_of[&x.0]; }
+    // Pens follow the layers (darkblue stays for the partition lines).
+    let mix_of = anat_assign_pens(fams, &mut lines, o.pens);
     for l in anat_trace(AnatKind::Discrete, &pid, w, h, cell, org, o.levels, o.gap, o.min_len, &|_, _| true) { lines.push((usize::MAX, 5, l)); }
     let how = if follow > 0.0 { format!("lines follow the outline, displaced up to {follow} band widths by each tile's family") } else { "each tile draws its family's own lines".to_string() };
     let note = format!("streamed mosaic: scored {} families at {cs} mm ({ws}x{hs}, {n_blocks} blocks) in {t_score:.0} s, {np} patches, {matched} families matched to a patch of their own, {used} used; drawn at {cell} mm ({w}x{h}), {how}; {:.0} s",
                        cands.len(), t_all.elapsed().as_secs_f64());
-    (lines, used, inside, note)
+    (lines, used, inside, note, mix_of)
 }
 
 /// Every layer `quat-anatomy` knows (551): what an orbit says about its starting
@@ -4664,9 +4718,20 @@ fn cmd_quat_anatomy(args: &[String]) {
     let compose_early = get_flag(args, "--compose").unwrap_or("overlay");
     let cell: f64 = get_flag_or(args, "--cell", match (&preview, compose_early) { (None, _) => 0.35, (Some(_), "plate") => 0.8, (Some(_), _) => 1.0 });
     let pen: f64 = get_flag_or(args, "--pen", 0.4);
-    let gap: f64 = get_flag_or(args, "--gap", 0.8);
+    // --ink X: X times the ink of the 0.8 mm gap (plotter.toml ink_density, 4.5: Carl found
+    // 0.8 mm pale, 2026-11-26), by a closer gap and X-fold finer levels, so the gap and not
+    // the level count sets the density. --gap overrides; --levels is the count at ink 1.
+    let ink: f64 = get_flag_or(args, "--ink", plotter_settings().ink_density).clamp(0.25, 16.0);
+    let gap: f64 = get_flag_or(args, "--gap", 0.8 / ink);
     let min_len: f64 = get_flag_or(args, "--min-len", 1.5);
-    let levels: usize = get_flag_or(args, "--levels", 256);
+    let base_levels: usize = get_flag_or(args, "--levels", 256usize);
+    let levels: usize = base_levels * (ink.ceil().max(1.0) as usize).next_power_of_two();
+    // --pens mix (default): gcodefractal's pens and two-pen mixes, lines alternating;
+    // --pens single: one pen per family. --color-seed N reproduces an assignment.
+    let pens = PenOpts {
+        mix: get_flag(args, "--pens").unwrap_or("mix") != "single",
+        seed: get_flag(args, "--color-seed").and_then(|v| v.parse().ok()).unwrap_or_else(fresh_seed),
+    };
     let max_iter: u32 = get_flag_or(args, "--max-iter", 150);
     let phase: f64 = get_flag_or(args, "--phase", 0.5);
     let tol: f64 = get_flag_or(args, "--tol", pen / 4.0);
@@ -4792,6 +4857,9 @@ fn cmd_quat_anatomy(args: &[String]) {
             sample: get_flag_or(args, "--sample-families", if preview.is_some() { 6usize } else { 1 }).max(1),
             match_top: get_flag_or(args, "--match-top", 256usize),
             follow: get_flag_or(args, "--follow", 0.5),
+            pens,
+            score_levels: base_levels,
+            score_gap: gap * ink,
         };
         let r = anatomy_mosaic_streamed(&fams, &active, &params, &point_mm, aw, ah, cell, origin, &o);
         inside = r.2;
@@ -4824,11 +4892,10 @@ fn cmd_quat_anatomy(args: &[String]) {
         }
     };
     type CellPred<'a> = &'a (dyn Fn(usize, usize) -> bool + Sync);
-    let lines_of = |kind: AnatKind, g: &[f32], org: (f64, f64), extra: CellPred| -> Vec<pp::Polyline> {
-        anat_trace(kind, g, w, h, cell, org, levels, gap, min_len, extra)
+    let lines_of = |kind: AnatKind, g: &[f32], org: (f64, f64), extra: CellPred| -> Vec<(usize, pp::Polyline)> {
+        anat_trace_keyed(kind, g, w, h, cell, org, levels, gap, min_len, extra)
     };
     let all_cells = |_: usize, _: usize| true;
-    let pen_of = |k: usize| if fams[k].name == "outline" { 5 } else { k % 6 };
 
     // Mosaic: the fractal subdivides itself and every patch shows one family.
     let mosaic = |org: (f64, f64)| -> (Vec<(usize, usize, pp::Polyline)>, usize) {
@@ -4960,21 +5027,12 @@ fn cmd_quat_anatomy(args: &[String]) {
             let id = j as u16;
             let fam_at = &fam_at;
             let in_patch = move |x: usize, y: usize| fam_at[y * w + x] == id && fam_at[y * w + x + 1] == id && fam_at[(y + 1) * w + x + 1] == id && fam_at[(y + 1) * w + x] == id;
-            for l in lines_of(fams[cands[j]].kind, &g, org, &in_patch) { out.push((cands[j], 0, l)); }
+            for (key, l) in lines_of(fams[cands[j]].kind, &g, org, &in_patch) { out.push((cands[j], key, l)); }
         }
-        // Pens follow the layers: in each region the families, longest first, take
-        // different pens (darkblue stays for the partition lines).
-        const FILL_PENS: [usize; 5] = [2, 4, 3, 1, 0]; // lightblue, purple, red, green, pink
-        for reg in [AnatReg::Out, AnatReg::In] {
-            let mut len: Vec<(f64, usize)> = used.iter().map(|&j| cands[j]).filter(|&k| fams[k].reg == reg)
-                .map(|k| (out.iter().filter(|x| x.0 == k).map(|x| x.2.length()).sum::<f64>(), k)).collect();
-            len.sort_by(|a, b| b.0.total_cmp(&a.0));
-            for (rank, &(_, k)) in len.iter().enumerate() {
-                for x in out.iter_mut().filter(|x| x.0 == k) { x.1 = FILL_PENS[rank % FILL_PENS.len()]; }
-            }
-        }
+        // Pens follow the layers (darkblue stays for the partition lines).
+        anat_assign_pens(&fams, &mut out, pens);
         let class: Vec<f32> = key_idx.iter().map(|&p| p as f32).collect();
-        for l in lines_of(AnatKind::Discrete, &class, org, &all_cells) { out.push((usize::MAX, 5, l)); }
+        for (_, l) in lines_of(AnatKind::Discrete, &class, org, &all_cells) { out.push((usize::MAX, 5, l)); }
         (out, used.len())
     };
 
@@ -4988,30 +5046,46 @@ fn cmd_quat_anatomy(args: &[String]) {
     let sheet = pp::Sheet { w: paper_w, h: paper_h, pen };
     let hex = |c: (u8, u8, u8)| format!("#{:02x}{:02x}{:02x}", c.0, c.1, c.2);
     let mut by_pen: Vec<Vec<pp::Polyline>> = vec![Vec::new(); 6];
-    let mut summary = format!("NNfractals quat-anatomy ({compose}): {stem_full}.nn\nslice {} tilt {}/{} spin {} offset {} zoom {} pan {pan_x},{pan_y}, T phase {phase} (time {:.4}), max_iter {max_iter}\n{w}x{h} samples at {cell} mm, paper {paper_w}x{paper_h} mm, {:.1}% inside; per family: {levels} levels, gap {gap} mm, min length {min_len} mm\n",
-        base.label(), spec.tilt_right, spec.tilt_up, spec.spin, spec.offset, spec.zoom, params.time_val, 100.0 * inside);
-    let report = |label: &str, pen_i: usize, what: &str, lines: &[pp::Polyline], summary: &mut String| {
-        let len_m: f64 = lines.iter().map(|l| l.length()).sum::<f64>() / 1000.0;
-        let line = format!("{label:30} {:9} {:7} pieces {:7.1} m  ({what})", CARL_PENS[pen_i].0, lines.len(), len_m);
+    let mut summary = format!("NNfractals quat-anatomy ({compose}): {stem_full}.nn\nslice {} tilt {}/{} spin {} offset {} zoom {} pan {pan_x},{pan_y}, T phase {phase} (time {:.4}), max_iter {max_iter}\n{w}x{h} samples at {cell} mm, paper {paper_w}x{paper_h} mm, {:.1}% inside; per family: {levels} levels, gap {gap:.3} mm, min length {min_len} mm\nink x{ink} (lines at least {gap:.3} mm apart); pens: {}\n",
+        base.label(), spec.tilt_right, spec.tilt_up, spec.spin, spec.offset, spec.zoom, params.time_val, 100.0 * inside,
+        if pens.mix { format!("gcodefractal's pens and mixes, a mix's pens alternating line by line, colour seed {} (--color-seed)", pens.seed) } else { "one per family".to_string() });
+    // A family's line in the summary: its pen or mix, pieces, metres.
+    let report = |label: &str, pens_name: &str, what: &str, lines: &[(usize, pp::Polyline)], summary: &mut String| {
+        let len_m: f64 = lines.iter().map(|l| l.1.length()).sum::<f64>() / 1000.0;
+        let line = format!("{label:30} {pens_name:15} {:7} pieces {:7.1} m  ({what})", lines.len(), len_m);
         eprintln!("{line}");
         summary.push_str(&line);
         summary.push('\n');
     };
-    let write_layer = |file: &str, name: &str, pen_i: usize, what: &str, lines: &[pp::Polyline]| {
+    // A family's SVG: one layer per pen it uses.
+    let write_layer = |file: &str, name: &str, what: &str, lines: &[(usize, pp::Polyline)]| {
         if lines.is_empty() || preview.is_some() { return; }
-        let paths: Vec<pp::CurvePath> = lines.par_iter().map(|l| pp::fit_polyline(l, tol)).filter(|c| !c.curves.is_empty()).collect();
-        let layer = [pp::Layer { name: name.to_string(), color: hex(CARL_PENS[pen_i].1), paths }];
-        std::fs::write(out.join("layers").join(file), pp::to_svg(&sheet, &layer, &format!("{stem_full}: {name} ({what})"))).expect("write layer svg");
+        let layers: Vec<pp::Layer> = (0..CARL_PENS.len()).filter_map(|pen| {
+            let paths: Vec<pp::CurvePath> = lines.par_iter().filter(|x| x.0 == pen).map(|x| pp::fit_polyline(&x.1, tol)).filter(|c| !c.curves.is_empty()).collect();
+            (!paths.is_empty()).then(|| pp::Layer { name: format!("{name} {}", CARL_PENS[pen].0), color: hex(CARL_PENS[pen].1), paths })
+        }).collect();
+        std::fs::write(out.join("layers").join(file), pp::to_svg(&sheet, &layers, &format!("{stem_full}: {name} ({what})"))).expect("write layer svg");
+    };
+    let mix_label = |mix_of: &std::collections::HashMap<usize, Vec<usize>>, k: usize| if k == usize::MAX { "darkblue".to_string() } else { mix_of.get(&k).map(|m| pp::mix_name(m)).unwrap_or_else(|| "darkblue".into()) };
+    // Every family's lines with their pens: (family, [(pen, line)]) in family order, and each family's pen or mix.
+    type FamLines = Vec<(usize, Vec<(usize, pp::Polyline)>)>;
+    let pens_for = |fl: Vec<(usize, Vec<(usize, pp::Polyline)>)>| -> (FamLines, std::collections::HashMap<usize, Vec<usize>>) {
+        let order: Vec<usize> = fl.iter().map(|x| x.0).collect();
+        let mut flat: Vec<(usize, usize, pp::Polyline)> = fl.into_iter().flat_map(|(k, ls)| ls.into_iter().map(move |(key, l)| (k, key, l))).collect();
+        let mix_of = anat_assign_pens(&fams, &mut flat, pens);
+        let mut per: std::collections::HashMap<usize, Vec<(usize, pp::Polyline)>> = std::collections::HashMap::new();
+        for (k, pen, l) in flat { per.entry(k).or_default().push((pen, l)); }
+        (order.into_iter().map(|k| { let v = per.remove(&k).unwrap_or_default(); (k, v) }).collect(), mix_of)
     };
     // Every family's lines (overlay, plate), keeping the ones that show something
     // here: a contour family drawing under --min-share (15%) of the median contour
     // family is degenerate on this view (e.g. B-C angles where b, c stay ~0);
     // outline families are short by nature and only need a few pieces.
     let min_share: f64 = get_flag_or(args, "--min-share", 0.15);
-    let collect_families = |org: (f64, f64)| -> Vec<(usize, Vec<pp::Polyline>)> {
-        let all: Vec<(usize, Vec<pp::Polyline>, f64)> = active.iter().map(|&k| {
+    let collect_families = |org: (f64, f64)| -> Vec<(usize, Vec<(usize, pp::Polyline)>)> {
+        let all: Vec<(usize, Vec<(usize, pp::Polyline)>, f64)> = active.iter().map(|&k| {
             let lines = lines_of(fams[k].kind, &field(k), org, &all_cells);
-            let len = lines.iter().map(|l| l.length()).sum::<f64>();
+            let len = lines.iter().map(|l| l.1.length()).sum::<f64>();
             (k, lines, len)
         }).collect();
         let mut lens: Vec<f64> = all.iter().filter(|x| fams[x.0].kind != AnatKind::Discrete).map(|x| x.2).collect();
@@ -5028,37 +5102,35 @@ fn cmd_quat_anatomy(args: &[String]) {
     let mut n_min = 0usize;
     match compose.as_str() {
         "overlay" => {
-            for (k, lines) in collect_families(origin) {
-                let len = lines.iter().map(|l| l.length()).sum::<f64>();
+            let (fl, mix_of) = pens_for(collect_families(origin));
+            for (k, lines) in fl {
+                let len = lines.iter().map(|l| l.1.length()).sum::<f64>();
                 if len >= 1000.0 { n_layers += 1; }
                 if len >= 500.0 { n_half += 1; }
-                report(&format!("{:2} {}", k + 1, fams[k].name), pen_of(k), &fams[k].what, &lines, &mut summary);
-                write_layer(&format!("{:02}_{}.svg", k + 1, fams[k].name), &fams[k].name, pen_of(k), &fams[k].what, &lines);
-                by_pen[pen_of(k)].extend(lines);
+                report(&format!("{:2} {}", k + 1, fams[k].name), &mix_label(&mix_of, k), &fams[k].what, &lines, &mut summary);
+                write_layer(&format!("{:02}_{}.svg", k + 1, fams[k].name), &fams[k].name, &fams[k].what, &lines);
+                for (pen, l) in lines { by_pen[pen].push(l); }
             }
         }
         "mosaic" => {
-            let (lines, _, _, note) = streamed_out.take().expect("the mosaic is streamed");
+            let (lines, _, _, note, mix_of) = streamed_out.take().expect("the mosaic is streamed");
             summary.push_str(&note);
             summary.push('\n');
-            let mut per: std::collections::BTreeMap<usize, (usize, Vec<pp::Polyline>)> = std::collections::BTreeMap::new();
-            for (k, pen_i, l) in lines {
-                by_pen[pen_i].push(l.clone());
-                let e = per.entry(k).or_insert((pen_i, Vec::new()));
-                e.1.push(l);
-            }
-            for (k, (pen_i, lines)) in &per {
-                let (label, name, what) = if *k == usize::MAX {
+            let mut per: std::collections::BTreeMap<usize, Vec<(usize, pp::Polyline)>> = std::collections::BTreeMap::new();
+            for (k, pen_i, l) in lines { per.entry(k).or_default().push((pen_i, l)); }
+            for (k, lines) in per {
+                let (label, name, what) = if k == usize::MAX {
                     ("partition".to_string(), "partition".to_string(), "boundaries of the patches".to_string())
                 } else {
-                    (format!("{:2} {}", k + 1, fams[*k].name), fams[*k].name.clone(), fams[*k].what.clone())
+                    (format!("{:2} {}", k + 1, fams[k].name), fams[k].name.clone(), fams[k].what.clone())
                 };
-                report(&label, *pen_i, &what, lines, &mut summary);
-                write_layer(&format!("{:02}_{name}.svg", if *k == usize::MAX { 0 } else { k + 1 }), &name, *pen_i, &what, lines);
-                let len = lines.iter().map(|l| l.length()).sum::<f64>();
-                if *k != usize::MAX && len >= 1000.0 { n_layers += 1; }
-                if *k != usize::MAX && len >= 500.0 { n_half += 1; }
-                if *k != usize::MAX && len >= min_layer_mm { n_min += 1; }
+                report(&label, &mix_label(&mix_of, k), &what, &lines, &mut summary);
+                write_layer(&format!("{:02}_{name}.svg", if k == usize::MAX { 0 } else { k + 1 }), &name, &what, &lines);
+                let len = lines.iter().map(|l| l.1.length()).sum::<f64>();
+                if k != usize::MAX && len >= 1000.0 { n_layers += 1; }
+                if k != usize::MAX && len >= 500.0 { n_half += 1; }
+                if k != usize::MAX && len >= min_layer_mm { n_min += 1; }
+                for (pen, l) in lines { by_pen[pen].push(l); }
             }
         }
         _ => {
@@ -5068,21 +5140,22 @@ fn cmd_quat_anatomy(args: &[String]) {
             let shift = |l: pp::Polyline, o: (f64, f64)| pp::Polyline { closed: l.closed, pts: l.pts.into_iter().map(|(x, y)| (x + o.0, y + o.1)).collect() };
             let n_tiles = cols * rows;
             let mut t = 0;
-            for (k, lines) in collect_families((0.0, 0.0)) {
+            let (fl, mix_of) = pens_for(collect_families((0.0, 0.0)));
+            for (k, lines) in fl {
                 if t + 1 >= n_tiles { break; }
-                let lines: Vec<pp::Polyline> = lines.into_iter().map(|l| shift(l, tile_origin(t))).collect();
-                report(&format!("tile {:2} {}", t + 1, fams[k].name), pen_of(k), &fams[k].what, &lines, &mut summary);
-                let len = lines.iter().map(|l| l.length()).sum::<f64>();
+                let lines: Vec<(usize, pp::Polyline)> = lines.into_iter().map(|(pen, l)| (pen, shift(l, tile_origin(t)))).collect();
+                report(&format!("tile {:2} {}", t + 1, fams[k].name), &mix_label(&mix_of, k), &fams[k].what, &lines, &mut summary);
+                let len = lines.iter().map(|l| l.1.length()).sum::<f64>();
                 if len >= 1000.0 { n_layers += 1; }
                 if len >= 500.0 { n_half += 1; }
-                by_pen[pen_of(k)].extend(lines);
+                for (pen, l) in lines { by_pen[pen].push(l); }
                 t += 1;
             }
             if t < n_tiles {
                 let (m, used) = mosaic(tile_origin(t));
-                let ls: Vec<pp::Polyline> = m.iter().map(|x| x.2.clone()).collect();
-                report(&format!("tile {:2} mosaic", t + 1), 5, &format!("{used} families in their own patches"), &ls, &mut summary);
-                for (_, pen_i, l) in m { by_pen[pen_i].push(l); }
+                let ls: Vec<(usize, pp::Polyline)> = m.into_iter().map(|x| (x.1, x.2)).collect();
+                report(&format!("tile {:2} mosaic", t + 1), "mixed", &format!("{used} families in their own patches"), &ls, &mut summary);
+                for (pen, l) in ls { by_pen[pen].push(l); }
             }
         }
     }
@@ -5169,7 +5242,14 @@ fn cmd_plot_thumbs(args: &[String]) {
         let mut a: Vec<String> = vec!["explorer".into(), "quat-anatomy".into(), "--genome".into(), nn.display().to_string(),
             "--preview".into(), tmp.display().to_string(), "--preview-px".into(), opt("--px", "320"),
             "--plane".into(), opt("--plane", "XY"), "--zoom".into(), opt("--zoom", "0.6"), "--cell".into(), opt("--cell", "2"),
-            "--compose".into(), compose.clone()];
+            "--compose".into(), compose.clone(),
+            // The same colours every time a genome's thumbnail is made (from its file name).
+            "--color-seed".into(), {
+                use std::hash::{Hash, Hasher};
+                let mut h = std::collections::hash_map::DefaultHasher::new();
+                nn.file_stem().hash(&mut h);
+                (h.finish() % 1_000_000_000).to_string()
+            }];
         if compose == "mosaic" {
             a.extend(["--bands", "64", "--sectors", "48", "--inner-bands", "56", "--inner-sectors", "56", "--levels", "2048",
                       "--min-layer-m", "0.05", "--min-fill", "0.03"].map(String::from));
@@ -5248,7 +5328,13 @@ struct PlotterSettings {
     xy_max_feed: f64,
     #[serde(default = "default_xy_max_accel")]
     xy_max_accel: f64,
+    /// quat-anatomy's ink: times the ink of lines 0.8 mm apart (--ink overrides). Carl
+    /// found 0.8 mm pale and asked for 4 to 5 times the ink (2026-11-26).
+    #[serde(default = "default_ink_density")]
+    ink_density: f64,
 }
+
+fn default_ink_density() -> f64 { 4.5 }
 
 fn default_draw_feed() -> f64 { 1800.0 }
 fn default_travel_feed() -> f64 { 3000.0 }
@@ -5265,7 +5351,8 @@ fn plotter_settings() -> PlotterSettings {
         return s;
     }
     let s = PlotterSettings { ink_g_per_m: 0.0, pen_capacity_g: 0.4, refill_g: 0.3, z_feed: default_z_feed(), z_max_feed: default_z_max_feed(), z_max_accel: default_z_max_accel(),
-        draw_feed: default_draw_feed(), travel_feed: default_travel_feed(), xy_max_feed: default_xy_max_feed(), xy_max_accel: default_xy_max_accel() };
+        draw_feed: default_draw_feed(), travel_feed: default_travel_feed(), xy_max_feed: default_xy_max_feed(), xy_max_accel: default_xy_max_accel(),
+        ink_density: default_ink_density() };
     let text = [
         "# Carl's pen plotter: the felt pens' ink, for the G-code's ink totals, refill pauses",
         "# and LCD progress (explorer quat-anatomy / quat-slice-plot / quat-surface-plot).",
@@ -5277,6 +5364,8 @@ fn plotter_settings() -> PlotterSettings {
         "# with M203 / M201 at the start of every plot (--machine carl).",
         "# draw_feed / travel_feed: drawing and travel speeds (mm/min); xy_max_feed (mm/s) and",
         "# xy_max_accel (mm/s^2) are set with M203 / M201 / M204 at the start of every plot.",
+        "# ink_density: quat-anatomy draws this many times the ink of lines 0.8 mm apart",
+        "# (4.5: lines about 0.18 mm apart); --ink overrides it per plot.",
         "",
     ].join("\n") + &toml::to_string(&s).unwrap_or_default();
     let _ = std::fs::write(&path, text);

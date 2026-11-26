@@ -283,6 +283,15 @@ pub fn cell_slope(a: f64, b: f64, c: f64, d: f64) -> f64 {
 #[allow(clippy::too_many_arguments)]
 pub fn contour_family(g: &[f32], w: usize, h: usize, cell: f64, origin: P2, levels: usize, min_gap: f64, min_len: f64,
                       mask: &(dyn Fn(usize, usize, usize) -> bool + Sync)) -> Vec<(usize, Polyline)> {
+    contour_family_strided(g, w, h, cell, origin, levels, min_gap, min_len, mask).into_iter().map(|(i, _, l)| (i, l)).collect()
+}
+
+/// [`contour_family`] with, per line, the stride of the cell it starts in: there only the
+/// multiples of that stride are drawn, so `level / stride` counts the lines one by one and
+/// neighbouring lines alternate its parity ([`mix_pen`] uses it to alternate pens).
+#[allow(clippy::too_many_arguments)]
+pub fn contour_family_strided(g: &[f32], w: usize, h: usize, cell: f64, origin: P2, levels: usize, min_gap: f64, min_len: f64,
+                              mask: &(dyn Fn(usize, usize, usize) -> bool + Sync)) -> Vec<(usize, usize, Polyline)> {
     let n = levels.max(2);
     let delta = 1.0 / n as f64;
     let values: Vec<f32> = (1..n).map(|i| (i as f64 * delta) as f32).collect();
@@ -304,13 +313,24 @@ pub fn contour_family(g: &[f32], w: usize, h: usize, cell: f64, origin: P2, leve
         }
         s
     };
+    // The cell a line (grid coordinates) starts in: the middle of its first segment.
+    let first_cell = |l: &Polyline| -> (usize, usize) {
+        let (p0, p1) = (l.pts[0], *l.pts.get(1).unwrap_or(&l.pts[0]));
+        let fx = (0.5 * (p0.0 + p1.0)).floor().max(0.0) as usize;
+        let fy = (0.5 * (p0.1 + p1.1)).floor().max(0.0) as usize;
+        (fx.min(w.saturating_sub(2)), fy.min(h.saturating_sub(2)))
+    };
     let keep = |k: usize, x: usize, y: usize| mask(k + 1, x, y);
     contour_levels_strided(g, w, h, &values, &stride, &keep)
         .into_iter()
         .enumerate()
         .flat_map(|(k, ls)| ls.into_iter().map(move |l| (k + 1, l)))
-        .map(|(i, l)| (i, grid_to_mm(l, cell, origin)))
-        .filter(|(_, l)| l.length() >= min_len)
+        .filter(|(_, l)| !l.pts.is_empty())
+        .map(|(i, l)| {
+            let (x, y) = first_cell(&l);
+            (i, stride(x, y), grid_to_mm(l, cell, origin))
+        })
+        .filter(|(_, _, l)| l.length() >= min_len)
         .collect()
 }
 
@@ -1113,6 +1133,82 @@ pub const CARL_PENS: [(&str, (u8, u8, u8)); 6] = [
     ("red", (159, 59, 61)), ("purple", (57, 32, 97)), ("darkblue", (50, 48, 117)),
 ];
 
+/// gcodefractal's pen-mixing rules (github.com/Carlsans/gcodefractal, ColorInterpreter.py
+/// and Configuration.py), indexed like [`CARL_PENS`]. A pen's saturation constraint is the
+/// most pens a mix containing it may have (darkblue never mixes; no mix of three passes:
+/// pink and lightblue allow 3 but every third pen allows 2 or 1).
+pub const CARL_PEN_SATURATION: [usize; 6] = [3, 2, 3, 2, 2, 1];
+/// gcodefractal's distribution factors: a mix's share of the colours is the mean of its pens'.
+pub const CARL_PEN_DISTRIBUTION: [f64; 6] = [0.9622950358343828, 0.12633089865085956, 0.2267058593810488, 0.08518526805075266, 0.7048169228716079, 0.24744098492908506];
+/// Pairs gcodefractal never mixes: green+pink, green+red, lightblue+red, green+purple,
+/// darkblue+purple, red+purple, lightblue+purple.
+pub const CARL_PEN_INCOMPATIBLE: [(usize, usize); 7] = [(1, 0), (1, 3), (2, 3), (1, 4), (5, 4), (3, 4), (2, 4)];
+
+/// One colour a plot can draw: a single pen, or pens whose lines alternate.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PenMix {
+    pub pens: Vec<usize>,
+    /// Relative share of the families drawn in it.
+    pub share: f64,
+}
+
+/// Every pen or mix gcodefractal allows, in its order (subsets numbered as binary over
+/// pink, green, lightblue, red, purple, darkblue), without its empty "mix" (bare paper):
+/// darkblue, purple, red, lightblue, green, green+lightblue, pink, pink+purple, pink+red,
+/// pink+lightblue.
+pub fn carl_pen_mixes() -> Vec<PenMix> {
+    let n = CARL_PENS.len();
+    let mut out = Vec::new();
+    for i in 1u32..(1 << n) {
+        let pens: Vec<usize> = (0..n).filter(|&p| (i >> (n - 1 - p)) & 1 == 1).collect();
+        let most = pens.iter().map(|&p| CARL_PEN_SATURATION[p]).min().unwrap_or(0);
+        if pens.len() > most || CARL_PEN_INCOMPATIBLE.iter().any(|&(a, b)| pens.contains(&a) && pens.contains(&b)) {
+            continue;
+        }
+        let share = pens.iter().map(|&p| CARL_PEN_DISTRIBUTION[p]).sum::<f64>() / pens.len() as f64;
+        out.push(PenMix { pens, share });
+    }
+    out
+}
+
+/// The mix of the `rank`-th family (0-based, e.g. longest first): a golden-ratio walk from
+/// `seed` through the mixes' cumulative shares, so each mix gets its share of the families
+/// and consecutive ranks spread over different mixes. gcodefractal hands out the image's
+/// colours in luminance order instead; a plot's families have no luminance, so only the
+/// shares carry over.
+pub fn pick_mix(mixes: &[PenMix], rank: usize, seed: u64) -> usize {
+    let total: f64 = mixes.iter().map(|m| m.share).sum();
+    if mixes.is_empty() || !(total > 0.0) {
+        return 0;
+    }
+    // SplitMix64 of the seed: neighbouring seeds start far apart.
+    let mut z = seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^= z >> 31;
+    let start = (z >> 11) as f64 / (1u64 << 53) as f64;
+    let u = (start + (rank as f64 + 1.0) * 0.618_033_988_749_894_9).fract() * total;
+    let mut acc = 0.0;
+    for (i, m) in mixes.iter().enumerate() {
+        acc += m.share;
+        if u < acc {
+            return i;
+        }
+    }
+    mixes.len() - 1
+}
+
+/// The pen of `mix` drawing line `key` (lines counted one by one, e.g.
+/// [`contour_family_strided`]'s level / stride): a mix's pens take turns, line by line.
+pub fn mix_pen(mix: &[usize], key: usize) -> usize {
+    if mix.is_empty() { 5 } else { mix[key % mix.len()] }
+}
+
+/// "pink+purple".
+pub fn mix_name(mix: &[usize]) -> String {
+    mix.iter().map(|&p| CARL_PENS[p].0).collect::<Vec<_>>().join("+")
+}
+
 /// A quick raster of a plot: `layers` (pen colour, lines in mm on a `paper` of
 /// width × height mm) on white paper, `px` pixels wide. Each line is an anti-aliased
 /// stroke about one pixel wide whose ink is scaled to a `pen_mm` wide pen (a 0.4 mm
@@ -1251,6 +1347,53 @@ pub fn gcode_lines(text: &str, flip_y: Option<bool>) -> (Vec<GcodePen>, P2, P2) 
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn pen_mixes_follow_gcodefractal() {
+        let m = carl_pen_mixes();
+        let names: Vec<String> = m.iter().map(|x| mix_name(&x.pens)).collect();
+        assert_eq!(names, ["darkblue", "purple", "red", "lightblue", "green", "green+lightblue", "pink", "pink+purple", "pink+red", "pink+lightblue"]);
+        // A mix's share is the mean of its pens' distribution factors.
+        let pp = m.iter().find(|x| x.pens == vec![0, 4]).unwrap();
+        assert!((pp.share - (0.9622950358343828 + 0.7048169228716079) / 2.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn families_spread_over_the_mixes_by_share() {
+        let m = carl_pen_mixes();
+        let total: f64 = m.iter().map(|x| x.share).sum();
+        let n = 20_000;
+        let mut count = vec![0usize; m.len()];
+        for r in 0..n { count[pick_mix(&m, r, 12345)] += 1; }
+        for (i, c) in count.iter().enumerate() {
+            let want = m[i].share / total;
+            assert!((*c as f64 / n as f64 - want).abs() < 0.01, "{}: {} vs {want}", mix_name(&m[i].pens), *c as f64 / n as f64);
+        }
+        // Consecutive families rarely share a mix; another seed gives another assignment.
+        let same = (0..1000).filter(|&r| pick_mix(&m, r, 7) == pick_mix(&m, r + 1, 7)).count();
+        assert!(same < 150, "{same}");
+        assert!((0..50).any(|r| pick_mix(&m, r, 7) != pick_mix(&m, r, 8)));
+    }
+
+    #[test]
+    fn a_mix_alternates_its_pens_line_by_line() {
+        assert_eq!((0..5).map(|k| mix_pen(&[0, 4], k)).collect::<Vec<_>>(), vec![0, 4, 0, 4, 0]);
+        assert_eq!(mix_pen(&[2], 7), 2);
+        // On a ramp, the lines' level / stride counts them one by one from left to right.
+        let (w, h) = (200usize, 20usize);
+        let g: Vec<f32> = (0..w * h).map(|i| (i % w) as f32 / w as f32).collect();
+        let lines = contour_family_strided(&g, w, h, 1.0, (0.0, 0.0), 1024, 3.0, 0.0, &|_, _, _| true);
+        let mut xs: Vec<(f64, usize, usize)> = lines.iter().map(|(i, s, l)| (l.pts[0].0, *i, *s)).collect();
+        xs.sort_by(|a, b| a.0.total_cmp(&b.0));
+        assert!(xs.len() > 20);
+        let s = xs[0].2;
+        assert!(xs.iter().all(|x| x.2 == s && x.1 % s == 0), "one stride on a uniform ramp, levels its multiples");
+        for p in xs.windows(2) {
+            assert_eq!(p[1].1 / s, p[0].1 / s + 1, "neighbouring lines are consecutive multiples");
+            assert_ne!(mix_pen(&[0, 4], p[0].1 / s), mix_pen(&[0, 4], p[1].1 / s));
+        }
+    }
+
     use super::*;
 
     #[test]

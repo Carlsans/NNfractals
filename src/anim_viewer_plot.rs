@@ -80,6 +80,12 @@ pub struct PlotPanel {
     draft: bool,
     machine_carl: bool,
     auto: bool,
+    /// Times the ink of lines 0.8 mm apart (quat-anatomy --ink).
+    ink: f64,
+    /// gcodefractal's pen mixes, a mix's pens alternating line by line (--pens mix).
+    mix: bool,
+    /// The pens' assignment (--color-seed): the same for the preview and the export.
+    color_seed: u64,
     tex: Option<egui::TextureHandle>,
     /// The PNG behind the picture shown.
     shown_png: Option<PathBuf>,
@@ -99,6 +105,7 @@ impl Default for PlotPanel {
         PlotPanel {
             pens: Vec::new(), total: None,
             open: false, compose: Compose::Mosaic, follow: 0.5, density: 0, atlas: 1, draft: false, machine_carl: true, auto: false,
+            ink: 4.5, mix: true, color_seed: fresh_color_seed(),
             tex: None, shown_png: None, shown: String::new(), note: String::new(), key: String::new(), changed_at: None, job: None, status: None,
             last_export: None, gcode_path: String::new(),
         }
@@ -106,6 +113,13 @@ impl Default for PlotPanel {
 }
 
 fn root() -> PathBuf { nnfractals::project_root() }
+
+/// A new colour seed (the window's start, and 🎲).
+fn fresh_color_seed() -> u64 {
+    let mut b = [0u8; 8];
+    let _ = std::fs::File::open("/dev/urandom").and_then(|mut f| std::io::Read::read_exact(&mut f, &mut b));
+    u64::from_le_bytes(b) % 1_000_000_000
+}
 
 fn timestamp() -> String {
     let s = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
@@ -172,7 +186,7 @@ fn load_png(ctx: &egui::Context, path: &Path) -> Result<egui::TextureHandle, Str
 impl PlotPanel {
     /// The settings part of the preview key.
     fn settings_key(&self) -> String {
-        format!("{:?}|{}|{}|{}|{}", self.compose, self.follow, self.density, self.atlas, self.draft)
+        format!("{:?}|{}|{}|{}|{}|{}|{}|{}", self.compose, self.follow, self.density, self.atlas, self.draft, self.ink, self.mix, self.color_seed)
     }
 
     /// `quat-anatomy` arguments for the viewer's state (written to files under
@@ -192,6 +206,8 @@ impl PlotPanel {
             "--tilt-right".into(), format!("{}", sp.tilt_right), "--tilt-up".into(), format!("{}", sp.tilt_up),
             "--spin".into(), format!("{}", sp.spin), "--offset".into(), format!("{}", sp.offset), "--zoom".into(), format!("{}", sp.zoom),
             "--max-iter".into(), format!("{}", inp.max_iter.max(20)),
+            "--ink".into(), format!("{}", self.ink), "--pens".into(), (if self.mix { "mix" } else { "single" }).into(),
+            "--color-seed".into(), self.color_seed.to_string(),
         ];
         match self.compose {
             Compose::Mosaic => {
@@ -361,6 +377,15 @@ impl PlotPanel {
                     });
                 }
             }
+            ui.add(egui::Slider::new(&mut self.ink, 1.0..=8.0).step_by(0.5).text("ink ×").custom_formatter(|v, _| format!("{v:.1} ({:.2} mm)", 0.8 / v)))
+                .on_hover_text("Times the ink of lines 0.8 mm apart: the lines' smallest gap is 0.8 mm / this. 4.5 (lines about 0.18 mm apart) is Carl's \"4 to 5 times more ink\"; plotting takes longer as the ink grows (more pen lifts).");
+            ui.horizontal(|ui| {
+                ui.checkbox(&mut self.mix, "mix pens").on_hover_text("gcodefractal's rules: a pen alone or one of its allowed mixes (pink+purple, pink+red, pink+lightblue, green+lightblue), shares by its distribution factors; a mix's two pens alternate line by line. Off: one pen per layer.");
+                ui.add_enabled_ui(self.mix, |ui| {
+                    ui.label(format!("colours #{}", self.color_seed)).on_hover_text("The seed of the pens' assignment, written in the plot's summary (--color-seed); the preview and the export use the same one");
+                    if ui.button("\u{1f3b2}").on_hover_text("Other colours: a new seed").clicked() { self.color_seed = fresh_color_seed(); }
+                });
+            });
             ui.separator();
             ui.horizontal(|ui| {
                 let busy = self.job.is_some();
