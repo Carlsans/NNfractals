@@ -700,6 +700,27 @@ impl eframe::App for App {
             });
         }
 
+        // The idle manager (nnfractals-idle) holds this window's render while the computer
+        // is in use (its "pause_all_renders" setting) and resumes it once nobody uses it.
+        let idle = nnfractals::idle::Status::read(&nnfractals::project_root());
+        let idle_fresh = nnfractals::idle::now_s() * 1000 < idle.updated_ms + 30_000;
+        if idle_fresh && idle.in_use && !idle.held.is_empty() {
+            egui::Panel::top("idle_hold").show(ui, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    ui.colored_label(Color32::from_rgb(230, 180, 80), "⏸ PAUSED WHILE YOU USE THE COMPUTER");
+                    ui.label("— the idle manager holds this render and resumes it when nobody uses the computer \
+                              (launcher → ⏾ Idle manager).");
+                    if ui.button("▶ Render anyway")
+                        .on_hover_text("Let renders run while you use the computer, until you next leave it")
+                        .clicked()
+                    {
+                        let f = nnfractals::project_root().join("explorer_out/idle_render_override");
+                        let _ = std::fs::write(f, "the Video queue window's \"Render anyway\"\n");
+                    }
+                });
+            });
+        }
+
         egui::Panel::top("controls").show(ui, |ui| {
             ui.horizontal(|ui| {
                 if ui.add_enabled(!running, egui::Button::new("▶ Process Queue")).clicked() {

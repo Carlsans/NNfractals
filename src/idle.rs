@@ -37,6 +37,9 @@ pub struct Config {
     pub renders: bool,
     pub campaign: bool,
     pub free_memory_after_min: f64,
+    /// Also pause renders it did not start (the Video queue window's, a cron queue-run)
+    /// while the computer is in use.
+    pub pause_all_renders: bool,
     pub max_workers: usize,
     pub min_free_gb: f64,
     pub campaign_log: String,
@@ -57,6 +60,7 @@ impl Default for Config {
             renders: true,
             campaign: true,
             free_memory_after_min: 15.0,
+            pause_all_renders: true,
             max_workers: 6,
             min_free_gb: 2.0,
             campaign_log: "optuna_campaign_orgcx.log".into(),
@@ -76,6 +80,8 @@ pub const CONFIG_HEADER: &str = "\
 # renders / campaign    what may run: the video render queue first, then the GA campaign
 # free_memory_after_min back at the computer this long: the paused campaign ends its trial
 #                       cleanly so its memory is freed (renders stay paused, keeping progress)
+# pause_all_renders     also pause renders it did not start (the Video queue window's, a cron
+#                       queue-run) while the computer is in use; they resume when it is not
 # max_workers           most GA workers; fewer when memory is short (14 GB free: up to 10, 9: 6, 6: 4, 4: 2, else 1)
 # min_free_gb           the campaign pauses below this much free memory, even while idle
 # campaign_log          where the campaign script writes (appended)
@@ -126,6 +132,10 @@ pub struct Status {
     pub note: String,
     pub devices: Vec<(String, u64)>,
     pub updated_ms: u64,
+    /// Render processes it did not start that it holds paused (the Video queue window's
+    /// render subprocess, ffmpeg): resumed when the computer is not in use.
+    #[serde(default)]
+    pub held: Vec<i32>,
 }
 
 impl Status {
@@ -281,10 +291,16 @@ pub fn stats(root: &Path, hours: f64) -> Stats {
     let n_min = ((end - start) / 60) as usize;
     let events = load_events(root);
     // Replay: state before `start`, then minute by minute.
+    // `render` covers both the manager's queue runs and renders run by others (the Video
+    // queue window's): xrender_* events.
     let (mut on, mut in_use, mut render, mut camp, mut workers) = (false, true, Job3::None, Job3::None, None::<f64>);
-    let apply = |e: &Event, on: &mut bool, in_use: &mut bool, render: &mut Job3, camp: &mut Job3, workers: &mut Option<f64>| {
+    let mut xrender = Job3::None;
+    let apply = |e: &Event, on: &mut bool, in_use: &mut bool, render: &mut Job3, camp: &mut Job3, workers: &mut Option<f64>, xrender: &mut Job3| {
         match e.ev.as_str() {
-            "start" => { *on = true; *in_use = true; *render = Job3::None; *camp = Job3::None; }
+            "start" => { *on = true; *in_use = true; *render = Job3::None; *camp = Job3::None; *xrender = Job3::None; }
+            "xrender_on" | "xrender_resume" => *xrender = Job3::Run,
+            "xrender_pause" => *xrender = Job3::Paused,
+            "xrender_off" => *xrender = Job3::None,
             "stop" => { *on = false; }
             "use" => *in_use = true,
             "idle" => *in_use = false,
@@ -302,7 +318,7 @@ pub fn stats(root: &Path, hours: f64) -> Stats {
     };
     let mut i = 0;
     while i < events.len() && events[i].t < start {
-        apply(&events[i], &mut on, &mut in_use, &mut render, &mut camp, &mut workers);
+        apply(&events[i], &mut on, &mut in_use, &mut render, &mut camp, &mut workers, &mut xrender);
         i += 1;
     }
     let mut s = Stats { start, end, ..Default::default() };
@@ -313,20 +329,20 @@ pub fn stats(root: &Path, hours: f64) -> Stats {
             let e = &events[i];
             match e.ev.as_str() {
                 "idle" => s.times_idle += 1,
-                "render_pause" | "camp_pause" => s.pauses += 1,
+                "render_pause" | "camp_pause" | "xrender_pause" => s.pauses += 1,
                 "camp_stop_clean" => s.clean_stops += 1,
                 "camp_start" => s.campaigns_started += 1,
                 "render_start" => s.render_runs += 1,
                 _ => {}
             }
-            apply(e, &mut on, &mut in_use, &mut render, &mut camp, &mut workers);
+            apply(e, &mut on, &mut in_use, &mut render, &mut camp, &mut workers, &mut xrender);
             i += 1;
         }
         let state = if !on {
             Minute::Off
         } else if in_use {
-            if render != Job3::None || camp != Job3::None { Minute::InUsePaused } else { Minute::InUse }
-        } else if render == Job3::Run {
+            if render != Job3::None || camp != Job3::None || xrender == Job3::Paused { Minute::InUsePaused } else { Minute::InUse }
+        } else if render == Job3::Run || xrender == Job3::Run {
             Minute::Render
         } else if camp == Job3::Run {
             if let Some(w) = workers { w_sum += w; w_n += 1; }

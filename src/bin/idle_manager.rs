@@ -261,6 +261,33 @@ fn stop_campaign_cleanly(root: &Path, job: &Job) {
     if !had_stop { let _ = fs::remove_file(&stop); }
 }
 
+/// A render of the video queue this manager did not start: the processing lock's holder
+/// (the Video queue window, or a queue-run started by hand or cron) and the processes to
+/// hold while the computer is in use: the window's render subprocess and ffmpeg (never
+/// the window itself, which stays responsive, nor its other children such as a YouTube
+/// upload), or all of a headless queue-run. `ours`: the group of the manager's queue run.
+fn foreign_render(root: &Path, ours: Option<i32>) -> Option<(i32, bool, Vec<i32>)> {
+    let pid: i32 = fs::read_to_string(root.join("video_queue/.processing.lock")).ok()?.trim().parse().ok()?;
+    let st = proc_stat(pid)?;
+    if st.3 == 'Z' || Some(st.2) == ours { return None; }
+    let headless = cmdline(pid).contains("queue-run");
+    let links: Vec<(i32, i32)> = all_pids().into_iter().filter_map(|p| proc_stat(p).map(|s| (s.0, s.1))).collect();
+    let mut tree = vec![pid];
+    let mut i = 0;
+    while i < tree.len() {
+        let parent = tree[i];
+        for &(p, pp) in &links { if pp == parent && !tree.contains(&p) { tree.push(p); } }
+        i += 1;
+    }
+    let renders = |p: i32| { let c = cmdline(p); c.contains("ffmpeg") || c.contains("explorer") || c.contains("rife") };
+    let procs: Vec<i32> = tree.into_iter().filter(|&p| if p == pid { headless } else { headless || renders(p) }).collect();
+    Some((pid, !headless, procs))
+}
+
+/// The Video queue window's "render anyway": renders are not held until the computer is
+/// next left alone (the manager removes the file then).
+const RENDER_OVERRIDE: &str = "explorer_out/idle_render_override";
+
 fn workers_for(mem_gb: f64, max: usize) -> usize {
     let w = if mem_gb >= 14.0 { 10 } else if mem_gb >= 9.0 { 6 } else if mem_gb >= 6.0 { 4 } else if mem_gb >= 4.0 { 2 } else { 1 };
     w.min(max.max(1))
@@ -308,6 +335,16 @@ fn run(root: &Path) {
             event(root, &format!("{}_adopt", ev_prefix(what)), Some(if j.paused { 1.0 } else { 0.0 }), None);
         }
     }
+    // Renders of others it held when it stopped (or crashed): let them go; the loop holds
+    // them again if the computer is in use.
+    for p in &old.held {
+        if alive(*p) {
+            // SAFETY: SIGCONT to a process this manager stopped.
+            unsafe { libc::kill(*p, libc::SIGCONT); }
+        }
+    }
+    let mut held: Vec<i32> = Vec::new();
+    let mut xr_seen = false;
     let explorer = root.join("target/release/explorer");
     let mut children: Vec<Child> = Vec::new();
     let mut in_use = true;
@@ -326,7 +363,12 @@ fn run(root: &Path) {
             // the computer is in use.
             if let Some(j) = render.as_mut() { resume(root, j, "render"); }
             if let Some(j) = campaign.as_mut() { resume(root, j, "campaign"); }
+            for p in held.drain(..) {
+                // SAFETY: SIGCONT to a process this manager stopped.
+                if alive(p) { unsafe { libc::kill(p, libc::SIGCONT); } }
+            }
             let mut st = Status::read(root);
+            st.held.clear();
             st.render = render.clone();
             st.campaign = campaign.clone();
             st.note = "manager stopped; its jobs were left running".into();
@@ -375,9 +417,41 @@ fn run(root: &Path) {
             } else {
                 log(&format!("computer not in use for {} min: work may run", cfg.idle_after_min));
                 event(root, "idle", None, None);
+                let _ = fs::remove_file(root.join(RENDER_OVERRIDE));
             }
         }
         let mem = mem_available_gb();
+        // Renders others started (the Video queue window's): held while the computer is in use.
+        held.retain(|&p| alive(p));
+        let xr = foreign_render(root, render.as_ref().map(|j| j.pgid));
+        let xr_running = xr.as_ref().is_some_and(|x| !x.2.is_empty());
+        if xr_running != xr_seen {
+            xr_seen = xr_running;
+            event(root, if xr_running { "xrender_on" } else { "xrender_off" }, None, None);
+        }
+        let hold = in_use && cfg.pause_all_renders && !root.join(RENDER_OVERRIDE).exists();
+        if let (true, Some((holder, window, procs))) = (hold, &xr) {
+            let new: Vec<i32> = procs.iter().copied().filter(|p| !held.contains(p)).collect();
+            if !new.is_empty() {
+                for p in &new {
+                    // SAFETY: SIGSTOP to the queue's render processes (resumed below).
+                    unsafe { libc::kill(*p, libc::SIGSTOP); }
+                }
+                if held.is_empty() {
+                    let who = if *window { "the Video queue window's render" } else { "a render queue run started by hand" };
+                    log(&format!("paused {who} (pid {holder}; computer in use)"));
+                    event(root, "xrender_pause", None, Some(who));
+                }
+                held.extend(new);
+            }
+        } else if !held.is_empty() {
+            for p in held.drain(..) {
+                // SAFETY: SIGCONT to a process this manager stopped.
+                unsafe { libc::kill(p, libc::SIGCONT); }
+            }
+            log("resumed the render it was holding");
+            event(root, "xrender_resume", None, None);
+        }
         if in_use {
             if let Some(j) = render.as_mut() { pause(root, j, "render", "computer in use"); }
             if let Some(j) = campaign.as_mut() { pause(root, j, "campaign", "computer in use"); }
@@ -390,11 +464,14 @@ fn run(root: &Path) {
                     log(&format!("campaign stopped; {:.1} GB free now", mem_available_gb()));
                 }
             }
-            note = "in use: work paused".into();
+            note = if held.is_empty() { "in use: work paused".into() } else { "in use: work paused, the Video queue window's render held too".into() };
         } else {
-            // 1) renders first.
+            // 1) renders first: the window's own, or the manager's queue run.
             let pending = if cfg.renders { pending_renders() } else { 0 };
-            if let Some(j) = render.as_mut() {
+            if xr_running && render.is_none() {
+                if let Some(c) = campaign.as_mut() { pause(root, c, "campaign", "the Video queue window is rendering"); }
+                note = "the Video queue window is rendering".into();
+            } else if let Some(j) = render.as_mut() {
                 if let Some(c) = campaign.as_mut() { pause(root, c, "campaign", "a render goes first"); }
                 resume(root, j, "render");
                 note = "rendering the video queue".into();
@@ -468,7 +545,7 @@ fn run(root: &Path) {
         Status {
             in_use, since_ms: since, last_input_ms: last_input, last_device: act.last_dev.lock().unwrap().clone(),
             sound_playing: sound, mem_free_gb: mem, workers, render: render.clone(), campaign: campaign.clone(),
-            note: note.clone(), devices, updated_ms: now,
+            note: note.clone(), devices, updated_ms: now, held: held.clone(),
         }.write(root);
         std::thread::sleep(Duration::from_secs(5));
     }

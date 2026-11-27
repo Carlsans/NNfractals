@@ -193,6 +193,7 @@ impl IdlePanel {
             }
         }
         ui.label(format!("{:.1} GB free{}", s.mem_free_gb, s.workers.map(|w| format!(", {w} GA workers")).unwrap_or_default()));
+        if !s.held.is_empty() { ui.label(format!("holding the Video queue window's render ({} processes) until you leave", s.held.len())); }
         let stop = root.join(idle::STOP_FILE);
         if stop.exists() {
             ui.horizontal(|ui| {
@@ -329,7 +330,9 @@ impl IdlePanel {
                 ui.checkbox(&mut c.sound_counts_as_use, "sound coming out counts as use (a film, a call)"); ui.end_row();
                 ui.label("what may run");
                 ui.horizontal(|ui| { ui.checkbox(&mut c.renders, "video render queue (first)"); ui.checkbox(&mut c.campaign, "then the campaign"); }); ui.end_row();
-                ui.label("free the campaign's memory");
+                ui.label("renders started elsewhere");
+                ui.checkbox(&mut c.pause_all_renders, "also pause the Video queue window's renders (and a queue-run started by hand) while the computer is in use"); ui.end_row();
+                                ui.label("free the campaign's memory");
                 ui.add(egui::DragValue::new(&mut c.free_memory_after_min).range(1.0..=600.0).speed(0.5).suffix(" min after you are back")); ui.end_row();
                 ui.label("GA workers");
                 ui.add(egui::DragValue::new(&mut c.max_workers).range(1..=16).suffix(" at most")).on_hover_text("Fewer when memory is short: 14 GB free up to 10, 9: 6, 6: 4, 4: 2, else 1"); ui.end_row();
