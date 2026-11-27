@@ -279,9 +279,31 @@ fn foreign_render(root: &Path, ours: Option<i32>) -> Option<(i32, bool, Vec<i32>
         for &(p, pp) in &links { if pp == parent && !tree.contains(&p) { tree.push(p); } }
         i += 1;
     }
-    let renders = |p: i32| { let c = cmdline(p); c.contains("ffmpeg") || c.contains("explorer") || c.contains("rife") };
-    let procs: Vec<i32> = tree.into_iter().filter(|&p| if p == pid { headless } else { headless || renders(p) }).collect();
-    Some((pid, !headless, procs))
+    if headless {
+        return Some((pid, false, tree));
+    }
+    // The window's render processes and everything under them; not its other children
+    // (a YouTube upload and the ffmpeg cutting its thumbnail, 2026-11-27).
+    let mut procs: Vec<i32> = tree.iter().copied().filter(|&p| p != pid && is_render(&argv(p))).collect();
+    let mut i = 0;
+    while i < procs.len() {
+        let parent = procs[i];
+        for &(p, pp) in &links { if pp == parent && !procs.contains(&p) { procs.push(p); } }
+        i += 1;
+    }
+    Some((pid, true, procs))
+}
+
+fn argv(pid: i32) -> Vec<String> {
+    fs::read(format!("/proc/{pid}/cmdline")).map(|b| b.split(|&c| c == 0).filter(|a| !a.is_empty()).map(|a| String::from_utf8_lossy(a).to_string()).collect()).unwrap_or_default()
+}
+
+/// A render process by its own program, not by words in its arguments (a YouTube upload's
+/// arguments name explorer_out/...): the explorer binary (quat-render-timeline), RIFE, or
+/// an ffmpeg encoding frames from a pipe (`-i -`, the 2D renders) rather than reading a file.
+fn is_render(argv: &[String]) -> bool {
+    let Some(exe) = argv.first().map(|a| a.rsplit('/').next().unwrap_or(a).to_string()) else { return false };
+    exe == "explorer" || exe.starts_with("rife") || (exe == "ffmpeg" && argv.windows(2).any(|w| w[0] == "-i" && w[1] == "-"))
 }
 
 /// The Video queue window's "render anyway": renders are not held until the computer is
@@ -594,6 +616,18 @@ fn main() {
 mod tests {
     use super::*;
     use nnfractals::idle::CONFIG_HEADER;
+
+    #[test]
+    fn only_render_processes_are_held() {
+        let v = |s: &str| s.split(' ').map(String::from).collect::<Vec<_>>();
+        assert!(is_render(&v("/home/carl/rust_projects/NNfractals/target/release/explorer quat-render-timeline explorer_out/a.mp4")));
+        assert!(is_render(&v("ffmpeg -y -f rawvideo -pix_fmt rgb24 -s 3840x2160 -r 30 -i - -c:v libx264 explorer_out/a.mp4")));
+        assert!(is_render(&v("/usr/bin/rife-ncnn-vulkan -i in -o out")));
+        // The YouTube upload and the thumbnail it cuts are not renders.
+        assert!(!is_render(&v("ffmpeg -y -v error -ss 30.00 -i explorer_out/quat_mandelbrot/a_reel.mp4 -frames:v 1 -vf scale=1280:-2 -q:v 3 /tmp/t.jpg")));
+        assert!(!is_render(&v("/home/carl/.local/share/nnfractals/youtube-venv/bin/python /home/carl/rust_projects/NNfractals/scripts/youtube_upload.py --file explorer_out/a.mp4")));
+        assert!(!is_render(&v("timeout 3 parec -d @DEFAULT_MONITOR@")));
+    }
 
     #[test]
     fn workers_follow_memory_and_the_cap() {
