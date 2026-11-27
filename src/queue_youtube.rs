@@ -47,8 +47,14 @@ struct Settings {
     title: String,
     description: String,
     thumbnail: bool,
+    /// Tick the 9:16 reel (as a Short) by default.
     short: bool,
+    /// Tick the full-size video by default.
+    #[serde(default = "yes")]
+    full: bool,
 }
+
+fn yes() -> bool { true }
 
 impl Default for Settings {
     fn default() -> Self {
@@ -60,6 +66,7 @@ impl Default for Settings {
             description: "A four-dimensional (quaternion) fractal, rendered with NNfractals.\n\nFormula: {formula}\n{width}×{height}, {fps} fps\n\n#fractal #generativeart #math".into(),
             thumbnail: true,
             short: true,
+            full: true,
         }
     }
 }
@@ -71,6 +78,28 @@ impl Settings {
     fn save(&self) {
         if let Ok(t) = toml::to_string(self) { let _ = std::fs::write(settings_path(), t); }
     }
+}
+
+/// An item's two videos, either of which may be missing: (the full-size render, its 9:16
+/// reel). With a reel crop the queue records the REEL as the item's output and keeps the
+/// full render beside it as `<name>.<ext>`; otherwise it records the full render, and a
+/// reel, if any, is `<name>_reel.<ext>` beside it.
+fn videos_of(output: &Path) -> (Option<PathBuf>, Option<PathBuf>) {
+    let stem = output.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+    let ext = output.extension().and_then(|e| e.to_str()).unwrap_or("mp4");
+    match stem.strip_suffix("_reel") {
+        Some(base) => {
+            let full = output.with_file_name(format!("{base}.{ext}"));
+            (full.exists().then_some(full), output.exists().then(|| output.to_path_buf()))
+        }
+        None => (output.exists().then(|| output.to_path_buf()), reel_of(output)),
+    }
+}
+
+/// Is this upload record a reel (by its flag, or by its file: before 2026-11-27 every
+/// upload sent the item's recorded output, the reel, as a plain video)?
+fn is_reel_upload(u: &YoutubeUpload) -> bool {
+    u.short || Path::new(&u.file).file_stem().and_then(|s| s.to_str()).is_some_and(|s| s.ends_with("_reel"))
 }
 
 /// The 9:16 centre crop the queue writes beside a render (`<name>_reel.<ext>`), if any.
@@ -134,15 +163,21 @@ struct Job {
 
 struct Dialog {
     item_id: String,
-    file: PathBuf,
+    /// The full-size video and the reel, each sent on its own (either may be missing).
+    full: Option<PathBuf>,
     reel: Option<PathBuf>,
+    send_full: bool,
+    send_reel: bool,
+    /// Their YouTube videos already, if any.
+    full_on_yt: Vec<YoutubeUpload>,
+    reel_on_yt: Vec<YoutubeUpload>,
     title: String,
+    reel_title: String,
     description: String,
     tags: String,
     privacy: String,
     category: String,
     thumbnail: bool,
-    short: bool,
 }
 
 #[derive(Default)]
@@ -232,8 +267,15 @@ impl YoutubePanel {
     /// progress, or the button.
     pub fn row(&mut self, ui: &mut egui::Ui, it: &QueueItem) {
         let Some(out) = it.output_path.as_ref().map(PathBuf::from) else { return };
+        // The recorded output is the reel when the queue made one: link the full video too.
+        let (full, reel) = videos_of(&out);
+        if let (Some(f), Some(r)) = (&full, &reel) {
+            if *r == out && ui.link("full 16:9").on_hover_text(format!("{} — the full-size render (the link before it is the 9:16 reel)", f.display())).clicked() {
+                let _ = Command::new("xdg-open").arg(f).spawn();
+            }
+        }
         for u in &it.youtube {
-            let label = format!("▶ {}{}", if u.short { "Short " } else { "" }, u.video_id);
+            let label = format!("▶ {}{}", if is_reel_upload(u) { "Short " } else { "" }, u.video_id);
             if ui.link(label).on_hover_text(format!("{} ({}) — open on YouTube", u.url(), u.privacy)).clicked() {
                 let _ = Command::new("xdg-open").arg(u.url()).spawn();
             }
@@ -243,8 +285,8 @@ impl YoutubePanel {
             return;
         }
         let label = if it.youtube.is_empty() { "⬆ YouTube" } else { "⬆ again" };
-        if ui.add_enabled(out.exists() && self.job.is_none(), egui::Button::new(label))
-            .on_hover_text("Upload this video to YouTube: title, description, tags and privacy first, then it all runs by itself").clicked() {
+        if ui.add_enabled((full.is_some() || reel.is_some()) && self.job.is_none(), egui::Button::new(label))
+            .on_hover_text("Upload the full-size video, the 9:16 reel as a Short, or both: title, description, tags and privacy first, then it all runs by itself").clicked() {
             self.open_for = Some(it.id.clone());
         }
     }
@@ -258,11 +300,22 @@ impl YoutubePanel {
             if let Some(it) = items.iter().find(|it| it.id == id) {
                 let s = self.settings().clone();
                 let formula = formula_of(it);
-                let file = PathBuf::from(it.output_path.clone().unwrap_or_default());
+                let (full, reel) = videos_of(Path::new(&it.output_path.clone().unwrap_or_default()));
+                let on_yt = |f: &Option<PathBuf>, reel_kind: bool| -> Vec<YoutubeUpload> {
+                    let Some(f) = f else { return Vec::new() };
+                    it.youtube.iter().filter(|u| Path::new(&u.file) == f.as_path() || (Path::new(&u.file).file_name() == f.file_name() && is_reel_upload(u) == reel_kind)).cloned().collect()
+                };
+                let (full_on_yt, reel_on_yt) = (on_yt(&full, false), on_yt(&reel, true));
+                let title = fill(&s.title, it, &formula);
                 self.dialog = Some(Dialog {
-                    item_id: id, reel: reel_of(&file), file,
-                    title: fill(&s.title, it, &formula), description: fill(&s.description, it, &formula),
-                    tags: s.tags, privacy: s.privacy, category: s.category, thumbnail: s.thumbnail, short: s.short,
+                    item_id: id,
+                    // Ticked: what is there and not on YouTube yet (and wanted by default).
+                    send_full: full.is_some() && full_on_yt.is_empty() && s.full,
+                    send_reel: reel.is_some() && reel_on_yt.is_empty() && s.short,
+                    full, reel, full_on_yt, reel_on_yt,
+                    reel_title: format!("{title} #Shorts"), title,
+                    description: fill(&s.description, it, &formula),
+                    tags: s.tags, privacy: s.privacy, category: s.category, thumbnail: s.thumbnail,
                 });
             }
         }
@@ -327,8 +380,35 @@ impl YoutubePanel {
             } else if !authorised {
                 ui.weak("The first upload opens the browser to sign in to Google and allow the upload.");
             }
-            ui.horizontal(|ui| { ui.label("video"); ui.monospace(d.file.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default()); });
-            ui.horizontal(|ui| { ui.label("title"); ui.add(egui::TextEdit::singleline(&mut d.title).desired_width(f32::INFINITY).char_limit(100)); });
+            // Each video on its own: the full-size render, the 9:16 reel as a Short, or both.
+            let name = |p: &Option<PathBuf>| p.as_ref().and_then(|p| p.file_name()).map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
+            let already = |ui: &mut egui::Ui, ups: &[YoutubeUpload]| {
+                for u in ups {
+                    ui.colored_label(Color32::from_rgb(230, 180, 80), "already on YouTube:");
+                    if ui.link(&u.video_id).on_hover_text(u.url()).clicked() { let _ = Command::new("xdg-open").arg(u.url()).spawn(); }
+                }
+            };
+            ui.add_enabled_ui(d.full.is_some(), |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    ui.checkbox(&mut d.send_full, "full-size video (16:9)");
+                    ui.monospace(if d.full.is_some() { name(&d.full) } else { "(no full-size file)".into() });
+                    already(ui, &d.full_on_yt);
+                });
+                if d.send_full {
+                    ui.horizontal(|ui| { ui.label("    title"); ui.add(egui::TextEdit::singleline(&mut d.title).desired_width(f32::INFINITY).char_limit(100)); });
+                }
+            });
+            ui.add_enabled_ui(d.reel.is_some(), |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    ui.checkbox(&mut d.send_reel, "9:16 reel, as a Short");
+                    ui.monospace(if d.reel.is_some() { name(&d.reel) } else { "(no reel: render with the reel crop to get one)".into() });
+                    already(ui, &d.reel_on_yt);
+                });
+                if d.send_reel {
+                    ui.horizontal(|ui| { ui.label("    title"); ui.add(egui::TextEdit::singleline(&mut d.reel_title).desired_width(f32::INFINITY).char_limit(100)); });
+                }
+            });
+            ui.separator();
             ui.label("description");
             ui.add(egui::TextEdit::multiline(&mut d.description).desired_rows(6).desired_width(f32::INFINITY));
             ui.horizontal(|ui| { ui.label("tags"); ui.add(egui::TextEdit::singleline(&mut d.tags).desired_width(f32::INFINITY)).on_hover_text("comma-separated"); });
@@ -344,13 +424,14 @@ impl YoutubePanel {
                 ui.colored_label(Color32::from_rgb(230, 180, 80), "Until YouTube audits your API project, its uploads stay private whatever is chosen here.")
                     .on_hover_text("YouTube's rule for API projects created since July 2020: request the audit at support.google.com/youtube/contact/yt_api_form");
             }
-            ui.checkbox(&mut d.thumbnail, "thumbnail from the middle of the video").on_hover_text("Custom thumbnails need a phone-verified channel; without it the upload still works");
-            if let Some(r) = &d.reel {
-                ui.checkbox(&mut d.short, format!("also upload the 9:16 reel as a Short ({})", r.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default()));
-            }
+            ui.add_enabled_ui(d.send_full, |ui| {
+                ui.checkbox(&mut d.thumbnail, "full video: thumbnail from its middle").on_hover_text("Custom thumbnails need a phone-verified channel; without it the upload still works. Shorts take theirs from the video.");
+            });
             ui.separator();
+            let ready = (d.send_full && !d.title.trim().is_empty()) || (d.send_reel && !d.reel_title.trim().is_empty());
+            let what = match (d.send_full, d.send_reel) { (true, true) => "⬆ Upload both", (true, false) => "⬆ Upload the full video", (false, true) => "⬆ Upload the reel", _ => "⬆ Upload" };
             ui.horizontal(|ui| {
-                start = ui.add_enabled(venv_ok && secret_ok && !busy && !d.title.trim().is_empty(), egui::Button::new("⬆ Upload")).clicked();
+                start = ui.add_enabled(venv_ok && secret_ok && !busy && ready, egui::Button::new(what)).clicked();
                 if busy { ui.spinner(); }
             });
             if let Some(j) = &self.job {
@@ -369,9 +450,11 @@ impl YoutubePanel {
         }
         if start {
             let d = self.dialog.as_ref().unwrap();
-            let mut files = vec![(d.file.clone(), false, d.title.trim().to_string())];
-            if d.short { if let Some(r) = &d.reel { files.push((r.clone(), true, format!("{} #Shorts", d.title.trim()))); } }
-            let (privacy, category, tags, thumbnail, short, id) = (d.privacy.clone(), d.category.clone(), d.tags.clone(), d.thumbnail, d.short, d.item_id.clone());
+            let mut files = Vec::new();
+            if d.send_full { if let Some(f) = &d.full { files.push((f.clone(), false, d.title.trim().to_string())); } }
+            if d.send_reel { if let Some(r) = &d.reel { files.push((r.clone(), true, d.reel_title.trim().to_string())); } }
+            let (privacy, category, tags, thumbnail, id) = (d.privacy.clone(), d.category.clone(), d.tags.clone(), d.thumbnail, d.item_id.clone());
+            let (full, short) = (d.send_full, d.send_reel);
             let work = Work::Upload { files, description: d.description.clone(), tags: tags.clone(), privacy: privacy.clone(), category: category.clone(), thumbnail };
             // What was used becomes the next default (the title and description templates stay).
             let s = self.settings();
@@ -380,6 +463,7 @@ impl YoutubePanel {
             s.tags = tags;
             s.thumbnail = thumbnail;
             s.short = short;
+            s.full = full;
             s.save();
             self.start(work, Some(id), "uploading");
         }
@@ -405,6 +489,23 @@ mod tests {
             blend_shape: String::new(), blend_amp: 0.0, time_prog: Vec::new(), rife_fps: 0, keyframe_stride: 0, quat: None,
             youtube: Vec::new(),
         }
+    }
+
+    #[test]
+    fn an_items_two_videos_are_found_whichever_is_recorded() {
+        let dir = std::env::temp_dir().join(format!("nnf_yt_videos_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (full, reel) = (dir.join("clip.mp4"), dir.join("clip_reel.mp4"));
+        std::fs::write(&full, b"x").unwrap();
+        // Only the full render.
+        assert_eq!(videos_of(&full), (Some(full.clone()), None));
+        std::fs::write(&reel, b"x").unwrap();
+        // The queue records the reel when it made one; the full render is beside it.
+        assert_eq!(videos_of(&reel), (Some(full.clone()), Some(reel.clone())));
+        assert_eq!(videos_of(&full), (Some(full.clone()), Some(reel.clone())));
+        let up = |f: &Path, short: bool| YoutubeUpload { file: f.display().to_string(), video_id: "x".into(), privacy: "private".into(), uploaded_at: 0, short };
+        assert!(is_reel_upload(&up(&reel, false)) && !is_reel_upload(&up(&full, false)) && is_reel_upload(&up(&full, true)));
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
